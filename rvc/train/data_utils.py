@@ -1,5 +1,4 @@
 import os
-import random
 import numpy as np
 import soundfile as sf
 import torch
@@ -129,11 +128,6 @@ class TextAudioLoaderMultiNSFsid(torch.utils.data.Dataset):
             )
         audio_norm = audio
         audio_norm = audio_norm.unsqueeze(0)
-        if random.choice((True, False)):
-            max_amp = float(torch.max(torch.abs(audio_norm))) + 1e-5
-            max_shift = min(1, np.log10(1 / max_amp))
-            log10_vol_shift = random.uniform(-1, max_shift)
-            audio_norm = audio_norm * (10 ** log10_vol_shift)
         spec = spectrogram_torch(
             audio_norm,
             self.filter_length,
