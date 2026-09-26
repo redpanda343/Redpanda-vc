@@ -148,7 +148,7 @@ def _apply_preset(preset_name):
         preset["total_epoch"],
         preset["save_every_epoch"],
         preset["cut_preprocess"],
-        "none",
+        preset["normalization_mode"],
         preset["dataset_format"],
         False,
         preset["f0_method"],
@@ -562,7 +562,7 @@ def one_click_train_tab():
                 value="none",
                 label=i18n("Normalization mode"),
                 interactive=True,
-                visible=False,
+                visible=True,
             )
             dataset_format = gr.Radio(
                 choices=["WAV 16-bit", "WAV 32-bit float", "FLAC"],

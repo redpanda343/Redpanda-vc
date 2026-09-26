@@ -625,7 +625,7 @@ def train_tab():
                     choices=["none", "pre", "post"],
                     value="none",
                     interactive=True,
-                    visible=False,
+                    visible=True,
                 )
 
                 noise_reduction = gr.Checkbox(
