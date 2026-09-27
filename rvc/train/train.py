@@ -948,6 +948,8 @@ def train_and_evaluate(
                         scaler.unscale_(optim_d)
                         grad_norm_d = commons.grad_norm(net_d.parameters())
                     scaler.step(optim_d)
+                    if discriminator_step + 1 < d_step_per_g_step:
+                        scaler.update()
                 else:
                     loss_disc.backward()
                     if log_grad_norms and discriminator_step + 1 == d_step_per_g_step:
