@@ -39,7 +39,7 @@ class TextAudioLoaderMultiNSFsid(torch.utils.data.Dataset):
             if self.min_text_len <= len(text) and len(text) <= self.max_text_len:
                 audiopaths_and_text_new.append([audiopath, text, pitch, pitchf, dv])
                 audio_info = sf.info(audiopath)
-                if audio_info.format == "FLAC" or audio_info.subtype == "FLOAT":
+                if audio_info.format == "FLAC" or audio_info.subtype in {"FLOAT", "PCM_16"}:
                     length = audio_info.frames // self.hop_length
                 else:
                     length = os.path.getsize(audiopath) // (3 * self.hop_length)
