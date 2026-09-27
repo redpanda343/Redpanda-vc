@@ -41,7 +41,7 @@ logging.getLogger("numba.core.ssa").setLevel(logging.WARNING)
 logging.getLogger("numba.core.interpreter").setLevel(logging.WARNING)
 
 OVERLAP = 0.3
-PERCENTAGE = 10.0
+PERCENTAGE = 3.0
 MAX_AMPLITUDE = 0.9
 ALPHA = 0.75
 POST_NORMALIZATION_MAX_GAIN = 4.0
