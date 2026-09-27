@@ -24,6 +24,8 @@ class TextAudioLoaderMultiNSFsid(torch.utils.data.Dataset):
         self.hop_length = hparams.hop_length
         self.win_length = hparams.win_length
         self.sample_rate = hparams.sample_rate
+        self.max_sample_frames = 11 * self.sample_rate // self.hop_length
+        self.train_sample_frames = 10 * self.sample_rate // self.hop_length
         self.min_text_len = getattr(hparams, "min_text_len", 1)
         self.max_text_len = getattr(hparams, "max_text_len", 5000)
         self._filter()
@@ -42,7 +44,7 @@ class TextAudioLoaderMultiNSFsid(torch.utils.data.Dataset):
                     length = audio_info.frames // self.hop_length
                 else:
                     length = os.path.getsize(audiopath) // (3 * self.hop_length)
-                lengths.append(length)
+                lengths.append(min(length, self.train_sample_frames))
         self.audiopaths_and_text = audiopaths_and_text_new
         self.lengths = lengths
 
@@ -90,6 +92,17 @@ class TextAudioLoaderMultiNSFsid(torch.utils.data.Dataset):
             pitch = pitch[:len_min]
             pitchf = pitchf[:len_min]
 
+        if phone.size(0) > self.train_sample_frames:
+            start = torch.randint(
+                phone.size(0) - self.train_sample_frames + 1, (1,)
+            ).item()
+            end = start + self.train_sample_frames
+            spec = spec[:, start:end]
+            wav = wav[:, start * self.hop_length : end * self.hop_length]
+            phone = phone[start:end]
+            pitch = pitch[start:end]
+            pitchf = pitchf[start:end]
+
         return (spec, wav, phone, pitch, pitchf, dv)
 
     def get_labels(self, phone, pitch, pitchf):
@@ -105,7 +118,7 @@ class TextAudioLoaderMultiNSFsid(torch.utils.data.Dataset):
         phone = np.repeat(phone, 2, axis=0)
         pitch = np.load(pitch)
         pitchf = np.load(pitchf)
-        n_num = min(phone.shape[0], 900)
+        n_num = min(phone.shape[0], self.max_sample_frames)
         phone = phone[:n_num, :]
         pitch = pitch[:n_num]
         pitchf = pitchf[:n_num]
@@ -126,6 +139,7 @@ class TextAudioLoaderMultiNSFsid(torch.utils.data.Dataset):
             raise ValueError(
                 f"{sample_rate} SR doesn't match target {self.sample_rate} SR"
             )
+        audio = audio[: self.max_sample_frames * self.hop_length]
         audio_norm = audio
         audio_norm = audio_norm.unsqueeze(0)
         spec = spectrogram_torch(
