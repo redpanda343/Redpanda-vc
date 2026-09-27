@@ -24,8 +24,7 @@ class TextAudioLoaderMultiNSFsid(torch.utils.data.Dataset):
         self.hop_length = hparams.hop_length
         self.win_length = hparams.win_length
         self.sample_rate = hparams.sample_rate
-        self.max_sample_frames = 11 * self.sample_rate // self.hop_length
-        self.train_sample_frames = 10 * self.sample_rate // self.hop_length
+        self.max_sample_frames = 15 * self.sample_rate // self.hop_length
         self.min_text_len = getattr(hparams, "min_text_len", 1)
         self.max_text_len = getattr(hparams, "max_text_len", 5000)
         self._filter()
@@ -44,7 +43,7 @@ class TextAudioLoaderMultiNSFsid(torch.utils.data.Dataset):
                     length = audio_info.frames // self.hop_length
                 else:
                     length = os.path.getsize(audiopath) // (3 * self.hop_length)
-                lengths.append(min(length, self.train_sample_frames))
+                lengths.append(min(length, self.max_sample_frames))
         self.audiopaths_and_text = audiopaths_and_text_new
         self.lengths = lengths
 
@@ -91,17 +90,6 @@ class TextAudioLoaderMultiNSFsid(torch.utils.data.Dataset):
             phone = phone[:len_min, :]
             pitch = pitch[:len_min]
             pitchf = pitchf[:len_min]
-
-        if phone.size(0) > self.train_sample_frames:
-            start = torch.randint(
-                phone.size(0) - self.train_sample_frames + 1, (1,)
-            ).item()
-            end = start + self.train_sample_frames
-            spec = spec[:, start:end]
-            wav = wav[:, start * self.hop_length : end * self.hop_length]
-            phone = phone[start:end]
-            pitch = pitch[start:end]
-            pitchf = pitchf[start:end]
 
         return (spec, wav, phone, pitch, pitchf, dv)
 

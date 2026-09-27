@@ -500,7 +500,10 @@ def run(
     train_sampler = DistributedBucketSampler(
         train_dataset,
         batch_size,
-        [50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000],
+        [
+            50, 100, 200, 300, 400, 500, 600, 700, 800, 900,
+            1000, 1100, 1200, 1300, 1400, 1500,
+        ],
         num_replicas=n_gpus,
         rank=rank,
         shuffle=True,
