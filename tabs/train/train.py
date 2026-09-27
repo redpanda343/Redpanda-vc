@@ -612,7 +612,7 @@ def train_tab():
                     info=i18n(
                         "Removes DC-offset from the dataset. Disable this if your dataset has no DC-offset or has already been passed through a high-pass filter."
                     ),
-                    value=False,
+                    value=True,
                     interactive=True,
                     visible=False,
                 )
