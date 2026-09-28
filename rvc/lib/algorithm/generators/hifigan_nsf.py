@@ -174,7 +174,7 @@ class HiFiGANNSFGenerator(torch.nn.Module):
         self, x: torch.Tensor, f0: torch.Tensor, g: Optional[torch.Tensor] = None
     ):
         har_source, _, _ = self.m_source(f0, self.upp)
-        har_source = har_source.transpose(1, 2)
+        har_source = har_source.squeeze(-1).unsqueeze(1)
         # new tensor
         x = self.conv_pre(x)
 
