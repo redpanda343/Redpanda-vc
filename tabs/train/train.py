@@ -692,7 +692,7 @@ def train_tab():
                     "Pitch extraction algorithm to use for the audio conversion. The default algorithm is rmvpe, which is recommended for most cases."
                 ),
                 choices=[
-                    "pm",
+                    "swift",
                     "rmvpe",
                     # "fcpe"
                 ],

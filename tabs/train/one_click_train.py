@@ -116,6 +116,8 @@ def _load_custom_presets():
             and name not in DEFAULT_TRAINING_PRESETS
         ):
             loaded_settings = defaults | settings
+            if loaded_settings["f0_method"] == "pm":
+                loaded_settings["f0_method"] = "swift"
             if loaded_settings["dataset_format"] == "WAV":
                 loaded_settings["dataset_format"] = "WAV 16-bit"
             if loaded_settings["cut_preprocess"] == "Simple":
@@ -647,7 +649,7 @@ def one_click_train_tab():
     with gr.Accordion(i18n("Feature Extraction"), open=False):
         with gr.Row():
             f0_method = gr.Radio(
-                choices=["pm", "rmvpe"],
+                choices=["swift", "rmvpe"],
                 value="rmvpe",
                 label=i18n("Pitch extraction algorithm"),
                 interactive=True,

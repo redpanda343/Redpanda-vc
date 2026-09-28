@@ -17,7 +17,7 @@ sys.path.append(os.path.join(now_dir))
 # Zluda hijack
 import rvc.lib.zluda
 from rvc.configs.config import Config
-from rvc.lib.predictors.f0 import RMVPE
+from rvc.lib.predictors.f0 import RMVPE, Swift
 from rvc.lib.utils import get_embedding_metadata, load_audio_16k, load_embedding
 from rvc.train.extract.preparing_files import generate_config, generate_filelist
 from rvc.train.validation_data import (
@@ -44,6 +44,10 @@ class FeatureInput:
             self.model = RMVPE(
                 device=self.device, sample_rate=self.sample_rate, hop_size=self.hop_size
             )
+        elif f0_method == "swift":
+            self.model = Swift(
+                device=self.device, sample_rate=self.sample_rate, hop_size=self.hop_size
+            )
         elif f0_method != "pm":
             raise ValueError(f"Unsupported F0 method: {f0_method}")
         self.f0_method = f0_method
@@ -55,6 +59,10 @@ class FeatureInput:
             f0 = self.get_pm(x, p_len)
         elif self.f0_method == "rmvpe":
             f0 = self.model.get_f0(x, filter_radius=0.03)
+        elif self.f0_method == "swift":
+            f0 = self.model.get_f0(
+                x, p_len=p_len, f0_min=self.f0_min, f0_max=self.f0_max
+            )
         return np.asarray(f0).copy()
 
     def get_pm(self, x, p_len):
@@ -89,34 +97,45 @@ class FeatureInput:
         )
         return f0_coarse
 
-    def process_file(self, file_info):
+    def process_file(self, file_info, force=False):
         inp_path, opt_path_coarse, opt_path_full, _ = file_info
-        if os.path.exists(opt_path_coarse) and os.path.exists(opt_path_full):
+        if not force and os.path.exists(opt_path_coarse) and os.path.exists(opt_path_full):
             return
 
         try:
             np_arr = load_audio_16k(inp_path)
             feature_pit = self.compute_f0(np_arr)
-            if feature_pit is None:
-                return
-            np.save(opt_path_full, feature_pit, allow_pickle=False)
+            if feature_pit.ndim != 1 or not feature_pit.size:
+                raise ValueError("Pitch extraction returned an empty or invalid contour.")
+            if not np.isfinite(feature_pit).all() or np.any(feature_pit < 0):
+                raise ValueError("Pitch extraction returned invalid frequencies.")
             coarse_pit = self.coarse_f0(feature_pit)
+            np.save(opt_path_full, feature_pit, allow_pickle=False)
             np.save(opt_path_coarse, coarse_pit, allow_pickle=False)
         except Exception as error:
-            print(
+            raise RuntimeError(
                 f"An error occurred extracting file {inp_path} on {self.device}: {error}"
-            )
+            ) from error
 
 
-def process_files(files, f0_method, device):
+def process_files(files, f0_method, device, force=False):
     fe = FeatureInput(f0_method=f0_method, device=device)
     with tqdm.tqdm(total=len(files), leave=True) as pbar:
         for file_info in files:
-            fe.process_file(file_info)
+            fe.process_file(file_info, force=force)
             pbar.update(1)
 
 
-def run_pitch_extraction(files, devices, f0_method, threads):
+def run_pitch_extraction(files, devices, f0_method, threads, force=False):
+    if not files:
+        return
+    if not devices:
+        raise ValueError("No pitch extraction devices were selected.")
+    if f0_method == "swift" and (
+        not torch.cuda.is_available()
+        or any(torch.device(device).type != "cuda" for device in devices)
+    ):
+        raise RuntimeError("SwiftF0 training extraction requires a CUDA GPU. Select a GPU or use RMVPE.")
     threads = max(1, int(threads))
     if f0_method == "pm":
         worker_count = min(threads, len(files))
@@ -138,10 +157,12 @@ def run_pitch_extraction(files, devices, f0_method, threads):
                 files[i::worker_count],
                 f0_method,
                 worker_devices[i],
+                force,
             )
             for i in range(worker_count)
         ]
-        concurrent.futures.wait(tasks)
+        for task in concurrent.futures.as_completed(tasks):
+            task.result()
 
     print(f"Pitch extraction completed in {time.time() - start_time:.2f} seconds.")
 
@@ -265,8 +286,8 @@ if __name__ == "__main__":
         for stale_path in glob.glob(os.path.join(exp_dir, "*.index")):
             os.remove(stale_path)
         print("Embedder changed; removed stale features and indexes.")
+    force_pitch_extraction = data.get("f0_method") != f0_method
     data.update(metadata)
-    data["f0_method"] = f0_method
     with open(file_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4)
 
@@ -303,7 +324,12 @@ if __name__ == "__main__":
 
     devices = ["cpu"] if gpus == "-" else [f"cuda:{idx}" for idx in gpus.split("-")]
 
-    run_pitch_extraction(extraction_files, devices, f0_method, num_processes)
+    run_pitch_extraction(
+        extraction_files, devices, f0_method, num_processes, force=force_pitch_extraction
+    )
+    data["f0_method"] = f0_method
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4)
 
     run_embedding_extraction(extraction_files, devices, embedder_model, num_processes)
 

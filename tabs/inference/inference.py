@@ -887,7 +887,6 @@ def inference_tab():
                         "Pitch extraction algorithm to use for the audio conversion. The default algorithm is rmvpe, which is recommended for most cases."
                     ),
                     choices=[
-                        "pm",
                         "rmvpe",
                         "fcpe",
                         "swift",
@@ -1368,7 +1367,6 @@ def inference_tab():
                         "Pitch extraction algorithm to use for the audio conversion. The default algorithm is rmvpe, which is recommended for most cases."
                     ),
                     choices=[
-                        "pm",
                         "rmvpe",
                         "fcpe",
                         "swift",
@@ -1542,7 +1540,7 @@ def inference_tab():
             multi_f0_method = gr.Radio(
                 label=i18n("Pitch extraction algorithm"),
                 info=i18n("Pitch extraction algorithm used by every model."),
-                choices=["pm", "rmvpe", "fcpe", "swift"],
+                choices=["rmvpe", "fcpe", "swift"],
                 value="rmvpe",
                 interactive=True,
             )
@@ -1727,7 +1725,7 @@ def inference_tab():
             batch_multi_f0_method = gr.Radio(
                 label=i18n("Pitch extraction algorithm"),
                 info=i18n("Pitch extraction algorithm used by every model."),
-                choices=["pm", "rmvpe", "fcpe", "swift"],
+                choices=["rmvpe", "fcpe", "swift"],
                 value="rmvpe",
                 interactive=True,
             )
