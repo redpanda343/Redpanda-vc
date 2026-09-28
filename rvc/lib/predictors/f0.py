@@ -67,7 +67,10 @@ class Swift:
 
         self.model = SwiftF0()
         self.model.session.set_providers(
-            [("CUDAExecutionProvider", {"device_id": self.device.index or 0})]
+            [
+                ("CUDAExecutionProvider", {"device_id": self.device.index or 0}),
+                "CPUExecutionProvider",
+            ]
         )
         if "CUDAExecutionProvider" not in self.model.session.get_providers():
             raise RuntimeError("SwiftF0 could not initialize its CUDA execution provider.")
