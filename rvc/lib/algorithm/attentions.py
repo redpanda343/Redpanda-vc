@@ -146,6 +146,8 @@ class MultiHeadAttention(torch.nn.Module):
         return torch.matmul(x, y.unsqueeze(0).transpose(-2, -1))
 
     def _get_relative_embeddings(self, embeddings, length):
+        if embeddings.size(0) == 1:
+            embeddings = embeddings.squeeze(0).unsqueeze(0)
         pad_length = max(length - (self.window_size + 1), 0)
         start = max((self.window_size + 1) - length, 0)
         end = start + 2 * length - 1
