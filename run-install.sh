@@ -84,6 +84,7 @@ install_dependencies() {
     uv pip install -r "$INSTALL_DIR/requirements.txt" \
         --extra-index-url https://download.pytorch.org/whl/cu128 \
         --index-strategy unsafe-best-match
+    uv pip install --no-deps swift-f0==0.3.0
     conda deactivate
     echo "Dependencies installation complete."
     echo

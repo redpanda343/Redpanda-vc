@@ -957,6 +957,7 @@ def _infer_opts(func):
                 [
                     "rmvpe",
                     "fcpe",
+                    "swift",
                     "hybrid[rmvpe+fcpe]",
                 ]
             ),

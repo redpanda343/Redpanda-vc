@@ -640,7 +640,7 @@ class RealtimeGUI:
         ttk.Label(settings, text="Pitch extraction").grid(row=5, column=0, sticky="w")
         pitch_methods = ttk.Frame(settings)
         pitch_methods.grid(row=5, column=1, sticky="w", pady=4)
-        for method in ("rmvpe", "fcpe", "pm"):
+        for method in ("rmvpe", "fcpe", "pm", "swift"):
             ttk.Radiobutton(
                 pitch_methods,
                 text=method,

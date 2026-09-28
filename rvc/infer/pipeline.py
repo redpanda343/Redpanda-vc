@@ -11,7 +11,7 @@ from torch import Tensor
 now_dir = os.getcwd()
 sys.path.append(now_dir)
 
-from rvc.lib.predictors.f0 import FCPE, RMVPE
+from rvc.lib.predictors.f0 import FCPE, RMVPE, Swift
 from rvc.infer.pm import extract_pm
 
 import logging
@@ -121,6 +121,14 @@ class Pipeline:
                     hop_size=self.window,
                 )
             f0 = self.model_fcpe.get_f0(x, p_len, filter_radius=0.006)
+        elif f0_method == "swift":
+            if not hasattr(self, "model_swift"):
+                self.model_swift = Swift(
+                    device=self.device,
+                    sample_rate=self.sample_rate,
+                    hop_size=self.window,
+                )
+            f0 = self.model_swift.get_f0(x, p_len)
         else:
             raise ValueError(f"Unsupported pitch extraction method: {f0_method}")
 
