@@ -73,6 +73,41 @@ class Swift:
             raise RuntimeError("SwiftF0 could not initialize its CUDA execution provider.")
         self.model.session.disable_fallback()
 
+    @staticmethod
+    def _repair_subharmonics(pitch, confidence, frame_period=0.016):
+        pitch = np.asarray(pitch, dtype=np.float64)
+        confidence = np.asarray(confidence, dtype=np.float64)
+        corrected = pitch.copy()
+        repaired = np.zeros(len(pitch), dtype=bool)
+        i = 1
+        while i < len(pitch) - 1:
+            if confidence[i - 1] < 0.5 or not 0.3 <= confidence[i] < 0.95:
+                i += 1
+                continue
+            ratio = pitch[i - 1] / pitch[i]
+            factor = min((2, 3), key=lambda value: abs(np.log2(ratio / value)))
+            if abs(1200 * np.log2(ratio / factor)) > 100:
+                i += 1
+                continue
+            j = i
+            while j < len(pitch) and (j - i) * frame_period < 1.0:
+                if not 0.3 <= confidence[j] < 0.95:
+                    break
+                previous = pitch[i - 1] if j == i else pitch[j - 1] * factor
+                if abs(1200 * np.log2(pitch[j] * factor / previous)) > 100:
+                    break
+                j += 1
+            if j > i and j < len(pitch) and confidence[j] >= 0.5:
+                return_error = abs(1200 * np.log2(pitch[j] / (pitch[j - 1] * factor)))
+                anchor_error = abs(1200 * np.log2(pitch[j] / pitch[i - 1]))
+                if return_error <= 100 and anchor_error <= 150:
+                    corrected[i:j] *= factor
+                    repaired[i:j] = True
+                    i = j + 1
+                    continue
+            i += 1
+        return corrected, repaired
+
     def get_f0(self, x, p_len=None, f0_min=50.0, f0_max=1100.0, threshold=0.5):
         from swift_f0 import FRAME_PERIOD
 
@@ -82,16 +117,20 @@ class Swift:
             p_len = np.asarray(x).shape[0] // self.hop_size
         if p_len <= 0:
             return np.zeros(0, dtype=np.float64)
-
         result = self.model.detect(x, self.sample_rate, fmin=f0_min, fmax=f0_max)
-        t_src = np.arange(result.pitch_hz.shape[0]) * FRAME_PERIOD
-        t_tgt = np.arange(p_len) * (self.hop_size / self.sample_rate)
-        conf_tgt = np.interp(t_tgt, t_src, result.confidence)
-        voiced = result.confidence >= threshold
+        pitch, repaired = self._repair_subharmonics(
+            result.pitch_hz, result.confidence, FRAME_PERIOD
+        )
+        repaired &= (pitch >= f0_min) & (pitch <= f0_max)
+        pitch = np.where(repaired, pitch, result.pitch_hz)
+        confidence = np.where(
+            repaired, np.maximum(result.confidence, threshold), result.confidence
+        )
+        t_src = result.timestamps
+        t_tgt = np.arange(p_len) * self.hop_size / self.sample_rate
+        voiced = confidence >= threshold
         if not np.any(voiced):
             return np.zeros(p_len, dtype=np.float64)
-        f0_tgt = np.power(
-            2.0, np.interp(t_tgt, t_src[voiced], np.log2(result.pitch_hz[voiced]))
-        )
-        f0_tgt[conf_tgt < threshold] = 0.0
-        return f0_tgt
+        f0 = np.exp2(np.interp(t_tgt, t_src[voiced], np.log2(pitch[voiced])))
+        f0[np.interp(t_tgt, t_src, confidence) < threshold] = 0.0
+        return f0
