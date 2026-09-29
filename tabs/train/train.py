@@ -316,6 +316,7 @@ def train_tab():
         truncate_silence_minimum_seconds,
         truncate_silence_action,
         truncate_silence_compress_percent,
+        model_version,
     ):
         gr.Info(i18n("Preprocessing dataset..."))
         result = run_preprocess_script(
@@ -337,6 +338,7 @@ def train_tab():
             truncate_silence_minimum_seconds=truncate_silence_minimum_seconds,
             truncate_silence_action=truncate_silence_action,
             truncate_silence_compress_percent=truncate_silence_compress_percent,
+            version=model_version,
         )
         if isinstance(result, str):
             if "error" in result.lower() or "failed" in result.lower():
