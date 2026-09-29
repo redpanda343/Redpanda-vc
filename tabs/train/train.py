@@ -1021,11 +1021,14 @@ def train_tab():
             def toggle_version(version):
                 if version == "v1":
                     return (
-                        gr.update(choices=["40000"], value="40000"),
+                        gr.update(
+                            choices=["40000"], value="40000", visible=False
+                        ),
                         gr.update(
                             choices=["HiFi-GAN"],
                             value="HiFi-GAN",
                             interactive=False,
+                            visible=False,
                         ),
                         gr.update(
                             choices=["contentvec"],
@@ -1035,12 +1038,15 @@ def train_tab():
                     )
                 return (
                     gr.update(
-                        choices=["32000", "40000", "48000"], value="40000"
+                        choices=["32000", "40000", "48000"],
+                        value="40000",
+                        visible=True,
                     ),
                     gr.update(
                         choices=["HiFi-GAN", "RefineGAN"],
                         value="HiFi-GAN",
                         interactive=True,
+                        visible=True,
                     ),
                     gr.update(
                         choices=["contentvec", "spin-v2"],
