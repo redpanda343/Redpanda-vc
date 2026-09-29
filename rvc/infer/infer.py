@@ -151,7 +151,7 @@ class VoiceConverter:
         Args:
             embedder_model (str): Path to the pre-trained HuBERT model.
         """
-        self.hubert_model = load_embedding(embedder_model)
+        self.hubert_model = load_embedding(embedder_model, self.version)
         self.hubert_model = self.hubert_model.to(self.config.device).float()
         self.hubert_model.eval()
 

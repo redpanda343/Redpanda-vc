@@ -24,7 +24,24 @@ index_filename_added = f"{model_name}.index"
 index_filepath_added = os.path.join(exp_dir, index_filename_added)
 
 if os.path.exists(index_filepath_added):
-    pass
+    expected_feature_dim = None
+    model_info_path = os.path.join(exp_dir, "model_info.json")
+    try:
+        with open(model_info_path, "r", encoding="utf-8") as f:
+            model_info = json.load(f)
+            if model_info.get("feature_dim") is not None:
+                expected_feature_dim = int(model_info["feature_dim"])
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    existing_index = faiss.read_index(index_filepath_added)
+    if expected_feature_dim is not None and int(existing_index.d) != expected_feature_dim:
+        raise RuntimeError(
+            f"Index file {index_filepath_added} has {existing_index.d} channels; "
+            f"expected {expected_feature_dim}."
+        )
+    if existing_index.ntotal < 1:
+        raise RuntimeError(f"Index file {index_filepath_added} is empty.")
+    print(f"Index file '{index_filepath_added}' is already valid.")
 else:
     npys = []
     print(f"Generating index for '{model_name}', this may take a while...")

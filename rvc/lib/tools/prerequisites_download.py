@@ -16,6 +16,13 @@ url_base = "https://huggingface.co/IAHispano/Applio/resolve/main/Resources"
 
 pretraineds_hifigan_list = [
     (
+        "pretrained_v1/",
+        [
+            "f0D40k.pth",
+            "f0G40k.pth",
+        ],
+    ),
+    (
         "pretrained_v2/",
         [
             "f0D32k.pth",
@@ -53,6 +60,7 @@ executables_list = [
 ]
 
 folder_mapping_list = {
+    "pretrained_v1/": "rvc/models/pretraineds/hifi-gan/v1/",
     "pretrained_v2/": "rvc/models/pretraineds/hifi-gan/",
     "refinegan/": "rvc/models/pretraineds/refinegan/",
     "embedders/contentvec/": "rvc/models/embedders/contentvec/",
@@ -63,6 +71,9 @@ folder_mapping_list = {
 }
 
 remote_base_mapping = {
+    "pretrained_v1/": (
+        "https://huggingface.co/lj1995/VoiceConversionWebUI/resolve/main/pretrained/"
+    ),
     "FireRedVAD/AED/": (
         "https://huggingface.co/FireRedTeam/FireRedVAD/resolve/"
         f"{FIREREDVAD_REVISION}/AED/"

@@ -33,11 +33,24 @@ class HubertModelWithFinalProj(HubertModel):
         self.final_proj = nn.Linear(config.hidden_size, config.classifier_proj_size)
 
 
-def get_embedding_metadata(embedder_model):
+def get_embedding_metadata(embedder_model, version="v2"):
     if embedder_model not in {"contentvec", "spin-v2"}:
         raise ValueError(f"Unsupported embedder model: {embedder_model}")
+    if version not in {"v1", "v2"}:
+        raise ValueError(f"Unsupported RVC version: {version}")
+    if version == "v1" and embedder_model != "contentvec":
+        raise ValueError("RVC v1 requires the ContentVec embedder.")
+    if version == "v1":
+        return {
+            "embedder_model": embedder_model,
+            "version": version,
+            "feature_dim": 256,
+            "feature_output": "hidden_states[9]+final_proj",
+            "feature_fingerprint": "contentvec-v1-hidden9-final-proj",
+        }
     return {
         "embedder_model": embedder_model,
+        "version": version,
         "feature_dim": 768,
         "feature_output": "last_hidden_state",
         "feature_fingerprint": embedder_model,
@@ -142,7 +155,24 @@ def _download_file(url, destination_path, expected_sha256=None):
             os.remove(temporary_path)
 
 
-def load_embedding(embedder_model):
+def extract_embedding_features(model, source, version):
+    if version == "v1":
+        output = model(
+            source,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        return model.final_proj(output.hidden_states[9])
+    if version == "v2":
+        return model(
+            source,
+            output_hidden_states=False,
+            return_dict=True,
+        ).last_hidden_state
+    raise ValueError(f"Unsupported RVC version: {version}")
+
+
+def load_embedding(embedder_model, version="v2"):
     embedder_root = os.path.join(now_dir, "rvc", "models", "embedders")
     rvc_contentvec_base_url = (
         "https://huggingface.co/IAHispano/Applio/resolve/main/Resources/embedders/contentvec"
@@ -216,7 +246,7 @@ def load_embedding(embedder_model):
         models.audio_requires_normalization = bool(feature_extractor.do_normalize)
     else:
         models.audio_requires_normalization = False
-    metadata = get_embedding_metadata(embedder_model)
+    metadata = get_embedding_metadata(embedder_model, version)
     models.feature_dim = metadata["feature_dim"]
     models.feature_output = metadata["feature_output"]
     models.feature_fingerprint = metadata["feature_fingerprint"]

@@ -376,15 +376,14 @@ def train_tab():
                     interactive=True,
                     allow_custom_value=True,
                 )
-                architecture = gr.Radio(
-                    label=i18n("Architecture"),
+                model_version = gr.Radio(
+                    label=i18n("RVC Version"),
                     info=i18n(
-                        "Choose the model architecture:\n- **RVC (V2)**: Default option, compatible with all clients.\n- **Applio**: Advanced quality with improved vocoders and higher sample rates, Applio-only."
+                        "Choose v1 for 256-channel ContentVec features and the 40 kHz HiFi-GAN path, or v2 for the 768-channel path."
                     ),
-                    choices=["RVC", "Applio"],
-                    value="RVC",
+                    choices=["v1", "v2"],
+                    value="v2",
                     interactive=True,
-                    visible=False,
                 )
             with gr.Column():
                 sampling_rate = gr.Radio(
@@ -397,9 +396,9 @@ def train_tab():
                 vocoder = gr.Radio(
                     label=i18n("Vocoder"),
                     info=i18n(
-                        "Choose the vocoder for audio synthesis:\n- **HiFi-GAN**: RVC v2.\n- **RefineGAN**: Experimental."
+                        "Choose the vocoder for audio synthesis. RVC v1 uses HiFi-GAN at 40 kHz."
                     ),
-                    choices=["HiFi-GAN", "RefineGAN"],  # "MRF HiFi-GAN", ],
+                    choices=["HiFi-GAN", "RefineGAN"],
                     value="HiFi-GAN",
                     interactive=True,
                     visible=True,
@@ -679,6 +678,7 @@ def train_tab():
                     truncate_silence_minimum_seconds,
                     truncate_silence_action,
                     truncate_silence_compress_percent,
+                    model_version,
                 ],
                 outputs=[preprocess_output_info],
             )
@@ -740,6 +740,7 @@ def train_tab():
                 sampling_rate,
                 embedder_model,
                 include_mutes,
+                model_version,
             ],
             outputs=[extract_output_info],
         )
@@ -1020,21 +1021,36 @@ def train_tab():
                 else:
                     return gr.update(visible=pretrained), gr.update(visible=pretrained)
 
-            def toggle_architecture(architecture):
-                if architecture == "Applio":
-                    return {
-                        "choices": ["32000", "40000", "48000"],
-                        "__type__": "update",
-                    }, {
-                        "interactive": True,
-                        "__type__": "update",
-                    }
-                else:
-                    return {
-                        "choices": ["32000", "40000", "48000"],
-                        "__type__": "update",
-                        "value": "40000",
-                    }, {"interactive": False, "__type__": "update", "value": "HiFi-GAN"}
+            def toggle_version(version):
+                if version == "v1":
+                    return (
+                        gr.update(choices=["40000"], value="40000"),
+                        gr.update(
+                            choices=["HiFi-GAN"],
+                            value="HiFi-GAN",
+                            interactive=False,
+                        ),
+                        gr.update(
+                            choices=["contentvec"],
+                            value="contentvec",
+                            interactive=False,
+                        ),
+                    )
+                return (
+                    gr.update(
+                        choices=["32000", "40000", "48000"], value="40000"
+                    ),
+                    gr.update(
+                        choices=["HiFi-GAN", "RefineGAN"],
+                        value="HiFi-GAN",
+                        interactive=True,
+                    ),
+                    gr.update(
+                        choices=["contentvec", "spin-v2"],
+                        value="contentvec",
+                        interactive=True,
+                    ),
+                )
 
             def toggle_vocoder(vocoder):
                 if vocoder == "HiFi-GAN":
@@ -1136,10 +1152,10 @@ def train_tab():
                     truncate_silence_compress_percent,
                 ],
             )
-            architecture.change(
-                fn=toggle_architecture,
-                inputs=[architecture],
-                outputs=[sampling_rate, vocoder],
+            model_version.change(
+                fn=toggle_version,
+                inputs=[model_version],
+                outputs=[sampling_rate, vocoder, embedder_model],
             )
             vocoder.change(
                 fn=toggle_vocoder,
@@ -1221,6 +1237,7 @@ def train_tab():
                     checkpointing,
                     shutdown_check,
                     save_every_steps,
+                    model_version,
                 ],
                 outputs=training_outputs,
             )

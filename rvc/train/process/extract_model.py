@@ -42,13 +42,12 @@ def extract_model(
     try:
         model_dir = os.path.dirname(model_path)
         os.makedirs(model_dir, exist_ok=True)
-        if version is None:
-            version = "v3" if vocoder == "RefineGAN" else "v2"
 
         dataset_length = None
         embedder_model = None
         speakers_id = 1
         feature_metadata = {}
+        model_info_version = None
         if os.path.exists(os.path.join(model_dir, "model_info.json")):
             with open(
                 os.path.join(model_dir, "model_info.json"), "r", encoding="utf-8"
@@ -57,6 +56,7 @@ def extract_model(
                 dataset_length = data.get("total_dataset_duration", None)
                 embedder_model = data.get("embedder_model", None)
                 speakers_id = data.get("speakers_id", 1)
+                model_info_version = data.get("version")
                 feature_metadata = {
                     key: data[key]
                     for key in (
@@ -67,13 +67,27 @@ def extract_model(
                     if key in data
                 }
 
+        if version is None:
+            if model_info_version is not None:
+                version = model_info_version
+            else:
+                configured_feature_dim = int(
+                    getattr(hps.model, "text_enc_hidden_dim", 768)
+                )
+                version = (
+                    "v3"
+                    if vocoder == "RefineGAN"
+                    else ("v1" if configured_feature_dim == 256 else "v2")
+                )
+
         feature_dim = int(
             feature_metadata.get(
                 "feature_dim", getattr(hps.model, "text_enc_hidden_dim", 768)
             )
         )
         feature_output = feature_metadata.get(
-            "feature_output", "final_proj" if version == "v1" else "last_hidden_state"
+            "feature_output",
+            "hidden_states[9]+final_proj" if version == "v1" else "last_hidden_state",
         )
         feature_fingerprint = feature_metadata.get("feature_fingerprint")
 

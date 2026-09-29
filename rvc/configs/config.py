@@ -3,6 +3,7 @@ import json
 import os
 
 version_config_paths = [
+    os.path.join("v1", "40k.json"),
     os.path.join("48000.json"),
     os.path.join("40000.json"),
     os.path.join("32000.json"),

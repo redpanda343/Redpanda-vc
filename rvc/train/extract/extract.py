@@ -18,7 +18,12 @@ sys.path.append(os.path.join(now_dir))
 import rvc.lib.zluda
 from rvc.configs.config import Config
 from rvc.lib.predictors.f0 import RMVPE, Swift
-from rvc.lib.utils import get_embedding_metadata, load_audio_16k, load_embedding
+from rvc.lib.utils import (
+    extract_embedding_features,
+    get_embedding_metadata,
+    load_audio_16k,
+    load_embedding,
+)
 from rvc.train.extract.preparing_files import generate_config, generate_filelist
 from rvc.train.validation_data import (
     build_validation_extraction_files,
@@ -167,8 +172,10 @@ def run_pitch_extraction(files, devices, f0_method, threads, force=False):
     print(f"Pitch extraction completed in {time.time() - start_time:.2f} seconds.")
 
 
-def process_file_embedding(files, embedder_model, device_num, device, n_threads):
-    model = load_embedding(embedder_model).to(device).float()
+def process_file_embedding(
+    files, embedder_model, version, device_num, device, n_threads
+):
+    model = load_embedding(embedder_model, version).to(device).float()
     model.eval()
     n_threads = max(1, n_threads)
 
@@ -182,7 +189,7 @@ def process_file_embedding(files, embedder_model, device_num, device, n_threads)
         feats = feats.to(device)
         feats = feats.view(1, -1)
         with torch.no_grad():
-            result = model(feats)["last_hidden_state"]
+            result = extract_embedding_features(model, feats, version)
         feats_out = result.squeeze(0).float().cpu().numpy()
         expected_dim = int(getattr(model, "feature_dim", feats_out.shape[-1]))
         if feats_out.ndim != 2 or feats_out.shape[1] != expected_dim:
@@ -202,7 +209,7 @@ def process_file_embedding(files, embedder_model, device_num, device, n_threads)
                 pbar.update(1)
 
 
-def run_embedding_extraction(files, devices, embedder_model, threads):
+def run_embedding_extraction(files, devices, embedder_model, version, threads):
     devices_str = ", ".join(devices)
     print(
         f"Starting embedding extraction with {threads} cores on {devices_str}..."
@@ -214,6 +221,7 @@ def run_embedding_extraction(files, devices, embedder_model, threads):
                 process_file_embedding,
                 files[i :: len(devices)],
                 embedder_model,
+                version,
                 i,
                 devices[i],
                 threads // len(devices),
@@ -234,6 +242,7 @@ if __name__ == "__main__":
     sample_rate = sys.argv[5]
     embedder_model = sys.argv[6]
     include_mutes = int(sys.argv[7]) if len(sys.argv) > 7 else 2
+    version = sys.argv[8] if len(sys.argv) > 8 else "v2"
 
     wav_path = os.path.join(exp_dir, "sliced_audios")
 
@@ -247,7 +256,7 @@ if __name__ == "__main__":
     os.makedirs(os.path.join(exp_dir, "f0_voiced"), exist_ok=True)
     os.makedirs(os.path.join(exp_dir, "extracted"), exist_ok=True)
 
-    metadata = get_embedding_metadata(embedder_model)
+    metadata = get_embedding_metadata(embedder_model, version)
     file_path = os.path.join(exp_dir, "model_info.json")
     if os.path.exists(file_path):
         with open(file_path, "r", encoding="utf-8") as f:
@@ -258,11 +267,16 @@ if __name__ == "__main__":
     if dataset_format not in {"wav", "flac"}:
         dataset_format = "wav"
     previous_embedder = data.get("embedder_model")
+    previous_version = data.get("version")
     previous_dim = data.get("feature_dim")
     previous_output = data.get("feature_output")
     previous_fingerprint = data.get("feature_fingerprint")
     feature_contract_changed = previous_embedder is not None and (
         previous_embedder != metadata["embedder_model"]
+        or (
+            previous_version is not None
+            and previous_version != metadata["version"]
+        )
         or (previous_dim is not None and int(previous_dim) != metadata["feature_dim"])
         or (
             previous_output is not None
@@ -273,6 +287,20 @@ if __name__ == "__main__":
             and previous_fingerprint != metadata["feature_fingerprint"]
         )
     )
+    if not feature_contract_changed:
+        for existing_feature_path in glob.glob(
+            os.path.join(exp_dir, "extracted", "*.npy")
+        ):
+            try:
+                existing_shape = np.load(
+                    existing_feature_path, mmap_mode="r", allow_pickle=False
+                ).shape
+            except Exception:
+                feature_contract_changed = True
+                break
+            if len(existing_shape) != 2 or existing_shape[1] != metadata["feature_dim"]:
+                feature_contract_changed = True
+                break
     if feature_contract_changed:
         generator_checkpoints = glob.glob(os.path.join(exp_dir, "G_*.pth"))
         if generator_checkpoints:
@@ -331,9 +359,11 @@ if __name__ == "__main__":
     with open(file_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4)
 
-    run_embedding_extraction(extraction_files, devices, embedder_model, num_processes)
+    run_embedding_extraction(
+        extraction_files, devices, embedder_model, version, num_processes
+    )
 
     write_validation_manifest(exp_dir, validation_entries)
 
-    generate_config(sample_rate, exp_dir)
+    generate_config(sample_rate, exp_dir, version)
     generate_filelist(exp_dir, sample_rate, include_mutes)

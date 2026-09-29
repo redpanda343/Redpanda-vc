@@ -1,16 +1,44 @@
 import json
+import glob
 import os
-import shutil
 from random import shuffle
 
 current_directory = os.getcwd()
 
 
-def generate_config(sample_rate: int, model_path: str):
-    config_path = os.path.join("rvc", "configs", f"{sample_rate}.json")
+def generate_config(sample_rate: int, model_path: str, version: str = "v2"):
+    if version not in {"v1", "v2"}:
+        raise ValueError(f"Unsupported RVC version: {version}")
+    expected_feature_dim = 256 if version == "v1" else 768
+    if version == "v1":
+        if int(sample_rate) != 40000:
+            raise ValueError("RVC v1 preprocessing requires a 40000 Hz model.")
+        config_path = os.path.join("rvc", "configs", "v1", "40k.json")
+    else:
+        config_path = os.path.join("rvc", "configs", f"{sample_rate}.json")
     config_save_path = os.path.join(model_path, "config.json")
-    if not os.path.exists(config_save_path):
-        shutil.copyfile(config_path, config_save_path)
+    if os.path.exists(config_save_path):
+        with open(config_save_path, "r", encoding="utf-8") as config_file:
+            config = json.load(config_file)
+        model_config = config.setdefault("model", {})
+        current_feature_dim = int(
+            model_config.get("text_enc_hidden_dim", expected_feature_dim)
+        )
+        if current_feature_dim != expected_feature_dim:
+            if glob.glob(os.path.join(model_path, "G_*.pth")):
+                raise RuntimeError(
+                    "The experiment already has generator checkpoints for a different "
+                    "RVC version. Use a new model name before changing versions."
+                )
+            model_config["text_enc_hidden_dim"] = expected_feature_dim
+            with open(config_save_path, "w", encoding="utf-8") as config_file:
+                json.dump(config, config_file, indent=4)
+        return
+    with open(config_path, "r", encoding="utf-8") as config_file:
+        config = json.load(config_file)
+    config.setdefault("model", {})["text_enc_hidden_dim"] = expected_feature_dim
+    with open(config_save_path, "w", encoding="utf-8") as config_file:
+        json.dump(config, config_file, indent=4)
 
 
 def generate_filelist(model_path: str, sample_rate: int, include_mutes: int = 2):

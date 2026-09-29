@@ -132,6 +132,12 @@ cleanup = _strtobool(sys.argv[12])
 vocoder = sys.argv[13]
 checkpointing = _strtobool(sys.argv[14])
 save_every_steps = max(0, int(sys.argv[15])) if len(sys.argv) > 15 else 0
+version = sys.argv[16] if len(sys.argv) > 16 else "v2"
+if version not in {"v1", "v2"}:
+    raise ValueError(f"Unsupported RVC version: {version}")
+if version == "v1" and (sample_rate != 40000 or vocoder != "HiFi-GAN"):
+    raise ValueError("RVC v1 training requires HiFi-GAN at 40000 Hz.")
+expected_feature_dim = 256 if version == "v1" else 768
 # experimental settings
 randomized = True
 d_lr_coeff = 1.0
@@ -139,9 +145,11 @@ g_lr_coeff = 1.0
 d_step_per_g_step = 1
 multiscale_mel_loss = False
 bf16_adamw = False
-disc_version = "v2"
+disc_version = version
 
 if vocoder == "RefineGAN":
+    if version == "v1":
+        raise ValueError("RVC v1 training does not support RefineGAN.")
     disc_version = "v3"
     multiscale_mel_loss = True
 
@@ -188,6 +196,12 @@ except FileNotFoundError:
     sys.exit(1)
 
 config.data.training_files = os.path.join(experiment_dir, "filelist.txt")
+configured_feature_dim = int(getattr(config.model, "text_enc_hidden_dim", 768))
+if configured_feature_dim != expected_feature_dim:
+    raise ValueError(
+        f"RVC {version} training requires {expected_feature_dim}-channel features, "
+        f"but the experiment config uses {configured_feature_dim}."
+    )
 
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = os.name == "nt"
@@ -1100,6 +1114,7 @@ def train_and_evaluate(
                         step=global_step,
                         hps=hps,
                         vocoder=vocoder,
+                        version=version,
                     )
 
             pbar.update(1)
@@ -1327,6 +1342,7 @@ def train_and_evaluate(
                         step=global_step,
                         hps=hps,
                         vocoder=vocoder,
+                        version=version,
                         export_dtype=inference_export_dtype,
                     )
 

@@ -28,6 +28,7 @@ custom_presets_lock = threading.RLock()
 
 DEFAULT_TRAINING_PRESETS = {
     "32k hifigan,cvec": {
+        "version": "v2",
         "sampling_rate": "32000",
         "vocoder": "HiFi-GAN",
         "batch_size": 8,
@@ -59,6 +60,7 @@ DEFAULT_TRAINING_PRESETS = {
         "cleanup": False,
     },
     "32k From scratch": {
+        "version": "v2",
         "sampling_rate": "32000",
         "vocoder": "HiFi-GAN",
         "batch_size": 16,
@@ -102,6 +104,7 @@ def _load_custom_presets():
         return {}
     defaults = next(iter(DEFAULT_TRAINING_PRESETS.values()))
     required_fields = set(defaults) - {
+        "version",
         "vocoder",
         "truncate_silence_action",
         "truncate_silence_compress_percent",
@@ -138,14 +141,19 @@ def _failed(message):
 
 def _apply_preset(preset_name):
     preset = TRAINING_PRESETS[preset_name]
-    sample_rate_choices = (
+    version = preset.get("version", "v2")
+    sample_rate_choices = ["40000"] if version == "v1" else (
         ["24000", "32000"]
         if preset["vocoder"] == "RefineGAN"
         else ["32000", "40000", "48000"]
     )
+    sample_rate = "40000" if version == "v1" else preset["sampling_rate"]
+    vocoder = "HiFi-GAN" if version == "v1" else preset["vocoder"]
+    embedder_model = "contentvec" if version == "v1" else preset["embedder_model"]
     return (
-        gr.update(choices=sample_rate_choices, value=preset["sampling_rate"]),
-        preset["vocoder"],
+        version,
+        gr.update(choices=sample_rate_choices, value=sample_rate),
+        vocoder,
         preset["batch_size"],
         preset["total_epoch"],
         preset["save_every_epoch"],
@@ -154,7 +162,7 @@ def _apply_preset(preset_name):
         preset["dataset_format"],
         False,
         preset["f0_method"],
-        preset["embedder_model"],
+        embedder_model,
         preset["include_mutes"],
         preset["pretrained_mode"],
         preset["cache_dataset_in_gpu"],
@@ -190,6 +198,7 @@ def _apply_preset(preset_name):
 
 def _save_custom_preset(
     preset_name,
+    model_version,
     sampling_rate,
     vocoder,
     batch_size,
@@ -231,6 +240,7 @@ def _save_custom_preset(
         return gr.update(), preset_name
 
     settings = {
+        "version": str(model_version),
         "sampling_rate": str(sampling_rate),
         "vocoder": vocoder,
         "batch_size": int(batch_size),
@@ -321,14 +331,54 @@ def _custom_pretrained_visibility(pretrained_mode):
     return gr.update(visible=pretrained_mode == "Custom pretrained")
 
 
-def _sampling_rate_for_vocoder(vocoder, sampling_rate):
-    choices = (
+def _sampling_rate_for_vocoder(model_version, vocoder, sampling_rate):
+    if model_version == "v1":
+        choices = ["40000"]
+        value = "40000"
+    else:
+        choices = (
+            ["24000", "32000"]
+            if vocoder == "RefineGAN"
+            else ["32000", "40000", "48000"]
+        )
+        value = sampling_rate if sampling_rate in choices else "32000"
+    return gr.update(choices=choices, value=value)
+
+
+def _controls_for_version(model_version, vocoder, sampling_rate, embedder_model):
+    if model_version == "v1":
+        return (
+            gr.update(choices=["40000"], value="40000"),
+            gr.update(
+                choices=["HiFi-GAN"], value="HiFi-GAN", interactive=False
+            ),
+            gr.update(
+                choices=["contentvec"], value="contentvec", interactive=False
+            ),
+        )
+    sample_rate_choices = (
         ["24000", "32000"]
         if vocoder == "RefineGAN"
         else ["32000", "40000", "48000"]
     )
-    value = sampling_rate if sampling_rate in choices else "32000"
-    return gr.update(choices=choices, value=value)
+    sample_rate_value = (
+        sampling_rate if sampling_rate in sample_rate_choices else "32000"
+    )
+    return (
+        gr.update(choices=sample_rate_choices, value=sample_rate_value),
+        gr.update(
+            choices=["HiFi-GAN", "RefineGAN"],
+            value=vocoder if vocoder in {"HiFi-GAN", "RefineGAN"} else "HiFi-GAN",
+            interactive=True,
+        ),
+        gr.update(
+            choices=["contentvec", "spin-v2"],
+            value=embedder_model
+            if embedder_model in {"contentvec", "spin-v2"}
+            else "contentvec",
+            interactive=True,
+        ),
+    )
 
 
 def _training_ui_state(model_name):
@@ -349,6 +399,7 @@ def _training_ui_state(model_name):
 def _run_one_click_training(
     model_name,
     dataset_path,
+    model_version,
     sampling_rate,
     vocoder,
     cut_preprocess,
@@ -399,7 +450,15 @@ def _run_one_click_training(
         message = "Overlap length must be shorter than chunk length."
         gr.Warning(message)
         return gr.update(interactive=True), message
-    valid_sample_rates = (
+    if model_version == "v1" and (
+        str(sampling_rate) != "40000"
+        or vocoder != "HiFi-GAN"
+        or embedder_model != "contentvec"
+    ):
+        message = "RVC v1 requires ContentVec, HiFi-GAN, and 40000 Hz."
+        gr.Warning(message)
+        return gr.update(interactive=True), message
+    valid_sample_rates = {"40000"} if model_version == "v1" else (
         {"24000", "32000"}
         if vocoder == "RefineGAN"
         else {"32000", "40000", "48000"}
@@ -441,6 +500,7 @@ def _run_one_click_training(
         truncate_silence_minimum_seconds=truncate_silence_minimum_seconds,
         truncate_silence_action=truncate_silence_action,
         truncate_silence_compress_percent=truncate_silence_compress_percent,
+        version=model_version,
     )
     if _failed(preprocess_message):
         gr.Warning(preprocess_message)
@@ -455,6 +515,7 @@ def _run_one_click_training(
         sample_rate=sampling_rate,
         embedder_model=embedder_model,
         include_mutes=include_mutes,
+        version=model_version,
     )
     if _failed(extract_message):
         gr.Warning(extract_message)
@@ -481,6 +542,7 @@ def _run_one_click_training(
         checkpointing=checkpointing,
         shutdown_check=False,
         save_every_steps=0,
+        version=model_version,
         generate_index=True,
     )
     progress(1.0, desc="Training started")
@@ -537,6 +599,15 @@ def one_click_train_tab():
 
     with gr.Accordion(i18n("Dataset Settings"), open=True):
         with gr.Row():
+            model_version = gr.Radio(
+                choices=["v1", "v2"],
+                value="v2",
+                label=i18n("RVC Version"),
+                info=i18n(
+                    "v1 uses ContentVec 256 features with HiFi-GAN at 40 kHz."
+                ),
+                interactive=True,
+            )
             sampling_rate = gr.Radio(
                 choices=["32000", "40000", "48000"],
                 value="32000",
@@ -762,6 +833,7 @@ def one_click_train_tab():
     one_click_button = gr.Button(i18n("One-click Training"), variant="primary")
 
     preset_outputs = [
+        model_version,
         sampling_rate,
         vocoder,
         batch_size,
@@ -805,6 +877,7 @@ def one_click_train_tab():
         fn=_save_custom_preset,
         inputs=[
             custom_preset_name,
+            model_version,
             sampling_rate,
             vocoder,
             batch_size,
@@ -867,8 +940,14 @@ def one_click_train_tab():
     )
     vocoder.input(
         fn=_sampling_rate_for_vocoder,
-        inputs=[vocoder, sampling_rate],
+        inputs=[model_version, vocoder, sampling_rate],
         outputs=[sampling_rate],
+        queue=False,
+    )
+    model_version.input(
+        fn=_controls_for_version,
+        inputs=[model_version, vocoder, sampling_rate, embedder_model],
+        outputs=[sampling_rate, vocoder, embedder_model],
         queue=False,
     )
 
@@ -877,6 +956,7 @@ def one_click_train_tab():
         inputs=[
             model_name,
             dataset_path,
+            model_version,
             sampling_rate,
             vocoder,
             cut_preprocess,

@@ -48,6 +48,7 @@ class PreProcess:
         exp_dir: str,
         dataset_format: str = "wav",
         use_fireredvad_gpu: bool = False,
+        version: str = "v2",
     ):
         self.post_normalization_slicer = Slicer(
             sr=sr,
@@ -62,8 +63,12 @@ class PreProcess:
             max_sil_kept=500,
         )
         self.sr = sr
+        if version not in {"v1", "v2"}:
+            raise ValueError(f"Unsupported RVC version: {version}")
+        self.version = version
+        high_pass_cutoff = 48 if version == "v1" else HIGH_PASS_CUTOFF
         self.b_high, self.a_high = signal.butter(
-            N=5, Wn=HIGH_PASS_CUTOFF, btype="high", fs=self.sr
+            N=5, Wn=high_pass_cutoff, btype="high", fs=self.sr
         )
         self.exp_dir = exp_dir
         self.dataset_format = normalize_dataset_format(dataset_format)
@@ -257,7 +262,7 @@ class PreProcess:
             cuts,
             total_frames,
         )
-        if process_effects:
+        if process_effects or self.version == "v1":
             blocks = iter_high_pass_audio(blocks, self.b_high, self.a_high)
         skipped_short = self.simple_cut_stream(
             blocks,
@@ -345,7 +350,7 @@ class PreProcess:
         reduction_strength: float,
         normalization_mode: str,
     ):
-        if process_effects:
+        if process_effects or self.version == "v1":
             audio = signal.lfilter(self.b_high, self.a_high, audio)
         if normalization_mode == "pre":
             audio = self._normalize_audio(audio)
@@ -384,9 +389,10 @@ class PreProcess:
 
         segments = self.automatic_slicer.slice(audio)
         idx1 = 0
-        step_samples = int(self.sr * (PERCENTAGE - OVERLAP))
-        chunk_samples = int(self.sr * PERCENTAGE)
-        long_tail_samples = int(self.sr * (PERCENTAGE + OVERLAP))
+        chunk_seconds = 3.7 if self.version == "v1" else PERCENTAGE
+        step_samples = int(self.sr * (chunk_seconds - OVERLAP))
+        chunk_samples = int(self.sr * chunk_seconds)
+        long_tail_samples = int(self.sr * (chunk_seconds + OVERLAP))
         with BoundedAudioWriter(self.audio_write_workers) as writer:
             for segment in segments:
                 start = 0

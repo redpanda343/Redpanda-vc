@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from rvc.infer.infer import VoiceConverter, deterministic_torch_scope
+from rvc.lib.utils import extract_embedding_features
 
 
 SUPPORTED_VOCODERS = {"HiFi-GAN", "RefineGAN"}
@@ -249,10 +250,7 @@ class RealTimeRVC:
         source = input_wav.float().view(1, -1)
         if getattr(self.embedder, "audio_requires_normalization", False):
             source = F.layer_norm(source, source.shape)
-        output = self.embedder(source)
-        features = output["last_hidden_state"]
-        if self.version == "v1":
-            features = self.embedder.final_proj(features[0]).unsqueeze(0)
+        features = extract_embedding_features(self.embedder, source, self.version)
         if features.shape[-1] != self.expected_feature_dim:
             raise RuntimeError(
                 f"{self.embedder_name} outputs {features.shape[-1]} channels, but "

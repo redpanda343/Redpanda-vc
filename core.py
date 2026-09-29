@@ -491,7 +491,12 @@ def run_preprocess_script(
     truncate_silence_minimum_seconds: float = 0.3,
     truncate_silence_action: str = "truncate",
     truncate_silence_compress_percent: float = 50.0,
+    version: str = "v2",
 ):
+    if version not in {"v1", "v2"}:
+        raise ValueError(f"Unsupported RVC version: {version}")
+    if version == "v1" and int(sample_rate) != 40000:
+        raise ValueError("RVC v1 preprocessing requires a 40000 Hz model.")
     preprocess_script_path = os.path.join("rvc", "train", "preprocess", "preprocess.py")
     command = [
         python,
@@ -517,6 +522,7 @@ def run_preprocess_script(
                 truncate_silence_minimum_seconds,
                 truncate_silence_action,
                 truncate_silence_compress_percent,
+                version,
             ],
         ),
     ]
@@ -536,7 +542,14 @@ def run_extract_script(
     sample_rate: int,
     embedder_model: str,
     include_mutes: int = 2,
+    version: str = "v2",
 ):
+    if version not in {"v1", "v2"}:
+        raise ValueError(f"Unsupported RVC version: {version}")
+    if version == "v1" and (
+        int(sample_rate) != 40000 or embedder_model != "contentvec"
+    ):
+        raise ValueError("RVC v1 extraction requires ContentVec at 40000 Hz.")
     model_path = os.path.join(logs_path, model_name)
     extract = os.path.join("rvc", "train", "extract", "extract.py")
 
@@ -553,6 +566,7 @@ def run_extract_script(
                 sample_rate,
                 embedder_model,
                 include_mutes,
+                version,
             ],
         ),
     ]
@@ -632,9 +646,15 @@ def _build_train_command(
     vocoder: str = "HiFi-GAN",
     checkpointing: bool = False,
     save_every_steps: int = 0,
+    version: str = "v2",
 ):
+    if version not in {"v1", "v2"}:
+        raise ValueError(f"Unsupported RVC version: {version}")
+    if version == "v1" and (int(sample_rate) != 40000 or vocoder != "HiFi-GAN"):
+        raise ValueError("RVC v1 training requires HiFi-GAN at 40000 Hz.")
+    expected_feature_dim = 256 if version == "v1" else 768
     model_config_path = os.path.join("logs", model_name, "config.json")
-    feature_dim = 768
+    feature_dim = expected_feature_dim
     if os.path.isfile(model_config_path):
         with open(model_config_path, "r", encoding="utf-8") as config_file:
             feature_dim = int(
@@ -642,17 +662,17 @@ def _build_train_command(
                     "text_enc_hidden_dim", 768
                 )
             )
-    if pretrained and not custom_pretrained and feature_dim != 768:
+    if feature_dim != expected_feature_dim:
         raise ValueError(
-            f"The bundled generator pretrained models expect 768-channel features, "
-            f"but this experiment uses {feature_dim}. Disable Pretrained to train from "
-            "scratch, or select a matching custom pretrained generator."
+            f"RVC {version} training requires {expected_feature_dim}-channel features, "
+            f"but this experiment uses {feature_dim}. Re-extract the experiment with "
+            f"RVC {version}."
         )
     if pretrained == True:
         from rvc.lib.tools.pretrained_selector import pretrained_selector
 
         if custom_pretrained == False:
-            pg, pd = pretrained_selector(str(vocoder), int(sample_rate))
+            pg, pd = pretrained_selector(str(vocoder), int(sample_rate), version)
         else:
             if g_pretrained_path is None or d_pretrained_path is None:
                 raise ValueError(
@@ -684,6 +704,7 @@ def _build_train_command(
                 vocoder,
                 checkpointing,
                 save_every_steps,
+                version,
             ],
         ),
     ]
@@ -711,6 +732,7 @@ def run_train_script(
     checkpointing: bool = False,
     shutdown_check: bool = False,
     save_every_steps: int = 0,
+    version: str = "v2",
 ):
     command = _build_train_command(
         model_name,
@@ -731,6 +753,7 @@ def run_train_script(
         vocoder,
         checkpointing,
         save_every_steps,
+        version,
     )
     result = subprocess.run(command)
     if result.returncode != 0:
@@ -777,6 +800,7 @@ def start_train_script(
     checkpointing: bool = False,
     shutdown_check: bool = False,
     save_every_steps: int = 0,
+    version: str = "v2",
     generate_index: bool = False,
 ):
     command = _build_train_command(
@@ -798,6 +822,7 @@ def start_train_script(
         vocoder,
         checkpointing,
         save_every_steps,
+        version,
     )
 
     on_success = None
@@ -1146,6 +1171,12 @@ def batch_infer(**kwargs):
     help="Target sampling rate.",
 )
 @click.option(
+    "--version",
+    type=click.Choice(["v1", "v2"]),
+    default="v2",
+    help="RVC feature and model version.",
+)
+@click.option(
     "--cpu-cores",
     type=click.IntRange(1, 64),
     default=None,
@@ -1280,6 +1311,7 @@ def preprocess(**kwargs):
         truncate_silence_compress_percent=kwargs[
             "truncate_silence_compress_percent"
         ],
+        version=kwargs["version"],
     )
     click.echo(result)
 
@@ -1319,6 +1351,12 @@ def preprocess(**kwargs):
     default=2,
     help="Number of silent files to include.",
 )
+@click.option(
+    "--version",
+    type=click.Choice(["v1", "v2"]),
+    default="v2",
+    help="RVC feature and model version.",
+)
 def extract(**kwargs):
     """Extract features from a preprocessed dataset."""
     kwargs["sample_rate"] = int(kwargs["sample_rate"])
@@ -1331,6 +1369,7 @@ def extract(**kwargs):
         sample_rate=kwargs["sample_rate"],
         embedder_model=kwargs["embedder_model"],
         include_mutes=kwargs["include_mutes"],
+        version=kwargs["version"],
     )
     click.echo(result)
 
@@ -1384,6 +1423,12 @@ def extract(**kwargs):
     required=True,
     type=click.Choice(["32000", "40000", "48000"]),
     help="Training sampling rate.",
+)
+@click.option(
+    "--version",
+    type=click.Choice(["v1", "v2"]),
+    default="v2",
+    help="RVC feature and model version.",
 )
 @click.option(
     "--batch-size", type=click.IntRange(1, 50), default=8, help="Training batch size."
@@ -1445,6 +1490,7 @@ def train(**kwargs):
         vocoder=kwargs["vocoder"],
         checkpointing=kwargs["checkpointing"],
         save_every_steps=kwargs["save_every_steps"],
+        version=kwargs["version"],
     )
     click.echo(result)
 

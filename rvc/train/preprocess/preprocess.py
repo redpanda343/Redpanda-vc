@@ -49,7 +49,7 @@ def strtobool(val):
 
 
 def initialize_preprocess_worker(
-    sr, exp_dir, dataset_format, audio_write_workers, torch_threads
+    sr, exp_dir, dataset_format, audio_write_workers, torch_threads, version
 ):
     global _PROCESS_PREPROCESSOR
     torch.set_num_threads(max(1, int(torch_threads)))
@@ -57,7 +57,9 @@ def initialize_preprocess_worker(
         torch.set_num_interop_threads(1)
     except RuntimeError:
         pass
-    _PROCESS_PREPROCESSOR = PreProcess(sr, exp_dir, dataset_format, False)
+    _PROCESS_PREPROCESSOR = PreProcess(
+        sr, exp_dir, dataset_format, False, version
+    )
     _PROCESS_PREPROCESSOR.audio_write_workers = max(1, int(audio_write_workers))
 
 
@@ -153,6 +155,7 @@ def preprocess_training_set(
     truncate_silence_minimum_seconds: float = SIMPLE_MIN_SILENCE_SECONDS,
     truncate_silence_action: str = "truncate",
     truncate_silence_compress_percent: float = SIMPLE_SILENCE_COMPRESS_PERCENT,
+    version: str = "v2",
 ):
     if not os.path.exists(input_root):
         print(f"The dataset path does not exist: '{input_root}'.")
@@ -218,7 +221,7 @@ def preprocess_training_set(
     if use_fireredvad_gpu:
         active_workers = min(active_workers, GPU_PREPROCESS_MAX_WORKERS)
     print(f"Starting preprocess with {active_workers} workers...")
-    pp = PreProcess(sr, exp_dir, dataset_format, use_fireredvad_gpu)
+    pp = PreProcess(sr, exp_dir, dataset_format, use_fireredvad_gpu, version)
     pp.audio_write_workers = (
         min(AUDIO_WRITE_MAX_WORKERS, available_cpus)
         if not use_fireredvad_gpu and active_workers == 1
@@ -282,6 +285,7 @@ def preprocess_training_set(
                 dataset_format,
                 pp.audio_write_workers,
                 max(1, available_cpus // active_workers),
+                version,
             ),
         }
     max_pending = max(active_workers, active_workers * PROCESS_PENDING_MULTIPLIER)
@@ -369,6 +373,7 @@ if __name__ == "__main__":
         if len(sys.argv) > 18
         else SIMPLE_SILENCE_COMPRESS_PERCENT
     )
+    version = str(sys.argv[19]) if len(sys.argv) > 19 else "v2"
     preprocess_training_set(
         input_root,
         sample_rate,
@@ -388,4 +393,5 @@ if __name__ == "__main__":
         truncate_silence_minimum_seconds,
         truncate_silence_action,
         truncate_silence_compress_percent,
+        version,
     )

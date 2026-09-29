@@ -13,6 +13,7 @@ sys.path.append(now_dir)
 
 from rvc.lib.predictors.f0 import FCPE, RMVPE, Swift
 from rvc.infer.pm import extract_pm
+from rvc.lib.utils import extract_embedding_features
 
 import logging
 
@@ -190,10 +191,7 @@ class Pipeline:
                 feats = F.layer_norm(feats, feats.shape)
             feats = feats.view(1, -1).to(self.device)
             # extract features
-            feats = model(feats)["last_hidden_state"]
-            feats = (
-                model.final_proj(feats[0]).unsqueeze(0) if version == "v1" else feats
-            )
+            feats = extract_embedding_features(model, feats, version)
             expected_dim = int(net_g.enc_p.emb_phone.in_features)
             if feats.shape[-1] != expected_dim:
                 raise RuntimeError(
@@ -250,8 +248,17 @@ class Pipeline:
                 f"{feats.shape[-1]}. Select the index created for this voice model."
             )
         npy = feats[0].cpu().numpy()
-        score, ix = index.search(npy, k=8)
+        neighbor_count = min(8, int(index.ntotal))
+        if neighbor_count < 1:
+            raise RuntimeError("The selected feature index is empty.")
+        score, ix = index.search(npy, k=neighbor_count)
+        valid = ix >= 0
+        if not valid.any(axis=1).all():
+            raise RuntimeError("The selected feature index returned no valid neighbors.")
+        ix = np.where(valid, ix, 0)
+        score = np.maximum(score, 1e-6)
         weight = np.square(1 / score)
+        weight = np.where(valid, weight, 0.0)
         weight /= weight.sum(axis=1, keepdims=True)
         npy = np.sum(big_npy[ix] * np.expand_dims(weight, axis=2), axis=1)
         feats = (
@@ -297,12 +304,10 @@ class Pipeline:
             hop_length: Hop length for F0 estimation methods.
         """
         if file_index != "" and os.path.exists(file_index) and index_rate > 0:
-            try:
-                index = faiss.read_index(file_index)
-                big_npy = index.reconstruct_n(0, index.ntotal)
-            except Exception as error:
-                print(f"An error occurred reading the FAISS index: {error}")
-                index = big_npy = None
+            index = faiss.read_index(file_index)
+            if index.ntotal < 1:
+                raise RuntimeError("The selected feature index is empty.")
+            big_npy = index.reconstruct_n(0, index.ntotal)
         else:
             index = big_npy = None
         audio = signal.filtfilt(bh, ah, audio)
