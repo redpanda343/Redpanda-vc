@@ -296,7 +296,7 @@ def auto_enable_checkpointing():
 
 
 # Train Tab
-def train_tab():
+def rvc_train_tab():
     def _preprocess_with_toast(
         model_name,
         dataset_path,
@@ -1288,3 +1288,12 @@ def train_tab():
                 inputs=[],
                 outputs=[pth_dropdown_export, index_dropdown_export],
             )
+
+
+def train_tab():
+    from tabs.train.rectified import rectified_train_tab
+
+    with gr.Tab("RVC"):
+        rvc_train_tab()
+    with gr.Tab("Rectified Flow"):
+        rectified_train_tab()

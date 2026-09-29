@@ -12,7 +12,14 @@ FFT/window 2048, 128 mel bins, fmin 40 and fmax 16000. Its accompanying
 `config.json`, when provided, must remain beside it. The loader checks the
 mel settings and loads generator weights strictly. Other vocoders are rejected.
 
-Run these commands from the repository root with its Python environment active.
+In the WebUI, open **Train > Rectified Flow**. Enter a new model name and
+dataset folder, preprocess, extract features, then enter the NSF-HiFiGAN
+checkpoint path and start training. The page shows the job status and live log.
+The stop button ends the current rectified job; training resumes from the last
+saved epoch, so unsaved steps are lost. The original trainer remains under
+**Train > RVC**.
+
+Alternatively, run these commands from the repository root with its Python environment active.
 Use a new experiment name so existing RVC training data is preserved.
 
 ```powershell
