@@ -7,6 +7,8 @@ from pathlib import Path
 import gradio as gr
 import psutil
 
+from tabs.settings.sections.precision import get_precision
+
 ROOT = Path(__file__).resolve().parents[2]
 _lock = threading.Lock()
 _process = None
@@ -117,11 +119,14 @@ def start(name, vocoder, pretrained, batch, epochs, save_every, device):
         raise gr.Error('Choose an existing OpenVPI NSF-HiFiGAN checkpoint.')
     if pretrained and not Path(pretrained).is_file():
         raise gr.Error('The pretrained flow checkpoint does not exist.')
+    precision = get_precision() or 'fp32'
+    if precision not in {'fp32', 'fp16', 'bf16'}:
+        raise gr.Error(f'Unsupported training precision: {precision}')
     arguments = ['--model-name', str(name).strip(), '--vocoder', vocoder,
                  '--batch-size', positive_integer(batch, 'Batch size'),
                  '--epochs', positive_integer(epochs, 'Total epochs'),
                  '--save-every', positive_integer(save_every, 'Save interval'),
-                 '--device', str(device).strip().lower(), '--precision', 'fp32']
+                 '--device', str(device).strip().lower(), '--precision', precision]
     if pretrained:
         arguments.extend(['--pretrained-flow', pretrained])
     return launch(name, 'rvc.rectified.train_flow', arguments, 'Training rectified flow')
@@ -153,7 +158,7 @@ def stop():
 
 
 def rectified_train_tab():
-    gr.Markdown('### Rectified Flow\nTrain Shiro rectified flow at **44.1 kHz in FP32**. '
+    gr.Markdown('### Rectified Flow\nTrain Shiro rectified flow at **44.1 kHz** using the saved Settings > Precision selection. '
                 'A frozen OpenVPI NSF-HiFiGAN vocoder renders previews. Use a separate experiment from RVC training.')
     with gr.Row():
         name = gr.Textbox(label='Model name', value='my-flow')
@@ -176,8 +181,8 @@ def rectified_train_tab():
             batch = gr.Number(label='Batch size', value=4, minimum=1, precision=0)
             epochs = gr.Number(label='Total epochs', value=100, minimum=1, precision=0)
             save_every = gr.Number(label='Save every N epochs', value=10, minimum=1, precision=0)
-        gr.Markdown('Precision: **FP32**, including Muon. Existing runs resume automatically from the last saved epoch. '
-                    'Stopping discards unsaved steps. Checkpoints and TensorBoard previews are saved in logs/<model name>/flow.')
+        gr.Markdown('Precision follows **Settings > Precision** when you start or resume. Click Update precision there to save it. '
+                    'Existing runs resume from the last saved epoch. Stopping discards unsaved steps. Checkpoints and TensorBoard previews are saved in logs/<model name>/flow.')
         with gr.Row():
             train_button = gr.Button('Start / resume rectified training', variant='primary')
             stop_button = gr.Button('Stop current rectified job', interactive=False)

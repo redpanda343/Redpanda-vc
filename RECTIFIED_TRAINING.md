@@ -36,8 +36,14 @@ The default configuration is `rvc/configs/rectified/44100.json`. To customize a
 run, copy it to `logs/my-flow/rectified_config.json` before training. The trainer
 creates that copy automatically on its first run. It retains Shiro's full model
 dimensions, pitch/time augmentation, shallow-flow objective, auxiliary decoder,
-Muon/AdamW parameter split and speaker dropout. Computation stays FP32,
-including Muon's matrix operations. No autocast or TF32 is enabled.
+Muon/AdamW parameter split and speaker dropout. The WebUI reads the saved **Settings > Precision** selection at each start or
+resume. Click **Update precision** to save your choice. FP16 uses CUDA autocast
+and gradient scaling; BF16 uses CUDA autocast on supported GPUs. CPU runs and
+unsupported BF16 GPUs fall back to FP32 with a log message. The CLI supports
+`--precision fp32`, `fp16`, or `bf16`, and defaults to FP32. Model weights,
+optimizer state, Muon matrix operations, held-out evaluation and audio previews
+remain FP32 for stability. TF32 stays disabled. Changing the setting does not
+alter a job already running.
 
 Training uses a single device, selected with `--device cuda:0` or `--device cpu`.
 `flow.segment_frames`, `flow.num_workers` and batch size control memory use.

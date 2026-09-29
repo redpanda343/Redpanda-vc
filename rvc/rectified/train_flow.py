@@ -27,26 +27,58 @@ def atomic_save(state, path):
     os.replace(temporary, path)
 
 
-def train_step(model, optimizer, ema, batch, data, settings, device, speaker_dropout):
+def precision_setup(precision, device):
+    if precision not in {'fp32', 'fp16', 'bf16'}:
+        raise ValueError(f'Unsupported precision: {precision}')
+    if device.type != 'cuda':
+        if precision != 'fp32':
+            print(f'{precision.upper()} requires CUDA in this trainer; using FP32.', flush=True)
+        return None, None
+    if precision == 'bf16':
+        with torch.cuda.device(device):
+            supported = torch.cuda.is_bf16_supported(including_emulation=False)
+        if not supported:
+            print('BF16 is not supported on this GPU; using FP32.', flush=True)
+            return None, None
+        return torch.bfloat16, None
+    if precision == 'fp16':
+        return torch.float16, torch.amp.GradScaler('cuda', init_scale=1024.0)
+    return None, None
+
+
+def train_step(model, optimizer, ema, batch, data, settings, device, speaker_dropout, amp_dtype=None, scaler=None):
     mel, content, f0, energy, breathiness, key_shift, speed, speaker, mask = (
         item.to(device, non_blocking=True) for item in batch
     )
     mel = normalize_mel(mel, data) * mask
     optimizer.zero_grad(set_to_none=True)
-    flow, auxiliary = model(
-        mel, content, f0, energy, speaker, mask,
-        speaker_dropout=speaker_dropout, breathiness=breathiness,
-        key_shift=key_shift, speed=speed,
-    )
-    loss = flow if auxiliary is None else flow + settings['aux_mel_weight'] * auxiliary
+    with torch.autocast(device.type, dtype=amp_dtype or torch.float32, enabled=amp_dtype is not None):
+        flow, auxiliary = model(
+            mel, content, f0, energy, speaker, mask,
+            speaker_dropout=speaker_dropout, breathiness=breathiness,
+            key_shift=key_shift, speed=speed,
+        )
+        loss = flow if auxiliary is None else flow + settings['aux_mel_weight'] * auxiliary
     if not torch.isfinite(loss):
         raise FloatingPointError('Non-finite rectified-flow loss.')
-    loss.backward()
-    norm = torch.nn.utils.clip_grad_norm_(
-        model.parameters(), settings['grad_clip'], error_if_nonfinite=True
-    )
-    optimizer.step()
-    ema.update(model)
+    if scaler is None:
+        loss.backward()
+        norm = torch.nn.utils.clip_grad_norm_(
+            model.parameters(), settings['grad_clip'], error_if_nonfinite=True
+        )
+        optimizer.step()
+        ema.update(model)
+    else:
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), settings['grad_clip'])
+        previous_scale = scaler.get_scale()
+        scaler.step(optimizer)
+        scaler.update()
+        if scaler.get_scale() >= previous_scale:
+            ema.update(model)
+        else:
+            print('FP16 overflow: skipped optimizer and EMA update; reduced gradient scale.', flush=True)
     return float(flow.detach()), float(auxiliary.detach()) if auxiliary is not None else 0.0, float(norm)
 
 
@@ -112,6 +144,8 @@ def train(args):
     if data['sample_rate'] != 44100:
         raise ValueError('This recipe requires 44100 Hz audio and a matching NSF-HiFiGAN vocoder.')
     device = torch.device(args.device)
+    amp_dtype, scaler = precision_setup(args.precision, device)
+    precision_label = str(amp_dtype).split(".")[-1].upper() if amp_dtype is not None else "FP32"
     vocoder, _ = load_vocoder(args.vocoder, data)
     vocoder = vocoder.to(device)
     entries = read_filelist(experiment / 'filelist.txt', ROOT)
@@ -157,6 +191,8 @@ def train(args):
         model.load_state_dict(state['model'], strict=True)
         optimizer.load_state_dict(state['optimizer'])
         ema.load_state_dict(state['ema'], model)
+        if scaler is not None and state.get('scaler'):
+            scaler.load_state_dict(state['scaler'])
         first_epoch, step = state['epoch'] + 1, state['step']
         del state
     elif args.pretrained_flow:
@@ -171,7 +207,7 @@ def train(args):
     (experiment / 'rectified_config.json').write_text(json.dumps(config, indent=4) + '\n', encoding='utf-8')
     total = args.epochs * len(loader)
     warmup = 0 if finetune else settings['warmup_steps']
-    print(f'Rectified flow: {sum(p.numel() for p in model.parameters()):,} parameters, FP32, {device}, batch {args.batch_size}, {segment} frames', flush=True)
+    print(f'Rectified flow: {sum(p.numel() for p in model.parameters()):,} parameters, {precision_label}, {device}, batch {args.batch_size}, {segment} frames', flush=True)
     with SummaryWriter(str(output)) as writer:
         model.train()
         for epoch in range(first_epoch, args.epochs + 1):
@@ -179,7 +215,7 @@ def train(args):
                 current_lr = learning_rate(lr, step, warmup, total, settings['lr_final_ratio'])
                 for group in optimizer.param_groups:
                     group['lr'] = current_lr
-                flow, auxiliary, norm = train_step(model, optimizer, ema, batch, data, settings, device, dropout)
+                flow, auxiliary, norm = train_step(model, optimizer, ema, batch, data, settings, device, dropout, amp_dtype, scaler)
                 step += 1
                 for tag, value in [('loss/flow', flow), ('loss/aux_mel_l1', auxiliary), ('grad_norm', norm), ('lr', current_lr)]:
                     writer.add_scalar(tag, value, step)
@@ -194,7 +230,9 @@ def train(args):
                 metadata = dict(config=config, speaker_count=speakers, embedder_model=embedder,
                                 vocoder=str(Path(args.vocoder).resolve()), epoch=epoch, step=step)
                 atomic_save(dict(model=model.state_dict(), optimizer=optimizer.state_dict(),
-                                 ema=ema.state_dict(), finetune=finetune, **metadata), resume_path)
+                                 ema=ema.state_dict(), finetune=finetune,
+                                 scaler=scaler.state_dict() if scaler is not None else None,
+                                 precision=args.precision, **metadata), resume_path)
                 atomic_save(dict(kind='rectified_flow', model=ema.cpu_state_dict(), **metadata),
                             output / f'{args.model_name}_flow_{epoch}e_{step}s.pth')
                 preview(model, ema, vocoder, reference, data, writer, step)
@@ -203,14 +241,14 @@ def train(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train Shiro rectified flow with a frozen OpenVPI NSF-HiFiGAN vocoder in FP32.')
+    parser = argparse.ArgumentParser(description='Train Shiro rectified flow with a frozen OpenVPI NSF-HiFiGAN vocoder.')
     parser.add_argument('--model-name', required=True)
     parser.add_argument('--vocoder', required=True)
     parser.add_argument('--batch-size', type=int, default=4)
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--save-every', type=int, default=10)
     parser.add_argument('--device', default='cuda:0' if torch.cuda.is_available() else 'cpu')
-    parser.add_argument('--precision', choices=['fp32'], default='fp32')
+    parser.add_argument('--precision', choices=['fp32', 'fp16', 'bf16'], default='fp32')
     parser.add_argument('--pretrained-flow')
     parser.add_argument('--learning-rate', type=float)
     parser.add_argument('--seed', type=int, default=1234)
