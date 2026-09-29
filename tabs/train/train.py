@@ -378,9 +378,6 @@ def train_tab():
                 )
                 model_version = gr.Radio(
                     label=i18n("RVC Version"),
-                    info=i18n(
-                        "Choose v1 for 256-channel ContentVec features and the 40 kHz HiFi-GAN path, or v2 for the 768-channel path."
-                    ),
                     choices=["v1", "v2"],
                     value="v2",
                     interactive=True,
