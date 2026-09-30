@@ -29,7 +29,12 @@ def deterministic_validation_scope(seed, cuda_devices=None):
         with torch.random.fork_rng(devices=devices):
             random.seed(seed)
             np.random.seed(seed % (2**32))
-            torch.manual_seed(seed)
+            torch.set_rng_state(
+                torch.Generator(device="cpu").manual_seed(seed).get_state()
+            )
+            for device in devices:
+                with torch.cuda.device(device):
+                    torch.cuda.manual_seed(seed)
             torch.use_deterministic_algorithms(True)
             torch.backends.cudnn.benchmark = False
             torch.backends.cudnn.deterministic = True
@@ -60,7 +65,7 @@ def deterministic_validation_scope(seed, cuda_devices=None):
 
 
 class UTMOSv2Validator:
-    def __init__(self, model_paths, device):
+    def __init__(self, model_paths, seed, device):
         missing_paths = [path for path in model_paths if not os.path.isfile(path)]
         if missing_paths:
             raise FileNotFoundError(
@@ -69,19 +74,21 @@ class UTMOSv2Validator:
         if importlib.util.find_spec("utmosv2") is None:
             raise ModuleNotFoundError("UTMOSv2 is not installed")
         self.model_paths = list(model_paths)
+        self.seed = int(seed) % (2**63 - 1)
         self.device = torch.device(device)
         self.repetitions = 5
 
     def _load_model(self, model_path, fold):
-        import utmosv2
+        with deterministic_validation_scope(self.seed):
+            import utmosv2
 
-        model = utmosv2.create_model(
-            pretrained=True,
-            fold=fold,
-            checkpoint_path=model_path,
-            device="cpu",
-        )
-        model.eval().float().to("cpu")
+            model = utmosv2.create_model(
+                pretrained=True,
+                fold=fold,
+                checkpoint_path=model_path,
+                device="cpu",
+            )
+            model.eval().float().to("cpu")
         floating_dtypes = {
             parameter.dtype
             for parameter in model.parameters()
@@ -204,16 +211,22 @@ class UTMOSv2Validator:
         raise RuntimeError("UTMOSv2 TTA inference failed")
 
     def _score_clips(self, model, clips, sample_rate, device):
+        cuda_devices = (
+            [device.index if device.index is not None else torch.cuda.current_device()]
+            if device.type == "cuda"
+            else []
+        )
         model.eval().float().to(device)
         predictions = []
-        for clip in clips:
-            prepared_clip = self._resample_clip(model, clip, sample_rate)
-            inputs = self._prepare_tta_inputs(
-                model, prepared_clip, self.repetitions
-            )
-            prediction = self._score_tta(model, inputs, device)
-            del inputs
-            predictions.append(prediction)
+        with deterministic_validation_scope(self.seed, cuda_devices=cuda_devices):
+            for clip in clips:
+                prepared_clip = self._resample_clip(model, clip, sample_rate)
+                inputs = self._prepare_tta_inputs(
+                    model, prepared_clip, self.repetitions
+                )
+                prediction = self._score_tta(model, inputs, device)
+                del inputs
+                predictions.append(prediction)
         return predictions
 
     def _score_fold(self, model, clips, sample_rate):
