@@ -927,11 +927,11 @@ def run(
                 torch.device("cuda", device_id) if device.type == "cuda" else device
             )
             mos_validator = UTMOSv2Validator(
-                mos_model_paths, config.train.seed, mos_device
+                mos_model_paths, mos_device
             )
             print(
                 "UTMOSv2 paper-style five-fold, five-frame batched validation enabled "
-                f"with deterministic FP32 {mos_device.type.upper()} inference."
+                f"with FP32 {mos_device.type.upper()} inference."
             )
         except Exception as error:
             print(f"UTMOSv2 validation disabled: {error}")

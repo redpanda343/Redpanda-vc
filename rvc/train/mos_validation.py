@@ -60,7 +60,7 @@ def deterministic_validation_scope(seed, cuda_devices=None):
 
 
 class UTMOSv2Validator:
-    def __init__(self, model_paths, seed, device):
+    def __init__(self, model_paths, device):
         missing_paths = [path for path in model_paths if not os.path.isfile(path)]
         if missing_paths:
             raise FileNotFoundError(
@@ -69,21 +69,19 @@ class UTMOSv2Validator:
         if importlib.util.find_spec("utmosv2") is None:
             raise ModuleNotFoundError("UTMOSv2 is not installed")
         self.model_paths = list(model_paths)
-        self.seed = int(seed) % (2**63 - 1)
         self.device = torch.device(device)
         self.repetitions = 5
 
     def _load_model(self, model_path, fold):
         import utmosv2
 
-        with deterministic_validation_scope(self.seed):
-            model = utmosv2.create_model(
-                pretrained=True,
-                fold=fold,
-                checkpoint_path=model_path,
-                device="cpu",
-            )
-            model.eval().float().to("cpu")
+        model = utmosv2.create_model(
+            pretrained=True,
+            fold=fold,
+            checkpoint_path=model_path,
+            device="cpu",
+        )
+        model.eval().float().to("cpu")
         floating_dtypes = {
             parameter.dtype
             for parameter in model.parameters()
@@ -205,27 +203,24 @@ class UTMOSv2Validator:
             return result
         raise RuntimeError("UTMOSv2 TTA inference failed")
 
-    def _score_clips(self, model, clips, sample_rate, device, fold):
-        cuda_devices = [device.index or 0] if device.type == "cuda" else []
-        fold_seed = (self.seed + int(fold)) % (2**63 - 1)
+    def _score_clips(self, model, clips, sample_rate, device):
         model.eval().float().to(device)
         predictions = []
-        with deterministic_validation_scope(fold_seed, cuda_devices=cuda_devices):
-            for clip in clips:
-                prepared_clip = self._resample_clip(model, clip, sample_rate)
-                inputs = self._prepare_tta_inputs(
-                    model, prepared_clip, self.repetitions
-                )
-                prediction = self._score_tta(model, inputs, device)
-                del inputs
-                predictions.append(prediction)
+        for clip in clips:
+            prepared_clip = self._resample_clip(model, clip, sample_rate)
+            inputs = self._prepare_tta_inputs(
+                model, prepared_clip, self.repetitions
+            )
+            prediction = self._score_tta(model, inputs, device)
+            del inputs
+            predictions.append(prediction)
         return predictions
 
-    def _score_fold(self, model, clips, sample_rate, fold):
+    def _score_fold(self, model, clips, sample_rate):
         target_device = self.device
         try:
             return self._score_clips(
-                model, clips, sample_rate, target_device, fold
+                model, clips, sample_rate, target_device
             )
         except RuntimeError as error:
             if target_device.type != "cuda" or "out of memory" not in str(error).lower():
@@ -234,7 +229,7 @@ class UTMOSv2Validator:
             torch.cuda.empty_cache()
             print("UTMOSv2 GPU validation ran out of VRAM; retrying safely on CPU.")
             return self._score_clips(
-                model, clips, sample_rate, torch.device("cpu"), fold
+                model, clips, sample_rate, torch.device("cpu")
             )
 
     def score_batch(self, generated, lengths, speaker_ids, sample_rate):
@@ -247,7 +242,7 @@ class UTMOSv2Validator:
             model = self._load_model(model_path, fold)
             try:
                 fold_predictions.append(
-                    self._score_fold(model, clips, sample_rate, fold)
+                    self._score_fold(model, clips, sample_rate)
                 )
             finally:
                 model.to("cpu")
