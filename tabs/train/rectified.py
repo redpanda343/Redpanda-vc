@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import sys
@@ -7,12 +8,18 @@ from pathlib import Path
 import gradio as gr
 import psutil
 import torch
+from tqdm import tqdm
 
 from tabs.settings.sections.precision import get_precision
 from rvc.rectified.distributed import parse_devices
+from rvc.lib.tools.prerequisites_download import _sha256, download_file
 
 ROOT = Path(__file__).resolve().parents[2]
 _lock = threading.Lock()
+_pretrain_lock = threading.Lock()
+FLOW_PRETRAIN_URL = ('https://huggingface.co/shiromiya/ShiroRVC-Resources/resolve/'
+                     'f84d2dfb2f6cc0a3205e437c7676455971dc6bf5/Rectified_pretrains/pretrain_flow_contentvec.pth')
+FLOW_PRETRAIN_SHA256 = '79fdb4e13ff3d68d755f23879985e86f0052cda10360c7d6bd8003aa08074568'
 _process = None
 _log_handle = None
 _log_path = None
@@ -109,17 +116,43 @@ def device_id(device):
     return '-' if devices == ['cpu'] else '-'.join(item[5:] for item in devices)
 
 
-def start(name, vocoder, pretrained, batch, epochs, save_every, device, compile_backbone=False):
+def toggle_pretrained(enabled, custom):
+    return gr.update(visible=enabled), gr.update(visible=enabled and custom)
+
+
+def resolve_pretrained(directory, enabled, custom, path):
+    if not enabled or (directory / 'flow' / 'checkpoint.pth').is_file():
+        return ''
+    if custom:
+        path = str(path or '').strip().strip('"')
+        if not path or not Path(path).is_file():
+            raise gr.Error('Choose an existing custom rectified-flow pretrained checkpoint.')
+        return path
+    info_path = directory / 'model_info.json'
+    info = json.loads(info_path.read_text(encoding='utf-8')) if info_path.is_file() else {}
+    if info.get('embedder_model', 'contentvec') != 'contentvec':
+        raise gr.Error('The default Shiro pretrained uses ContentVec. Extract with ContentVec or select a compatible custom pretrained.')
+    destination = ROOT / 'rvc' / 'models' / 'pretraineds' / 'rectified' / 'pretrain_flow_contentvec.pth'
+    with _pretrain_lock:
+        if not destination.is_file() or _sha256(destination) != FLOW_PRETRAIN_SHA256:
+            gr.Info('Downloading the Shiro ContentVec flow pretrained. It will be reused for future runs.')
+            try:
+                with tqdm(total=319370011, unit='B', unit_scale=True, desc='Shiro flow pretrained') as progress:
+                    download_file(FLOW_PRETRAIN_URL, str(destination), progress, expected_sha256=FLOW_PRETRAIN_SHA256)
+            except Exception as error:
+                raise gr.Error(f'Could not download the Shiro flow pretrained: {error}') from error
+    return str(destination)
+
+
+def start(name, vocoder, pretrained, batch, epochs, save_every, device, compile_backbone=False,
+          use_pretrained=True, custom_pretrained=False):
     directory = experiment_path(name)
     device_id(device)
     if not (directory / 'filelist.txt').is_file():
         raise gr.Error('Extract features for this experiment first.')
     vocoder = str(vocoder).strip().strip('"')
-    pretrained = str(pretrained or '').strip().strip('"')
     if vocoder and not Path(vocoder).is_file():
         raise gr.Error('Choose an existing OpenVPI NSF-HiFiGAN checkpoint.')
-    if pretrained and not Path(pretrained).is_file():
-        raise gr.Error('The pretrained flow checkpoint does not exist.')
     precision = get_precision() or 'fp32'
     if precision not in {'fp32', 'fp16', 'bf16'}:
         raise gr.Error(f'Unsupported training precision: {precision}')
@@ -130,6 +163,7 @@ def start(name, vocoder, pretrained, batch, epochs, save_every, device, compile_
                  '--device', str(device).strip().lower(), '--precision', precision]
     if compile_backbone:
         arguments.append('--compile')
+    pretrained = resolve_pretrained(directory, use_pretrained, custom_pretrained, pretrained)
     if pretrained:
         arguments.extend(['--pretrained-flow', pretrained])
     return launch(name, 'rvc.rectified.train_flow', arguments, 'Training rectified flow')
@@ -180,7 +214,14 @@ def rectified_train_tab():
     with gr.Accordion('3. Train rectified flow', open=True):
         vocoder = gr.Textbox(label='OpenVPI NSF-HiFiGAN checkpoint path (optional)',
                             info='Leave empty for mel previews only. 44.1 kHz, 128 mel bins, hop 512. Keep its config.json beside it. RVC generator checkpoints are incompatible.')
-        pretrained = gr.Textbox(label='Pretrained flow path (optional)', info='Use a flow trained with the selected content embedder. Leave empty to train from scratch.')
+        use_pretrained = gr.Checkbox(label='Pretrained', value=True,
+                                     info='Automatically download and use the Shiro ContentVec pretrained. Disable to train a new experiment from scratch.')
+        custom_pretrained = gr.Checkbox(label='Custom pretrained', value=False,
+                                       info='Use your own compatible rectified-flow checkpoint instead of the default Shiro pretrained.')
+        with gr.Column(visible=False) as custom_pretrained_settings:
+            pretrained_upload = gr.File(label='Upload custom flow pretrained', file_types=['.pth'], type='filepath')
+            pretrained = gr.Textbox(label='Custom pretrained flow path',
+                                    info='Choose a flow checkpoint compatible with the experiment configuration and content embedder.')
         with gr.Row():
             batch = gr.Number(label='Batch size per GPU', value=4, minimum=1, precision=0)
             epochs = gr.Number(label='Total epochs', value=100, minimum=1, precision=0)
@@ -197,6 +238,12 @@ def rectified_train_tab():
     outputs = [state, log, preprocess_button, extract_button, train_button, stop_button]
     preprocess_button.click(preprocess, [name, dataset, workers], outputs, queue=False)
     extract_button.click(extract, [name, method, workers, device, embedder], outputs, queue=False)
-    train_button.click(start, [name, vocoder, pretrained, batch, epochs, save_every, device, compile_backbone], outputs, queue=False)
+    use_pretrained.change(toggle_pretrained, [use_pretrained, custom_pretrained],
+                          [custom_pretrained, custom_pretrained_settings], queue=False)
+    custom_pretrained.change(toggle_pretrained, [use_pretrained, custom_pretrained],
+                             [custom_pretrained, custom_pretrained_settings], queue=False)
+    pretrained_upload.upload(lambda path: path or '', [pretrained_upload], [pretrained], queue=False)
+    train_button.click(start, [name, vocoder, pretrained, batch, epochs, save_every, device, compile_backbone,
+                               use_pretrained, custom_pretrained], outputs, queue=False)
     stop_button.click(stop, [], outputs, queue=False)
     gr.Timer(2).tick(status, [], outputs, queue=False)

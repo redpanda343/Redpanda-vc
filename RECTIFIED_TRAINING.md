@@ -19,6 +19,17 @@ The stop button ends the current rectified job; training resumes from the last
 saved epoch, so unsaved steps are lost. The original trainer remains under
 **Train > RVC**.
 
+The WebUI enables **Pretrained** by default. On the first start of a new
+ContentVec experiment, it downloads the [Shiro ContentVec flow pretrained](https://huggingface.co/shiromiya/ShiroRVC-Resources/blob/main/Rectified_pretrains/pretrain_flow_contentvec.pth)
+to `rvc/models/pretraineds/rectified/pretrain_flow_contentvec.pth`. The download
+is pinned to a verified revision, checked with SHA-256, and reused for later runs.
+Enable **Custom pretrained** to upload a compatible `.pth` checkpoint or enter
+its path. Disable **Pretrained** to train a new experiment from scratch.
+Existing experiments still resume from their saved checkpoint regardless of
+these controls. Use a new model name to start over and preserve an existing run.
+The default pretrained requires ContentVec; other embedders need a compatible
+custom pretrained or training from scratch.
+
 Alternatively, run these commands from the repository root with its Python environment active.
 Use a new experiment name so existing RVC training data is preserved.
 
