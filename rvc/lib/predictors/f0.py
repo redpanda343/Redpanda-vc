@@ -53,7 +53,9 @@ class FCPE:
 
 
 class Swift:
-    def __init__(self, device, sample_rate=16000, hop_size=160):
+    def __init__(
+        self, device, sample_rate=16000, hop_size=160, *, threads=None, spin=True
+    ):
         from swift_f0 import SwiftF0
         import onnxruntime as ort
 
@@ -65,7 +67,7 @@ class Swift:
         if "CUDAExecutionProvider" not in ort.get_available_providers():
             raise RuntimeError("SwiftF0 requires onnxruntime-gpu with CUDAExecutionProvider.")
 
-        self.model = SwiftF0()
+        self.model = SwiftF0(threads=threads, spin=spin)
         self.model.session.set_providers(
             [
                 ("CUDAExecutionProvider", {"device_id": self.device.index or 0}),
