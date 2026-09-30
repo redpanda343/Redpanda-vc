@@ -224,7 +224,8 @@ def train(args):
         dropout = 0.0
     lr = args.learning_rate or settings['finetune_learning_rate' if finetune else 'learning_rate']
     if settings['optimizer'] == 'muon':
-        optimizer = MuonAdamW(model, lr, muon_weight_decay=settings['weight_decay'], betas=tuple(settings['betas']))
+        optimizer = MuonAdamW(model, lr, muon_weight_decay=settings['weight_decay'],
+                              betas=tuple(settings['betas']), iteration_dtype=amp_dtype or torch.float32)
     elif settings['optimizer'] == 'adamw':
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=tuple(settings['betas']), weight_decay=settings['weight_decay'])
     else:

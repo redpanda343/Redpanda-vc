@@ -5,15 +5,15 @@ from torch import nn
 MIN_FAN_IN = 16
 
 
-def _iteration_dtype(device: torch.device) -> torch.dtype:
-    return torch.float32
+def _iteration_dtype(device: torch.device, dtype: torch.dtype = torch.float32) -> torch.dtype:
+    return dtype if device.type == "cuda" else torch.float32
 
 
-def orthogonalize(g: torch.Tensor, steps: int = 5) -> torch.Tensor:
+def orthogonalize(g: torch.Tensor, steps: int = 5, dtype: torch.dtype = torch.float32) -> torch.Tensor:
     a, b, c = 3.4445, -4.7750, 2.0315
     x = g.float()
     x = x / x.flatten(-2).norm(dim=-1).clamp_min(1e-7)[..., None, None]
-    x = x.to(_iteration_dtype(g.device))
+    x = x.to(_iteration_dtype(g.device, dtype))
     transposed = x.shape[-2] > x.shape[-1]
     if transposed:
         x = x.mT
@@ -36,7 +36,10 @@ def muon_parameters(model: nn.Module) -> set:
 
 class MuonAdamW(torch.optim.Optimizer):
     def __init__(self, model, lr, muon_weight_decay=0.1, adamw_weight_decay=0.0,
-                 momentum=0.95, betas=(0.9, 0.98), eps=1e-8):
+                 momentum=0.95, betas=(0.9, 0.98), eps=1e-8, iteration_dtype=torch.float32):
+        if iteration_dtype not in {torch.float32, torch.float16, torch.bfloat16}:
+            raise ValueError(f"Unsupported Muon iteration dtype: {iteration_dtype}")
+        self.iteration_dtype = iteration_dtype
         chosen = muon_parameters(model)
         params = [p for p in model.parameters() if p.requires_grad]
         groups = [
@@ -73,7 +76,7 @@ class MuonAdamW(torch.optim.Optimizer):
             tall = update.shape[0] > update.shape[1]
             shapes.setdefault(tuple(sorted(update.shape)), []).append((p, update.mT if tall else update, tall))
         for shape, members in shapes.items():
-            orthogonal = orthogonalize(torch.stack([update for _, update, _ in members])).unbind(0)
+            orthogonal = orthogonalize(torch.stack([update for _, update, _ in members]), dtype=self.iteration_dtype).unbind(0)
             torch._foreach_add_(
                 [p for p, _, _ in members],
                 [(u.mT if tall else u).reshape(p.shape) for (p, _, tall), u in zip(members, orthogonal)],

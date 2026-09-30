@@ -41,8 +41,12 @@ resume. Click **Update precision** to save your choice. FP16 uses CUDA autocast
 and gradient scaling; BF16 uses CUDA autocast on supported GPUs. CPU runs and
 unsupported BF16 GPUs fall back to FP32 with a log message. The CLI supports
 `--precision fp32`, `fp16`, or `bf16`, and defaults to FP32. Model weights,
-optimizer state, Muon matrix operations, held-out evaluation and audio previews
-remain FP32 for stability. TF32 stays disabled. Changing the setting does not
+optimizer state, held-out evaluation and audio previews remain FP32. Muon
+Newton-Schulz matrix iterations follow the effective training precision: FP16
+when FP16 is selected, BF16 when supported and selected, and FP32 otherwise.
+CPU runs and unsupported BF16 requests use FP32 iterations. Normalization is
+computed in FP32 and the matrix update is converted back to FP32 afterward,
+as in Shiro. AdamW calculations remain FP32. TF32 stays disabled. Changing the setting does not
 alter a job already running.
 
 Training uses a single device, selected with `--device cuda:0` or `--device cpu`.
@@ -65,8 +69,11 @@ load these exports; conversion integration is outside this training-only port.
 The flow implementation is synchronized with the local ShiroRVC update: LYNXNet2
 uses the revised modulation arithmetic and a full-precision input projection.
 Sampling also supports `churn` and caller-supplied churn noise. Muon batches
-same-shaped matrices and AdamW uses grouped updates; RedPanda retains FP32
-Newton-Schulz iterations rather than Shiro's automatic FP16/BF16 selection.
+same-shaped matrices and AdamW uses grouped updates. RedPanda selects the
+Newton-Schulz iteration dtype from the effective training precision, while
+Shiro chooses FP16/BF16 automatically by GPU capability. Changing precision
+on resume also changes Muon's iteration dtype without changing checkpoint
+parameter or optimizer-state formats.
 Model dimensions, the flow-matching objective, and the 400-frame crop are unchanged.
 
 The vocoder path is optional. Without it, TensorBoard records mel previews and
