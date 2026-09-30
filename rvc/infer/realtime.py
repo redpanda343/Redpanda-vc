@@ -182,6 +182,7 @@ class RealTimeRVC:
         self.lock = threading.RLock()
         self.seed = int(seed) % (2**63 - 1)
         self.last_f0_method = None
+        self.pitch_sample_count = 0
         self.prepared_f0_methods = set()
         self.rmvpe_viterbi = RMVPEViterbi()
         self.cache_pitch = torch.zeros(4096, device=self.device, dtype=torch.long)
@@ -210,6 +211,10 @@ class RealTimeRVC:
             self._load_index(index_path)
         if self.index_rate > 0 and self.index is None:
             raise ValueError("Select a valid feature index or set Index Rate to 0.")
+
+    @staticmethod
+    def pitch_lookahead_frames(method):
+        return 20 if method == "swift" else 0
 
     @property
     def speaker_count(self):
@@ -245,6 +250,7 @@ class RealTimeRVC:
         self.cache_pitchf.zero_()
         self.rmvpe_viterbi.reset()
         self.last_f0_method = None
+        self.pitch_sample_count = 0
 
     def _extract_features(self, input_wav):
         source = input_wav.float().view(1, -1)
@@ -283,6 +289,17 @@ class RealTimeRVC:
 
     def _prepare_pitch_predictor(self, method):
         predictor = getattr(self.pipeline, f"model_{method}", None)
+        if predictor is None and method == "swift":
+            from rvc.lib.predictors.f0 import Swift
+
+            predictor = Swift(
+                device=self.device,
+                sample_rate=16000,
+                hop_size=160,
+                threads=1,
+                spin=False,
+            )
+            self.pipeline.model_swift = predictor
         if predictor is None:
             return
         current = predictor
@@ -303,7 +320,15 @@ class RealTimeRVC:
             self.last_f0_method = method
         if method not in self.prepared_f0_methods:
             self._prepare_pitch_predictor(method)
+        self.pitch_sample_count += int(block_frame_16k)
         extractor_frame = block_frame_16k + 800
+        if method == "swift":
+            extractor_frame = min(block_frame_16k + 19200, input_wav.shape[0])
+            start = self.pitch_sample_count - extractor_frame
+            aligned_start = start - start % 1280
+            if self.pitch_sample_count - aligned_start > input_wav.shape[0]:
+                aligned_start += 1280
+            extractor_frame = self.pitch_sample_count - aligned_start
         if method == "rmvpe":
             extractor_frame = 5120 * ((extractor_frame - 1) // 5120 + 1) - 160
         source = input_wav[-extractor_frame:].detach().cpu().numpy()
@@ -328,8 +353,12 @@ class RealTimeRVC:
         ).flatten()
         self.cache_pitch[:-shift] = self.cache_pitch[shift:].clone()
         self.cache_pitchf[:-shift] = self.cache_pitchf[shift:].clone()
-        usable_pitch = pitch[3:-1] if pitch.numel() > 4 else pitch
-        usable_pitchf = pitchf[3:-1] if pitchf.numel() > 4 else pitchf
+        if method == "swift":
+            usable_pitch = pitch
+            usable_pitchf = pitchf
+        else:
+            usable_pitch = pitch[3:-1] if pitch.numel() > 4 else pitch
+            usable_pitchf = pitchf[3:-1] if pitchf.numel() > 4 else pitchf
         count = min(usable_pitch.numel(), self.cache_pitch.numel())
         if count:
             self.cache_pitch[-count:] = usable_pitch[-count:]
@@ -344,6 +373,10 @@ class RealTimeRVC:
         return_length,
         f0_method,
     ):
+        lookahead = self.pitch_lookahead_frames(f0_method)
+        if skip_head < lookahead:
+            raise ValueError("SwiftF0 realtime requires at least 0.2 seconds of extra context.")
+        skip_head = int(skip_head) - lookahead
         started = time.perf_counter()
         with deterministic_torch_scope():
             with self.lock:
