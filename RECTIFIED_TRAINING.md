@@ -2,8 +2,8 @@
 
 This ports ShiroRVC's 44.1 kHz rectified-flow training recipe. The flow predicts
 128-bin log mel spectrograms from content, F0, loudness, breathiness and speaker.
-An optional OpenVPI NSF-HiFiGAN checkpoint renders audio previews and is
-recorded in the exported model. Without one, previews show mel images only. The vocoder is frozen; this trains the flow,
+The default OpenVPI NSF-HiFiGAN vocoder renders audio previews and is
+recorded in the exported model. Mel-only previews can be selected instead. The vocoder is frozen; this trains the flow,
 not a new vocoder. RVC latent NSF-HiFiGAN generator checkpoints do not accept
 these mels and cannot be used as the vocoder.
 
@@ -13,8 +13,8 @@ FFT/window 2048, 128 mel bins, fmin 40 and fmax 16000. Its accompanying
 mel settings and loads generator weights strictly. Other vocoders are rejected.
 
 In the WebUI, open **Train > Rectified Flow**. Enter a new model name and
-dataset folder, preprocess, extract features, then enter the NSF-HiFiGAN
-checkpoint path if audio previews are wanted, and start training. The page shows the job status and live log.
+dataset folder, preprocess, extract features, choose the audio preview vocoder,
+and start training. The page shows the job status and live log.
 The stop button ends the current rectified job; training resumes from the last
 saved epoch, so unsaved steps are lost. The original trainer remains under
 **Train > RVC**.
@@ -29,6 +29,17 @@ Existing experiments still resume from their saved checkpoint regardless of
 these controls. Use a new model name to start over and preserve an existing run.
 The default pretrained requires ContentVec; other embedders need a compatible
 custom pretrained or training from scratch.
+
+**Audio preview vocoder** defaults to **Default NSF-HiFiGAN**. On start,
+it downloads only `pc_nsf_hifigan_44.1k_hop512_128bin_vocoder.pth` from
+[Shiro's vocoders](https://huggingface.co/shiromiya/ShiroRVC-Resources/tree/main/vocoders)
+to `rvc/models/pretraineds/rectified/`. This 56.6 MB file is the converted
+inference generator from the larger `.ckpt`; the larger checkpoint is not
+needed or downloaded. The revision and SHA-256 are verified, and the file is
+reused on later starts. Choose **Custom NSF-HiFiGAN** to enter a compatible
+OpenVPI `.ckpt` or converted `.pth` path. Choose **Mel previews only** to skip
+the vocoder download and audio rendering. This selection is independent of
+the flow pretrained toggle and also applies when resuming a run.
 
 Alternatively, run these commands from the repository root with its Python environment active.
 Use a new experiment name so existing RVC training data is preserved.

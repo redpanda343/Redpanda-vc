@@ -20,6 +20,11 @@ _pretrain_lock = threading.Lock()
 FLOW_PRETRAIN_URL = ('https://huggingface.co/shiromiya/ShiroRVC-Resources/resolve/'
                      'f84d2dfb2f6cc0a3205e437c7676455971dc6bf5/Rectified_pretrains/pretrain_flow_contentvec.pth')
 FLOW_PRETRAIN_SHA256 = '79fdb4e13ff3d68d755f23879985e86f0052cda10360c7d6bd8003aa08074568'
+VOCODER_FILENAME = 'pc_nsf_hifigan_44.1k_hop512_128bin_vocoder.pth'
+VOCODER_URL = ('https://huggingface.co/shiromiya/ShiroRVC-Resources/resolve/'
+               'f84d2dfb2f6cc0a3205e437c7676455971dc6bf5/vocoders/' + VOCODER_FILENAME)
+VOCODER_SHA256 = '4d7c843cb663137a28b94e8707503d540e5eec4b16e40867ae0d17f07440cc8d'
+VOCODER_CHOICES = ['Default NSF-HiFiGAN', 'Custom NSF-HiFiGAN', 'Mel previews only']
 _process = None
 _log_handle = None
 _log_path = None
@@ -120,6 +125,32 @@ def toggle_pretrained(enabled, custom):
     return gr.update(visible=enabled), gr.update(visible=enabled and custom)
 
 
+def download_checkpoint(destination, url, checksum, size, label):
+    with _pretrain_lock:
+        if not destination.is_file() or _sha256(destination) != checksum:
+            gr.Info(f'Downloading {label}. It will be reused for future runs.')
+            try:
+                with tqdm(total=size, unit='B', unit_scale=True, desc=label) as progress:
+                    download_file(url, str(destination), progress, expected_sha256=checksum)
+            except Exception as error:
+                raise gr.Error(f'Could not download {label}: {error}') from error
+    return str(destination)
+
+
+def resolve_vocoder(mode, path):
+    if mode == 'Mel previews only':
+        return ''
+    if mode == 'Custom NSF-HiFiGAN':
+        path = str(path or '').strip().strip('"')
+        if not path or not Path(path).is_file():
+            raise gr.Error('Choose an existing OpenVPI NSF-HiFiGAN checkpoint or converted vocoder export.')
+        return path
+    if mode != 'Default NSF-HiFiGAN':
+        raise gr.Error('Choose a supported vocoder option.')
+    destination = ROOT / 'rvc' / 'models' / 'pretraineds' / 'rectified' / VOCODER_FILENAME
+    return download_checkpoint(destination, VOCODER_URL, VOCODER_SHA256, 56600485, 'NSF-HiFiGAN vocoder')
+
+
 def resolve_pretrained(directory, enabled, custom, path):
     if not enabled or (directory / 'flow' / 'checkpoint.pth').is_file():
         return ''
@@ -133,29 +164,19 @@ def resolve_pretrained(directory, enabled, custom, path):
     if info.get('embedder_model', 'contentvec') != 'contentvec':
         raise gr.Error('The default Shiro pretrained uses ContentVec. Extract with ContentVec or select a compatible custom pretrained.')
     destination = ROOT / 'rvc' / 'models' / 'pretraineds' / 'rectified' / 'pretrain_flow_contentvec.pth'
-    with _pretrain_lock:
-        if not destination.is_file() or _sha256(destination) != FLOW_PRETRAIN_SHA256:
-            gr.Info('Downloading the Shiro ContentVec flow pretrained. It will be reused for future runs.')
-            try:
-                with tqdm(total=319370011, unit='B', unit_scale=True, desc='Shiro flow pretrained') as progress:
-                    download_file(FLOW_PRETRAIN_URL, str(destination), progress, expected_sha256=FLOW_PRETRAIN_SHA256)
-            except Exception as error:
-                raise gr.Error(f'Could not download the Shiro flow pretrained: {error}') from error
-    return str(destination)
+    return download_checkpoint(destination, FLOW_PRETRAIN_URL, FLOW_PRETRAIN_SHA256, 319370011, 'Shiro ContentVec flow pretrained')
 
 
 def start(name, vocoder, pretrained, batch, epochs, save_every, device, compile_backbone=False,
-          use_pretrained=True, custom_pretrained=False):
+          use_pretrained=True, custom_pretrained=False, vocoder_mode='Default NSF-HiFiGAN'):
     directory = experiment_path(name)
     device_id(device)
     if not (directory / 'filelist.txt').is_file():
         raise gr.Error('Extract features for this experiment first.')
-    vocoder = str(vocoder).strip().strip('"')
-    if vocoder and not Path(vocoder).is_file():
-        raise gr.Error('Choose an existing OpenVPI NSF-HiFiGAN checkpoint.')
     precision = get_precision() or 'fp32'
     if precision not in {'fp32', 'fp16', 'bf16'}:
         raise gr.Error(f'Unsupported training precision: {precision}')
+    vocoder = resolve_vocoder(vocoder_mode, vocoder)
     arguments = ['--model-name', str(name).strip(), '--vocoder', vocoder,
                  '--batch-size', positive_integer(batch, 'Batch size'),
                  '--epochs', positive_integer(epochs, 'Total epochs'),
@@ -212,8 +233,10 @@ def rectified_train_tab():
             embedder = gr.Dropdown(label='Content embedder', choices=['contentvec', 'spin-v2'], value='contentvec')
         extract_button = gr.Button('Extract content and F0')
     with gr.Accordion('3. Train rectified flow', open=True):
-        vocoder = gr.Textbox(label='OpenVPI NSF-HiFiGAN checkpoint path (optional)',
-                            info='Leave empty for mel previews only. 44.1 kHz, 128 mel bins, hop 512. Keep its config.json beside it. RVC generator checkpoints are incompatible.')
+        vocoder_mode = gr.Dropdown(label='Audio preview vocoder', choices=VOCODER_CHOICES, value='Default NSF-HiFiGAN',
+                                   info='The default NSF-HiFiGAN downloads automatically on start. Choose mel previews only to skip audio rendering.')
+        vocoder = gr.Textbox(label='Custom OpenVPI NSF-HiFiGAN checkpoint path', visible=False,
+                            info='Use a compatible .ckpt or converted .pth export: 44.1 kHz, 128 mel bins, hop 512. Keep config.json beside raw checkpoints when provided.')
         use_pretrained = gr.Checkbox(label='Pretrained', value=True,
                                      info='Automatically download and use the Shiro ContentVec pretrained. Disable to train a new experiment from scratch.')
         custom_pretrained = gr.Checkbox(label='Custom pretrained', value=False,
@@ -243,7 +266,9 @@ def rectified_train_tab():
     custom_pretrained.change(toggle_pretrained, [use_pretrained, custom_pretrained],
                              [custom_pretrained, custom_pretrained_settings], queue=False)
     pretrained_upload.upload(lambda path: path or '', [pretrained_upload], [pretrained], queue=False)
+    vocoder_mode.change(lambda mode: gr.update(visible=mode == 'Custom NSF-HiFiGAN'),
+                        [vocoder_mode], [vocoder], queue=False)
     train_button.click(start, [name, vocoder, pretrained, batch, epochs, save_every, device, compile_backbone,
-                               use_pretrained, custom_pretrained], outputs, queue=False)
+                               use_pretrained, custom_pretrained, vocoder_mode], outputs, queue=False)
     stop_button.click(stop, [], outputs, queue=False)
     gr.Timer(2).tick(status, [], outputs, queue=False)
