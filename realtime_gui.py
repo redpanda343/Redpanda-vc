@@ -259,13 +259,8 @@ class AudioEngine:
         self._refresh_latency()
 
     def _refresh_latency(self):
-        lookahead_ms = 0
-        if not self.settings["monitor_input"]:
-            lookahead_ms = 10 * self.rvc.pitch_lookahead_frames(
-                self.settings["f0_method"]
-            )
         self.algorithm_latency_ms = round(
-            self.base_latency_ms + lookahead_ms + self.last_block_ms
+            self.base_latency_ms + self.last_block_ms
         )
 
     def stop(self):
@@ -325,9 +320,8 @@ class AudioEngine:
         rate = self.settings["rms_mix_rate"]
         if rate >= 1:
             return converted
-        lookahead = self.rvc.pitch_lookahead_frames(self.settings["f0_method"])
-        source_start = self.extra_frame - lookahead * self.zero_crossing
-        source = self.input_wav[source_start : source_start + converted.shape[0]]
+        source = self.input_wav[self.extra_frame :]
+        source = source[: converted.shape[0]]
         rms_source = librosa.feature.rms(
             y=source.detach().cpu().numpy(),
             frame_length=4 * self.zero_crossing,

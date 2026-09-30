@@ -212,10 +212,6 @@ class RealTimeRVC:
         if self.index_rate > 0 and self.index is None:
             raise ValueError("Select a valid feature index or set Index Rate to 0.")
 
-    @staticmethod
-    def pitch_lookahead_frames(method):
-        return 20 if method == "swift" else 0
-
     @property
     def speaker_count(self):
         return self.converter.n_spk
@@ -373,10 +369,6 @@ class RealTimeRVC:
         return_length,
         f0_method,
     ):
-        lookahead = self.pitch_lookahead_frames(f0_method)
-        if skip_head < lookahead:
-            raise ValueError("SwiftF0 realtime requires at least 0.2 seconds of extra context.")
-        skip_head = int(skip_head) - lookahead
         started = time.perf_counter()
         with deterministic_torch_scope():
             with self.lock:
