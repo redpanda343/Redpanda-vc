@@ -334,8 +334,6 @@ def train_rank(args, ranks):
                 step += 1
                 media_step = bool((preview_interval and step % preview_interval == 0) or
                                   (held and settings.get('eval_interval', 0) and step % settings['eval_interval'] == 0))
-                if media_step:
-                    ranks.barrier()
                 if ranks.main:
                     for tag, value in [('loss/flow', flow), ('loss/aux_mel_l1', auxiliary), ('grad_norm', norm), ('lr', current_lr)]:
                         writer.add_scalar(tag, value, step)
@@ -345,26 +343,35 @@ def train_rank(args, ranks):
                             writer.add_scalar(tag, value, step)
                         if scaler is not None:
                             writer.add_scalar("amp/scale", scaler.get_scale(), step)
-                    if preview_interval and step % preview_interval == 0:
-                        preview(model, ema, vocoder, reference, data, writer, step)
-                    if held_loader is not None and settings.get('eval_interval', 0) and step % settings['eval_interval'] == 0:
-                        evaluate(model, ema, held_loader, data, writer, step)
                 if media_step:
-                    ranks.barrier()
-            ranks.barrier()
-            if ranks.main and (epoch % args.save_every == 0 or epoch == args.epochs):
-                if any(not torch.isfinite(value).all() for value in model.state_dict().values()):
-                    raise FloatingPointError('Non-finite trained model weights.')
-                metadata = dict(config=config, speaker_count=speakers, embedder_model=embedder,
-                                vocoder=str(Path(args.vocoder).resolve()) if args.vocoder else '', epoch=epoch, step=step)
-                atomic_save(dict(model=model.state_dict(), optimizer=optimizer.state_dict(),
-                                 ema=ema.state_dict(), finetune=finetune,
-                                 scaler=scaler.state_dict() if scaler is not None else None,
-                                 precision=args.precision, **metadata), resume_path)
-                atomic_save(dict(kind='rectified_flow', model=ema.cpu_state_dict(), **metadata),
-                            output / f'{args.model_name}_flow_{epoch}e_{step}s.pth')
-                preview(model, ema, vocoder, reference, data, writer, step)
-                writer.flush()
+                    with ranks.main_work(f'preview/validation at step {step}') as main:
+                        if main:
+                            if preview_interval and step % preview_interval == 0:
+                                print(f'Rank 0: starting preview at step {step}.', flush=True)
+                                preview(model, ema, vocoder, reference, data, writer, step)
+                                print(f'Rank 0: preview finished at step {step}.', flush=True)
+                            if held_loader is not None and settings.get('eval_interval', 0) and step % settings['eval_interval'] == 0:
+                                print(f'Rank 0: starting validation at step {step}.', flush=True)
+                                evaluate(model, ema, held_loader, data, writer, step)
+                                print(f'Rank 0: validation finished at step {step}.', flush=True)
+            if epoch % args.save_every == 0 or epoch == args.epochs:
+                with ranks.main_work(f'checkpoint/preview at epoch {epoch}') as main:
+                    if main:
+                        print(f'Rank 0: saving checkpoint at epoch {epoch}.', flush=True)
+                        if any(not torch.isfinite(value).all() for value in model.state_dict().values()):
+                            raise FloatingPointError('Non-finite trained model weights.')
+                        metadata = dict(config=config, speaker_count=speakers, embedder_model=embedder,
+                                        vocoder=str(Path(args.vocoder).resolve()) if args.vocoder else '', epoch=epoch, step=step)
+                        atomic_save(dict(model=model.state_dict(), optimizer=optimizer.state_dict(),
+                                         ema=ema.state_dict(), finetune=finetune,
+                                         scaler=scaler.state_dict() if scaler is not None else None,
+                                         precision=args.precision, **metadata), resume_path)
+                        atomic_save(dict(kind='rectified_flow', model=ema.cpu_state_dict(), **metadata),
+                                    output / f'{args.model_name}_flow_{epoch}e_{step}s.pth')
+                        print(f'Rank 0: checkpoint saved; starting preview at step {step}.', flush=True)
+                        preview(model, ema, vocoder, reference, data, writer, step)
+                        writer.flush()
+                        print(f'Rank 0: epoch {epoch} checkpoint and preview finished.', flush=True)
             ranks.barrier()
     if ranks.main:
         print(f'Finished at step {step}. Checkpoints and TensorBoard previews: {output}', flush=True)

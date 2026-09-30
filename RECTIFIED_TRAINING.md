@@ -85,7 +85,12 @@ Training accepts `--device cuda:0`, `--device cpu`, or multiple GPUs with
 Multiple GPUs use DDP with one process per GPU and a distributed sampler.
 Batch size and data-loader workers are per GPU; global batch size is batch size
 times GPU count. Only rank zero writes checkpoints, TensorBoard logs, and
-previews. Linux CUDA runs use NCCL. Windows uses Gloo with model synchronization
+previews. Rank-zero preview, validation and checkpoint work uses a separate
+CPU/Gloo control group with a one-hour timeout, so an idle GPU does not enqueue
+an NCCL barrier while this work runs. Training collectives retain their ten-minute
+timeout. Stage start/finish messages identify slow work, and rank-zero exceptions
+in these stages are sent to the other ranks. A stuck process or CUDA kernel can
+still time out; this does not repair such failures. Linux CUDA runs use NCCL. Windows uses Gloo with model synchronization
 and gradient averaging through CPU memory to avoid native CUDA Gloo collectives;
 this adds CPU transfer overhead. Single-device training
 retains its existing path. GPU IDs must be unique and available.

@@ -1,5 +1,6 @@
 import sys
 import tempfile
+from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
 
@@ -38,6 +39,7 @@ class Ranks:
         self.main = rank == 0
         self.device = torch.device(devices[rank])
         self.init_method = init_method
+        self.control_group = None
         self.backend = 'nccl' if self.device.type == 'cuda' and sys.platform != 'win32' else 'gloo'
         self.collective_device = self.device if self.backend == 'nccl' else torch.device('cpu')
 
@@ -47,17 +49,35 @@ class Ranks:
         if self.world > 1:
             dist.init_process_group(self.backend, init_method=self.init_method,
                                     rank=self.rank, world_size=self.world, timeout=timedelta(minutes=10))
+            self.control_group = dist.new_group(backend='gloo', timeout=timedelta(hours=1))
 
     def close(self):
         if self.world > 1 and dist.is_initialized():
+            if self.control_group is not None:
+                dist.destroy_process_group(self.control_group)
+                self.control_group = None
             dist.destroy_process_group()
 
     def barrier(self):
         if self.world > 1:
-            if self.backend == 'nccl':
-                dist.barrier(device_ids=[self.device.index])
-            else:
-                dist.barrier()
+            dist.barrier(group=self.control_group)
+
+    @contextmanager
+    def main_work(self, label):
+        if self.world == 1:
+            yield True
+            return
+        failure = None
+        try:
+            yield self.main
+        except Exception as error:
+            failure = error
+        result = [f'{type(failure).__name__}: {failure}' if failure is not None else None]
+        dist.broadcast_object_list(result, src=0, group=self.control_group)
+        if failure is not None:
+            raise failure
+        if result[0] is not None:
+            raise RuntimeError(f'Rank 0 failed during {label}: {result[0]}')
 
     def sum(self, value):
         if self.world == 1:
