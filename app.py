@@ -102,7 +102,6 @@ platform_config()
 
 import argparse
 import logging
-import types
 
 import gradio as gr
 
@@ -152,15 +151,12 @@ if sys.platform == "win32":
     _pe._ProactorBasePipeTransport._call_connection_lost = _ccl_patched
 
 # Fix Gradio NoneType error when entering an invalid value
-gr.Number.preprocess = types.MethodType(
-    lambda self, payload: (
-        None
-        if payload is None
-        or (self.minimum is not None and payload < self.minimum)
-        or (self.maximum is not None and payload > self.maximum)
-        else self.round_to_precision(payload, self.precision)
-    ),
-    gr.Number,
+gr.Number.preprocess = lambda self, payload: (
+    None
+    if payload is None
+    or (self.minimum is not None and payload < self.minimum)
+    or (self.maximum is not None and payload > self.maximum)
+    else self.round_to_precision(payload, self.precision)
 )
 
 # detect gradio
