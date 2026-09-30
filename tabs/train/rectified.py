@@ -53,7 +53,10 @@ def _status():
         _log_handle = None
     status = _description
     if _process is not None:
-        status += ' Running.' if active else f' Finished with exit code {code}.'
+        if code == 0 and _description.startswith('Preprocessing:'):
+            status += ' Slicing completed. Ready to extract content and F0.'
+        else:
+            status += ' Running.' if active else f' Finished with exit code {code}.'
     log = ''
     if _log_path is not None and _log_path.exists():
         with _log_path.open('rb') as handle:
@@ -65,6 +68,15 @@ def _status():
 def status():
     with _lock:
         return _status()
+
+
+def print_job_completion(process, description):
+    code = process.wait()
+    if code == 0 and description.startswith('Preprocessing:'):
+        message = 'Slicing completed. Ready to extract content and F0.'
+    else:
+        message = f'Finished with exit code {code}.'
+    print(f'{description} {message}', flush=True)
 
 
 def launch(name, module, arguments, description):
@@ -90,6 +102,7 @@ def launch(name, module, arguments, description):
             _log_handle = None
             raise
         _description = f'{description}: {name}.'
+        threading.Thread(target=print_job_completion, args=(_process, _description), daemon=True).start()
         return _status()
 
 

@@ -315,6 +315,7 @@ def preprocess_training_set(
                         except StopIteration:
                             continue
                         pending.add(executor.submit(worker, work_item))
+                print("\nSlicing completed. Finalizing preprocessing...", flush=True)
     finally:
         if use_fireredvad_gpu:
             shutdown_fireredvad_gpu()
@@ -334,7 +335,8 @@ def preprocess_training_set(
         f"Preprocess completed in {elapsed_time:.2f} seconds on "
         f"{format_duration(audio_length)} seconds of audio. Short-audio filter: "
         f"{automatic_filter}{skipped_short_outputs} output slice(s) under "
-        f"{MINIMUM_OUTPUT_AUDIO_SECONDS:.1f}s skipped before writing."
+        f"{MINIMUM_OUTPUT_AUDIO_SECONDS:.1f}s skipped before writing.",
+        flush=True,
     )
 
 
