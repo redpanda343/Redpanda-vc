@@ -103,6 +103,7 @@ def run_infer_script(
     delay_mix: float = 0.5,
     sid: int = 0,
     seed: int = 0,
+    rectified_vocoder_path: str = "",
 ):
     seed = resolve_inference_seed(seed)
     kwargs = {
@@ -158,6 +159,7 @@ def run_infer_script(
         "delay_mix": delay_mix,
         "sid": sid,
         "seed": seed,
+        "rectified_vocoder_path": rectified_vocoder_path,
     }
     infer_pipeline = import_voice_converter()
     infer_pipeline.convert_audio(**kwargs)
@@ -220,6 +222,7 @@ def run_batch_infer_script(
     delay_mix: float = 0.5,
     sid: int = 0,
     seed: int = 0,
+    rectified_vocoder_path: str = "",
 ):
     seed = resolve_inference_seed(seed)
     kwargs = {
@@ -275,6 +278,7 @@ def run_batch_infer_script(
         "delay_mix": delay_mix,
         "sid": sid,
         "seed": seed,
+        "rectified_vocoder_path": rectified_vocoder_path,
     }
     infer_pipeline = import_voice_converter()
     infer_pipeline.convert_audio_batch(**kwargs)

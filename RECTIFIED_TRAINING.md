@@ -106,8 +106,24 @@ training checkpoint. It retains Shiro's single-speaker fine-tuning freeze policy
 EMA exports are saved as `my-flow_flow_<epoch>e_<step>s.pth`. TensorBoard in
 the same directory records flow loss, auxiliary mel loss, gradient norm, learning
 rate, held-out loss when configured, and NSF-HiFiGAN audio previews. Exports
-retain Shiro's rectified-flow format. The ordinary RVC conversion UI cannot
-load these exports; conversion integration is outside this training-only port.
+retain Shiro's rectified-flow format. Select a flow export in the ordinary
+**Inference** tab; the loader detects it and uses the flow and NSF-HiFiGAN
+vocoder instead of the RVC synthesizer. Single and Batch conversion support
+flow models. The flow's speaker count populates the speaker selector.
+
+Inference runs the flow and vocoder in FP32 with 16 sampling steps. It reuses
+the tab's F0 extractor, pitch shift, ContentVec or spin-v2 selection, optional
+index retrieval and protection, audio splitting, and output processing. The
+flow generates at its configured sample rate (44.1 kHz for this recipe).
+Content, F0, energy and breathiness use the training recipe's frame alignment.
+
+Leave **Rectified Flow vocoder path (optional)** empty to use the exported
+model's vocoder. If its default vocoder path belongs to another machine or
+no vocoder was recorded, the default NSF-HiFiGAN is located locally or
+downloaded and verified automatically. Custom vocoder paths can be entered
+in Single and Batch advanced settings. Missing custom vocoders require an
+explicit replacement; incompatible mel settings are rejected. Training
+checkpoints also load using their EMA weights when available.
 
 The flow implementation is synchronized with the local ShiroRVC update: LYNXNet2
 uses the revised modulation arithmetic and a full-precision input projection.
@@ -131,7 +147,7 @@ for diagnosis.
 and Triton are available. Preview and evaluation paths remain eager. Compilation
 runtime errors are surfaced. Existing checkpoint names and resume rules are retained.
 Shiro's separate vocoder trainer, NSF-BigVGAN vocoder, and
-conversion interface are not part of this flow training update.
+separate conversion interface are not part of this flow training update.
 
 `python -m rvc.rectified.openvpi input.ckpt output.pth` converts an OpenVPI
 checkpoint into a compatible rectified vocoder export.

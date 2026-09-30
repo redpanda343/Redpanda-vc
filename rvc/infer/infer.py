@@ -397,6 +397,10 @@ class VoiceConverter:
             return
 
         self.get_vc(model_path, sid)
+        rectified = isinstance(self.cpt.get('config'), dict)
+        if rectified:
+            self.vc.set_vocoder(kwargs.pop('rectified_vocoder_path', ''))
+            self.tgt_sr = int(self.cpt['config']['data']['sample_rate'])
 
         start_time = time.time()
         print(f"Converting audio '{audio_input_path}'...")
@@ -440,7 +444,7 @@ class VoiceConverter:
             .replace("trained", "added")
         )
 
-        if self.tgt_sr != resample_sr >= 16000:
+        if not rectified and self.tgt_sr != resample_sr >= 16000:
             self.tgt_sr = resample_sr
 
         if split_audio:
@@ -473,6 +477,10 @@ class VoiceConverter:
             )
         else:
             audio_opt = converted_chunks[0]
+
+        if rectified and self.tgt_sr != resample_sr >= 16000:
+            audio_opt = soxr.resample(audio_opt, self.tgt_sr, resample_sr, quality="HQ")
+            self.tgt_sr = resample_sr
 
         if clean_audio:
             cleaned_audio = self.remove_audio_noise(
@@ -655,6 +663,22 @@ class VoiceConverter:
         Sets up the network configuration based on the loaded checkpoint.
         """
         if self.cpt is not None:
+            if isinstance(self.cpt.get('config'), dict):
+                from rvc.rectified.flow_model import build_flow
+                from rvc.rectified.infer import is_rectified
+
+                if not is_rectified(self.cpt):
+                    raise ValueError('Select an RVC model or Rectified Flow voice checkpoint, not a vocoder checkpoint.')
+                weights = self.cpt['ema']['shadow'] if self.cpt.get('ema') else self.cpt['model']
+                self.n_spk = int(self.cpt.get('speaker_count', weights['encoder.speaker.weight'].shape[0] - 1))
+                self.tgt_sr = int(self.cpt['config']['data']['sample_rate'])
+                self.version, self.use_f0 = 'v2', 1
+                self.text_enc_hidden_dim = int(self.cpt['config']['flow']['model']['content_channels'])
+                self.vocoder = 'OpenVPI NSF-HiFiGAN'
+                self.net_g = build_flow(self.cpt['config'], self.n_spk)
+                self.net_g.load_state_dict(weights, strict=True)
+                self.net_g = self.net_g.to(self.config.device).float().eval().requires_grad_(False)
+                return
             self.tgt_sr = self.cpt["config"][-1]
             self.cpt["config"][-3] = self.cpt["weight"]["emb_g.weight"].shape[0]
             self.use_f0 = self.cpt.get("f0", 1)
@@ -683,7 +707,12 @@ class VoiceConverter:
         """
         if self.cpt is not None:
             previous_vc = self.vc
-            self.vc = VC(self.tgt_sr, self.config)
+            if isinstance(self.cpt.get('config'), dict):
+                from rvc.rectified.infer import RectifiedPipeline
+
+                self.vc = RectifiedPipeline(self.tgt_sr, self.config, self.cpt)
+            else:
+                self.vc = VC(self.tgt_sr, self.config)
             if previous_vc is not None:
                 for predictor_name in ("model_rmvpe", "model_fcpe", "model_swift"):
                     if hasattr(previous_vc, predictor_name):
@@ -692,4 +721,5 @@ class VoiceConverter:
                             predictor_name,
                             getattr(previous_vc, predictor_name),
                         )
-            self.n_spk = self.cpt["config"][-3]
+            if not isinstance(self.cpt.get("config"), dict):
+                self.n_spk = self.cpt["config"][-3]

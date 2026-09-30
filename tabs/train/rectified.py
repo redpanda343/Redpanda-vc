@@ -12,6 +12,7 @@ from tqdm import tqdm
 
 from tabs.settings.sections.precision import get_precision
 from rvc.rectified.distributed import parse_devices
+from rvc.rectified.resources import VOCODER_FILENAME, VOCODER_URL, VOCODER_SHA256
 from rvc.lib.tools.prerequisites_download import _sha256, download_file
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -20,10 +21,6 @@ _pretrain_lock = threading.Lock()
 FLOW_PRETRAIN_URL = ('https://huggingface.co/shiromiya/ShiroRVC-Resources/resolve/'
                      'f84d2dfb2f6cc0a3205e437c7676455971dc6bf5/Rectified_pretrains/pretrain_flow_contentvec.pth')
 FLOW_PRETRAIN_SHA256 = '79fdb4e13ff3d68d755f23879985e86f0052cda10360c7d6bd8003aa08074568'
-VOCODER_FILENAME = 'pc_nsf_hifigan_44.1k_hop512_128bin_vocoder.pth'
-VOCODER_URL = ('https://huggingface.co/shiromiya/ShiroRVC-Resources/resolve/'
-               'f84d2dfb2f6cc0a3205e437c7676455971dc6bf5/vocoders/' + VOCODER_FILENAME)
-VOCODER_SHA256 = '4d7c843cb663137a28b94e8707503d540e5eec4b16e40867ae0d17f07440cc8d'
 VOCODER_CHOICES = ['Default NSF-HiFiGAN', 'Custom NSF-HiFiGAN', 'Mel previews only']
 _process = None
 _log_handle = None
