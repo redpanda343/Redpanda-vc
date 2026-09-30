@@ -8,6 +8,7 @@ import gradio as gr
 import psutil
 
 from tabs.settings.sections.precision import get_precision
+from rvc.rectified.distributed import parse_devices
 
 ROOT = Path(__file__).resolve().parents[2]
 _lock = threading.Lock()
@@ -100,12 +101,11 @@ def extract(name, method, workers, device, embedder):
 
 
 def device_id(device):
-    device = str(device).strip().lower()
-    if device == 'cpu':
-        return '-'
-    if device.startswith('cuda:') and device[5:].isdigit():
-        return str(int(device[5:]))
-    raise gr.Error('Device must be cpu or cuda followed by a GPU number, for example cuda:0.')
+    try:
+        devices = parse_devices(device)
+    except ValueError as error:
+        raise gr.Error(str(error)) from error
+    return '-' if devices == ['cpu'] else '-'.join(item[5:] for item in devices)
 
 
 def start(name, vocoder, pretrained, batch, epochs, save_every, device, compile_backbone=False):
@@ -164,7 +164,7 @@ def rectified_train_tab():
                 'An optional frozen OpenVPI NSF-HiFiGAN vocoder renders audio previews. Use a separate experiment from RVC training.')
     with gr.Row():
         name = gr.Textbox(label='Model name', value='my-flow')
-        device = gr.Textbox(label='Device', value='cuda:0', info='One GPU, for example cuda:0, or cpu.')
+        device = gr.Textbox(label='Device', value='cuda:0', info='One GPU: cuda:0. Multiple GPUs: cuda:0,cuda:1. CPU: cpu.')
     with gr.Accordion('1. Prepare dataset', open=True):
         dataset = gr.Textbox(label='Dataset folder')
         workers = gr.Number(label='CPU workers', value=4, minimum=1, precision=0)
@@ -180,7 +180,7 @@ def rectified_train_tab():
                             info='Leave empty for mel previews only. 44.1 kHz, 128 mel bins, hop 512. Keep its config.json beside it. RVC generator checkpoints are incompatible.')
         pretrained = gr.Textbox(label='Pretrained flow path (optional)', info='Use a flow trained with the selected content embedder. Leave empty to train from scratch.')
         with gr.Row():
-            batch = gr.Number(label='Batch size', value=4, minimum=1, precision=0)
+            batch = gr.Number(label='Batch size per GPU', value=4, minimum=1, precision=0)
             epochs = gr.Number(label='Total epochs', value=100, minimum=1, precision=0)
             save_every = gr.Number(label='Save every N epochs', value=10, minimum=1, precision=0)
         compile_backbone = gr.Checkbox(label='Compile flow backbone', value=False,

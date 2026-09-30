@@ -49,7 +49,19 @@ computed in FP32 and the matrix update is converted back to FP32 afterward,
 as in Shiro. AdamW calculations remain FP32. TF32 stays disabled. Changing the setting does not
 alter a job already running.
 
-Training uses a single device, selected with `--device cuda:0` or `--device cpu`.
+Training accepts `--device cuda:0`, `--device cpu`, or multiple GPUs with
+`--device cuda:0,cuda:1`. The WebUI Device field accepts the same values.
+Multiple GPUs use DDP with one process per GPU and a distributed sampler.
+Batch size and data-loader workers are per GPU; global batch size is batch size
+times GPU count. Only rank zero writes checkpoints, TensorBoard logs, and
+previews. Linux CUDA runs use NCCL. Windows uses Gloo with model synchronization
+and gradient averaging through CPU memory to avoid native CUDA Gloo collectives;
+this adds CPU transfer overhead. Single-device training
+retains its existing path. GPU IDs must be unique and available.
+Training loss and gradients are weighted by valid frames across ranks, so
+short-clip padding does not give a GPU a disproportionate contribution.
+Resume checkpoints keep the existing unwrapped model and optimizer formats.
+BF16 falls back to FP32 on all ranks if any selected GPU cannot support it.
 `flow.segment_frames`, `flow.num_workers` and batch size control memory use.
 The default crop is 400 mel frames. Short clips are padded and masked.
 
@@ -87,7 +99,7 @@ for diagnosis.
 `--compile` (or the WebUI checkbox) compiles only the training backbone when CUDA
 and Triton are available. Preview and evaluation paths remain eager. Compilation
 runtime errors are surfaced. Existing checkpoint names and resume rules are retained.
-Shiro's separate vocoder trainer, NSF-BigVGAN vocoder, multi-GPU launcher, and
+Shiro's separate vocoder trainer, NSF-BigVGAN vocoder, and
 conversion interface are not part of this flow training update.
 
 `python -m rvc.rectified.openvpi input.ckpt output.pth` converts an OpenVPI
