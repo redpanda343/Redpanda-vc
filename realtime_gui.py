@@ -555,7 +555,7 @@ class RealtimeGUI:
         self.threshold = tk.IntVar(value=value.get("threshold", -60))
         f0_method = value.get("f0_method", "rmvpe")
         self.f0_method = tk.StringVar(
-            value="swift" if f0_method == "pm" else f0_method
+            value=f0_method if f0_method in {"rmvpe", "fcpe"} else "rmvpe"
         )
         self.block_time = tk.DoubleVar(value=value.get("block_time", 0.25))
         self.crossfade_time = tk.DoubleVar(
@@ -644,7 +644,7 @@ class RealtimeGUI:
         ttk.Label(settings, text="Pitch extraction").grid(row=5, column=0, sticky="w")
         pitch_methods = ttk.Frame(settings)
         pitch_methods.grid(row=5, column=1, sticky="w", pady=4)
-        for method in ("rmvpe", "fcpe", "swift"):
+        for method in ("rmvpe", "fcpe"):
             ttk.Radiobutton(
                 pitch_methods,
                 text=method,
