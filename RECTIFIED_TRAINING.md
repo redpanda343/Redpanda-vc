@@ -2,8 +2,8 @@
 
 This ports ShiroRVC's 44.1 kHz rectified-flow training recipe. The flow predicts
 128-bin log mel spectrograms from content, F0, loudness, breathiness and speaker.
-An existing OpenVPI NSF-HiFiGAN checkpoint renders training previews and is
-recorded in the exported model. The vocoder is frozen; this trains the flow,
+An optional OpenVPI NSF-HiFiGAN checkpoint renders audio previews and is
+recorded in the exported model. Without one, previews show mel images only. The vocoder is frozen; this trains the flow,
 not a new vocoder. RVC latent NSF-HiFiGAN generator checkpoints do not accept
 these mels and cannot be used as the vocoder.
 
@@ -14,7 +14,7 @@ mel settings and loads generator weights strictly. Other vocoders are rejected.
 
 In the WebUI, open **Train > Rectified Flow**. Enter a new model name and
 dataset folder, preprocess, extract features, then enter the NSF-HiFiGAN
-checkpoint path and start training. The page shows the job status and live log.
+checkpoint path if audio previews are wanted, and start training. The page shows the job status and live log.
 The stop button ends the current rectified job; training resumes from the last
 saved epoch, so unsaved steps are lost. The original trainer remains under
 **Train > RVC**.
@@ -61,3 +61,27 @@ the same directory records flow loss, auxiliary mel loss, gradient norm, learnin
 rate, held-out loss when configured, and NSF-HiFiGAN audio previews. Exports
 retain Shiro's rectified-flow format. The ordinary RVC conversion UI cannot
 load these exports; conversion integration is outside this training-only port.
+
+The flow implementation is synchronized with the local ShiroRVC update: LYNXNet2
+uses the revised modulation arithmetic and a full-precision input projection.
+Sampling also supports `churn` and caller-supplied churn noise. Muon batches
+same-shaped matrices and AdamW uses grouped updates; RedPanda retains FP32
+Newton-Schulz iterations rather than Shiro's automatic FP16/BF16 selection.
+Model dimensions, the flow-matching objective, and the 400-frame crop are unchanged.
+
+The vocoder path is optional. Without it, TensorBoard records mel previews and
+exports have an empty vocoder reference. With it, previews include the original
+recording, the flow output, and the real mel rendered by the vocoder. Dataset
+previews use a non-mute clip of at least two seconds, capped at ten seconds.
+Fine-tuning previews default to every 500 steps. Validation records loss at each
+of five flow times and auxiliary mel loss; conditioning weight norms are logged
+for diagnosis.
+
+`--compile` (or the WebUI checkbox) compiles only the training backbone when CUDA
+and Triton are available. Preview and evaluation paths remain eager. Compilation
+runtime errors are surfaced. Existing checkpoint names and resume rules are retained.
+Shiro's separate vocoder trainer, NSF-BigVGAN vocoder, multi-GPU launcher, and
+conversion interface are not part of this flow training update.
+
+`python -m rvc.rectified.openvpi input.ckpt output.pth` converts an OpenVPI
+checkpoint into a compatible rectified vocoder export.

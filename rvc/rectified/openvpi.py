@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 
 import numpy as np
 import torch
@@ -231,3 +232,26 @@ def openvpi_spec(path: str, state: dict):
         noise_sigma=float(config.get("noise_sigma") or 0.0),
     )
     return hparams, mel, state
+
+
+def export_openvpi(path: str, output: str) -> None:
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    state = generator_state(checkpoint)
+    if state is None:
+        raise ValueError(f"{path} is not an OpenVPI vocoder checkpoint.")
+    hparams, mel, weights = openvpi_spec(path, state)
+    NSFHiFiGAN(**hparams).load_state_dict(weights)
+    torch.save(
+        {
+            "kind": "rectified_vocoder",
+            "architecture": ARCHITECTURE,
+            "config": {"data": mel, "vocoder": {"model": hparams}},
+            "model": {k: v.float().contiguous() for k, v in weights.items()},
+            "source": os.path.basename(path),
+        },
+        output,
+    )
+
+
+if __name__ == "__main__":
+    export_openvpi(sys.argv[1], sys.argv[2])

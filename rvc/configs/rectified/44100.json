@@ -67,6 +67,7 @@
             },
             "t_start": 0.4,
             "aux_grad": 0.1
-        }
+        },
+        "finetune_preview_interval": 500
     }
 }

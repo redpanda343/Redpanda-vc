@@ -199,14 +199,15 @@ class LYNXNet2Block(nn.Module):
 
     def forward(self, x, mask, embedding=None):
         y = self.norm(x)
-        gate = 1.0
+        gate = None
         if self.modulation is not None:
             shift, scale, gate = self.modulation(F.silu(embedding)).chunk(3, dim=-1)
-            y = y * (1.0 + scale) + shift
-            gate = 1.0 + gate
+            y = y + y * scale + shift
         y = self.depthwise((y * mask).transpose(1, 2)).transpose(1, 2)
         y = self.down(atan_glu(self.mid(atan_glu(self.up(y)))))
-        return (x + gate * y) * mask
+        if gate is not None:
+            y = y + gate * y
+        return (x + y) * mask
 
 
 class LYNXNet2Backbone(nn.Module):
@@ -234,7 +235,9 @@ class LYNXNet2Backbone(nn.Module):
     def forward(self, x, t, cond, mask, voice=None):
         time = self.time_mlp(timestep_embedding(t, self.channels))[:, None, :]
         frame_mask = mask.transpose(1, 2)
-        h = self.input(x.transpose(1, 2)) + self.input_cond(cond).transpose(1, 2) + time
+        with torch.autocast(x.device.type, enabled=False):
+            h = self.input(x.transpose(1, 2).to(self.input.weight.dtype))
+        h = h + self.input_cond(cond).transpose(1, 2) + time
         h = h * frame_mask
         embedding = None
         if self.voice is not None:
@@ -388,6 +391,8 @@ class RectifiedFlow(nn.Module):
         guidance_interval: tuple = (0.0, 1.0),
         rescale_mode: str = "global",
         schedule: str = "uniform",
+        churn: float = 0.0,
+        churn_noise: Optional[Callable[[int], torch.Tensor]] = None,
     ):
         if method not in SAMPLERS:
             raise ValueError(f"method must be one of {SAMPLERS}, not {method!r}.")
@@ -452,8 +457,16 @@ class RectifiedFlow(nn.Module):
             x = noise * mask
         times = time_grid(schedule, max(1, int(steps)), t0, x.device)
         for index in range(times.shape[0] - 1):
-            t = times[index].expand(batch)
-            dt = times[index + 1] - times[index]
+            now = float(times[index])
+            back = max(self.t_start, now - float(churn) * float(times[index + 1] - times[index]))
+            if churn > 0 and 0 < back < now:
+                fresh = torch.randn_like(x) if churn_noise is None else churn_noise(index)
+                scale = back / now
+                top_up = math.sqrt(max((1.0 - back) ** 2 - (scale * (1.0 - now)) ** 2, 0.0))
+                x = (scale * x + float(temperature) * top_up * fresh) * mask
+                now = back
+            t = torch.full((batch,), now, device=x.device, dtype=times.dtype)
+            dt = times[index + 1] - now
             v = field(x, t)
             if method == "heun":
                 v_next = field(x + dt * v, times[index + 1].expand(batch))

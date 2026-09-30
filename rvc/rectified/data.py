@@ -147,6 +147,42 @@ class RectifiedDataset(Dataset):
             breathiness[start:stop], key_shift, speed, sid,
         )
 
+    def _reference_item(self, audio, content, f0, sid, path, max_frames=None):
+        frames = min(
+            audio.shape[0] // self.hop,
+            mel_frames(min(f0.shape[0], content.shape[0]), self.sample_rate, self.hop),
+        )
+        if max_frames is not None:
+            frames = min(frames, max_frames)
+        audio = audio[: frames * self.hop]
+        content = to_mel_rate(content, frames, self.sample_rate, self.hop)
+        breathiness = self._breathiness(audio.unsqueeze(0), f0.unsqueeze(0), frames, self.hop)
+        f0 = f0_to_mel_rate(f0, frames, self.sample_rate, self.hop)
+        with torch.no_grad():
+            mel = self.mel(audio.unsqueeze(0))[:, :, :frames]
+        energy = self._energy(audio.unsqueeze(0), frames, self.hop)
+        return (
+            mel, content.unsqueeze(0), f0.unsqueeze(0), energy, breathiness,
+            audio.unsqueeze(0), int(sid), path,
+        )
+
+    def reference(self, max_seconds: float = 10.0):
+        ordered = sorted(range(len(self.entries)), key=lambda i: self.entries[i][0])
+        for index in ordered:
+            wav_path, content_path, _, f0_path, sid = self.entries[index]
+            if "mute" in os.path.basename(wav_path):
+                continue
+            audio = self._audio(wav_path)
+            if audio.shape[0] < 2 * self.sample_rate:
+                continue
+            f0 = torch.from_numpy(np.load(f0_path, allow_pickle=False).astype(np.float32))
+            content = upsample_content(
+                torch.from_numpy(np.load(content_path, allow_pickle=False).astype(np.float32)),
+                self.data["content_interpolation"],
+            )
+            max_frames = int(max_seconds * self.sample_rate) // self.hop
+            return self._reference_item(audio, content, f0, sid, wav_path, max_frames)
+        return None
 
 
 def collate_flow(batch, frames=None):

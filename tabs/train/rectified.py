@@ -108,14 +108,14 @@ def device_id(device):
     raise gr.Error('Device must be cpu or cuda followed by a GPU number, for example cuda:0.')
 
 
-def start(name, vocoder, pretrained, batch, epochs, save_every, device):
+def start(name, vocoder, pretrained, batch, epochs, save_every, device, compile_backbone=False):
     directory = experiment_path(name)
     device_id(device)
     if not (directory / 'filelist.txt').is_file():
         raise gr.Error('Extract features for this experiment first.')
     vocoder = str(vocoder).strip().strip('"')
     pretrained = str(pretrained or '').strip().strip('"')
-    if not Path(vocoder).is_file():
+    if vocoder and not Path(vocoder).is_file():
         raise gr.Error('Choose an existing OpenVPI NSF-HiFiGAN checkpoint.')
     if pretrained and not Path(pretrained).is_file():
         raise gr.Error('The pretrained flow checkpoint does not exist.')
@@ -127,6 +127,8 @@ def start(name, vocoder, pretrained, batch, epochs, save_every, device):
                  '--epochs', positive_integer(epochs, 'Total epochs'),
                  '--save-every', positive_integer(save_every, 'Save interval'),
                  '--device', str(device).strip().lower(), '--precision', precision]
+    if compile_backbone:
+        arguments.append('--compile')
     if pretrained:
         arguments.extend(['--pretrained-flow', pretrained])
     return launch(name, 'rvc.rectified.train_flow', arguments, 'Training rectified flow')
@@ -159,7 +161,7 @@ def stop():
 
 def rectified_train_tab():
     gr.Markdown('### Rectified Flow\nTrain Shiro rectified flow at **44.1 kHz** using the saved Settings > Precision selection. '
-                'A frozen OpenVPI NSF-HiFiGAN vocoder renders previews. Use a separate experiment from RVC training.')
+                'An optional frozen OpenVPI NSF-HiFiGAN vocoder renders audio previews. Use a separate experiment from RVC training.')
     with gr.Row():
         name = gr.Textbox(label='Model name', value='my-flow')
         device = gr.Textbox(label='Device', value='cuda:0', info='One GPU, for example cuda:0, or cpu.')
@@ -174,13 +176,15 @@ def rectified_train_tab():
             embedder = gr.Dropdown(label='Content embedder', choices=['contentvec', 'spin-v2'], value='contentvec')
         extract_button = gr.Button('Extract content and F0')
     with gr.Accordion('3. Train rectified flow', open=True):
-        vocoder = gr.Textbox(label='OpenVPI NSF-HiFiGAN checkpoint path',
-                            info='44.1 kHz, 128 mel bins, hop 512. Keep its config.json beside it. RVC generator checkpoints are incompatible.')
+        vocoder = gr.Textbox(label='OpenVPI NSF-HiFiGAN checkpoint path (optional)',
+                            info='Leave empty for mel previews only. 44.1 kHz, 128 mel bins, hop 512. Keep its config.json beside it. RVC generator checkpoints are incompatible.')
         pretrained = gr.Textbox(label='Pretrained flow path (optional)', info='Use a flow trained with the selected content embedder. Leave empty to train from scratch.')
         with gr.Row():
             batch = gr.Number(label='Batch size', value=4, minimum=1, precision=0)
             epochs = gr.Number(label='Total epochs', value=100, minimum=1, precision=0)
             save_every = gr.Number(label='Save every N epochs', value=10, minimum=1, precision=0)
+        compile_backbone = gr.Checkbox(label='Compile flow backbone', value=False,
+                                       info='Requires CUDA and Triton. Training falls back to eager mode when unavailable.')
         gr.Markdown('Precision follows **Settings > Precision** when you start or resume. Click Update precision there to save it. '
                     'Existing runs resume from the last saved epoch. Stopping discards unsaved steps. Checkpoints and TensorBoard previews are saved in logs/<model name>/flow.')
         with gr.Row():
@@ -191,6 +195,6 @@ def rectified_train_tab():
     outputs = [state, log, preprocess_button, extract_button, train_button, stop_button]
     preprocess_button.click(preprocess, [name, dataset, workers], outputs, queue=False)
     extract_button.click(extract, [name, method, workers, device, embedder], outputs, queue=False)
-    train_button.click(start, [name, vocoder, pretrained, batch, epochs, save_every, device], outputs, queue=False)
+    train_button.click(start, [name, vocoder, pretrained, batch, epochs, save_every, device, compile_backbone], outputs, queue=False)
     stop_button.click(stop, [], outputs, queue=False)
     gr.Timer(2).tick(status, [], outputs, queue=False)

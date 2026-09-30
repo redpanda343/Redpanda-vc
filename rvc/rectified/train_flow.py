@@ -1,4 +1,5 @@
 import argparse
+import importlib.util
 import json
 import os
 import random
@@ -46,7 +47,29 @@ def precision_setup(precision, device):
     return None, None
 
 
-def train_step(model, optimizer, ema, batch, data, settings, device, speaker_dropout, amp_dtype=None, scaler=None):
+def conditioning_norms(model) -> dict:
+    backbone = model.backbone
+    norms = {"diag/time_mlp_norm": sum(p.norm().item() ** 2 for p in backbone.time_mlp.parameters()) ** 0.5}
+    modulation = [layer.modulation.weight.norm().item()
+                  for layer in backbone.layers if layer.modulation is not None]
+    if modulation:
+        norms["diag/adaln_norm_max"] = max(modulation)
+        norms["diag/adaln_norm_mean"] = sum(modulation) / len(modulation)
+    if backbone.voice is not None:
+        norms["diag/voice_proj_norm"] = backbone.voice.weight.norm().item()
+    return norms
+
+
+def compiled_backbone(model, enabled: bool, mode: str, device):
+    if not enabled:
+        return None
+    if device.type != "cuda" or importlib.util.find_spec("triton") is None:
+        print("torch.compile needs CUDA and Triton; training uncompiled.", flush=True)
+        return None
+    return torch.compile(model.backbone, mode=mode)
+
+
+def train_step(model, optimizer, ema, batch, data, settings, device, speaker_dropout, amp_dtype=None, scaler=None, backbone=None):
     mel, content, f0, energy, breathiness, key_shift, speed, speaker, mask = (
         item.to(device, non_blocking=True) for item in batch
     )
@@ -56,7 +79,7 @@ def train_step(model, optimizer, ema, batch, data, settings, device, speaker_dro
         flow, auxiliary = model(
             mel, content, f0, energy, speaker, mask,
             speaker_dropout=speaker_dropout, breathiness=breathiness,
-            key_shift=key_shift, speed=speed,
+            key_shift=key_shift, speed=speed, backbone=backbone,
         )
         loss = flow if auxiliary is None else flow + settings['aux_mel_weight'] * auxiliary
     if not torch.isfinite(loss):
@@ -83,20 +106,32 @@ def train_step(model, optimizer, ema, batch, data, settings, device, speaker_dro
 
 
 @torch.no_grad()
-def preview(model, ema, vocoder, batch, data, writer, step):
+def preview(model, ema, vocoder, reference, data, writer, step):
+    if reference is None:
+        return
     device = next(model.parameters()).device
-    mel, content, f0, energy, breathiness, key_shift, speed, speaker, mask = (
-        item[:1].to(device) for item in batch
-    )
-    with ema.applied(model):
-        model.eval()
-        generated = model.sample(content, f0, energy, speaker, mask, steps=16,
-                                 breathiness=breathiness, key_shift=key_shift)
-        model.train()
-    frames = int(mask.sum())
-    audio = vocoder(generated[:, :, :frames], f0[:, :frames])[0]
-    reference = vocoder(normalize_mel(mel[:, :, :frames], data), f0[:, :frames])[0]
-    for name, value in [('flow', audio), ('vocoder_on_real_mel', reference)]:
+    mel, content, f0, energy, breathiness, audio, sid, path = reference
+    content, f0, energy = content.to(device), f0.to(device), energy.to(device)
+    mask = torch.ones(1, 1, f0.shape[1], device=device)
+    speaker = torch.tensor([sid], device=device)
+    training = model.training
+    try:
+        with ema.applied(model):
+            model.eval()
+            generated = model.sample(content, f0, energy, speaker, mask, steps=16,
+                                     breathiness=breathiness.to(device))
+    finally:
+        model.train(training)
+    if not torch.isfinite(generated).all():
+        raise FloatingPointError('Non-finite flow preview.')
+    writer.add_image('mel/flow', (generated[0] / 6.0 + 0.5).clamp(0, 1).cpu(), step, dataformats='HW')
+    writer.add_image('mel/reference', (normalize_mel(mel[0], data) / 6.0 + 0.5).clamp(0, 1).cpu(), step, dataformats='HW')
+    if vocoder is None:
+        return
+    generated_audio = vocoder(generated, f0)[0]
+    rendered_reference = vocoder(normalize_mel(mel.to(device), data), f0)[0]
+    for name, value in [('flow', generated_audio), ('reference', audio[0]),
+                        ('vocoder_on_real_mel', rendered_reference)]:
         if not torch.isfinite(value).all():
             raise FloatingPointError(f'Non-finite {name} preview.')
         writer.add_audio(f'audio/{name}', value.clamp(-1, 1).cpu(), step, data['sample_rate'])
@@ -105,7 +140,9 @@ def preview(model, ema, vocoder, batch, data, writer, step):
 @torch.no_grad()
 def evaluate(model, ema, loader, data, writer, step):
     device = next(model.parameters()).device
-    total, count = 0.0, 0
+    fractions = (0.1, 0.3, 0.5, 0.7, 0.9)
+    totals = torch.zeros(len(fractions), device=device)
+    aux_total, count = 0.0, 0
     with ema.applied(model):
         model.eval()
         for index, batch in enumerate(loader):
@@ -117,12 +154,18 @@ def evaluate(model, ema, loader, data, writer, step):
             noise = torch.randn(mel.shape, device=device, generator=generator)
             losses, auxiliary = model.validation_losses(
                 mel, content, f0, energy, speaker, mask, breathiness, key_shift, speed,
-                noise, (0.1, 0.3, 0.5, 0.7, 0.9),
+                noise, fractions,
             )
-            total += float(losses.mean()) * mel.shape[0]
+            totals += losses.float() * mel.shape[0]
+            aux_total += (float(auxiliary) if auxiliary is not None else 0.0) * mel.shape[0]
             count += mel.shape[0]
         model.train()
-    writer.add_scalar('val/flow', total / count, step)
+    totals /= max(1, count)
+    writer.add_scalar('val/flow', float(totals.mean()), step)
+    for fraction, value in zip(fractions, totals.tolist()):
+        writer.add_scalar(f'val/flow_t{fraction:g}', value, step)
+    if model.aux is not None:
+        writer.add_scalar('val/aux_mel_l1', aux_total / max(1, count), step)
 
 
 def train(args):
@@ -146,8 +189,12 @@ def train(args):
     device = torch.device(args.device)
     amp_dtype, scaler = precision_setup(args.precision, device)
     precision_label = str(amp_dtype).split(".")[-1].upper() if amp_dtype is not None else "FP32"
-    vocoder, _ = load_vocoder(args.vocoder, data)
-    vocoder = vocoder.to(device)
+    vocoder = None
+    if args.vocoder:
+        vocoder, _ = load_vocoder(args.vocoder, data)
+        vocoder = vocoder.to(device)
+    else:
+        print('No vocoder selected: previews will show mel images only.', flush=True)
     entries = read_filelist(experiment / 'filelist.txt', ROOT)
     speakers = max(int(entry[4]) for entry in entries) + 1
     entries, held = split_holdout(entries, int(settings.get('holdout_clips', 0)))
@@ -162,7 +209,7 @@ def train(args):
                         pin_memory=device.type == 'cuda', persistent_workers=workers > 0)
     held_loader = DataLoader(RectifiedDataset(held, config, segment, augment=False),
                              batch_size=args.batch_size, collate_fn=collate) if held else None
-    reference = collate([RectifiedDataset(entries[:1], config, segment, augment=False)[0]])
+    reference = dataset.reference()
     info_path = experiment / 'model_info.json'
     info = json.loads(info_path.read_text(encoding='utf-8')) if info_path.exists() else {}
     embedder = info.get('embedder_model', 'contentvec')
@@ -205,6 +252,10 @@ def train(args):
         del state, weights
     output.mkdir(parents=True, exist_ok=True)
     (experiment / 'rectified_config.json').write_text(json.dumps(config, indent=4) + '\n', encoding='utf-8')
+    backbone = compiled_backbone(model, getattr(args, 'compile', False),
+                                 getattr(args, 'torch_compile_mode', 'default'), device)
+    preview_interval = int(settings.get('finetune_preview_interval', 500) if finetune
+                           else settings.get('preview_interval', 1000))
     total = args.epochs * len(loader)
     warmup = 0 if finetune else settings['warmup_steps']
     print(f'Rectified flow: {sum(p.numel() for p in model.parameters()):,} parameters, {precision_label}, {device}, batch {args.batch_size}, {segment} frames', flush=True)
@@ -215,12 +266,17 @@ def train(args):
                 current_lr = learning_rate(lr, step, warmup, total, settings['lr_final_ratio'])
                 for group in optimizer.param_groups:
                     group['lr'] = current_lr
-                flow, auxiliary, norm = train_step(model, optimizer, ema, batch, data, settings, device, dropout, amp_dtype, scaler)
+                flow, auxiliary, norm = train_step(model, optimizer, ema, batch, data, settings, device, dropout, amp_dtype, scaler, backbone)
                 step += 1
                 for tag, value in [('loss/flow', flow), ('loss/aux_mel_l1', auxiliary), ('grad_norm', norm), ('lr', current_lr)]:
                     writer.add_scalar(tag, value, step)
                 print(f'epoch={epoch} step={step}/{total} flow={flow:.6f} aux={auxiliary:.6f} grad_norm={norm:.6f}', flush=True)
-                if settings.get('preview_interval', 0) and step % settings['preview_interval'] == 0:
+                if step % 50 == 0:
+                    for tag, value in conditioning_norms(model).items():
+                        writer.add_scalar(tag, value, step)
+                    if scaler is not None:
+                        writer.add_scalar("amp/scale", scaler.get_scale(), step)
+                if preview_interval and step % preview_interval == 0:
                     preview(model, ema, vocoder, reference, data, writer, step)
                 if held_loader is not None and settings.get('eval_interval', 0) and step % settings['eval_interval'] == 0:
                     evaluate(model, ema, held_loader, data, writer, step)
@@ -228,7 +284,7 @@ def train(args):
                 if any(not torch.isfinite(value).all() for value in model.state_dict().values()):
                     raise FloatingPointError('Non-finite trained model weights.')
                 metadata = dict(config=config, speaker_count=speakers, embedder_model=embedder,
-                                vocoder=str(Path(args.vocoder).resolve()), epoch=epoch, step=step)
+                                vocoder=str(Path(args.vocoder).resolve()) if args.vocoder else '', epoch=epoch, step=step)
                 atomic_save(dict(model=model.state_dict(), optimizer=optimizer.state_dict(),
                                  ema=ema.state_dict(), finetune=finetune,
                                  scaler=scaler.state_dict() if scaler is not None else None,
@@ -241,9 +297,9 @@ def train(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train Shiro rectified flow with a frozen OpenVPI NSF-HiFiGAN vocoder.')
+    parser = argparse.ArgumentParser(description='Train Shiro rectified flow with an optional frozen OpenVPI NSF-HiFiGAN preview vocoder.')
     parser.add_argument('--model-name', required=True)
-    parser.add_argument('--vocoder', required=True)
+    parser.add_argument('--vocoder', default='')
     parser.add_argument('--batch-size', type=int, default=4)
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--save-every', type=int, default=10)
@@ -252,6 +308,8 @@ def main():
     parser.add_argument('--pretrained-flow')
     parser.add_argument('--learning-rate', type=float)
     parser.add_argument('--seed', type=int, default=1234)
+    parser.add_argument('--compile', action='store_true')
+    parser.add_argument('--torch-compile-mode', choices=['default', 'reduce-overhead', 'max-autotune'], default='default')
     parser.add_argument('--fresh', action='store_true')
     train(parser.parse_args())
 
