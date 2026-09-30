@@ -6,6 +6,7 @@ from pathlib import Path
 
 import gradio as gr
 import psutil
+import torch
 
 from tabs.settings.sections.precision import get_precision
 from rvc.rectified.distributed import parse_devices
@@ -164,7 +165,8 @@ def rectified_train_tab():
                 'An optional frozen OpenVPI NSF-HiFiGAN vocoder renders audio previews. Use a separate experiment from RVC training.')
     with gr.Row():
         name = gr.Textbox(label='Model name', value='my-flow')
-        device = gr.Textbox(label='Device', value='cuda:0', info='One GPU: cuda:0. Multiple GPUs: cuda:0,cuda:1. CPU: cpu.')
+        device = gr.Textbox(label='Device', value=','.join(f'cuda:{index}' for index in range(torch.cuda.device_count())) or 'cpu',
+                            info='Detected GPUs are selected automatically. One GPU: cuda:0. Multiple GPUs: cuda:0,cuda:1. CPU: cpu.')
     with gr.Accordion('1. Prepare dataset', open=True):
         dataset = gr.Textbox(label='Dataset folder')
         workers = gr.Number(label='CPU workers', value=4, minimum=1, precision=0)
