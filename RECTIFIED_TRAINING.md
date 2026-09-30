@@ -117,13 +117,14 @@ index retrieval and protection, audio splitting, and output processing. The
 flow generates at its configured sample rate (44.1 kHz for this recipe).
 Content, F0, energy and breathiness use the training recipe's frame alignment.
 
-Leave **Rectified Flow vocoder path (optional)** empty to use the exported
-model's vocoder. If its default vocoder path belongs to another machine or
-no vocoder was recorded, the default NSF-HiFiGAN is located locally or
-downloaded and verified automatically. Custom vocoder paths can be entered
-in Single and Batch advanced settings. Missing custom vocoders require an
-explicit replacement; incompatible mel settings are rejected. Training
-checkpoints also load using their EMA weights when available.
+Inference automatically uses the vocoder path recorded in the exported model.
+The vocoder weights are stored separately from the flow checkpoint. If its
+default vocoder path belongs to another machine or no vocoder was recorded,
+the default NSF-HiFiGAN is located locally or downloaded and verified
+automatically. Missing custom vocoders must be restored or replaced through
+the inference API's optional `rectified_vocoder_path` argument; incompatible
+mel settings are rejected. Training checkpoints also load using their EMA
+weights when available.
 
 The flow implementation is synchronized with the local ShiroRVC update: LYNXNet2
 uses the revised modulation arithmetic and a full-precision input projection.

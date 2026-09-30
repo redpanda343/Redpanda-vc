@@ -904,10 +904,6 @@ def inference_tab():
                     value="contentvec",
                     interactive=True,
                 )
-                rectified_vocoder_path = gr.Textbox(
-                    label='Rectified Flow vocoder path (optional)',
-                    info='Leave empty to use the model vocoder or automatically download the default NSF-HiFiGAN. For flow models only.',
-                )
         def convert_audio(*args):
             try:
                 gr.Info(i18n("Converting audio..."))
@@ -1387,10 +1383,6 @@ def inference_tab():
                     ],
                     value="contentvec",
                     interactive=True,
-                )
-                rectified_vocoder_path_batch = gr.Textbox(
-                    label='Rectified Flow vocoder path (optional)',
-                    info='Leave empty to use the model vocoder or automatically download the default NSF-HiFiGAN. For flow models only.',
                 )
         convert_button_batch = gr.Button(i18n("Convert"))
         stop_button = gr.Button(i18n("Stop convert"), visible=False)
@@ -2211,7 +2203,6 @@ def inference_tab():
             delay_mix,
             sid,
             seed,
-            rectified_vocoder_path,
         ],
         outputs=[vc_output1, vc_output2],
     )
@@ -2274,7 +2265,6 @@ def inference_tab():
             delay_mix_batch,
             sid_batch,
             seed_batch,
-            rectified_vocoder_path_batch,
         ],
         outputs=[vc_output3],
     ).then(
