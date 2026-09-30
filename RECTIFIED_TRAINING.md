@@ -84,8 +84,13 @@ Training accepts `--device cuda:0`, `--device cpu`, or multiple GPUs with
 `--device cuda:0,cuda:1`. The WebUI Device field accepts the same values.
 Multiple GPUs use DDP with one process per GPU and a distributed sampler.
 Batch size and data-loader workers are per GPU; global batch size is batch size
-times GPU count. Only rank zero writes checkpoints, TensorBoard logs, and
-previews. Rank-zero preview, validation and checkpoint work uses a separate
+times GPU count. Data-loader workers explicitly use `spawn`, as recommended
+by [PyTorch's DDP documentation](https://docs.pytorch.org/docs/2.11/generated/torch.nn.parallel.DistributedDataParallel.html)
+to avoid NCCL/fork deadlocks on Linux. CPU synchronization uses monitored
+barriers to report missing ranks. NCCL initialization explicitly binds each
+rank to its selected GPU. Startup vocoder loading, preview reference preparation
+and output setup also propagate rank-zero errors to the other ranks. Only rank
+zero writes checkpoints, TensorBoard logs, and previews. Rank-zero preview, validation and checkpoint work uses a separate
 CPU/Gloo control group with a one-hour timeout, so an idle GPU does not enqueue
 an NCCL barrier while this work runs. Training collectives retain their ten-minute
 timeout. Stage start/finish messages identify slow work, and rank-zero exceptions

@@ -240,11 +240,13 @@ def train_rank(args, ranks):
             print('At least one selected GPU cannot use BF16; all ranks will use FP32.', flush=True)
     precision_label = str(amp_dtype).split(".")[-1].upper() if amp_dtype is not None else "FP32"
     vocoder = None
-    if args.vocoder and ranks.main:
-        vocoder, _ = load_vocoder(args.vocoder, data)
-        vocoder = vocoder.to(device)
-    elif ranks.main:
-        print('No vocoder selected: previews will show mel images only.', flush=True)
+    with ranks.main_work('preview vocoder loading') as main:
+        if main:
+            if args.vocoder:
+                vocoder, _ = load_vocoder(args.vocoder, data)
+                vocoder = vocoder.to(device)
+            else:
+                print('No vocoder selected: previews will show mel images only.', flush=True)
     entries = read_filelist(experiment / 'filelist.txt', ROOT)
     speakers = max(int(entry[4]) for entry in entries) + 1
     entries, held = split_holdout(entries, int(settings.get('holdout_clips', 0)))
@@ -258,10 +260,14 @@ def train_rank(args, ranks):
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=sampler is None,
                         sampler=sampler, drop_last=True,
                         num_workers=workers, collate_fn=collate,
-                        pin_memory=device.type == 'cuda', persistent_workers=workers > 0)
+                        pin_memory=device.type == 'cuda', persistent_workers=workers > 0,
+                        multiprocessing_context='spawn' if workers > 0 else None)
     held_loader = DataLoader(RectifiedDataset(held, config, segment, augment=False),
                              batch_size=args.batch_size, collate_fn=collate) if held and ranks.main else None
-    reference = dataset.reference() if ranks.main else None
+    reference = None
+    with ranks.main_work('preview reference preparation') as main:
+        if main:
+            reference = dataset.reference()
     info_path = experiment / 'model_info.json'
     info = json.loads(info_path.read_text(encoding='utf-8')) if info_path.exists() else {}
     embedder = info.get('embedder_model', 'contentvec')
@@ -303,11 +309,10 @@ def train_rank(args, ranks):
         model.load_state_dict(resize_speakers(weights, speakers), strict=True)
         ema.reseed(model)
         del state, weights
-    ranks.barrier()
-    if ranks.main:
-        output.mkdir(parents=True, exist_ok=True)
-        (experiment / 'rectified_config.json').write_text(json.dumps(config, indent=4) + '\n', encoding='utf-8')
-    ranks.barrier()
+    with ranks.main_work('training output setup') as main:
+        if main:
+            output.mkdir(parents=True, exist_ok=True)
+            (experiment / 'rectified_config.json').write_text(json.dumps(config, indent=4) + '\n', encoding='utf-8')
     backbone = compiled_backbone(model, getattr(args, 'compile', False),
                                  getattr(args, 'torch_compile_mode', 'default'), device)
     train_model = ranks.wrap(model)

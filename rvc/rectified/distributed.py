@@ -48,7 +48,8 @@ class Ranks:
             torch.cuda.set_device(self.device)
         if self.world > 1:
             dist.init_process_group(self.backend, init_method=self.init_method,
-                                    rank=self.rank, world_size=self.world, timeout=timedelta(minutes=10))
+                                    rank=self.rank, world_size=self.world, timeout=timedelta(minutes=10),
+                                    device_id=self.device if self.backend == 'nccl' else None)
             self.control_group = dist.new_group(backend='gloo', timeout=timedelta(hours=1))
 
     def close(self):
@@ -60,18 +61,21 @@ class Ranks:
 
     def barrier(self):
         if self.world > 1:
-            dist.barrier(group=self.control_group)
+            dist.monitored_barrier(group=self.control_group, timeout=timedelta(hours=1),
+                                   wait_all_ranks=True)
 
     @contextmanager
     def main_work(self, label):
         if self.world == 1:
             yield True
             return
+        self.barrier()
         failure = None
         try:
             yield self.main
         except Exception as error:
             failure = error
+        self.barrier()
         result = [f'{type(failure).__name__}: {failure}' if failure is not None else None]
         dist.broadcast_object_list(result, src=0, group=self.control_group)
         if failure is not None:
