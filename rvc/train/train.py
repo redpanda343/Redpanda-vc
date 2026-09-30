@@ -333,6 +333,152 @@ class AsyncInferenceExporter:
             self.executor = None
 
 
+def load_saved_validation_model(model_path, device):
+    from rvc.lib.algorithm.synthesizers import Synthesizer
+    from rvc.train.utils import replace_keys_in_dict
+
+    checkpoint = torch.load(model_path, map_location="cpu", weights_only=True)
+    model_config = list(checkpoint["config"])
+    model_config[-3] = checkpoint["weight"]["emb_g.weight"].shape[0]
+    saved_version = checkpoint.get("version", "v1")
+    feature_dim = int(
+        checkpoint.get("feature_dim", 768 if saved_version in {"v2", "v3"} else 256)
+    )
+    with torch.random.fork_rng(devices=[]):
+        model = Synthesizer(
+            *model_config,
+            use_f0=checkpoint.get("f0", 1),
+            text_enc_hidden_dim=feature_dim,
+            vocoder=checkpoint.get("vocoder", "HiFi-GAN"),
+        )
+    del model.enc_q
+    weights = replace_keys_in_dict(
+        replace_keys_in_dict(
+            checkpoint["weight"], ".weight_v", ".parametrizations.weight.original1"
+        ),
+        ".weight_g",
+        ".parametrizations.weight.original0",
+    )
+    model.load_state_dict(weights, strict=True)
+    return model.to(device).float().eval()
+
+
+def evaluate_external_validation(
+    model,
+    config,
+    device,
+    device_id,
+    audio_reference,
+    timbre_reference,
+    timbre_validator,
+    mos_validator,
+    global_step,
+):
+    validation_scalars = {}
+    audio_o = None
+    timbre_o = None
+    if should_run_external_validation(
+        timbre_reference, timbre_validator, mos_validator
+    ):
+        inference_model = model.module if hasattr(model, "module") else model
+        was_training = inference_model.training
+        inference_model.eval()
+        rng_devices = [device_id] if device.type == "cuda" else []
+        try:
+            with deterministic_validation_scope(
+                config.train.seed, cuda_devices=rng_devices
+            ):
+                with torch.amp.autocast(
+                    device_type="cuda", enabled=False
+                ):
+                    with torch.inference_mode():
+                        try:
+                            timbre_o = infer_validation_audio(
+                                inference_model,
+                                timbre_reference[0],
+                                config.data.sample_rate,
+                                config.data.hop_length,
+                            )
+                        except Exception as error:
+                            print(
+                                f"External validation generation failed: {error}"
+                            )
+                        if audio_reference is not None:
+                            if timbre_o is not None:
+                                audio_o = timbre_o[:1]
+                            else:
+                                audio_o, *_ = inference_model.infer(
+                                    *audio_reference
+                                )
+        finally:
+            inference_model.train(was_training)
+
+    generated_lengths = None
+    if timbre_o is not None:
+        generated_lengths = (
+            timbre_reference[0][1].detach() * config.data.hop_length
+        )
+
+    if (
+        timbre_validator is not None
+        and timbre_o is not None
+        and generated_lengths is not None
+    ):
+        try:
+            speaker_ids = timbre_reference[3]
+            timbre_scores = timbre_validator.score_batch_accelerated(
+                timbre_o.detach(),
+                generated_lengths,
+                speaker_ids,
+                config.data.sample_rate,
+                device,
+            )
+            if timbre_scores["multi_speaker"]:
+                validation_scalars.update(
+                    {
+                        "validation/voice_similarity": timbre_scores[
+                            "speaker_mean"
+                        ],
+                        "validation/ecapa_margin_mean": timbre_scores[
+                            "margin_mean"
+                        ],
+                        "validation/ecapa_top1_accuracy_percent": timbre_scores[
+                            "top1_accuracy_percent"
+                        ],
+                        "validation/ecapa_eer_percent": timbre_scores[
+                            "eer_percent"
+                        ],
+                        "validation/ecapa_min_dcf": timbre_scores["min_dcf"],
+                    }
+                )
+            else:
+                validation_scalars["validation/voice_similarity"] = (
+                    timbre_scores["speaker_mean"]
+                )
+        except Exception as error:
+            print(f"ECAPA timbre validation failed: {error}")
+    if (
+        mos_validator is not None
+        and timbre_o is not None
+        and generated_lengths is not None
+    ):
+        try:
+            validation_scalars["validation/MOS_utmosv2"] = (
+                mos_validator.score_batch(
+                    timbre_o.detach(),
+                    generated_lengths,
+                    timbre_reference[3],
+                    config.data.sample_rate,
+                )
+            )
+        except Exception as error:
+            print(f"UTMOSv2 validation failed: {error}")
+    audio_dict = {}
+    if audio_o is not None:
+        audio_dict[f"gen/audio_{global_step:07d}"] = audio_o[0, :, :]
+    return validation_scalars, audio_dict
+
+
 class EpochRecorder:
     """
     Records the time elapsed per epoch.
@@ -1116,6 +1262,39 @@ def train_and_evaluate(
                         vocoder=vocoder,
                         version=version,
                     )
+                    if should_run_external_validation(
+                        timbre_reference, timbre_validator, mos_validator
+                    ):
+                        inference_exporter.wait_for_completion()
+                        print(f"Validating saved model '{inference_model_path}'")
+                        try:
+                            saved_model = load_saved_validation_model(
+                                inference_model_path, device
+                            )
+                        except Exception as error:
+                            print(f"Saved model validation loading failed: {error}")
+                        else:
+                            try:
+                                validation_scalars, audio_dict = evaluate_external_validation(
+                                    saved_model,
+                                    config,
+                                    device,
+                                    device_id,
+                                    audio_reference,
+                                    timbre_reference,
+                                    timbre_validator,
+                                    mos_validator,
+                                    global_step,
+                                )
+                            finally:
+                                del saved_model
+                            summarize(
+                                writer=writer,
+                                global_step=global_step,
+                                scalars=validation_scalars,
+                                audios=audio_dict,
+                                audio_sample_rate=config.data.sample_rate,
+                            )
 
             pbar.update(1)
         # end of batch train
@@ -1160,106 +1339,19 @@ def train_and_evaluate(
                 ),
                 "all/mel": plot_spectrogram_to_numpy(mel[0].data.cpu().numpy()),
             }
-            audio_o = None
-            timbre_o = None
-            if should_run_external_validation(
-                timbre_reference, timbre_validator, mos_validator
-            ):
-                inference_model = net_g.module if hasattr(net_g, "module") else net_g
-                inference_model.eval()
-                rng_devices = [device_id] if device.type == "cuda" else []
-                try:
-                    with deterministic_validation_scope(
-                        config.train.seed, cuda_devices=rng_devices
-                    ):
-                        with torch.amp.autocast(
-                            device_type="cuda", enabled=False
-                        ):
-                            with torch.inference_mode():
-                                try:
-                                    timbre_o = infer_validation_audio(
-                                        inference_model,
-                                        timbre_reference[0],
-                                        config.data.sample_rate,
-                                        config.data.hop_length,
-                                    )
-                                except Exception as error:
-                                    print(
-                                        f"External validation generation failed: {error}"
-                                    )
-                                if audio_reference is not None:
-                                    if timbre_o is not None:
-                                        audio_o = timbre_o[:1]
-                                    else:
-                                        audio_o, *_ = inference_model.infer(
-                                            *audio_reference
-                                        )
-                finally:
-                    inference_model.train()
-
-            generated_lengths = None
-            if timbre_o is not None:
-                generated_lengths = (
-                    timbre_reference[0][1].detach() * config.data.hop_length
-                )
-
-            if (
-                timbre_validator is not None
-                and timbre_o is not None
-                and generated_lengths is not None
-            ):
-                try:
-                    speaker_ids = timbre_reference[3]
-                    timbre_scores = timbre_validator.score_batch_accelerated(
-                        timbre_o.detach(),
-                        generated_lengths,
-                        speaker_ids,
-                        config.data.sample_rate,
-                        device,
-                    )
-                    if timbre_scores["multi_speaker"]:
-                        validation_scalars.update(
-                            {
-                                "validation/voice_similarity": timbre_scores[
-                                    "speaker_mean"
-                                ],
-                                "validation/ecapa_margin_mean": timbre_scores[
-                                    "margin_mean"
-                                ],
-                                "validation/ecapa_top1_accuracy_percent": timbre_scores[
-                                    "top1_accuracy_percent"
-                                ],
-                                "validation/ecapa_eer_percent": timbre_scores[
-                                    "eer_percent"
-                                ],
-                                "validation/ecapa_min_dcf": timbre_scores["min_dcf"],
-                            }
-                        )
-                    else:
-                        validation_scalars["validation/voice_similarity"] = (
-                            timbre_scores["speaker_mean"]
-                        )
-                except Exception as error:
-                    print(f"ECAPA timbre validation failed: {error}")
-            if (
-                mos_validator is not None
-                and timbre_o is not None
-                and generated_lengths is not None
-            ):
-                try:
-                    validation_scalars["validation/MOS_utmosv2"] = (
-                        mos_validator.score_batch(
-                            timbre_o.detach(),
-                            generated_lengths,
-                            timbre_reference[3],
-                            config.data.sample_rate,
-                        )
-                    )
-                except Exception as error:
-                    print(f"UTMOSv2 validation failed: {error}")
             audio_dict = {}
-            if audio_o is not None:
-                audio_dict[f"gen/audio_{global_step:07d}"] = audio_o[0, :, :]
+            if save_every_steps == 0:
+                validation_scalars, audio_dict = evaluate_external_validation(
+                    net_g,
+                    config,
+                    device,
+                    device_id,
+                    audio_reference,
+                    timbre_reference,
+                    timbre_validator,
+                    mos_validator,
+                    global_step,
+                )
             summarize(
                 writer=writer,
                 global_step=global_step,
