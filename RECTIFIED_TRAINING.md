@@ -71,6 +71,15 @@ computed in FP32 and the matrix update is converted back to FP32 afterward,
 as in Shiro. AdamW calculations remain FP32. TF32 stays disabled. Changing the setting does not
 alter a job already running.
 
+If an FP16 forward pass produces a non-finite loss, the trainer retries that
+batch once with autocast disabled (FP32). All DDP ranks make the same decision
+and replay their original random draws, preserving the sampled noise, times,
+and dropout. Successful retries update the optimizer and EMA normally; later
+batches still use FP16. Gradient scaling continues to handle backward overflows.
+If the FP32 retry also fails, training stops and reports any non-finite input
+fields or model parameters across ranks. This does not repair corrupted data
+or already corrupted weights.
+
 Training accepts `--device cuda:0`, `--device cpu`, or multiple GPUs with
 `--device cuda:0,cuda:1`. The WebUI Device field accepts the same values.
 Multiple GPUs use DDP with one process per GPU and a distributed sampler.

@@ -77,18 +77,47 @@ def train_step(model, optimizer, ema, batch, data, settings, device, speaker_dro
     )
     mel = normalize_mel(mel, data) * mask
     optimizer.zero_grad(set_to_none=True)
-    with torch.autocast(device.type, dtype=amp_dtype or torch.float32, enabled=amp_dtype is not None):
-        flow, auxiliary = model(
-            mel, content, f0, energy, speaker, mask,
-            speaker_dropout=speaker_dropout, breathiness=breathiness,
-            key_shift=key_shift, speed=speed, backbone=backbone,
-        )
-        loss = flow if auxiliary is None else flow + settings['aux_mel_weight'] * auxiliary
+    rng_state = torch.get_rng_state() if amp_dtype == torch.float16 else None
+    cuda_rng_state = torch.cuda.get_rng_state(device) if rng_state is not None and device.type == 'cuda' else None
+
+    def forward_loss(dtype):
+        with torch.autocast(device.type, dtype=dtype or torch.float32, enabled=dtype is not None):
+            flow, auxiliary = model(
+                mel, content, f0, energy, speaker, mask,
+                speaker_dropout=speaker_dropout, breathiness=breathiness,
+                key_shift=key_shift, speed=speed, backbone=backbone,
+            )
+            loss = flow if auxiliary is None else flow + settings['aux_mel_weight'] * auxiliary
+        return flow, auxiliary, loss
+
+    flow, auxiliary, loss = forward_loss(amp_dtype)
     finite = bool(torch.isfinite(loss))
     if ranks is not None:
         finite = ranks.all_true(finite)
+    retried = not finite and amp_dtype == torch.float16
+    if retried:
+        del flow, auxiliary, loss
+        torch.set_rng_state(rng_state)
+        if cuda_rng_state is not None:
+            torch.cuda.set_rng_state(cuda_rng_state, device)
+        if ranks is None or ranks.main:
+            print('FP16 forward overflow: retrying this batch in FP32 on all training ranks.', flush=True)
+        flow, auxiliary, loss = forward_loss(None)
+        finite = bool(torch.isfinite(loss))
+        if ranks is not None:
+            finite = ranks.all_true(finite)
     if not finite:
-        raise FloatingPointError('Non-finite rectified-flow loss.')
+        inputs = dict(mel=mel, content=content, f0=f0, energy=energy, breathiness=breathiness,
+                      key_shift=key_shift, speed=speed, mask=mask)
+        invalid = [not bool(torch.isfinite(value).all()) for value in inputs.values()]
+        invalid.append(any(not bool(torch.isfinite(param).all()) for param in model.parameters()))
+        invalid = torch.tensor(invalid, device=device, dtype=torch.float32)
+        if ranks is not None and ranks.world > 1:
+            invalid = ranks.sum(invalid)
+        names = list(inputs) + ['model parameters']
+        details = ', '.join(name for name, flag in zip(names, invalid.tolist()) if flag) or 'none in inputs or model parameters'
+        retry = ' after an FP32 retry' if retried else ''
+        raise FloatingPointError(f'Non-finite rectified-flow loss{retry}. Non-finite values: {details}.')
     frames = mask.sum().detach()
     if ranks is not None and ranks.world > 1:
         loss = loss * (frames * ranks.world / ranks.sum(frames).clamp_min(1.0))
