@@ -81,7 +81,9 @@ install_dependencies() {
     # shellcheck disable=SC1091
     source "$MINICONDA_DIR/etc/profile.d/conda.sh"
     conda activate "$ENV_DIR"
+    uv pip uninstall onnxruntime
     uv pip install -r "$INSTALL_DIR/requirements.txt" \
+        --reinstall-package onnxruntime-gpu \
         --extra-index-url https://download.pytorch.org/whl/cu128 \
         --index-strategy unsafe-best-match
     uv pip install --no-deps swift-f0==0.3.0

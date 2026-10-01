@@ -21,7 +21,6 @@ torch==2.11.0
 torchaudio==2.11.0
 torchvision==0.26.0
 praat-parselmouth
-swift-f0==0.3.0
 torchfcpe==0.0.4
 onnxruntime-gpu==1.26.0
 einops==0.8.2
