@@ -35,6 +35,10 @@ SOFTWARE.
 The rectified-flow model, conditioning, mel processing, Muon optimizer, EMA,
 and OpenVPI NSF-HiFiGAN adapter in `rvc/rectified` are adapted from [ShiroRVC](https://github.com/ShiromiyaG/ShiroRVC).
 The flow configuration is adapted from its 44.1 kHz recipe.
+MeanFlow span conditioning, directional-derivative training, adaptive weighting
+and mean-velocity sampling are adapted from the user-supplied `shiro-new.zip`
+ShiroRVC source. The integration retains RedPanda conditioning, legacy sampling
+and checkpoint contracts.
 
 MIT License
 

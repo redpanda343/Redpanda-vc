@@ -235,3 +235,41 @@ checkpoints with mismatched voicing, tension or dual-timestep settings.
 These are experimental quality features. Functional checks and short synthetic
 training runs do not establish better voice similarity or audio quality. Compare
 properly trained models on held-out real audio before choosing a new pretrained.
+
+
+## Experimental MeanFlow
+
+Enable **MeanFlow for new models** in the rectified Train tab, or pass
+`--mean-flow` to `python -m rvc.rectified.train_flow` for a new experiment.
+It works with either recipe and preserves that recipe's conditioning inputs.
+Use FP32 and batch size 4; at least 2 examples per GPU are required. The default
+quality recipe still includes WORLD voicing and tension extraction.
+
+New MeanFlow experiments use `mean_flow: true`, backbone `time_scale: 1.0`,
+`sampling_method: "mean"`, and `sampling_steps: 2`. The saved inference checkpoint
+uses those sampling defaults automatically in the normal inference tab.
+The model API also accepts `method="mean", steps=1` for one-step evaluation.
+Euler, Heun and RK4 remain available. These steps cover the saved shallow-flow
+interval, including the existing auxiliary mel initialization.
+
+The adapted ShiroRVC objective trains part of each batch on average velocity,
+using a detached directional derivative, bounded bootstrap correction and
+adaptive loss weighting. `mean_flow_ratio` defaults to 0.25 and
+`mean_flow_warmup_steps` to 10000. The correction ramps with the saved global
+step, including after resume. Batch size 2 still trains one MeanFlow example.
+TensorBoard includes raw instantaneous and MeanFlow errors, weighted MeanFlow
+loss and the bootstrap correction ratio. The flow loss is the mixed weighted
+objective for these models. Normal validation reports instantaneous flow error;
+audio previews use the saved two-step sampler.
+
+Train a new pretrained model, or select a matching MeanFlow custom pretrained.
+Ordinary flow pretrains are rejected, as are mismatched time embedding scales.
+Existing experiments retain their architecture and sampling settings; selecting
+MeanFlow for an existing ordinary-flow experiment reports an error. Resume a
+saved MeanFlow experiment normally, without needing to enable the checkbox.
+MeanFlow training runs eagerly, even when compilation is requested, because its
+forward-mode derivatives use a separate execution path.
+
+This adds training and offline inference support. It does not add microphone
+streaming or establish realtime latency or perceptual quality. Those require a
+trained model, audio comparisons and a streaming adapter.

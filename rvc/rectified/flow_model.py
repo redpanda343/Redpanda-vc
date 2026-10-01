@@ -11,7 +11,7 @@ from rvc.rectified.content_bottleneck import ContentBottleneck
 
 LOG_F0_CENTER = math.log(200.0)
 LOG_F0_SCALE = 0.7
-SAMPLERS = ("euler", "heun", "rk4")
+SAMPLERS = ("euler", "heun", "rk4", "mean")
 
 
 SCHEDULES = ("uniform", "sway", "logit-normal")
@@ -164,12 +164,12 @@ class ConditionEncoder(nn.Module):
         return x
 
 
-def timestep_embedding(t: torch.Tensor, channels: int) -> torch.Tensor:
+def timestep_embedding(t: torch.Tensor, channels: int, scale: float = 1000.0) -> torch.Tensor:
     half = channels // 2
     frequencies = torch.exp(
         -math.log(10000.0) * torch.arange(half, device=t.device, dtype=torch.float32) / half
     )
-    angles = (t.float() * 1000.0)[:, None] * frequencies[None]
+    angles = (t.float() * scale)[:, None] * frequencies[None]
     return torch.cat((angles.sin(), angles.cos()), dim=-1)
 
 
@@ -186,9 +186,9 @@ class _ATanGLU(torch.autograd.Function):
         return grad * atan_gate, grad * decay_out
 
 
-def atan_glu(x: torch.Tensor) -> torch.Tensor:
+def atan_glu(x: torch.Tensor, fused: bool = True) -> torch.Tensor:
     out, gate = x.chunk(2, dim=-1)
-    if torch.is_grad_enabled():
+    if fused and torch.is_grad_enabled():
         return _ATanGLU.apply(out, gate)
     return out * torch.atan(gate)
 
@@ -208,14 +208,14 @@ class LYNXNet2Block(nn.Module):
             nn.init.zeros_(self.modulation.weight)
             nn.init.zeros_(self.modulation.bias)
 
-    def forward(self, x, mask, embedding=None):
+    def forward(self, x, mask, embedding=None, fused=True):
         y = self.norm(x)
         gate = None
         if self.modulation is not None:
             shift, scale, gate = self.modulation(F.silu(embedding)).chunk(3, dim=-1)
             y = y + y * scale + shift
         y = self.depthwise((y * mask).transpose(1, 2)).transpose(1, 2)
-        y = self.down(atan_glu(self.mid(atan_glu(self.up(y)))))
+        y = self.down(atan_glu(self.mid(atan_glu(self.up(y), fused)), fused))
         if gate is not None:
             y = y + gate * y
         return (x + y) * mask
@@ -223,14 +223,22 @@ class LYNXNet2Block(nn.Module):
 
 class LYNXNet2Backbone(nn.Module):
     def __init__(self, n_mels, cond_channels, channels=1024, layers=6, expansion=1, kernel_size=31,
-                 adaln=False):
+                 adaln=False, span=False, time_scale=1000.0):
         super().__init__()
         self.channels = int(channels)
+        self.time_scale = float(time_scale)
         self.input = nn.Linear(n_mels, channels)
         self.input_cond = nn.Conv1d(cond_channels, channels, 1)
         self.time_mlp = nn.Sequential(
             nn.Linear(channels, channels * 4), nn.GELU(), nn.Linear(channels * 4, channels)
         )
+        self.span_mlp = None
+        if span:
+            self.span_mlp = nn.Sequential(
+                nn.Linear(channels, channels * 4, bias=False), nn.GELU(),
+                nn.Linear(channels * 4, channels, bias=False),
+            )
+            nn.init.zeros_(self.span_mlp[-1].weight)
         self.layers = nn.ModuleList(
             [LYNXNet2Block(channels, expansion, kernel_size, adaln) for _ in range(layers)]
         )
@@ -243,9 +251,14 @@ class LYNXNet2Backbone(nn.Module):
         nn.init.zeros_(self.output.weight)
         nn.init.zeros_(self.output.bias)
 
-    def forward(self, x, t, cond, mask, voice=None):
-        time = self.time_mlp(timestep_embedding(t.reshape(-1), self.channels))
-        time = time.reshape(t.shape[0], -1, self.channels)
+    def forward(self, x, t, cond, mask, voice=None, span=None):
+        time = self.time_mlp(timestep_embedding(t.reshape(-1), self.channels, self.time_scale))
+        time = time.view(t.shape[0], -1, self.channels)
+        if span is not None:
+            features = timestep_embedding(span.reshape(-1), self.channels, self.time_scale)
+            half = self.channels // 2
+            features = torch.cat((features[:, :half], 1.0 - features[:, half:]), dim=-1)
+            time = time + self.span_mlp(features).view(span.shape[0], -1, self.channels)
         frame_mask = mask.transpose(1, 2)
         with torch.autocast(x.device.type, enabled=False):
             h = self.input(x.transpose(1, 2).to(self.input.weight.dtype))
@@ -255,8 +268,12 @@ class LYNXNet2Backbone(nn.Module):
         if self.voice is not None:
             embedding = time + self.voice(voice)[:, None, :]
         for layer in self.layers:
-            h = layer(h, frame_mask, embedding)
-        return (self.output(self.norm(h)) * frame_mask).transpose(1, 2)
+            h = layer(h, frame_mask, embedding, fused=span is None)
+        if span is None:
+            h = self.norm(h)
+        else:
+            h = F.layer_norm(h, (self.channels,), eps=self.norm.eps) * self.norm.weight + self.norm.bias
+        return (self.output(h) * frame_mask).transpose(1, 2)
 
 
 class AuxDecoder(nn.Module):
@@ -302,6 +319,7 @@ class RectifiedFlow(nn.Module):
         tension: bool = False,
         sampling_method: str = "euler",
         sampling_steps: int = 16,
+        mean_flow: bool = False,
     ):
         super().__init__()
         if backbone != "lynxnet2":
@@ -324,10 +342,10 @@ class RectifiedFlow(nn.Module):
             voicing,
             tension,
         )
-        self.backbone = LYNXNet2Backbone(n_mels, hidden_channels, **(backbone_args or {}))
+        self.backbone = LYNXNet2Backbone(n_mels, hidden_channels, span=bool(mean_flow), **(backbone_args or {}))
 
 
-        conditioning = [self.backbone.time_mlp, self.encoder.speaker_proj, self.backbone.voice]
+        conditioning = [self.backbone.time_mlp, self.backbone.span_mlp, self.encoder.speaker_proj, self.backbone.voice]
         conditioning += [layer.modulation for layer in self.backbone.layers]
         for module in filter(None, conditioning):
             for child in module.modules():
@@ -338,6 +356,8 @@ class RectifiedFlow(nn.Module):
         self.dual_timestep = bool(dual_timestep)
         if sampling_method not in SAMPLERS or int(sampling_steps) != sampling_steps or sampling_steps < 1:
             raise ValueError("Invalid flow sampling method or step count.")
+        if sampling_method == "mean" and not mean_flow:
+            raise ValueError("Mean sampling requires a MeanFlow-trained checkpoint.")
         self.sampling_method = sampling_method
         self.sampling_steps = int(sampling_steps)
 
@@ -365,6 +385,76 @@ class RectifiedFlow(nn.Module):
             aux = aux_error.sum() / count.sum()
         return flow, aux
 
+    def _flow_error(self, mel, cond, voice, mask, t, noise, backbone):
+        mix = t[:, None, None] if t.dim() == 1 else t[:, None, :]
+        x_t = (1.0 - mix) * noise + mix * mel
+        prediction = backbone(x_t, t, cond, mask, voice)
+        error = (prediction.float() - (mel - noise).float()).square() * mask
+        return error.sum((1, 2)) / (mask.sum((1, 2)) * self.n_mels).clamp_min(1.0)
+
+    def _aux_loss(self, mel, cond, mask):
+        if self.aux is None:
+            return None
+        aux_cond = cond * self.aux_grad + cond.detach() * (1.0 - self.aux_grad)
+        error = (self.aux(aux_cond, mask).float() - mel.float()).abs() * mask
+        return error.sum() / (mask.sum() * self.n_mels).clamp_min(1.0)
+
+    def mean_velocity(self, x, t, span, velocity, cond, mask, voice):
+
+        def field(x, t, span):
+            return self.backbone(x, t, cond, mask, voice, span)
+        tangents = (velocity, torch.ones_like(t), -torch.ones_like(span))
+        mean, derivative = torch.func.jvp(field, (x, t, span), tangents)
+        return (mean, derivative.detach())
+
+    def _mean_error(self, mel, cond, voice, mask, noise, mean_field, bootstrap=1.0):
+        first, second = (self._times(mel.shape[0], mel.device) for _ in range(2))
+        t, span = (torch.minimum(first, second), (first - second).abs())
+        x_t = (1.0 - t[:, None, None]) * noise + t[:, None, None] * mel
+        velocity = mel - noise
+        mean, derivative = mean_field(x_t, t, span, velocity, cond, mask, voice)
+        correction = span[:, None, None] * derivative.float() * mask
+        count = (mask.sum((1, 2)) * self.n_mels).clamp_min(1.0)
+        size = (correction.square().sum((1, 2)) / count).sqrt()
+        ratio = size / ((velocity.square() * mask).sum((1, 2)) / count).sqrt().clamp_min(1e-08)
+        correction = correction * (1.0 / ratio.clamp_min(1.0))[:, None, None]
+        target = velocity + bootstrap * correction
+        error = (mean.float() - target).square() * mask
+        return (error.sum((1, 2)) / count, ratio)
+
+    def _mean_forward(self, mel, cond, voice, mask, backbone, mean_ratio, mean_bootstrap):
+        if mel.shape[0] < 2 or not 0.0 < mean_ratio < 1.0:
+            raise ValueError("MeanFlow training requires batch size at least 2 and a ratio between 0 and 1.")
+        mean_field = self.mean_velocity
+        noise = torch.randn_like(mel)
+        batch = mel.shape[0]
+        mean_items = min(batch - 1, max(1, int(round(mean_ratio * batch))))
+        rest = slice(mean_items, None)
+        t = self._times(batch - mean_items, mel.device)
+        if self.dual_timestep:
+            other = self._times(batch - mean_items, mel.device)
+            swap = torch.rand(batch - mean_items, mel.shape[-1], device=mel.device) < 0.25
+            t = torch.where(swap & mask[rest, 0].bool(), other[:, None], t[:, None])
+        backbone = self.backbone if backbone is None else backbone
+        error = self._flow_error(mel[rest], cond[rest], voice[rest], mask[rest], t, noise[rest], backbone)
+
+        def pooled(error, frames, weighted=False):
+            weight = (error.detach() + 1e-3).reciprocal() if weighted else 1.0
+            return (weight * error * frames).sum() / frames.sum().clamp_min(1.0)
+        frames = mask[rest].sum((1, 2))
+        flow = pooled(error, frames)
+        head = slice(0, mean_items)
+        mean_error, bootstrap_ratio = self._mean_error(
+            mel[head], cond[head], voice[head], mask[head], noise[head], mean_field, mean_bootstrap
+        )
+        mean_frames = mask[head].sum((1, 2))
+        mean = torch.stack((
+            pooled(mean_error, mean_frames, True), flow.detach(),
+            pooled(mean_error, mean_frames).detach(), bootstrap_ratio.mean(),
+        ))
+        flow = pooled(error, frames, True)
+        return (flow, self._aux_loss(mel, cond, mask), mean)
+
     def _times(self, batch, device):
         u = (torch.arange(batch, device=device) + torch.rand(batch, device=device)) / batch
         u = u[torch.randperm(batch, device=device)].clamp(1e-6, 1.0 - 1e-6)
@@ -372,10 +462,13 @@ class RectifiedFlow(nn.Module):
         return self.t_start + (1.0 - self.t_start) * t
 
     def forward(self, mel, content, f0, energy, speaker, mask, speaker_dropout=0.0,
-                breathiness=None, key_shift=None, speed=None, backbone=None, voicing=None, tension=None):
+                breathiness=None, key_shift=None, speed=None, backbone=None, voicing=None, tension=None,
+                mean_ratio=0.25, mean_bootstrap=1.0):
         speaker = self._drop_speakers(speaker, speaker_dropout)
         cond = self.encoder(content, f0, energy, speaker, mask, breathiness, key_shift, speed, voicing, tension)
         voice = self.encoder.voice(speaker)
+        if self.backbone.span_mlp is not None:
+            return self._mean_forward(mel, cond, voice, mask, backbone, mean_ratio, mean_bootstrap)
         t = self._times(mel.shape[0], mel.device)
         if self.dual_timestep:
             t2 = self._times(mel.shape[0], mel.device)
@@ -427,6 +520,8 @@ class RectifiedFlow(nn.Module):
     ):
         method = self.sampling_method if method is None else method
         steps = self.sampling_steps if steps is None else steps
+        if method == "mean" and self.backbone.span_mlp is None:
+            raise ValueError("Mean sampling requires a MeanFlow-trained checkpoint.")
         if method not in SAMPLERS:
             raise ValueError(f"method must be one of {SAMPLERS}, not {method!r}.")
         if rescale_mode not in RESCALE_MODES:
@@ -462,12 +557,12 @@ class RectifiedFlow(nn.Module):
             frames = mask.sum((1, 2)).clamp_min(1.0) * self.n_mels
             return ((y.square() * mask).sum((1, 2)) / frames).sqrt()[:, None, None]
 
-        def field(x, t):
+        def field(x, t, span=None):
             now = float(t[0])
 
             if count == 1 or not (guide_from <= now and (now < guide_until or guide_until >= 1.0)):
-                return self.backbone(x, t, cond[:batch], mask, voice[:batch])
-            v = self.backbone(repeat(x), repeat(t), cond, masks, voice).chunk(count)
+                return self.backbone(x, t, cond[:batch], mask, voice[:batch], span)
+            v = self.backbone(repeat(x), repeat(t), cond, masks, voice, repeat(span)).chunk(count)
             guided, index = v[0], 1
             if cfg_scale != 1.0:
                 guided = guided + (cfg_scale - 1.0) * (v[0] - v[index])
@@ -501,7 +596,7 @@ class RectifiedFlow(nn.Module):
                 now = back
             t = torch.full((batch,), now, device=x.device, dtype=times.dtype)
             dt = times[index + 1] - now
-            v = field(x, t)
+            v = field(x, t, dt.expand(batch) if method == "mean" else None)
             if method == "heun":
                 v_next = field(x + dt * v, times[index + 1].expand(batch))
                 v = 0.5 * (v + v_next)

@@ -67,6 +67,9 @@ def conditioning_norms(model) -> dict:
 def compiled_backbone(model, enabled: bool, mode: str, device):
     if not enabled:
         return None
+    if model.backbone.span_mlp is not None:
+        print("MeanFlow uses eager training for its forward-mode derivatives; compilation is disabled.", flush=True)
+        return None
     if sys.platform != "linux" or device.type != "cuda" or not torch.cuda.is_available():
         print("Flow backbone compilation requires Linux and CUDA; training uncompiled.", flush=True)
         return None
@@ -82,22 +85,34 @@ def compiled_backbone(model, enabled: bool, mode: str, device):
     return torch.compile(model.backbone, backend="inductor", mode=mode)
 
 
-def train_step(model, optimizer, ema, batch, data, settings, device, speaker_dropout, amp_dtype=None, scaler=None, backbone=None, ranks=None):
+def train_step(model, optimizer, ema, batch, data, settings, device, speaker_dropout, amp_dtype=None, scaler=None, backbone=None, ranks=None, step=0, metrics=None):
     mel, content, f0, energy, breathiness, key_shift, speed, speaker, mask, voicing, tension = unpack_flow(batch, device, True)
     mel = normalize_mel(mel, data) * mask
     optimizer.zero_grad(set_to_none=True)
     rng_state = torch.get_rng_state() if amp_dtype == torch.float16 else None
     cuda_rng_state = torch.cuda.get_rng_state(device) if rng_state is not None and device.type == 'cuda' else None
 
+    mean_enabled = bool(settings["model"].get("mean_flow", False))
+    mean_ratio = float(settings.get("mean_flow_ratio", 0.25))
+    mean_warmup = int(settings.get("mean_flow_warmup_steps", 10000))
+    mean_stats = None
+
     def forward_loss(dtype):
+        nonlocal mean_stats
         backward_context = aot_config.patch(backward_pass_autocast="off") if backbone is not None else nullcontext()
         with backward_context, torch.autocast(device.type, dtype=dtype or torch.float32, enabled=dtype is not None):
-            flow, auxiliary = model(
+            result = model(
                 mel, content, f0, energy, speaker, mask,
                 speaker_dropout=speaker_dropout, breathiness=breathiness,
                 key_shift=key_shift, speed=speed, backbone=backbone,
                 voicing=voicing, tension=tension,
+                mean_ratio=mean_ratio,
+                mean_bootstrap=min(1.0, step / mean_warmup) if mean_warmup else 1.0,
             )
+            flow, auxiliary = result[:2]
+            if mean_enabled:
+                mean_stats = result[2].detach()
+                flow = (1.0 - mean_ratio) * flow + mean_ratio * result[2][0]
             loss = flow if auxiliary is None else flow + settings['aux_mel_weight'] * auxiliary
         return flow, auxiliary, loss
 
@@ -151,6 +166,11 @@ def train_step(model, optimizer, ema, batch, data, settings, device, speaker_dro
             ema.update(model)
         else:
             print('FP16 overflow: skipped optimizer and EMA update; reduced gradient scale.', flush=True)
+    if mean_stats is not None:
+        if ranks is not None and ranks.world > 1:
+            mean_stats = ranks.sum(mean_stats) / ranks.world
+        if metrics is not None:
+            metrics.update(zip(("loss/mean_weighted", "loss/instantaneous", "loss/mean_flow", "diag/mean_bootstrap_ratio"), mean_stats.tolist()))
     if ranks is not None and ranks.world > 1:
         stats = torch.stack([flow.detach() * frames,
                              auxiliary.detach() * frames if auxiliary is not None else frames * 0, frames])
@@ -226,6 +246,29 @@ def train(args):
     launch(train_rank, args)
 
 
+def configure_mean_flow(config, requested, existing_config, batch_size):
+    settings = config['flow']
+    model = settings['model']
+    if requested and existing_config and not model.get('mean_flow', False):
+        raise ValueError('MeanFlow needs a new experiment. Existing experiments keep their saved architecture.')
+    if requested and not existing_config:
+        model['mean_flow'] = True
+        model.setdefault('backbone_args', {})['time_scale'] = 1.0
+        model['sampling_method'] = 'mean'
+        model['sampling_steps'] = 2
+        settings['mean_flow_ratio'] = 0.25
+        settings['mean_flow_warmup_steps'] = 10000
+    if model.get('mean_flow', False):
+        if batch_size < 2:
+            raise ValueError('MeanFlow requires batch size at least 2 per GPU; use 4 when possible.')
+        if not 0.0 < float(settings.get('mean_flow_ratio', 0.25)) < 1.0:
+            raise ValueError('mean_flow_ratio must be between 0 and 1.')
+        if int(settings.get('mean_flow_warmup_steps', 10000)) < 0:
+            raise ValueError('mean_flow_warmup_steps cannot be negative.')
+        if not 0.0 < float(model.get('backbone_args', {}).get('time_scale', 1000.0)) <= 10:
+            raise ValueError('MeanFlow needs a positive time_scale of 10 or less. Use a new MeanFlow experiment with time_scale 1.')
+
+
 def train_rank(args, ranks):
     if args.batch_size < 1 or args.epochs < 1 or args.save_every < 1:
         raise ValueError('Batch size, epochs and save interval must be positive.')
@@ -245,6 +288,7 @@ def train_rank(args, ranks):
     if not existing_config and getattr(args, 'recipe', 'quality') == 'legacy':
         for name in ('dual_timestep', 'voicing', 'tension', 'sampling_method', 'sampling_steps'):
             config['flow']['model'].pop(name, None)
+    configure_mean_flow(config, getattr(args, "mean_flow", False), existing_config, args.batch_size)
     settings, data = config['flow'], config['data']
     if data['sample_rate'] != 44100:
         raise ValueError('This recipe requires 44100 Hz audio and a matching NSF-HiFiGAN vocoder.')
@@ -322,9 +366,13 @@ def train_rank(args, ranks):
         if state.get('embedder_model', embedder) != embedder:
             raise ValueError('Pretrained flow uses a different content embedder.')
         pretrained_model = state.get('config', {}).get('flow', {}).get('model', {})
-        for name in ('dual_timestep', 'voicing', 'tension'):
+        for name in ('dual_timestep', 'voicing', 'tension', 'mean_flow'):
             if bool(pretrained_model.get(name, False)) != bool(settings['model'].get(name, False)):
                 raise ValueError(f'Pretrained flow differs in {name}. Use a matching pretrained or train a new model from scratch.')
+        source_scale = float(pretrained_model.get('backbone_args', {}).get('time_scale', 1000.0))
+        target_scale = float(settings['model'].get('backbone_args', {}).get('time_scale', 1000.0))
+        if source_scale != target_scale:
+            raise ValueError('Pretrained flow uses a different time embedding scale. Use a matching pretrained.')
         weights = state['ema']['shadow'] if state.get('ema') else state['model']
         model.load_state_dict(resize_speakers(weights, speakers), strict=True)
         ema.reseed(model)
@@ -355,12 +403,15 @@ def train_rank(args, ranks):
                 current_lr = learning_rate(lr, step, warmup, total, settings['lr_final_ratio'])
                 for group in optimizer.param_groups:
                     group['lr'] = current_lr
-                flow, auxiliary, norm = train_step(train_model, optimizer, ema, batch, data, settings, device, dropout, amp_dtype, scaler, backbone, ranks)
+                metrics = {}
+                flow, auxiliary, norm = train_step(train_model, optimizer, ema, batch, data, settings, device, dropout, amp_dtype, scaler, backbone, ranks, step, metrics)
                 step += 1
                 media_step = bool((preview_interval and step % preview_interval == 0) or
                                   (held and settings.get('eval_interval', 0) and step % settings['eval_interval'] == 0))
                 if ranks.main:
                     for tag, value in [('loss/flow', flow), ('loss/aux_mel_l1', auxiliary), ('grad_norm', norm), ('lr', current_lr)]:
+                        writer.add_scalar(tag, value, step)
+                    for tag, value in metrics.items():
                         writer.add_scalar(tag, value, step)
                     print(f'epoch={epoch} step={step}/{total} flow={flow:.6f} aux={auxiliary:.6f} grad_norm={norm:.6f}', flush=True)
                     if step % 50 == 0:
@@ -415,6 +466,8 @@ def main():
     parser.add_argument('--pretrained-flow')
     parser.add_argument('--recipe', choices=['quality', 'legacy'], default='quality',
                         help='Recipe for a new experiment. Saved experiment configs always take precedence.')
+    parser.add_argument('--mean-flow', action='store_true',
+                        help='Enable MeanFlow for a new experiment, with two-step sampling. Saved MeanFlow runs resume automatically.')
     parser.add_argument('--learning-rate', type=float)
     parser.add_argument('--seed', type=int, default=1234)
     parser.add_argument('--compile', action='store_true')

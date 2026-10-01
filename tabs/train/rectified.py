@@ -180,7 +180,7 @@ def resolve_pretrained(directory, enabled, custom, path):
 
 def start(name, vocoder, pretrained, batch, epochs, save_every, device, compile_backbone=False,
           use_pretrained=False, custom_pretrained=False, vocoder_mode='Default NSF-HiFiGAN',
-          recipe=RECIPE_CHOICES[0]):
+          recipe=RECIPE_CHOICES[0], mean_flow=False):
     directory = experiment_path(name)
     device_id(device)
     if not (directory / 'filelist.txt').is_file():
@@ -193,9 +193,14 @@ def start(name, vocoder, pretrained, batch, epochs, save_every, device, compile_
     config_path = directory / 'rectified_config.json'
     config = json.loads(config_path.read_text(encoding='utf-8')) if config_path.is_file() else None
     model_config = config['flow']['model'] if config else {'voicing': recipe == RECIPE_CHOICES[0]}
-    enhanced = any(model_config.get(key, False) for key in ('dual_timestep', 'voicing', 'tension'))
+    if mean_flow and config and not model_config.get('mean_flow', False):
+        raise gr.Error('MeanFlow needs a new experiment. Choose a new model name.')
+    mean_enabled = bool(model_config.get('mean_flow', False)) if config else bool(mean_flow)
+    if mean_enabled and int(positive_integer(batch, 'Batch size')) < 2:
+        raise gr.Error('MeanFlow requires batch size at least 2 per GPU; use 4 when possible.')
+    enhanced = mean_enabled or any(model_config.get(key, False) for key in ('dual_timestep', 'voicing', 'tension'))
     if use_pretrained and not custom_pretrained and enhanced and not (directory / 'flow' / 'checkpoint.pth').is_file():
-        raise gr.Error('The quality recipe needs a matching custom pretrained. Disable Pretrained to train from scratch, or choose Legacy Shiro for the default Shiro pretrained.')
+        raise gr.Error('This recipe needs a matching custom pretrained. Disable Pretrained to train from scratch, or choose Legacy Shiro without MeanFlow for the default Shiro pretrained.')
     vocoder = resolve_vocoder(vocoder_mode, vocoder)
     arguments = ['--model-name', str(name).strip(), '--vocoder', vocoder,
                  '--batch-size', positive_integer(batch, 'Batch size'),
@@ -203,6 +208,8 @@ def start(name, vocoder, pretrained, batch, epochs, save_every, device, compile_
                  '--save-every', positive_integer(save_every, 'Save interval'),
                  '--device', str(device).strip().lower(), '--precision', precision,
                  '--recipe', 'quality' if recipe == RECIPE_CHOICES[0] else 'legacy']
+    if mean_flow:
+        arguments.append('--mean-flow')
     if compile_backbone:
         arguments.append('--compile')
     pretrained = resolve_pretrained(directory, use_pretrained, custom_pretrained, pretrained)
@@ -256,6 +263,8 @@ def rectified_train_tab():
     with gr.Accordion('3. Train rectified flow', open=True):
         recipe = gr.Dropdown(label='New model recipe', choices=RECIPE_CHOICES, value=RECIPE_CHOICES[0],
                              info='New models use RK4 sampling, dual-timestep training and separate voicing/tension inputs. Existing experiments keep their saved configuration.')
+        mean_flow = gr.Checkbox(label='MeanFlow for new models', value=False,
+                                info='Train for one or two sampling steps. Needs a new experiment and a matching MeanFlow pretrained, or training from scratch. Batch size must be at least 2. Uses two-step inference by default; existing MeanFlow runs resume automatically.')
         vocoder_mode = gr.Dropdown(label='Audio preview vocoder', choices=VOCODER_CHOICES, value='Default NSF-HiFiGAN',
                                    info='The default NSF-HiFiGAN downloads automatically on start. Choose mel previews only to skip audio rendering.')
         vocoder = gr.Textbox(label='Custom OpenVPI NSF-HiFiGAN checkpoint path', visible=False,
@@ -292,6 +301,6 @@ def rectified_train_tab():
     vocoder_mode.change(lambda mode: gr.update(visible=mode == 'Custom NSF-HiFiGAN'),
                         [vocoder_mode], [vocoder], queue=False)
     train_button.click(start, [name, vocoder, pretrained, batch, epochs, save_every, device, compile_backbone,
-                               use_pretrained, custom_pretrained, vocoder_mode, recipe], outputs, queue=False)
+                               use_pretrained, custom_pretrained, vocoder_mode, recipe, mean_flow], outputs, queue=False)
     stop_button.click(stop, [], outputs, queue=False)
     gr.Timer(2).tick(status, [], outputs, queue=False)
