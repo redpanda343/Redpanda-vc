@@ -63,6 +63,24 @@ def f0_to_mel_rate(f0: torch.Tensor, frames: int, sample_rate: int, hop: int) ->
     nearest = torch.where(weight < 0.5, a, b)
     return torch.where((a > 0) & (b > 0), a * (1 - weight) + b * weight, nearest)
 
+
+def variance_curves(audio, f0, frames, sample_rate, hop):
+    from rvc.rectified.variance import voicing_tension
+
+    count = max(1, audio.shape[-1] // (sample_rate // FEATURE_RATE))
+    curves = voicing_tension(audio, sample_rate, f0, count)
+    return tuple(to_mel_rate(smooth_curve(curve).unsqueeze(-1), frames, sample_rate, hop)[..., 0]
+                 for curve in curves)
+
+
+def unpack_flow(batch, device, non_blocking=False):
+    values = tuple(item.to(device, non_blocking=non_blocking) for item in batch)
+    if len(values) == 9:
+        return (*values, None, None)
+    if len(values) != 11:
+        raise ValueError("Invalid rectified-flow batch.")
+    return values
+
 class RectifiedDataset(Dataset):
     def __init__(self, entries, config: dict, segment_frames: int, augment: bool = True):
         self.entries = entries
@@ -77,6 +95,7 @@ class RectifiedDataset(Dataset):
         self.stretch_range = tuple(config["flow"].get("time_stretch_range", (1.0, 1.0)))
         self.stretch_prob = float(config["flow"].get("time_stretch_prob", 0.0))
         self.augment = augment
+        self.use_variances = any(config["flow"]["model"].get(name, False) for name in ("voicing", "tension"))
 
     def __len__(self):
         return len(self.entries)
@@ -142,10 +161,14 @@ class RectifiedDataset(Dataset):
         length = min(frames, self.segment_frames)
         start = random.randint(0, frames - length) if self.augment else 0
         stop = start + length
-        return (
+        item = (
             mel[:, start:stop], content[start:stop], f0[start:stop], energy[start:stop],
             breathiness[start:stop], key_shift, speed, sid,
         )
+        if self.use_variances:
+            curves = variance_curves(audio.unsqueeze(0), source_f0.unsqueeze(0), frames, self.sample_rate, hop)
+            item += tuple(curve[0, start:stop] for curve in curves)
+        return item
 
     def _reference_item(self, audio, content, f0, sid, path, max_frames=None):
         frames = min(
@@ -157,14 +180,18 @@ class RectifiedDataset(Dataset):
         audio = audio[: frames * self.hop]
         content = to_mel_rate(content, frames, self.sample_rate, self.hop)
         breathiness = self._breathiness(audio.unsqueeze(0), f0.unsqueeze(0), frames, self.hop)
+        source_f0 = f0
         f0 = f0_to_mel_rate(f0, frames, self.sample_rate, self.hop)
         with torch.no_grad():
             mel = self.mel(audio.unsqueeze(0))[:, :, :frames]
         energy = self._energy(audio.unsqueeze(0), frames, self.hop)
-        return (
+        item = (
             mel, content.unsqueeze(0), f0.unsqueeze(0), energy, breathiness,
             audio.unsqueeze(0), int(sid), path,
         )
+        if self.use_variances:
+            item += variance_curves(audio.unsqueeze(0), source_f0.unsqueeze(0), frames, self.sample_rate, self.hop)
+        return item
 
     def reference(self, max_seconds: float = 10.0):
         ordered = sorted(range(len(self.entries)), key=lambda i: self.entries[i][0])
@@ -197,7 +224,12 @@ def collate_flow(batch, frames=None):
     speed = torch.ones(size)
     mask = torch.zeros(size, 1, frames)
     speaker = torch.zeros(size, dtype=torch.long)
-    for i, (m, c, p, e, b, k, v, s) in enumerate(batch):
+    extended = len(batch[0]) == 10
+    voicing, tension = torch.zeros(size, frames), torch.zeros(size, frames)
+    for i, item in enumerate(batch):
+        if len(item) != (10 if extended else 8):
+            raise ValueError("Mixed conditioning formats in rectified-flow batch.")
+        m, c, p, e, b, k, v, s = item[:8]
         n = m.shape[-1]
         mel[i, :, :n] = m
         content[i, :n] = c
@@ -208,7 +240,10 @@ def collate_flow(batch, frames=None):
         speed[i] = v
         mask[i, :, :n] = 1.0
         speaker[i] = s
-    return mel, content, f0, energy, breathiness, key_shift, speed, speaker, mask
+        if extended:
+            voicing[i, :n], tension[i, :n] = item[8:]
+    result = (mel, content, f0, energy, breathiness, key_shift, speed, speaker, mask)
+    return (*result, voicing, tension) if extended else result
 
 def read_filelist(path, root):
     rows = []

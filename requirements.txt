@@ -21,6 +21,7 @@ torch==2.11.0
 torchaudio==2.11.0
 torchvision==0.26.0
 praat-parselmouth
+pyworld==0.3.5
 torchfcpe==0.0.4
 onnxruntime-gpu==1.26.0
 einops==0.8.2

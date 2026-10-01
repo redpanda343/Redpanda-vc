@@ -12,7 +12,7 @@ import torch
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-from rvc.rectified.data import RectifiedDataset, collate_flow, read_filelist, split_holdout
+from rvc.rectified.data import RectifiedDataset, collate_flow, read_filelist, split_holdout, unpack_flow
 from rvc.rectified.distributed import launch
 from rvc.rectified.ema import WeightEMA
 from rvc.rectified.flow_model import build_flow, resize_speakers
@@ -72,9 +72,7 @@ def compiled_backbone(model, enabled: bool, mode: str, device):
 
 
 def train_step(model, optimizer, ema, batch, data, settings, device, speaker_dropout, amp_dtype=None, scaler=None, backbone=None, ranks=None):
-    mel, content, f0, energy, breathiness, key_shift, speed, speaker, mask = (
-        item.to(device, non_blocking=True) for item in batch
-    )
+    mel, content, f0, energy, breathiness, key_shift, speed, speaker, mask, voicing, tension = unpack_flow(batch, device, True)
     mel = normalize_mel(mel, data) * mask
     optimizer.zero_grad(set_to_none=True)
     rng_state = torch.get_rng_state() if amp_dtype == torch.float16 else None
@@ -86,6 +84,7 @@ def train_step(model, optimizer, ema, batch, data, settings, device, speaker_dro
                 mel, content, f0, energy, speaker, mask,
                 speaker_dropout=speaker_dropout, breathiness=breathiness,
                 key_shift=key_shift, speed=speed, backbone=backbone,
+                voicing=voicing, tension=tension,
             )
             loss = flow if auxiliary is None else flow + settings['aux_mel_weight'] * auxiliary
         return flow, auxiliary, loss
@@ -109,6 +108,7 @@ def train_step(model, optimizer, ema, batch, data, settings, device, speaker_dro
     if not finite:
         inputs = dict(mel=mel, content=content, f0=f0, energy=energy, breathiness=breathiness,
                       key_shift=key_shift, speed=speed, mask=mask)
+        inputs.update({name: value for name, value in (("voicing", voicing), ("tension", tension)) if value is not None})
         invalid = [not bool(torch.isfinite(value).all()) for value in inputs.values()]
         invalid.append(any(not bool(torch.isfinite(param).all()) for param in model.parameters()))
         invalid = torch.tensor(invalid, device=device, dtype=torch.float32)
@@ -152,7 +152,8 @@ def preview(model, ema, vocoder, reference, data, writer, step):
     if reference is None:
         return
     device = next(model.parameters()).device
-    mel, content, f0, energy, breathiness, audio, sid, path = reference
+    mel, content, f0, energy, breathiness, audio, sid, path = reference[:8]
+    variances = dict(zip(("voicing", "tension"), (value.to(device) for value in reference[8:])))
     content, f0, energy = content.to(device), f0.to(device), energy.to(device)
     mask = torch.ones(1, 1, f0.shape[1], device=device)
     speaker = torch.tensor([sid], device=device)
@@ -160,8 +161,8 @@ def preview(model, ema, vocoder, reference, data, writer, step):
     try:
         with ema.applied(model):
             model.eval()
-            generated = model.sample(content, f0, energy, speaker, mask, steps=16,
-                                     breathiness=breathiness.to(device))
+            generated = model.sample(content, f0, energy, speaker, mask,
+                                     breathiness=breathiness.to(device), **variances)
     finally:
         model.train(training)
     if not torch.isfinite(generated).all():
@@ -188,15 +189,14 @@ def evaluate(model, ema, loader, data, writer, step):
     with ema.applied(model):
         model.eval()
         for index, batch in enumerate(loader):
-            mel, content, f0, energy, breathiness, key_shift, speed, speaker, mask = (
-                item.to(device) for item in batch
-            )
+            mel, content, f0, energy, breathiness, key_shift, speed, speaker, mask, voicing, tension = unpack_flow(batch, device)
             mel = normalize_mel(mel, data) * mask
             generator = torch.Generator(device=device).manual_seed(index)
             noise = torch.randn(mel.shape, device=device, generator=generator)
             losses, auxiliary = model.validation_losses(
                 mel, content, f0, energy, speaker, mask, breathiness, key_shift, speed,
                 noise, fractions,
+                voicing=voicing, tension=tension,
             )
             totals += losses.float() * mel.shape[0]
             aux_total += (float(auxiliary) if auxiliary is not None else 0.0) * mel.shape[0]
@@ -226,9 +226,13 @@ def train_rank(args, ranks):
     torch.backends.cudnn.allow_tf32 = False
     experiment = ROOT / 'logs' / args.model_name
     config_path = experiment / 'rectified_config.json'
-    if not config_path.exists():
+    existing_config = config_path.exists()
+    if not existing_config:
         config_path = ROOT / 'rvc' / 'configs' / 'rectified' / '44100.json'
     config = json.loads(config_path.read_text(encoding='utf-8'))
+    if not existing_config and getattr(args, 'recipe', 'quality') == 'legacy':
+        for name in ('dual_timestep', 'voicing', 'tension', 'sampling_method', 'sampling_steps'):
+            config['flow']['model'].pop(name, None)
     settings, data = config['flow'], config['data']
     if data['sample_rate'] != 44100:
         raise ValueError('This recipe requires 44100 Hz audio and a matching NSF-HiFiGAN vocoder.')
@@ -305,6 +309,10 @@ def train_rank(args, ranks):
         state = torch.load(args.pretrained_flow, map_location='cpu', weights_only=True)
         if state.get('embedder_model', embedder) != embedder:
             raise ValueError('Pretrained flow uses a different content embedder.')
+        pretrained_model = state.get('config', {}).get('flow', {}).get('model', {})
+        for name in ('dual_timestep', 'voicing', 'tension'):
+            if bool(pretrained_model.get(name, False)) != bool(settings['model'].get(name, False)):
+                raise ValueError(f'Pretrained flow differs in {name}. Use a matching pretrained or train a new model from scratch.')
         weights = state['ema']['shadow'] if state.get('ema') else state['model']
         model.load_state_dict(resize_speakers(weights, speakers), strict=True)
         ema.reseed(model)
@@ -393,6 +401,8 @@ def main():
                         help='cpu, one GPU such as cuda:0, or multiple GPUs such as cuda:0,cuda:1')
     parser.add_argument('--precision', choices=['fp32', 'fp16', 'bf16'], default='fp32')
     parser.add_argument('--pretrained-flow')
+    parser.add_argument('--recipe', choices=['quality', 'legacy'], default='quality',
+                        help='Recipe for a new experiment. Saved experiment configs always take precedence.')
     parser.add_argument('--learning-rate', type=float)
     parser.add_argument('--seed', type=int, default=1234)
     parser.add_argument('--compile', action='store_true')

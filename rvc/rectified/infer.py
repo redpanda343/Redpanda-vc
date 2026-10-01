@@ -8,7 +8,7 @@ from torch.nn import functional as F
 from rvc.infer.pipeline import Pipeline, _INFERENCE_RNG_LOCK
 from rvc.lib.utils import extract_embedding_features
 from rvc.rectified.aperiodicity import aperiodicity
-from rvc.rectified.data import f0_to_mel_rate, smooth_curve, to_mel_rate, upsample_content
+from rvc.rectified.data import f0_to_mel_rate, smooth_curve, to_mel_rate, upsample_content, variance_curves
 from rvc.rectified.energy import frame_energy
 from rvc.rectified.resources import default_vocoder
 from rvc.rectified.vocoder import load_vocoder
@@ -85,10 +85,13 @@ class RectifiedPipeline(Pipeline):
         energy = to_mel_rate(energy.unsqueeze(-1), frames, rate, hop)[..., 0]
         breathiness = to_mel_rate(breathiness.unsqueeze(-1), frames, rate, hop)[..., 0]
         mask = torch.ones(1, 1, frames, device=self.device)
+        variances = {}
+        if net_g.encoder.voicing is not None or net_g.encoder.tension is not None:
+            variances = dict(zip(('voicing', 'tension'), variance_curves(waveform, source_f0, frames, rate, hop)))
         with _INFERENCE_RNG_LOCK:
             if inference_rng is not None:
                 inference_rng.seed_next_segment()
-            mel = net_g.sample(content, f0, energy, sid, mask, steps=16, breathiness=breathiness)
+            mel = net_g.sample(content, f0, energy, sid, mask, breathiness=breathiness, **variances)
             audio = self.vocoder_model(mel, f0)[0, 0, :length]
         if not torch.isfinite(audio).all():
             raise FloatingPointError('Non-finite Rectified Flow audio output.')

@@ -41,6 +41,11 @@
         "holdout_clips": 32,
         "num_workers": 4,
         "model": {
+            "dual_timestep": true,
+            "voicing": true,
+            "tension": true,
+            "sampling_method": "rk4",
+            "sampling_steps": 16,
             "content_channels": 768,
             "hidden_channels": 384,
             "encoder_layers": 4,

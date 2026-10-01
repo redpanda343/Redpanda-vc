@@ -1,7 +1,9 @@
 # Experimental rectified-flow training
 
-This ports ShiroRVC's 44.1 kHz rectified-flow training recipe. The flow predicts
-128-bin log mel spectrograms from content, F0, loudness, breathiness and speaker.
+This extends ShiroRVC's 44.1 kHz rectified-flow training recipe. New models use
+dual-timestep training, separate voicing and tension conditioning, and RK4 sampling.
+The flow predicts 128-bin log mel spectrograms from content, F0, loudness,
+breathiness, voicing, tension and speaker. Existing models keep their saved recipe.
 The default OpenVPI NSF-HiFiGAN vocoder renders audio previews and is
 recorded in the exported model. Mel-only previews can be selected instead. The vocoder is frozen; this trains the flow,
 not a new vocoder. RVC latent NSF-HiFiGAN generator checkpoints do not accept
@@ -19,8 +21,15 @@ The stop button ends the current rectified job; training resumes from the last
 saved epoch, so unsaved steps are lost. The original trainer remains under
 **Train > RVC**.
 
-The WebUI enables **Pretrained** by default. On the first start of a new
-ContentVec experiment, it downloads the [Shiro ContentVec flow pretrained](https://huggingface.co/shiromiya/ShiroRVC-Resources/blob/main/Rectified_pretrains/pretrain_flow_contentvec.pth)
+The WebUI defaults to the **Quality** recipe with **Pretrained** disabled so a
+new model can learn the additional conditioning inputs from scratch. To fine-tune
+a quality model, enable **Pretrained** and **Custom pretrained** and select a
+checkpoint trained with the same inputs and dual-timestep setting. The original
+Shiro pretrained is not compatible with the quality recipe.
+
+For an original Shiro model, select **Legacy Shiro** and enable **Pretrained**.
+On the first start of a new ContentVec legacy experiment, it downloads the
+[Shiro ContentVec flow pretrained](https://huggingface.co/shiromiya/ShiroRVC-Resources/blob/main/Rectified_pretrains/pretrain_flow_contentvec.pth)
 to `rvc/models/pretraineds/rectified/pretrain_flow_contentvec.pth`. The download
 is pinned to a verified revision, checked with SHA-256, and reused for later runs.
 Enable **Custom pretrained** to upload a compatible `.pth` checkpoint or enter
@@ -56,8 +65,8 @@ of `contentvec` only when training from scratch or using a matching flow pretrai
 
 The default configuration is `rvc/configs/rectified/44100.json`. To customize a
 run, copy it to `logs/my-flow/rectified_config.json` before training. The trainer
-creates that copy automatically on its first run. It retains Shiro's full model
-dimensions, pitch/time augmentation, shallow-flow objective, auxiliary decoder,
+creates that copy automatically on its first run. It retains Shiro's full backbone
+dimensions, pitch/time augmentation, auxiliary decoder,
 Muon/AdamW parameter split and speaker dropout. The WebUI reads the saved **Settings > Precision** selection at each start or
 resume. Click **Update precision** to save your choice. FP16 uses CUDA autocast
 and gradient scaling; BF16 uses CUDA autocast on supported GPUs. CPU runs and
@@ -121,11 +130,12 @@ retain Shiro's rectified-flow format. Select a flow export in the ordinary
 vocoder instead of the RVC synthesizer. Single and Batch conversion support
 flow models. The flow's speaker count populates the speaker selector.
 
-Inference runs the flow and vocoder in FP32 with 16 sampling steps. It reuses
+Inference runs the flow and vocoder in FP32. New quality models use 16 RK4 steps
+(64 backbone evaluations). Legacy checkpoints retain 16 Euler steps. It reuses
 the tab's F0 extractor, pitch shift, ContentVec or spin-v2 selection, optional
 index retrieval and protection, audio splitting, and output processing. The
 flow generates at its configured sample rate (44.1 kHz for this recipe).
-Content, F0, energy and breathiness use the training recipe's frame alignment.
+Content, F0, energy, breathiness, voicing and tension use the training recipe's frame alignment.
 
 Inference automatically uses the vocoder path recorded in the exported model.
 The vocoder weights are stored separately from the flow checkpoint. If its
@@ -144,7 +154,8 @@ Newton-Schulz iteration dtype from the effective training precision, while
 Shiro chooses FP16/BF16 automatically by GPU capability. Changing precision
 on resume also changes Muon's iteration dtype without changing checkpoint
 parameter or optimizer-state formats.
-Model dimensions, the flow-matching objective, and the 400-frame crop are unchanged.
+The backbone dimensions and 400-frame crop are unchanged. The quality recipe
+adds two conditioning projections and dual-timestep training.
 
 The vocoder path is optional. Without it, TensorBoard records mel previews and
 exports have an empty vocoder reference. With it, previews include the original
@@ -162,3 +173,47 @@ separate conversion interface are not part of this flow training update.
 
 `python -m rvc.rectified.openvpi input.ckpt output.pth` converts an OpenVPI
 checkpoint into a compatible rectified vocoder export.
+
+## Quality recipe
+
+The default `rvc/configs/rectified/44100.json` enables `dual_timestep`, `voicing`
+and `tension` under `flow.model`, with `sampling_method: "rk4"` and
+`sampling_steps: 16`. Those settings travel with the exported checkpoint and
+control both previews and ordinary Single/Batch inference. The Python sampler
+also accepts explicit `method="euler"`, `"heun"` or `"rk4"` and `steps` overrides.
+RK4 evaluates the backbone four times per step and is slower than Euler at the
+same step count. An audible improvement is not guaranteed.
+
+Dual-timestep training assigns a second independently sampled flow time to 25%
+of frames on average. Both the noisy mel mixture and the backbone time embedding
+use each frame's selected time, including adaptive normalization. Padding remains
+excluded from losses. RedPanda's existing logit-normal time distribution is
+retained; the uniform-time distribution from DiffSinger is not copied.
+Validation and inference use a common time across frames.
+
+Voicing and tension follow DiffSinger's WORLD harmonic-analysis definitions.
+Voicing is harmonic RMS loudness in dB, divided by 96. Tension is the logit of
+the non-fundamental harmonic RMS fraction, scaled by 0.1. Extraction uses
+`pyworld==0.3.5`, fixed local dither for repeatability, finite silence handling,
+and the existing 100 Hz alignment and 60 ms smoothing. Existing breathiness
+conditioning is unchanged. WORLD analysis uses its required double-precision CPU
+arrays internally; the extracted inputs and FP32 model remain float32.
+Training, validation, previews and conversion call the same extractor. Pitch
+augmentation and conversion pitch shifts retain the source voicing/tension
+curves, and time stretching aligns them to the adjusted mel hop.
+
+These features add CPU extraction work per clip and two small learned projections.
+Install the updated requirements before training or converting a quality model.
+Models with the new inputs require a newly trained compatible pretrained model.
+Legacy models do not invoke WORLD extraction. Missing new conditioning inputs
+raise an error instead of silently replacing them with invented curves.
+
+Use a new experiment name for the quality recipe. The CLI defaults to this recipe;
+`--recipe legacy` creates a new experiment with the original architecture and
+Euler sampler. Existing `rectified_config.json` files always take precedence,
+and resume still verifies the saved configuration. The trainer rejects pretrained
+checkpoints with mismatched voicing, tension or dual-timestep settings.
+
+These are experimental quality features. Functional checks and short synthetic
+training runs do not establish better voice similarity or audio quality. Compare
+properly trained models on held-out real audio before choosing a new pretrained.

@@ -11,7 +11,7 @@ from rvc.rectified.content_bottleneck import ContentBottleneck
 
 LOG_F0_CENTER = math.log(200.0)
 LOG_F0_SCALE = 0.7
-SAMPLERS = ("euler", "heun")
+SAMPLERS = ("euler", "heun", "rk4")
 
 
 SCHEDULES = ("uniform", "sway", "logit-normal")
@@ -101,6 +101,8 @@ class ConditionEncoder(nn.Module):
         key_shift: bool = False,
         content_bottleneck_noise: float = 0.0,
         speed: bool = False,
+        voicing: bool = False,
+        tension: bool = False,
     ):
         super().__init__()
         self.speaker_count = int(speaker_count)
@@ -122,11 +124,14 @@ class ConditionEncoder(nn.Module):
         self.speaker = nn.Embedding(self.speaker_count + 1, speaker_channels)
         self.speaker_proj = nn.Linear(speaker_channels, hidden_channels)
         self.blocks = nn.ModuleList([ConvNeXtBlock(hidden_channels) for _ in range(layers)])
+        self.voicing = nn.Conv1d(1, hidden_channels, 3, padding=1) if voicing else None
+        self.tension = nn.Conv1d(1, hidden_channels, 3, padding=1) if tension else None
 
     def voice(self, speaker: torch.Tensor) -> torch.Tensor:
         return self.speaker_proj(self.speaker(speaker))
 
-    def forward(self, content, f0, energy, speaker, mask, breathiness=None, key_shift=None, speed=None):
+    def forward(self, content, f0, energy, speaker, mask, breathiness=None, key_shift=None, speed=None,
+                voicing=None, tension=None):
         if self.bottleneck is not None:
             content = self.bottleneck(content)
         x = self.content(content).transpose(1, 2)
@@ -134,6 +139,12 @@ class ConditionEncoder(nn.Module):
         if self.harmonic_prior is not None:
             x = x + self.harmonics(self.harmonic_prior(f0))
         x = x + self.energy(energy.unsqueeze(1))
+        for name, value in (("voicing", voicing), ("tension", tension)):
+            projection = getattr(self, name)
+            if projection is not None:
+                if value is None:
+                    raise ValueError(f"This flow checkpoint requires {name} conditioning.")
+                x = x + projection(value.unsqueeze(1))
         if self.breathiness is not None:
             if breathiness is None:
                 breathiness = torch.ones_like(energy)
@@ -233,7 +244,8 @@ class LYNXNet2Backbone(nn.Module):
         nn.init.zeros_(self.output.bias)
 
     def forward(self, x, t, cond, mask, voice=None):
-        time = self.time_mlp(timestep_embedding(t, self.channels))[:, None, :]
+        time = self.time_mlp(timestep_embedding(t.reshape(-1), self.channels))
+        time = time.reshape(t.shape[0], -1, self.channels)
         frame_mask = mask.transpose(1, 2)
         with torch.autocast(x.device.type, enabled=False):
             h = self.input(x.transpose(1, 2).to(self.input.weight.dtype))
@@ -285,6 +297,11 @@ class RectifiedFlow(nn.Module):
         aux_decoder: Optional[dict] = None,
         t_start: float = 0.0,
         aux_grad: float = 0.1,
+        dual_timestep: bool = False,
+        voicing: bool = False,
+        tension: bool = False,
+        sampling_method: str = "euler",
+        sampling_steps: int = 16,
     ):
         super().__init__()
         if backbone != "lynxnet2":
@@ -304,6 +321,8 @@ class RectifiedFlow(nn.Module):
             key_shift,
             content_bottleneck_noise,
             speed,
+            voicing,
+            tension,
         )
         self.backbone = LYNXNet2Backbone(n_mels, hidden_channels, **(backbone_args or {}))
 
@@ -316,6 +335,11 @@ class RectifiedFlow(nn.Module):
         self.aux = AuxDecoder(hidden_channels, n_mels, **aux_decoder) if aux_decoder else None
         self.t_start = float(t_start) if self.aux is not None else 0.0
         self.aux_grad = float(aux_grad)
+        self.dual_timestep = bool(dual_timestep)
+        if sampling_method not in SAMPLERS or int(sampling_steps) != sampling_steps or sampling_steps < 1:
+            raise ValueError("Invalid flow sampling method or step count.")
+        self.sampling_method = sampling_method
+        self.sampling_steps = int(sampling_steps)
 
     @property
     def speaker_count(self) -> int:
@@ -328,7 +352,8 @@ class RectifiedFlow(nn.Module):
         return torch.where(dropped, torch.full_like(speaker, self.speaker_count), speaker)
 
     def _losses(self, mel, cond, voice, mask, t, noise, backbone):
-        x_t = (1.0 - t[:, None, None]) * noise + t[:, None, None] * mel
+        mixing = t[:, None, None] if t.ndim == 1 else t[:, None, :]
+        x_t = (1.0 - mixing) * noise + mixing * mel
         prediction = backbone(x_t, t, cond, mask, voice)
         error = (prediction.float() - (mel - noise).float()).square() * mask
         count = (mask.sum((1, 2)) * self.n_mels).clamp_min(1.0)
@@ -347,11 +372,15 @@ class RectifiedFlow(nn.Module):
         return self.t_start + (1.0 - self.t_start) * t
 
     def forward(self, mel, content, f0, energy, speaker, mask, speaker_dropout=0.0,
-                breathiness=None, key_shift=None, speed=None, backbone=None):
+                breathiness=None, key_shift=None, speed=None, backbone=None, voicing=None, tension=None):
         speaker = self._drop_speakers(speaker, speaker_dropout)
-        cond = self.encoder(content, f0, energy, speaker, mask, breathiness, key_shift, speed)
+        cond = self.encoder(content, f0, energy, speaker, mask, breathiness, key_shift, speed, voicing, tension)
         voice = self.encoder.voice(speaker)
         t = self._times(mel.shape[0], mel.device)
+        if self.dual_timestep:
+            t2 = self._times(mel.shape[0], mel.device)
+            alternate = torch.rand(mel.shape[0], mel.shape[-1], device=mel.device) < 0.25
+            t = torch.where(alternate & mask[:, 0].bool(), t2[:, None], t[:, None])
 
         backbone = self.backbone if backbone is None else backbone
         flow, aux = self._losses(mel, cond, voice, mask, t, torch.randn_like(mel), backbone)
@@ -359,8 +388,8 @@ class RectifiedFlow(nn.Module):
 
     @torch.no_grad()
     def validation_losses(self, mel, content, f0, energy, speaker, mask, breathiness, key_shift,
-                          speed, noise, fractions):
-        cond = self.encoder(content, f0, energy, speaker, mask, breathiness, key_shift, speed)
+                          speed, noise, fractions, voicing=None, tension=None):
+        cond = self.encoder(content, f0, energy, speaker, mask, breathiness, key_shift, speed, voicing, tension)
         voice = self.encoder.voice(speaker)
         losses, aux = [], None
         for fraction in fractions:
@@ -377,8 +406,8 @@ class RectifiedFlow(nn.Module):
         energy,
         speaker,
         mask,
-        steps: int = 16,
-        method: str = "euler",
+        steps: Optional[int] = None,
+        method: Optional[str] = None,
         cfg_scale: float = 1.0,
         noise: Optional[torch.Tensor] = None,
         callback: Optional[Callable[[], None]] = None,
@@ -393,7 +422,11 @@ class RectifiedFlow(nn.Module):
         schedule: str = "uniform",
         churn: float = 0.0,
         churn_noise: Optional[Callable[[int], torch.Tensor]] = None,
+        voicing: Optional[torch.Tensor] = None,
+        tension: Optional[torch.Tensor] = None,
     ):
+        method = self.sampling_method if method is None else method
+        steps = self.sampling_steps if steps is None else steps
         if method not in SAMPLERS:
             raise ValueError(f"method must be one of {SAMPLERS}, not {method!r}.")
         if rescale_mode not in RESCALE_MODES:
@@ -417,6 +450,7 @@ class RectifiedFlow(nn.Module):
         cond = self.encoder(
             torch.cat([c for c, _ in variants]), repeat(f0), repeat(energy),
             torch.cat([s for _, s in variants]), repeat(mask), repeat(breathiness), repeat(key_shift),
+            voicing=repeat(voicing), tension=repeat(tension),
         )
         voice = self.encoder.voice(torch.cat([s for _, s in variants]))
         masks = repeat(mask)
@@ -471,6 +505,12 @@ class RectifiedFlow(nn.Module):
             if method == "heun":
                 v_next = field(x + dt * v, times[index + 1].expand(batch))
                 v = 0.5 * (v + v_next)
+            elif method == "rk4":
+                middle = t + 0.5 * dt
+                k2 = field(x + 0.5 * dt * v, middle)
+                k3 = field(x + 0.5 * dt * k2, middle)
+                k4 = field(x + dt * k3, times[index + 1].expand(batch))
+                v = (v + 2.0 * k2 + 2.0 * k3 + k4) / 6.0
             x = x + dt * v
             if callback is not None:
                 callback()

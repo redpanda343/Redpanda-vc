@@ -22,6 +22,7 @@ FLOW_PRETRAIN_URL = ('https://huggingface.co/shiromiya/ShiroRVC-Resources/resolv
                      'f84d2dfb2f6cc0a3205e437c7676455971dc6bf5/Rectified_pretrains/pretrain_flow_contentvec.pth')
 FLOW_PRETRAIN_SHA256 = '79fdb4e13ff3d68d755f23879985e86f0052cda10360c7d6bd8003aa08074568'
 VOCODER_CHOICES = ['Default NSF-HiFiGAN', 'Custom NSF-HiFiGAN', 'Mel previews only']
+RECIPE_CHOICES = ['Quality: RK4 + dual timestep + voicing/tension', 'Legacy Shiro']
 _process = None
 _log_handle = None
 _log_path = None
@@ -178,7 +179,8 @@ def resolve_pretrained(directory, enabled, custom, path):
 
 
 def start(name, vocoder, pretrained, batch, epochs, save_every, device, compile_backbone=False,
-          use_pretrained=True, custom_pretrained=False, vocoder_mode='Default NSF-HiFiGAN'):
+          use_pretrained=False, custom_pretrained=False, vocoder_mode='Default NSF-HiFiGAN',
+          recipe=RECIPE_CHOICES[0]):
     directory = experiment_path(name)
     device_id(device)
     if not (directory / 'filelist.txt').is_file():
@@ -186,12 +188,21 @@ def start(name, vocoder, pretrained, batch, epochs, save_every, device, compile_
     precision = get_precision() or 'fp32'
     if precision not in {'fp32', 'fp16', 'bf16'}:
         raise gr.Error(f'Unsupported training precision: {precision}')
+    if recipe not in RECIPE_CHOICES:
+        raise gr.Error('Choose a supported rectified-flow recipe.')
+    config_path = directory / 'rectified_config.json'
+    config = json.loads(config_path.read_text(encoding='utf-8')) if config_path.is_file() else None
+    model_config = config['flow']['model'] if config else {'voicing': recipe == RECIPE_CHOICES[0]}
+    enhanced = any(model_config.get(key, False) for key in ('dual_timestep', 'voicing', 'tension'))
+    if use_pretrained and not custom_pretrained and enhanced and not (directory / 'flow' / 'checkpoint.pth').is_file():
+        raise gr.Error('The quality recipe needs a matching custom pretrained. Disable Pretrained to train from scratch, or choose Legacy Shiro for the default Shiro pretrained.')
     vocoder = resolve_vocoder(vocoder_mode, vocoder)
     arguments = ['--model-name', str(name).strip(), '--vocoder', vocoder,
                  '--batch-size', positive_integer(batch, 'Batch size'),
                  '--epochs', positive_integer(epochs, 'Total epochs'),
                  '--save-every', positive_integer(save_every, 'Save interval'),
-                 '--device', str(device).strip().lower(), '--precision', precision]
+                 '--device', str(device).strip().lower(), '--precision', precision,
+                 '--recipe', 'quality' if recipe == RECIPE_CHOICES[0] else 'legacy']
     if compile_backbone:
         arguments.append('--compile')
     pretrained = resolve_pretrained(directory, use_pretrained, custom_pretrained, pretrained)
@@ -243,14 +254,16 @@ def rectified_train_tab():
             embedder = gr.Dropdown(label='Content embedder', choices=['contentvec', 'spin-v2'], value='contentvec')
         extract_button = gr.Button('Extract content and F0')
     with gr.Accordion('3. Train rectified flow', open=True):
+        recipe = gr.Dropdown(label='New model recipe', choices=RECIPE_CHOICES, value=RECIPE_CHOICES[0],
+                             info='New models use RK4 sampling, dual-timestep training and separate voicing/tension inputs. Existing experiments keep their saved configuration.')
         vocoder_mode = gr.Dropdown(label='Audio preview vocoder', choices=VOCODER_CHOICES, value='Default NSF-HiFiGAN',
                                    info='The default NSF-HiFiGAN downloads automatically on start. Choose mel previews only to skip audio rendering.')
         vocoder = gr.Textbox(label='Custom OpenVPI NSF-HiFiGAN checkpoint path', visible=False,
                             info='Use a compatible .ckpt or converted .pth export: 44.1 kHz, 128 mel bins, hop 512. Keep config.json beside raw checkpoints when provided.')
-        use_pretrained = gr.Checkbox(label='Pretrained', value=True,
-                                     info='Automatically download and use the Shiro ContentVec pretrained. Disable to train a new experiment from scratch.')
-        custom_pretrained = gr.Checkbox(label='Custom pretrained', value=False,
-                                       info='Use your own compatible rectified-flow checkpoint instead of the default Shiro pretrained.')
+        use_pretrained = gr.Checkbox(label='Pretrained', value=False,
+                                     info='Enable to use a compatible pretrained. The quality recipe requires a custom pretrained trained with the same inputs. Leave disabled to train from scratch.')
+        custom_pretrained = gr.Checkbox(label='Custom pretrained', value=False, visible=False,
+                                       info='Use a compatible rectified-flow checkpoint. The default Shiro pretrained is only compatible with the legacy recipe.')
         with gr.Column(visible=False) as custom_pretrained_settings:
             pretrained_upload = gr.File(label='Upload custom flow pretrained', file_types=['.pth'], type='filepath')
             pretrained = gr.Textbox(label='Custom pretrained flow path',
@@ -279,6 +292,6 @@ def rectified_train_tab():
     vocoder_mode.change(lambda mode: gr.update(visible=mode == 'Custom NSF-HiFiGAN'),
                         [vocoder_mode], [vocoder], queue=False)
     train_button.click(start, [name, vocoder, pretrained, batch, epochs, save_every, device, compile_backbone,
-                               use_pretrained, custom_pretrained, vocoder_mode], outputs, queue=False)
+                               use_pretrained, custom_pretrained, vocoder_mode, recipe], outputs, queue=False)
     stop_button.click(stop, [], outputs, queue=False)
     gr.Timer(2).tick(status, [], outputs, queue=False)
