@@ -2,6 +2,7 @@ import os
 import torch
 
 from rvc.lib.predictors.RMVPE import RMVPE0Predictor
+from rvc.lib.predictors.swift_dependencies import ensure_swift_f0
 from torchfcpe import spawn_bundled_infer_model
 import numpy as np
 
@@ -56,17 +57,12 @@ class Swift:
     def __init__(
         self, device, sample_rate=16000, hop_size=160, *, threads=None, spin=True
     ):
-        from swift_f0 import SwiftF0
-        import onnxruntime as ort
-
         self.device = torch.device(device)
         self.sample_rate = sample_rate
         self.hop_size = hop_size
         if self.device.type != "cuda" or not torch.cuda.is_available():
             raise RuntimeError("SwiftF0 inference requires a CUDA device.")
-        if "CUDAExecutionProvider" not in ort.get_available_providers():
-            raise RuntimeError("SwiftF0 requires onnxruntime-gpu with CUDAExecutionProvider.")
-
+        SwiftF0 = ensure_swift_f0().SwiftF0
         self.model = SwiftF0(threads=threads, spin=spin)
         self.model.session.set_providers(
             [

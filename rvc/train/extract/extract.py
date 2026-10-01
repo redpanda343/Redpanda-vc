@@ -18,6 +18,7 @@ sys.path.append(os.path.join(now_dir))
 import rvc.lib.zluda
 from rvc.configs.config import Config
 from rvc.lib.predictors.f0 import RMVPE, Swift
+from rvc.lib.predictors.swift_dependencies import ensure_swift_f0
 from rvc.lib.utils import (
     extract_embedding_features,
     get_embedding_metadata,
@@ -141,6 +142,8 @@ def run_pitch_extraction(files, devices, f0_method, threads, force=False):
         or any(torch.device(device).type != "cuda" for device in devices)
     ):
         raise RuntimeError("SwiftF0 training extraction requires a CUDA GPU. Select a GPU or use RMVPE.")
+    if f0_method == "swift":
+        ensure_swift_f0()
     threads = max(1, int(threads))
     if f0_method == "pm":
         worker_count = min(threads, len(files))
