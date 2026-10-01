@@ -1,14 +1,16 @@
 import argparse
-import importlib.util
+import importlib
 import json
 import os
 import random
+import sys
 from contextlib import nullcontext
 from functools import partial
 from pathlib import Path
 
 import numpy as np
 import torch
+from torch._functorch import config as aot_config
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
@@ -65,10 +67,19 @@ def conditioning_norms(model) -> dict:
 def compiled_backbone(model, enabled: bool, mode: str, device):
     if not enabled:
         return None
-    if device.type != "cuda" or importlib.util.find_spec("triton") is None:
-        print("torch.compile needs CUDA and Triton; training uncompiled.", flush=True)
+    if sys.platform != "linux" or device.type != "cuda" or not torch.cuda.is_available():
+        print("Flow backbone compilation requires Linux and CUDA; training uncompiled.", flush=True)
         return None
-    return torch.compile(model.backbone, mode=mode)
+    if not torch.version.hip and torch.cuda.get_device_capability(device) < (8, 0):
+        print("Triton 3.6 requires NVIDIA compute capability 8.0 or newer; training uncompiled.", flush=True)
+        return None
+    try:
+        importlib.import_module("triton")
+    except (ImportError, OSError) as error:
+        print(f"Triton is unavailable ({error}); training uncompiled.", flush=True)
+        return None
+    print(f"Flow backbone compilation requested (Inductor, {mode}). The first training step compiles forward and backward graphs.", flush=True)
+    return torch.compile(model.backbone, backend="inductor", mode=mode)
 
 
 def train_step(model, optimizer, ema, batch, data, settings, device, speaker_dropout, amp_dtype=None, scaler=None, backbone=None, ranks=None):
@@ -79,7 +90,8 @@ def train_step(model, optimizer, ema, batch, data, settings, device, speaker_dro
     cuda_rng_state = torch.cuda.get_rng_state(device) if rng_state is not None and device.type == 'cuda' else None
 
     def forward_loss(dtype):
-        with torch.autocast(device.type, dtype=dtype or torch.float32, enabled=dtype is not None):
+        backward_context = aot_config.patch(backward_pass_autocast="off") if backbone is not None else nullcontext()
+        with backward_context, torch.autocast(device.type, dtype=dtype or torch.float32, enabled=dtype is not None):
             flow, auxiliary = model(
                 mel, content, f0, energy, speaker, mask,
                 speaker_dropout=speaker_dropout, breathiness=breathiness,

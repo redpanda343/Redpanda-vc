@@ -165,9 +165,27 @@ Fine-tuning previews default to every 500 steps. Validation records loss at each
 of five flow times and auxiliary mel loss; conditioning weight norms are logged
 for diagnosis.
 
-`--compile` (or the WebUI checkbox) compiles only the training backbone when CUDA
-and Triton are available. Preview and evaluation paths remain eager. Compilation
-runtime errors are surfaced. Existing checkpoint names and resume rules are retained.
+`--compile` (or the WebUI checkbox) compiles only the training backbone with
+PyTorch Inductor. `requirements.txt` pins Triton 3.6.0 for PyTorch 2.11.0 on Linux;
+Triton provides Python 3.12 wheels for Linux x86_64 and aarch64. Official Triton
+supports Linux and NVIDIA compute capability 8.0 or newer. Unsupported platforms,
+non-CUDA devices, older NVIDIA GPUs and unavailable Triton imports train uncompiled
+and report the reason in the job log. Compilation starts on the first training
+step, including the backward graph, so startup takes longer. The WebUI uses the
+`default` compile mode; the CLI also accepts `reduce-overhead` and `max-autotune`,
+which can use more GPU memory through CUDA graphs. Preview and evaluation paths
+remain eager. Compilation runtime errors are surfaced. Existing checkpoint names
+and resume rules are retained.
+
+Compiled forwards use a scoped `backward_pass_autocast="off"` setting to match
+the trainer's backward pass outside autocast. This also covers FP32 overflow
+retries without changing the eager training path or the global compiler setting.
+See [PyTorch compiled autograd semantics](https://docs.pytorch.org/docs/2.11/user_guide/torch_compiler/torch.compiler_backward.html).
+
+Compatibility references: [PyTorch 2.11.0 Triton pin](https://github.com/pytorch/pytorch/blob/v2.11.0/.ci/docker/triton_version.txt),
+[Triton installation](https://triton-lang.org/main/getting-started/installation.html),
+[Triton 3.6.0 hardware support](https://github.com/triton-lang/triton/blob/v3.6.0/README.md#compatibility),
+and [PyTorch 2.11 torch.compile](https://docs.pytorch.org/docs/2.11/generated/torch.compile.html).
 Shiro's separate vocoder trainer, NSF-BigVGAN vocoder, and
 separate conversion interface are not part of this flow training update.
 

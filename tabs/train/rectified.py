@@ -273,7 +273,7 @@ def rectified_train_tab():
             epochs = gr.Number(label='Total epochs', value=100, minimum=1, precision=0)
             save_every = gr.Number(label='Save every N epochs', value=10, minimum=1, precision=0)
         compile_backbone = gr.Checkbox(label='Compile flow backbone', value=False,
-                                       info='Requires CUDA and Triton. Training falls back to eager mode when unavailable.')
+                                       info='Requires Linux, CUDA and Triton 3.6.0. NVIDIA GPUs need compute capability 8.0 or newer. The first step takes longer to compile. Unsupported setups train uncompiled.')
         gr.Markdown('Precision follows **Settings > Precision** when you start or resume. Click Update precision there to save it. '
                     'Existing runs resume from the last saved epoch. Stopping discards unsaved steps. Checkpoints and TensorBoard previews are saved in logs/<model name>/flow.')
         with gr.Row():
