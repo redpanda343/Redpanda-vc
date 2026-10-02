@@ -103,8 +103,14 @@ class ConditionEncoder(nn.Module):
         speed: bool = False,
         voicing: bool = False,
         tension: bool = False,
+        conditioning_version: int = 1,
     ):
         super().__init__()
+        if conditioning_version not in (1, 2):
+            raise ValueError('Unsupported conditioning version.')
+        if conditioning_version == 2 and (content_bottleneck or speaker_channels != hidden_channels):
+            raise ValueError('Conditioning v2 requires full content features and hidden-width speaker embeddings.')
+        self.conditioning_version = conditioning_version
         self.speaker_count = int(speaker_count)
         self.bottleneck = (
             ContentBottleneck(content_channels, content_bottleneck, content_bottleneck_noise)
@@ -126,15 +132,34 @@ class ConditionEncoder(nn.Module):
         self.blocks = nn.ModuleList([ConvNeXtBlock(hidden_channels) for _ in range(layers)])
         self.voicing = nn.Conv1d(1, hidden_channels, 3, padding=1) if voicing else None
         self.tension = nn.Conv1d(1, hidden_channels, 3, padding=1) if tension else None
+        if conditioning_version == 2:
+            self.content_norm = nn.LayerNorm(content_channels)
+            self.speaker_proj = nn.Identity()
+            nn.init.normal_(self.speaker.weight, std=hidden_channels ** -0.5)
+            nn.init.xavier_uniform_(self.content.weight)
+            nn.init.zeros_(self.content.bias)
 
     def voice(self, speaker: torch.Tensor) -> torch.Tensor:
         return self.speaker_proj(self.speaker(speaker))
 
+    def encode_content(self, content, mask):
+        x = self.content(self.content_norm(content)).transpose(1, 2) * mask
+        for block in self.blocks:
+            x = block(x, mask)
+        return x
+
     def forward(self, content, f0, energy, speaker, mask, breathiness=None, key_shift=None, speed=None,
                 voicing=None, tension=None):
+        if self.conditioning_version == 2:
+            frame_mask = mask[:, 0]
+            f0, energy = f0 * frame_mask, energy * frame_mask
+            breathiness = None if breathiness is None else breathiness * frame_mask
+            voicing = None if voicing is None else voicing * frame_mask
+            tension = None if tension is None else tension * frame_mask
         if self.bottleneck is not None:
             content = self.bottleneck(content)
-        x = self.content(content).transpose(1, 2)
+        x = (self.encode_content(content, mask) if self.conditioning_version == 2
+             else self.content(content).transpose(1, 2))
         x = x + self.pitch(pitch_features(f0, self.pitch_fourier))
         if self.harmonic_prior is not None:
             x = x + self.harmonics(self.harmonic_prior(f0))
@@ -159,8 +184,9 @@ class ConditionEncoder(nn.Module):
             x = x + self.speed(speed.float().view(-1, 1)).unsqueeze(-1)
         x = x + self.voice(speaker).unsqueeze(-1)
         x = x * mask
-        for block in self.blocks:
-            x = block(x, mask)
+        if self.conditioning_version == 1:
+            for block in self.blocks:
+                x = block(x, mask)
         return x
 
 
@@ -320,6 +346,7 @@ class RectifiedFlow(nn.Module):
         sampling_method: str = "euler",
         sampling_steps: int = 16,
         mean_flow: bool = False,
+        conditioning_version: int = 1,
     ):
         super().__init__()
         if backbone != "lynxnet2":
@@ -341,6 +368,7 @@ class RectifiedFlow(nn.Module):
             speed,
             voicing,
             tension,
+            conditioning_version,
         )
         self.backbone = LYNXNet2Backbone(n_mels, hidden_channels, span=bool(mean_flow), **(backbone_args or {}))
 
@@ -401,7 +429,7 @@ class RectifiedFlow(nn.Module):
 
     def mean_reconstruction_loss(self, mel, content, f0, energy, speaker, mask,
                                  breathiness=None, key_shift=None, speed=None,
-                                 voicing=None, tension=None, noise=None):
+                                 voicing=None, tension=None, noise=None, reduction='mean'):
         if self.backbone.span_mlp is None:
             raise ValueError("Mean reconstruction requires a MeanFlow model.")
         cond = self.encoder(content, f0, energy, speaker, mask, breathiness,
@@ -418,6 +446,10 @@ class RectifiedFlow(nn.Module):
         velocity = self.backbone(x, t, cond, mask, voice, span)
         generated = x + span[:, None, None] * velocity
         error = (generated.float() - mel.float()).abs() * mask
+        if reduction == 'none':
+            return error.sum((1, 2)) / (mask.sum((1, 2)) * self.n_mels).clamp_min(1.0)
+        if reduction != 'mean':
+            raise ValueError('Unknown reconstruction reduction.')
         return error.sum() / (mask.sum() * self.n_mels).clamp_min(1.0)
 
     def mean_velocity(self, x, t, span, velocity, cond, mask, voice):
@@ -641,9 +673,15 @@ class RectifiedFlow(nn.Module):
         return x * mask
 
 
-def resize_speakers(state_dict: dict, speaker_count: int) -> dict:
+def resize_speakers(state_dict: dict, speaker_count: int, speaker_init=None) -> dict:
     key = "encoder.speaker.weight"
     table = state_dict[key]
+    if speaker_init is not None:
+        if speaker_init.shape != (speaker_count + 1, table.shape[1]):
+            raise ValueError('Invalid target speaker initialization.')
+        state_dict = dict(state_dict)
+        state_dict[key] = torch.cat((speaker_init[:-1].detach().to(table).clone(), table[-1:]), dim=0)
+        return state_dict
     if table.shape[0] == speaker_count + 1:
         return state_dict
     trained, null = table[:-1], table[-1:]

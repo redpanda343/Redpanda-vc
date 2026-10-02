@@ -7,7 +7,7 @@ import numpy as np
 import soundfile as sf
 import torch
 from torch.nn import functional as F
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 
 from rvc.rectified.energy import frame_energy
 from rvc.rectified.aperiodicity import aperiodicity
@@ -36,11 +36,81 @@ def smooth_curve(curve: torch.Tensor) -> torch.Tensor:
     padded = F.pad(curve.unsqueeze(1), ((width - 1) // 2, width // 2), mode="replicate")
     return F.conv1d(padded, kernel.to(curve.dtype)).squeeze(1)
 
-def split_holdout(entries, count: int, seed: int = 1234):
+def split_holdout(entries, count: int, seed: int = 1234, stratified: bool = False):
     candidates = [i for i, entry in enumerate(entries) if "mute" not in os.path.basename(entry[0])]
+    if stratified:
+        rng = random.Random(seed)
+        groups = {}
+        for index in candidates:
+            groups.setdefault(int(entries[index][4]), []).append(index)
+        pools = []
+        for sid in sorted(groups):
+            group = sorted(groups[sid], key=lambda i: entries[i][0])
+            rng.shuffle(group)
+            if len(group) > 1:
+                pools.append(group[1:])
+        target = min(sum(map(len, pools)), max(count, len(pools))) if count > 0 else 0
+        held = set()
+        while len(held) < target:
+            rng.shuffle(pools)
+            for pool in pools:
+                if pool and len(held) < target:
+                    held.add(pool.pop())
+        return ([entry for i, entry in enumerate(entries) if i not in held],
+                [entries[i] for i in sorted(held)])
     held = set(random.Random(seed).sample(candidates, min(count, len(candidates) // 10)))
     train = [entry for i, entry in enumerate(entries) if i not in held]
     return train, [entries[i] for i in sorted(held)]
+
+
+class SpeakerBalancedSampler(Sampler):
+    def __init__(self, entries, seed=1234, rank=0, world=1):
+        if not 0 <= rank < world:
+            raise ValueError('Invalid sampler rank.')
+        self.groups = {}
+        for index, entry in enumerate(entries):
+            self.groups.setdefault(int(entry[4]), []).append(index)
+        if not self.groups:
+            raise ValueError('Speaker sampling requires training clips.')
+        self.seed, self.rank, self.world = seed, rank, world
+        self.epoch = 0
+        self.samples = len(entries) // world
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+    def __len__(self):
+        return self.samples
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self.epoch)
+        speakers = sorted(self.groups)
+        pools = {sid: [] for sid in speakers}
+        indices = []
+        while len(indices) < self.samples * self.world:
+            rng.shuffle(speakers)
+            for sid in speakers:
+                if len(indices) == self.samples * self.world:
+                    break
+                if not pools[sid]:
+                    pools[sid] = list(self.groups[sid])
+                    rng.shuffle(pools[sid])
+                indices.append(pools[sid].pop())
+        return iter(indices[self.rank::self.world])
+
+
+def speaker_inventory(entries):
+    assignments = {}
+    counts = {}
+    for entry in entries:
+        audio, sid = os.path.normcase(os.path.abspath(entry[0])), int(entry[4])
+        if audio in assignments:
+            raise ValueError(f'Duplicate audio or conflicting speaker labels: {entry[0]}')
+        assignments[audio] = sid
+        counts[sid] = counts.get(sid, 0) + 1
+    if sorted(counts) != list(range(len(counts))):
+        raise ValueError('Multispeaker training requires contiguous speaker IDs starting at 0.')
+    return counts
 
 def mel_frames(feature_frames: int, sample_rate: int, hop: int) -> int:
     return int(feature_frames * sample_rate / (hop * FEATURE_RATE))
@@ -90,6 +160,7 @@ class RectifiedDataset(Dataset):
         self.sample_rate = int(self.data["sample_rate"])
         self.mel = LogMel.from_config(self.data)
         self.content_channels = int(config["flow"]["model"]["content_channels"])
+        self.strict_features = config['flow']['model'].get('conditioning_version', 1) == 2
         self.key_shift_range = float(config["flow"].get("key_shift_range", 0.0))
         self.key_shift_prob = float(config["flow"].get("key_shift_prob", 0.0))
         self.stretch_range = tuple(config["flow"].get("time_stretch_range", (1.0, 1.0)))
@@ -132,6 +203,12 @@ class RectifiedDataset(Dataset):
             raise ValueError(f"Expected {self.content_channels}-wide content features: {content_path}")
         if source_f0.ndim != 1 or source_f0.size(0) == 0 or content.size(0) == 0:
             raise ValueError(f"Empty or invalid features: {wav_path}")
+        if self.strict_features:
+            if not all(torch.isfinite(value).all() for value in (audio, source_f0, content)) or (source_f0 < 0).any():
+                raise ValueError(f'Invalid audio, content or pitch values: {wav_path}')
+            seconds = audio.numel() / self.sample_rate
+            if any(abs(value.shape[0] / FEATURE_RATE - seconds) > 0.25 for value in (source_f0, content)):
+                raise ValueError(f'Content or pitch duration does not match audio; re-extract features: {wav_path}')
         return self._flow_item(audio, source_f0, content, int(sid))
 
     def _flow_item(self, audio, source_f0, content, sid):

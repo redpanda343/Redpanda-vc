@@ -15,7 +15,7 @@ from torch._functorch import config as aot_config
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-from rvc.rectified.data import RectifiedDataset, collate_flow, read_filelist, split_holdout, unpack_flow
+from rvc.rectified.data import RectifiedDataset, SpeakerBalancedSampler, collate_flow, read_filelist, speaker_inventory, split_holdout, unpack_flow
 from rvc.rectified.distributed import launch
 from rvc.rectified.ema import WeightEMA
 from rvc.rectified.flow_model import build_flow, resize_speakers
@@ -225,6 +225,7 @@ def evaluate(model, ema, loader, data, writer, step, mean_reconstruction=False):
     totals = torch.zeros(len(fractions), device=device)
     aux_total, count = 0.0, 0
     reconstruction_total, reconstruction_frames = 0.0, 0.0
+    speaker_totals = {}
     with ema.applied(model):
         model.eval()
         for index, batch in enumerate(loader):
@@ -242,11 +243,14 @@ def evaluate(model, ema, loader, data, writer, step, mean_reconstruction=False):
             if mean_reconstruction:
                 reconstruction = model.mean_reconstruction_loss(
                     mel, content, f0, energy, speaker, mask, breathiness,
-                    key_shift, speed, voicing, tension, noise,
+                    key_shift, speed, voicing, tension, noise, reduction='none',
                 )
-                frames = float(mask.sum())
-                reconstruction_total += float(reconstruction) * frames
-                reconstruction_frames += frames
+                frames = mask.sum((1, 2))
+                reconstruction_total += float((reconstruction * frames).sum())
+                reconstruction_frames += float(frames.sum())
+                for sid, error, length in zip(speaker.tolist(), reconstruction.tolist(), frames.tolist()):
+                    total_error, total_frames = speaker_totals.get(sid, (0.0, 0.0))
+                    speaker_totals[sid] = total_error + error * length, total_frames + length
             count += mel.shape[0]
         model.train()
     totals /= max(1, count)
@@ -257,6 +261,13 @@ def evaluate(model, ema, loader, data, writer, step, mean_reconstruction=False):
         writer.add_scalar('val/aux_mel_l1', aux_total / max(1, count), step)
     if mean_reconstruction:
         writer.add_scalar('val/mean_reconstruction_l1', reconstruction_total / max(1.0, reconstruction_frames), step)
+        speaker_errors = []
+        for sid, (error, frames) in sorted(speaker_totals.items()):
+            value = error / max(1.0, frames)
+            speaker_errors.append(value)
+            writer.add_scalar(f'val/speaker_{sid}/mean_reconstruction_l1', value, step)
+        if speaker_errors:
+            writer.add_scalar('val/speaker_mean_reconstruction_l1', sum(speaker_errors) / len(speaker_errors), step)
 
 
 def train(args):
@@ -272,7 +283,7 @@ def configure_mean_flow(config, requested, existing_config, batch_size):
         model['mean_flow'] = True
         model.setdefault('backbone_args', {})['time_scale'] = 1.0
         model['sampling_method'] = 'mean'
-        model['sampling_steps'] = 2
+        model['sampling_steps'] = 1 if model.get('conditioning_version', 1) == 2 else 2
         settings['mean_flow_ratio'] = 0.25
         settings['mean_flow_warmup_steps'] = 10000
     if model.get('mean_flow', False):
@@ -306,13 +317,15 @@ def train_rank(args, ranks):
     config_path = experiment / 'rectified_config.json'
     existing_config = config_path.exists()
     if not existing_config:
-        config_path = ROOT / 'rvc' / 'configs' / 'rectified' / '44100.json'
+        filename = '44100_multispeaker.json' if getattr(args, 'recipe', 'quality') == 'multispeaker' else '44100.json'
+        config_path = ROOT / 'rvc' / 'configs' / 'rectified' / filename
     config = json.loads(config_path.read_text(encoding='utf-8'))
     if not existing_config and getattr(args, 'recipe', 'quality') == 'legacy':
         for name in ('dual_timestep', 'voicing', 'tension', 'sampling_method', 'sampling_steps'):
             config['flow']['model'].pop(name, None)
     configure_mean_flow(config, getattr(args, "mean_flow", False), existing_config, args.batch_size)
     settings, data = config['flow'], config['data']
+    multispeaker = settings['model'].get('conditioning_version', 1) == 2
     if data['sample_rate'] != 44100:
         raise ValueError('This recipe requires 44100 Hz audio and a matching NSF-HiFiGAN vocoder.')
     device = ranks.device
@@ -331,15 +344,17 @@ def train_rank(args, ranks):
             else:
                 print('No vocoder selected: previews will show mel images only.', flush=True)
     entries = read_filelist(experiment / 'filelist.txt', ROOT)
+    inventory = speaker_inventory(entries) if multispeaker else None
     speakers = max(int(entry[4]) for entry in entries) + 1
-    entries, held = split_holdout(entries, int(settings.get('holdout_clips', 0)))
+    entries, held = split_holdout(entries, int(settings.get('holdout_clips', 0)), stratified=multispeaker)
     segment = int(settings['segment_frames'])
     dataset = RectifiedDataset(entries, config, segment)
     if len(dataset) // ranks.world < args.batch_size:
         raise ValueError('The training split has fewer clips than one full batch per selected GPU.')
     workers = int(settings.get('num_workers', 4))
     collate = partial(collate_flow, frames=segment)
-    sampler = ranks.sampler(dataset, args.seed)
+    sampler = (SpeakerBalancedSampler(entries, args.seed, ranks.rank, ranks.world)
+               if settings.get('speaker_balanced_sampling', False) else ranks.sampler(dataset, args.seed))
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=sampler is None,
                         sampler=sampler, drop_last=True,
                         num_workers=workers, collate_fn=collate,
@@ -354,6 +369,9 @@ def train_rank(args, ranks):
     info_path = experiment / 'model_info.json'
     info = json.loads(info_path.read_text(encoding='utf-8')) if info_path.exists() else {}
     embedder = info.get('embedder_model', 'contentvec')
+    feature_metadata = {key: info[key] for key in ('embedder_model', 'version', 'feature_dim', 'feature_output', 'feature_fingerprint') if key in info}
+    if multispeaker and (info.get('version', 'v2') != 'v2' or int(info.get('feature_dim', settings['model']['content_channels'])) != settings['model']['content_channels']):
+        raise ValueError('Extraction metadata does not match the content encoder. Re-extract v2 features.')
     model = build_flow(config, speakers).to(device).float()
     output = experiment / 'flow'
     resume_path = output / 'checkpoint.pth'
@@ -375,6 +393,8 @@ def train_rank(args, ranks):
     ema = WeightEMA(model, decay)
     first_epoch, step = 1, 0
     if state:
+        if multispeaker and (state.get('speaker_ids') != sorted(inventory) or state.get('feature_metadata') != feature_metadata):
+            raise ValueError('Speaker IDs or extracted feature metadata changed. Use a new experiment.')
         if settings['model'].get('mean_flow', False):
             state['config']['flow'].setdefault('mean_reconstruction_weight', settings['mean_reconstruction_weight'])
         configure_mean_flow(state['config'], False, True, args.batch_size)
@@ -392,6 +412,8 @@ def train_rank(args, ranks):
         if state.get('embedder_model', embedder) != embedder:
             raise ValueError('Pretrained flow uses a different content embedder.')
         pretrained_model = state.get('config', {}).get('flow', {}).get('model', {})
+        if pretrained_model.get('conditioning_version', 1) != settings['model'].get('conditioning_version', 1):
+            raise ValueError('Pretrained conditioning version differs. Start a new model or use a matching pretrained.')
         for name in ('dual_timestep', 'voicing', 'tension', 'mean_flow'):
             if bool(pretrained_model.get(name, False)) != bool(settings['model'].get(name, False)):
                 raise ValueError(f'Pretrained flow differs in {name}. Use a matching pretrained or train a new model from scratch.')
@@ -400,7 +422,8 @@ def train_rank(args, ranks):
         if source_scale != target_scale:
             raise ValueError('Pretrained flow uses a different time embedding scale. Use a matching pretrained.')
         weights = state['ema']['shadow'] if state.get('ema') else state['model']
-        model.load_state_dict(resize_speakers(weights, speakers), strict=True)
+        speaker_init = model.encoder.speaker.weight if multispeaker else None
+        model.load_state_dict(resize_speakers(weights, speakers, speaker_init), strict=True)
         ema.reseed(model)
         del state, weights
     with ranks.main_work('training output setup') as main:
@@ -420,6 +443,10 @@ def train_rank(args, ranks):
     warmup = 0 if finetune else settings['warmup_steps']
     if ranks.main:
         print(f'Rectified flow: {sum(p.numel() for p in model.parameters()):,} parameters, {precision_label}, {device}, batch {args.batch_size}, {segment} frames, {ranks.world} device(s)', flush=True)
+        if multispeaker:
+            print(f'Multispeaker conditioning v2: {speakers} speakers, {len(held)} held-out clips, balanced sampling={settings.get("speaker_balanced_sampling", False)}. Clips per speaker: {inventory}', flush=True)
+            if finetune and first_epoch == 1:
+                print('Initialized independent speaker embeddings for the new dataset.', flush=True)
         if settings.get('mean_reconstruction_weight', 0.0) > 0:
             print(f"MeanFlow one-step reconstruction weight: {settings['mean_reconstruction_weight']:g}", flush=True)
     with SummaryWriter(str(output)) if ranks.main else nullcontext(None) as writer:
@@ -467,6 +494,8 @@ def train_rank(args, ranks):
                             raise FloatingPointError('Non-finite trained model weights.')
                         metadata = dict(config=config, speaker_count=speakers, embedder_model=embedder,
                                         vocoder=str(Path(args.vocoder).resolve()) if args.vocoder else '', epoch=epoch, step=step)
+                        if multispeaker:
+                            metadata.update(speaker_ids=sorted(inventory), feature_metadata=feature_metadata)
                         atomic_save(dict(model=model.state_dict(), optimizer=optimizer.state_dict(),
                                          ema=ema.state_dict(), finetune=finetune,
                                          scaler=scaler.state_dict() if scaler is not None else None,
@@ -493,7 +522,7 @@ def main():
                         help='cpu, one GPU such as cuda:0, or multiple GPUs such as cuda:0,cuda:1')
     parser.add_argument('--precision', choices=['fp32', 'fp16', 'bf16'], default='fp32')
     parser.add_argument('--pretrained-flow')
-    parser.add_argument('--recipe', choices=['quality', 'legacy'], default='quality',
+    parser.add_argument('--recipe', choices=['multispeaker', 'quality', 'legacy'], default='multispeaker',
                         help='Recipe for a new experiment. Saved experiment configs always take precedence.')
     parser.add_argument('--mean-flow', action='store_true',
                         help='Enable MeanFlow for a new experiment, with two-step sampling. Saved MeanFlow runs resume automatically.')

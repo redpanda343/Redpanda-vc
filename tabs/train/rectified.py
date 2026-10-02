@@ -22,7 +22,8 @@ FLOW_PRETRAIN_URL = ('https://huggingface.co/shiromiya/ShiroRVC-Resources/resolv
                      'f84d2dfb2f6cc0a3205e437c7676455971dc6bf5/Rectified_pretrains/pretrain_flow_contentvec.pth')
 FLOW_PRETRAIN_SHA256 = '79fdb4e13ff3d68d755f23879985e86f0052cda10360c7d6bd8003aa08074568'
 VOCODER_CHOICES = ['Default NSF-HiFiGAN', 'Custom NSF-HiFiGAN', 'Mel previews only']
-RECIPE_CHOICES = ['Quality: RK4 + dual timestep + voicing/tension', 'Legacy Shiro']
+RECIPE_CHOICES = ['Multispeaker: direct content + MeanFlow', 'Quality: RK4 + dual timestep + voicing/tension', 'Legacy Shiro']
+RECIPE_NAMES = dict(zip(RECIPE_CHOICES, ('multispeaker', 'quality', 'legacy')))
 _process = None
 _log_handle = None
 _log_path = None
@@ -192,10 +193,10 @@ def start(name, vocoder, pretrained, batch, epochs, save_every, device, compile_
         raise gr.Error('Choose a supported rectified-flow recipe.')
     config_path = directory / 'rectified_config.json'
     config = json.loads(config_path.read_text(encoding='utf-8')) if config_path.is_file() else None
-    model_config = config['flow']['model'] if config else {'voicing': recipe == RECIPE_CHOICES[0]}
+    model_config = config['flow']['model'] if config else {'voicing': RECIPE_NAMES[recipe] == 'quality', 'mean_flow': RECIPE_NAMES[recipe] == 'multispeaker'}
     if mean_flow and config and not model_config.get('mean_flow', False):
         raise gr.Error('MeanFlow needs a new experiment. Choose a new model name.')
-    mean_enabled = bool(model_config.get('mean_flow', False)) if config else bool(mean_flow)
+    mean_enabled = bool(model_config.get('mean_flow', False)) if config else bool(mean_flow or model_config.get('mean_flow'))
     if mean_enabled and int(positive_integer(batch, 'Batch size')) < 2:
         raise gr.Error('MeanFlow requires batch size at least 2 per GPU; use 4 when possible.')
     enhanced = mean_enabled or any(model_config.get(key, False) for key in ('dual_timestep', 'voicing', 'tension'))
@@ -207,7 +208,7 @@ def start(name, vocoder, pretrained, batch, epochs, save_every, device, compile_
                  '--epochs', positive_integer(epochs, 'Total epochs'),
                  '--save-every', positive_integer(save_every, 'Save interval'),
                  '--device', str(device).strip().lower(), '--precision', precision,
-                 '--recipe', 'quality' if recipe == RECIPE_CHOICES[0] else 'legacy']
+                 '--recipe', RECIPE_NAMES[recipe]]
     if mean_flow:
         arguments.append('--mean-flow')
     if compile_backbone:
@@ -262,15 +263,15 @@ def rectified_train_tab():
         extract_button = gr.Button('Extract content and F0')
     with gr.Accordion('3. Train rectified flow', open=True):
         recipe = gr.Dropdown(label='New model recipe', choices=RECIPE_CHOICES, value=RECIPE_CHOICES[0],
-                             info='New models use RK4 sampling, dual-timestep training and separate voicing/tension inputs. Existing experiments keep their saved configuration.')
+                             info='Multispeaker uses separate content and speaker conditioning, balanced training and one-step MeanFlow. Start a new experiment for this architecture. Existing experiments keep their saved configuration.')
         mean_flow = gr.Checkbox(label='MeanFlow for new models', value=False,
-                                info='Train for one or two sampling steps. Needs a new experiment and a matching MeanFlow pretrained, or training from scratch. Batch size must be at least 2. Uses two-step inference by default; existing MeanFlow runs resume automatically.')
+                                info='Already enabled with one-step inference in the Multispeaker recipe. For other new recipes, enables MeanFlow with two-step inference. Needs a matching pretrained or training from scratch; at least 2 examples per GPU. Existing runs keep their saved settings.')
         vocoder_mode = gr.Dropdown(label='Audio preview vocoder', choices=VOCODER_CHOICES, value='Default NSF-HiFiGAN',
                                    info='The default NSF-HiFiGAN downloads automatically on start. Choose mel previews only to skip audio rendering.')
         vocoder = gr.Textbox(label='Custom OpenVPI NSF-HiFiGAN checkpoint path', visible=False,
                             info='Use a compatible .ckpt or converted .pth export: 44.1 kHz, 128 mel bins, hop 512. Keep config.json beside raw checkpoints when provided.')
         use_pretrained = gr.Checkbox(label='Pretrained', value=False,
-                                     info='Enable to use a compatible pretrained. The quality recipe requires a custom pretrained trained with the same inputs. Leave disabled to train from scratch.')
+                                     info='Multispeaker and Quality need matching custom pretrained models. Multispeaker initializes fresh speaker identities for the new dataset. Leave disabled to train from scratch.')
         custom_pretrained = gr.Checkbox(label='Custom pretrained', value=False, visible=False,
                                        info='Use a compatible rectified-flow checkpoint. The default Shiro pretrained is only compatible with the legacy recipe.')
         with gr.Column(visible=False) as custom_pretrained_settings:
