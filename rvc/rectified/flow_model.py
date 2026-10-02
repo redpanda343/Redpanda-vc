@@ -6,9 +6,6 @@ from librosa.filters import mel as librosa_mel_fn
 from torch import nn
 from torch.nn import functional as F
 
-from rvc.rectified.content_bottleneck import ContentBottleneck
-
-
 LOG_F0_CENTER = math.log(200.0)
 LOG_F0_SCALE = 0.7
 SAMPLERS = ("euler", "heun", "rk4", "mean")
@@ -103,20 +100,16 @@ class ConditionEncoder(nn.Module):
         speed: bool = False,
         voicing: bool = False,
         tension: bool = False,
-        conditioning_version: int = 1,
+        conditioning_version: int = 2,
     ):
         super().__init__()
-        if conditioning_version not in (1, 2):
-            raise ValueError('Unsupported conditioning version.')
-        if conditioning_version == 2 and (content_bottleneck or speaker_channels != hidden_channels):
+        if conditioning_version != 2:
+            raise ValueError('Obsolete conditioning version. Train a new Multispeaker model.')
+        if content_bottleneck or content_bottleneck_noise or speaker_channels != hidden_channels:
             raise ValueError('Conditioning v2 requires full content features and hidden-width speaker embeddings.')
         self.conditioning_version = conditioning_version
         self.speaker_count = int(speaker_count)
-        self.bottleneck = (
-            ContentBottleneck(content_channels, content_bottleneck, content_bottleneck_noise)
-            if content_bottleneck > 0
-            else None
-        )
+        self.bottleneck = None
         self.content = nn.Linear(content_channels, hidden_channels)
         self.pitch_fourier = int(pitch_fourier)
         self.pitch = nn.Conv1d(2 + 2 * self.pitch_fourier, hidden_channels, 3, padding=1)
@@ -128,16 +121,14 @@ class ConditionEncoder(nn.Module):
         self.key_shift = nn.Linear(1, hidden_channels) if key_shift else None
         self.speed = nn.Linear(1, hidden_channels) if speed else None
         self.speaker = nn.Embedding(self.speaker_count + 1, speaker_channels)
-        self.speaker_proj = nn.Linear(speaker_channels, hidden_channels)
+        self.speaker_proj = nn.Identity()
         self.blocks = nn.ModuleList([ConvNeXtBlock(hidden_channels) for _ in range(layers)])
         self.voicing = nn.Conv1d(1, hidden_channels, 3, padding=1) if voicing else None
         self.tension = nn.Conv1d(1, hidden_channels, 3, padding=1) if tension else None
-        if conditioning_version == 2:
-            self.content_norm = nn.LayerNorm(content_channels)
-            self.speaker_proj = nn.Identity()
-            nn.init.normal_(self.speaker.weight, std=hidden_channels ** -0.5)
-            nn.init.xavier_uniform_(self.content.weight)
-            nn.init.zeros_(self.content.bias)
+        self.content_norm = nn.LayerNorm(content_channels)
+        nn.init.normal_(self.speaker.weight, std=hidden_channels ** -0.5)
+        nn.init.xavier_uniform_(self.content.weight)
+        nn.init.zeros_(self.content.bias)
 
     def voice(self, speaker: torch.Tensor) -> torch.Tensor:
         return self.speaker_proj(self.speaker(speaker))
@@ -150,16 +141,12 @@ class ConditionEncoder(nn.Module):
 
     def forward(self, content, f0, energy, speaker, mask, breathiness=None, key_shift=None, speed=None,
                 voicing=None, tension=None):
-        if self.conditioning_version == 2:
-            frame_mask = mask[:, 0]
-            f0, energy = f0 * frame_mask, energy * frame_mask
-            breathiness = None if breathiness is None else breathiness * frame_mask
-            voicing = None if voicing is None else voicing * frame_mask
-            tension = None if tension is None else tension * frame_mask
-        if self.bottleneck is not None:
-            content = self.bottleneck(content)
-        x = (self.encode_content(content, mask) if self.conditioning_version == 2
-             else self.content(content).transpose(1, 2))
+        frame_mask = mask[:, 0]
+        f0, energy = f0 * frame_mask, energy * frame_mask
+        breathiness = None if breathiness is None else breathiness * frame_mask
+        voicing = None if voicing is None else voicing * frame_mask
+        tension = None if tension is None else tension * frame_mask
+        x = self.encode_content(content, mask)
         x = x + self.pitch(pitch_features(f0, self.pitch_fourier))
         if self.harmonic_prior is not None:
             x = x + self.harmonics(self.harmonic_prior(f0))
@@ -184,9 +171,6 @@ class ConditionEncoder(nn.Module):
             x = x + self.speed(speed.float().view(-1, 1)).unsqueeze(-1)
         x = x + self.voice(speaker).unsqueeze(-1)
         x = x * mask
-        if self.conditioning_version == 1:
-            for block in self.blocks:
-                x = block(x, mask)
         return x
 
 
@@ -329,7 +313,7 @@ class RectifiedFlow(nn.Module):
         encoder_layers: int = 4,
         content_bottleneck: int = 0,
         content_bottleneck_noise: float = 0.0,
-        speaker_channels: int = 256,
+        speaker_channels: int = 384,
         pitch_fourier: int = 0,
         harmonic_prior: Optional[dict] = None,
         breathiness: bool = False,
@@ -346,7 +330,7 @@ class RectifiedFlow(nn.Module):
         sampling_method: str = "euler",
         sampling_steps: int = 16,
         mean_flow: bool = False,
-        conditioning_version: int = 1,
+        conditioning_version: int = 2,
     ):
         super().__init__()
         if backbone != "lynxnet2":
@@ -691,8 +675,18 @@ def resize_speakers(state_dict: dict, speaker_count: int, speaker_init=None) -> 
     return state_dict
 
 
+def validate_model_config(model: dict):
+    if (model.get('conditioning_version') != 2 or not model.get('mean_flow', False)
+            or any(model.get(name, False) for name in ('dual_timestep', 'voicing', 'tension'))):
+        raise ValueError('Obsolete rectified-flow recipe or checkpoint. Only Multispeaker MeanFlow is supported; use a new experiment.')
+    if (model.get('content_bottleneck', 0) or model.get('content_bottleneck_noise', 0)
+            or model.get('speaker_channels', 384) != model.get('hidden_channels', 384)):
+        raise ValueError('Multispeaker MeanFlow requires full content features and hidden-width speaker embeddings.')
+
+
 def build_flow(config: dict, speaker_count: int) -> RectifiedFlow:
     model = dict(config["flow"]["model"])
+    validate_model_config(model)
     data = config["data"]
     if model.pop("harmonic_prior", False):
         model["harmonic_prior"] = dict(

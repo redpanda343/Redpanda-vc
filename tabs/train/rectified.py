@@ -18,12 +18,7 @@ from rvc.lib.tools.prerequisites_download import _sha256, download_file
 ROOT = Path(__file__).resolve().parents[2]
 _lock = threading.Lock()
 _pretrain_lock = threading.Lock()
-FLOW_PRETRAIN_URL = ('https://huggingface.co/shiromiya/ShiroRVC-Resources/resolve/'
-                     'f84d2dfb2f6cc0a3205e437c7676455971dc6bf5/Rectified_pretrains/pretrain_flow_contentvec.pth')
-FLOW_PRETRAIN_SHA256 = '79fdb4e13ff3d68d755f23879985e86f0052cda10360c7d6bd8003aa08074568'
 VOCODER_CHOICES = ['Default NSF-HiFiGAN', 'Custom NSF-HiFiGAN', 'Mel previews only']
-RECIPE_CHOICES = ['Multispeaker: direct content + MeanFlow', 'Quality: RK4 + dual timestep + voicing/tension', 'Legacy Shiro']
-RECIPE_NAMES = dict(zip(RECIPE_CHOICES, ('multispeaker', 'quality', 'legacy')))
 _process = None
 _log_handle = None
 _log_path = None
@@ -133,8 +128,8 @@ def device_id(device):
     return '-' if devices == ['cpu'] else '-'.join(item[5:] for item in devices)
 
 
-def toggle_pretrained(enabled, custom):
-    return gr.update(visible=enabled), gr.update(visible=enabled and custom)
+def toggle_pretrained(enabled):
+    return gr.update(visible=enabled)
 
 
 def download_checkpoint(destination, url, checksum, size, label):
@@ -163,25 +158,17 @@ def resolve_vocoder(mode, path):
     return download_checkpoint(destination, VOCODER_URL, VOCODER_SHA256, 56600485, 'NSF-HiFiGAN vocoder')
 
 
-def resolve_pretrained(directory, enabled, custom, path):
+def resolve_pretrained(directory, enabled, path):
     if not enabled or (directory / 'flow' / 'checkpoint.pth').is_file():
         return ''
-    if custom:
-        path = str(path or '').strip().strip('"')
-        if not path or not Path(path).is_file():
-            raise gr.Error('Choose an existing custom rectified-flow pretrained checkpoint.')
-        return path
-    info_path = directory / 'model_info.json'
-    info = json.loads(info_path.read_text(encoding='utf-8')) if info_path.is_file() else {}
-    if info.get('embedder_model', 'contentvec') != 'contentvec':
-        raise gr.Error('The default Shiro pretrained uses ContentVec. Extract with ContentVec or select a compatible custom pretrained.')
-    destination = ROOT / 'rvc' / 'models' / 'pretraineds' / 'rectified' / 'pretrain_flow_contentvec.pth'
-    return download_checkpoint(destination, FLOW_PRETRAIN_URL, FLOW_PRETRAIN_SHA256, 319370011, 'Shiro ContentVec flow pretrained')
+    path = str(path or '').strip().strip('"')
+    if not path or not Path(path).is_file():
+        raise gr.Error('Choose a matching Multispeaker pretrained checkpoint, or disable Pretrained.')
+    return path
 
 
 def start(name, vocoder, pretrained, batch, epochs, save_every, device, compile_backbone=False,
-          use_pretrained=False, custom_pretrained=False, vocoder_mode='Default NSF-HiFiGAN',
-          recipe=RECIPE_CHOICES[0], mean_flow=False):
+          use_pretrained=False, vocoder_mode='Default NSF-HiFiGAN'):
     directory = experiment_path(name)
     device_id(device)
     if not (directory / 'filelist.txt').is_file():
@@ -189,31 +176,26 @@ def start(name, vocoder, pretrained, batch, epochs, save_every, device, compile_
     precision = get_precision() or 'fp32'
     if precision not in {'fp32', 'fp16', 'bf16'}:
         raise gr.Error(f'Unsupported training precision: {precision}')
-    if recipe not in RECIPE_CHOICES:
-        raise gr.Error('Choose a supported rectified-flow recipe.')
     config_path = directory / 'rectified_config.json'
     config = json.loads(config_path.read_text(encoding='utf-8')) if config_path.is_file() else None
-    model_config = config['flow']['model'] if config else {'voicing': RECIPE_NAMES[recipe] == 'quality', 'mean_flow': RECIPE_NAMES[recipe] == 'multispeaker'}
-    if mean_flow and config and not model_config.get('mean_flow', False):
-        raise gr.Error('MeanFlow needs a new experiment. Choose a new model name.')
-    mean_enabled = bool(model_config.get('mean_flow', False)) if config else bool(mean_flow or model_config.get('mean_flow'))
-    if mean_enabled and int(positive_integer(batch, 'Batch size')) < 2:
+    if config:
+        from rvc.rectified.flow_model import validate_model_config
+
+        try:
+            validate_model_config(config['flow']['model'])
+        except ValueError as error:
+            raise gr.Error(str(error)) from error
+    if int(positive_integer(batch, 'Batch size')) < 2:
         raise gr.Error('MeanFlow requires batch size at least 2 per GPU; use 4 when possible.')
-    enhanced = mean_enabled or any(model_config.get(key, False) for key in ('dual_timestep', 'voicing', 'tension'))
-    if use_pretrained and not custom_pretrained and enhanced and not (directory / 'flow' / 'checkpoint.pth').is_file():
-        raise gr.Error('This recipe needs a matching custom pretrained. Disable Pretrained to train from scratch, or choose Legacy Shiro without MeanFlow for the default Shiro pretrained.')
     vocoder = resolve_vocoder(vocoder_mode, vocoder)
     arguments = ['--model-name', str(name).strip(), '--vocoder', vocoder,
                  '--batch-size', positive_integer(batch, 'Batch size'),
                  '--epochs', positive_integer(epochs, 'Total epochs'),
                  '--save-every', positive_integer(save_every, 'Save interval'),
-                 '--device', str(device).strip().lower(), '--precision', precision,
-                 '--recipe', RECIPE_NAMES[recipe]]
-    if mean_flow:
-        arguments.append('--mean-flow')
+                 '--device', str(device).strip().lower(), '--precision', precision]
     if compile_backbone:
         arguments.append('--compile')
-    pretrained = resolve_pretrained(directory, use_pretrained, custom_pretrained, pretrained)
+    pretrained = resolve_pretrained(directory, use_pretrained, pretrained)
     if pretrained:
         arguments.extend(['--pretrained-flow', pretrained])
     return launch(name, 'rvc.rectified.train_flow', arguments, 'Training rectified flow')
@@ -262,24 +244,20 @@ def rectified_train_tab():
             embedder = gr.Dropdown(label='Content embedder', choices=['contentvec', 'spin-v2'], value='contentvec')
         extract_button = gr.Button('Extract content and F0')
     with gr.Accordion('3. Train rectified flow', open=True):
-        recipe = gr.Dropdown(label='New model recipe', choices=RECIPE_CHOICES, value=RECIPE_CHOICES[0],
-                             info='Multispeaker uses separate content and speaker conditioning, balanced training and one-step MeanFlow. Start a new experiment for this architecture. Existing experiments keep their saved configuration.')
-        mean_flow = gr.Checkbox(label='MeanFlow for new models', value=False,
-                                info='Already enabled with one-step inference in the Multispeaker recipe. For other new recipes, enables MeanFlow with two-step inference. Needs a matching pretrained or training from scratch; at least 2 examples per GPU. Existing runs keep their saved settings.')
+        gr.Markdown('**Multispeaker MeanFlow** trains separate content and speaker conditioning with balanced speaker sampling. '
+                    'One-step MeanFlow is enabled automatically. WORLD features are disabled. Older recipes and checkpoints are no longer supported.')
         vocoder_mode = gr.Dropdown(label='Audio preview vocoder', choices=VOCODER_CHOICES, value='Default NSF-HiFiGAN',
                                    info='The default NSF-HiFiGAN downloads automatically on start. Choose mel previews only to skip audio rendering.')
         vocoder = gr.Textbox(label='Custom OpenVPI NSF-HiFiGAN checkpoint path', visible=False,
                             info='Use a compatible .ckpt or converted .pth export: 44.1 kHz, 128 mel bins, hop 512. Keep config.json beside raw checkpoints when provided.')
         use_pretrained = gr.Checkbox(label='Pretrained', value=False,
-                                     info='Multispeaker and Quality need matching custom pretrained models. Multispeaker initializes fresh speaker identities for the new dataset. Leave disabled to train from scratch.')
-        custom_pretrained = gr.Checkbox(label='Custom pretrained', value=False, visible=False,
-                                       info='Use a compatible rectified-flow checkpoint. The default Shiro pretrained is only compatible with the legacy recipe.')
+                                     info='Use a matching Multispeaker checkpoint. Speaker identities initialize independently for the new dataset. Leave disabled to train from scratch.')
         with gr.Column(visible=False) as custom_pretrained_settings:
             pretrained_upload = gr.File(label='Upload custom flow pretrained', file_types=['.pth'], type='filepath')
             pretrained = gr.Textbox(label='Custom pretrained flow path',
                                     info='Choose a flow checkpoint compatible with the experiment configuration and content embedder.')
         with gr.Row():
-            batch = gr.Number(label='Batch size per GPU', value=4, minimum=1, precision=0)
+            batch = gr.Number(label='Batch size per GPU', value=4, minimum=2, precision=0)
             epochs = gr.Number(label='Total epochs', value=100, minimum=1, precision=0)
             save_every = gr.Number(label='Save every N epochs', value=10, minimum=1, precision=0)
         compile_backbone = gr.Checkbox(label='Compile flow backbone', value=False,
@@ -294,14 +272,11 @@ def rectified_train_tab():
     outputs = [state, log, preprocess_button, extract_button, train_button, stop_button]
     preprocess_button.click(preprocess, [name, dataset, workers], outputs, queue=False)
     extract_button.click(extract, [name, method, workers, device, embedder], outputs, queue=False)
-    use_pretrained.change(toggle_pretrained, [use_pretrained, custom_pretrained],
-                          [custom_pretrained, custom_pretrained_settings], queue=False)
-    custom_pretrained.change(toggle_pretrained, [use_pretrained, custom_pretrained],
-                             [custom_pretrained, custom_pretrained_settings], queue=False)
+    use_pretrained.change(toggle_pretrained, [use_pretrained], [custom_pretrained_settings], queue=False)
     pretrained_upload.upload(lambda path: path or '', [pretrained_upload], [pretrained], queue=False)
     vocoder_mode.change(lambda mode: gr.update(visible=mode == 'Custom NSF-HiFiGAN'),
                         [vocoder_mode], [vocoder], queue=False)
     train_button.click(start, [name, vocoder, pretrained, batch, epochs, save_every, device, compile_backbone,
-                               use_pretrained, custom_pretrained, vocoder_mode, recipe, mean_flow], outputs, queue=False)
+                               use_pretrained, vocoder_mode], outputs, queue=False)
     stop_button.click(stop, [], outputs, queue=False)
     gr.Timer(2).tick(status, [], outputs, queue=False)

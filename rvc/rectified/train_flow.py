@@ -18,7 +18,7 @@ from torch.utils.tensorboard import SummaryWriter
 from rvc.rectified.data import RectifiedDataset, SpeakerBalancedSampler, collate_flow, read_filelist, speaker_inventory, split_holdout, unpack_flow
 from rvc.rectified.distributed import launch
 from rvc.rectified.ema import WeightEMA
-from rvc.rectified.flow_model import build_flow, resize_speakers
+from rvc.rectified.flow_model import build_flow, resize_speakers, validate_model_config
 from rvc.rectified.mel import normalize_mel
 from rvc.rectified.muon import MuonAdamW
 from rvc.rectified.schedule import freeze_voice, learning_rate
@@ -317,13 +317,10 @@ def train_rank(args, ranks):
     config_path = experiment / 'rectified_config.json'
     existing_config = config_path.exists()
     if not existing_config:
-        filename = '44100_multispeaker.json' if getattr(args, 'recipe', 'quality') == 'multispeaker' else '44100.json'
-        config_path = ROOT / 'rvc' / 'configs' / 'rectified' / filename
+        config_path = ROOT / 'rvc' / 'configs' / 'rectified' / '44100_multispeaker.json'
     config = json.loads(config_path.read_text(encoding='utf-8'))
-    if not existing_config and getattr(args, 'recipe', 'quality') == 'legacy':
-        for name in ('dual_timestep', 'voicing', 'tension', 'sampling_method', 'sampling_steps'):
-            config['flow']['model'].pop(name, None)
-    configure_mean_flow(config, getattr(args, "mean_flow", False), existing_config, args.batch_size)
+    validate_model_config(config['flow']['model'])
+    configure_mean_flow(config, False, existing_config, args.batch_size)
     settings, data = config['flow'], config['data']
     multispeaker = settings['model'].get('conditioning_version', 1) == 2
     if data['sample_rate'] != 44100:
@@ -393,6 +390,7 @@ def train_rank(args, ranks):
     ema = WeightEMA(model, decay)
     first_epoch, step = 1, 0
     if state:
+        validate_model_config(state['config']['flow']['model'])
         if multispeaker and (state.get('speaker_ids') != sorted(inventory) or state.get('feature_metadata') != feature_metadata):
             raise ValueError('Speaker IDs or extracted feature metadata changed. Use a new experiment.')
         if settings['model'].get('mean_flow', False):
@@ -412,6 +410,7 @@ def train_rank(args, ranks):
         if state.get('embedder_model', embedder) != embedder:
             raise ValueError('Pretrained flow uses a different content embedder.')
         pretrained_model = state.get('config', {}).get('flow', {}).get('model', {})
+        validate_model_config(pretrained_model)
         if pretrained_model.get('conditioning_version', 1) != settings['model'].get('conditioning_version', 1):
             raise ValueError('Pretrained conditioning version differs. Start a new model or use a matching pretrained.')
         for name in ('dual_timestep', 'voicing', 'tension', 'mean_flow'):
@@ -512,7 +511,7 @@ def train_rank(args, ranks):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train Shiro rectified flow with an optional frozen OpenVPI NSF-HiFiGAN preview vocoder.')
+    parser = argparse.ArgumentParser(description='Train Multispeaker MeanFlow with an optional frozen OpenVPI NSF-HiFiGAN preview vocoder.')
     parser.add_argument('--model-name', required=True)
     parser.add_argument('--vocoder', default='')
     parser.add_argument('--batch-size', type=int, default=4)
@@ -522,10 +521,6 @@ def main():
                         help='cpu, one GPU such as cuda:0, or multiple GPUs such as cuda:0,cuda:1')
     parser.add_argument('--precision', choices=['fp32', 'fp16', 'bf16'], default='fp32')
     parser.add_argument('--pretrained-flow')
-    parser.add_argument('--recipe', choices=['multispeaker', 'quality', 'legacy'], default='multispeaker',
-                        help='Recipe for a new experiment. Saved experiment configs always take precedence.')
-    parser.add_argument('--mean-flow', action='store_true',
-                        help='Enable MeanFlow for a new experiment, with two-step sampling. Saved MeanFlow runs resume automatically.')
     parser.add_argument('--learning-rate', type=float)
     parser.add_argument('--seed', type=int, default=1234)
     parser.add_argument('--compile', action='store_true')
