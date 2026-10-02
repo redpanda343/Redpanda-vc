@@ -1,6 +1,7 @@
 import argparse
 import importlib
 import json
+import math
 import os
 import random
 import sys
@@ -95,6 +96,7 @@ def train_step(model, optimizer, ema, batch, data, settings, device, speaker_dro
     mean_enabled = bool(settings["model"].get("mean_flow", False))
     mean_ratio = float(settings.get("mean_flow_ratio", 0.25))
     mean_warmup = int(settings.get("mean_flow_warmup_steps", 10000))
+    reconstruction_weight = float(settings.get("mean_reconstruction_weight", 0.0)) if mean_enabled else 0.0
     mean_stats = None
 
     def forward_loss(dtype):
@@ -108,12 +110,16 @@ def train_step(model, optimizer, ema, batch, data, settings, device, speaker_dro
                 voicing=voicing, tension=tension,
                 mean_ratio=mean_ratio,
                 mean_bootstrap=min(1.0, step / mean_warmup) if mean_warmup else 1.0,
+                mean_reconstruction=reconstruction_weight > 0,
             )
             flow, auxiliary = result[:2]
             if mean_enabled:
                 mean_stats = result[2].detach()
                 flow = (1.0 - mean_ratio) * flow + mean_ratio * result[2][0]
             loss = flow if auxiliary is None else flow + settings['aux_mel_weight'] * auxiliary
+            if reconstruction_weight > 0:
+                loss = loss + reconstruction_weight * result[3]
+                mean_stats = torch.cat((mean_stats, result[3].detach().reshape(1)))
         return flow, auxiliary, loss
 
     flow, auxiliary, loss = forward_loss(amp_dtype)
@@ -170,7 +176,7 @@ def train_step(model, optimizer, ema, batch, data, settings, device, speaker_dro
         if ranks is not None and ranks.world > 1:
             mean_stats = ranks.sum(mean_stats) / ranks.world
         if metrics is not None:
-            metrics.update(zip(("loss/mean_weighted", "loss/instantaneous", "loss/mean_flow", "diag/mean_bootstrap_ratio"), mean_stats.tolist()))
+            metrics.update(zip(("loss/mean_weighted", "loss/instantaneous", "loss/mean_flow", "diag/mean_bootstrap_ratio", "loss/mean_reconstruction_l1"), mean_stats.tolist()))
     if ranks is not None and ranks.world > 1:
         stats = torch.stack([flow.detach() * frames,
                              auxiliary.detach() * frames if auxiliary is not None else frames * 0, frames])
@@ -213,11 +219,12 @@ def preview(model, ema, vocoder, reference, data, writer, step):
 
 
 @torch.no_grad()
-def evaluate(model, ema, loader, data, writer, step):
+def evaluate(model, ema, loader, data, writer, step, mean_reconstruction=False):
     device = next(model.parameters()).device
     fractions = (0.1, 0.3, 0.5, 0.7, 0.9)
     totals = torch.zeros(len(fractions), device=device)
     aux_total, count = 0.0, 0
+    reconstruction_total, reconstruction_frames = 0.0, 0.0
     with ema.applied(model):
         model.eval()
         for index, batch in enumerate(loader):
@@ -232,6 +239,14 @@ def evaluate(model, ema, loader, data, writer, step):
             )
             totals += losses.float() * mel.shape[0]
             aux_total += (float(auxiliary) if auxiliary is not None else 0.0) * mel.shape[0]
+            if mean_reconstruction:
+                reconstruction = model.mean_reconstruction_loss(
+                    mel, content, f0, energy, speaker, mask, breathiness,
+                    key_shift, speed, voicing, tension, noise,
+                )
+                frames = float(mask.sum())
+                reconstruction_total += float(reconstruction) * frames
+                reconstruction_frames += frames
             count += mel.shape[0]
         model.train()
     totals /= max(1, count)
@@ -240,6 +255,8 @@ def evaluate(model, ema, loader, data, writer, step):
         writer.add_scalar(f'val/flow_t{fraction:g}', value, step)
     if model.aux is not None:
         writer.add_scalar('val/aux_mel_l1', aux_total / max(1, count), step)
+    if mean_reconstruction:
+        writer.add_scalar('val/mean_reconstruction_l1', reconstruction_total / max(1.0, reconstruction_frames), step)
 
 
 def train(args):
@@ -259,6 +276,12 @@ def configure_mean_flow(config, requested, existing_config, batch_size):
         settings['mean_flow_ratio'] = 0.25
         settings['mean_flow_warmup_steps'] = 10000
     if model.get('mean_flow', False):
+        legacy = not any(model.get(name, False) for name in ('dual_timestep', 'voicing', 'tension'))
+        settings.setdefault('mean_reconstruction_weight', 1.0 if legacy else 0.0)
+        weight = float(settings['mean_reconstruction_weight'])
+        if not math.isfinite(weight) or weight < 0:
+            raise ValueError('mean_reconstruction_weight must be finite and nonnegative.')
+        settings['mean_reconstruction_weight'] = weight
         if batch_size < 2:
             raise ValueError('MeanFlow requires batch size at least 2 per GPU; use 4 when possible.')
         if not 0.0 < float(settings.get('mean_flow_ratio', 0.25)) < 1.0:
@@ -352,6 +375,9 @@ def train_rank(args, ranks):
     ema = WeightEMA(model, decay)
     first_epoch, step = 1, 0
     if state:
+        if settings['model'].get('mean_flow', False):
+            state['config']['flow'].setdefault('mean_reconstruction_weight', settings['mean_reconstruction_weight'])
+        configure_mean_flow(state['config'], False, True, args.batch_size)
         if state['config'] != config or state['embedder_model'] != embedder:
             raise ValueError('Resume config or embedder differs from the saved checkpoint.')
         model.load_state_dict(state['model'], strict=True)
@@ -394,6 +420,8 @@ def train_rank(args, ranks):
     warmup = 0 if finetune else settings['warmup_steps']
     if ranks.main:
         print(f'Rectified flow: {sum(p.numel() for p in model.parameters()):,} parameters, {precision_label}, {device}, batch {args.batch_size}, {segment} frames, {ranks.world} device(s)', flush=True)
+        if settings.get('mean_reconstruction_weight', 0.0) > 0:
+            print(f"MeanFlow one-step reconstruction weight: {settings['mean_reconstruction_weight']:g}", flush=True)
     with SummaryWriter(str(output)) if ranks.main else nullcontext(None) as writer:
         model.train()
         for epoch in range(first_epoch, args.epochs + 1):
@@ -428,7 +456,8 @@ def train_rank(args, ranks):
                                 print(f'Rank 0: preview finished at step {step}.', flush=True)
                             if held_loader is not None and settings.get('eval_interval', 0) and step % settings['eval_interval'] == 0:
                                 print(f'Rank 0: starting validation at step {step}.', flush=True)
-                                evaluate(model, ema, held_loader, data, writer, step)
+                                evaluate(model, ema, held_loader, data, writer, step,
+                                         mean_reconstruction=settings.get('mean_reconstruction_weight', 0.0) > 0)
                                 print(f'Rank 0: validation finished at step {step}.', flush=True)
             if epoch % args.save_every == 0 or epoch == args.epochs:
                 with ranks.main_work(f'checkpoint/preview at epoch {epoch}') as main:

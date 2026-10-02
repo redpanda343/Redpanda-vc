@@ -262,6 +262,32 @@ loss and the bootstrap correction ratio. The flow loss is the mixed weighted
 objective for these models. Normal validation reports instantaneous flow error;
 audio previews use the saved two-step sampler.
 
+Legacy Shiro + MeanFlow also uses `mean_reconstruction_weight: 1.0` by default.
+This adds masked L1 supervision on the complete one-step mel prediction, starting
+from the auxiliary mel and noise mixture used at inference. It retains the real
+speaker ID for this reconstruction branch, even when the flow-matching branch
+uses speaker dropout. Gradients reach the content encoder, speaker conditioning,
+auxiliary decoder and MeanFlow backbone. This closes a gap in the old objective,
+which never directly scored generation from the predicted shallow-flow start.
+It does not add weights or change checkpoint inference, and it does not replace
+the existing flow or auxiliary losses. It costs an additional encoder, auxiliary
+decoder and backbone pass during training.
+
+The correction applies when starting or resuming a Legacy Shiro + MeanFlow run
+whose config does not yet contain the setting. Old resume configs are normalized
+for this setting before compatibility checking; all other compatibility checks
+remain in place. The resolved setting is saved in future checkpoints. An explicit
+value of `0.0` retains the old training objective. Quality + MeanFlow defaults to
+`0.0`, and ordinary flow is unchanged. Existing exports do not improve merely by
+loading the updated code; they need further training with the corrected objective.
+
+TensorBoard records `loss/mean_reconstruction_l1` and, when held-out validation is
+enabled, `val/mean_reconstruction_l1`. The validation metric uses fixed noise and
+the actual one-step generation path. It complements instantaneous flow validation;
+it is not a phoneme accuracy or speaker similarity score. This correction has
+focused numerical and single-clip training validation, not a completed multispeaker
+retraining or proof that source-speaker leakage is eliminated.
+
 Train a new pretrained model, or select a matching MeanFlow custom pretrained.
 Ordinary flow pretrains are rejected, as are mismatched time embedding scales.
 Existing experiments retain their architecture and sampling settings; selecting

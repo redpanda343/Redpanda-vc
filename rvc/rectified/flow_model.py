@@ -399,6 +399,27 @@ class RectifiedFlow(nn.Module):
         error = (self.aux(aux_cond, mask).float() - mel.float()).abs() * mask
         return error.sum() / (mask.sum() * self.n_mels).clamp_min(1.0)
 
+    def mean_reconstruction_loss(self, mel, content, f0, energy, speaker, mask,
+                                 breathiness=None, key_shift=None, speed=None,
+                                 voicing=None, tension=None, noise=None):
+        if self.backbone.span_mlp is None:
+            raise ValueError("Mean reconstruction requires a MeanFlow model.")
+        cond = self.encoder(content, f0, energy, speaker, mask, breathiness,
+                            key_shift, speed, voicing, tension)
+        voice = self.encoder.voice(speaker)
+        noise = torch.randn_like(mel) if noise is None else noise
+        start = self.t_start
+        x = noise
+        if start > 0:
+            x = (1.0 - start) * noise + start * self.aux(cond, mask)
+        x = x * mask
+        t = mel.new_full((mel.shape[0],), start)
+        span = torch.full_like(t, 1.0 - start)
+        velocity = self.backbone(x, t, cond, mask, voice, span)
+        generated = x + span[:, None, None] * velocity
+        error = (generated.float() - mel.float()).abs() * mask
+        return error.sum() / (mask.sum() * self.n_mels).clamp_min(1.0)
+
     def mean_velocity(self, x, t, span, velocity, cond, mask, voice):
 
         def field(x, t, span):
@@ -463,12 +484,20 @@ class RectifiedFlow(nn.Module):
 
     def forward(self, mel, content, f0, energy, speaker, mask, speaker_dropout=0.0,
                 breathiness=None, key_shift=None, speed=None, backbone=None, voicing=None, tension=None,
-                mean_ratio=0.25, mean_bootstrap=1.0):
+                mean_ratio=0.25, mean_bootstrap=1.0, mean_reconstruction=False):
+        target_speaker = speaker
         speaker = self._drop_speakers(speaker, speaker_dropout)
         cond = self.encoder(content, f0, energy, speaker, mask, breathiness, key_shift, speed, voicing, tension)
         voice = self.encoder.voice(speaker)
         if self.backbone.span_mlp is not None:
-            return self._mean_forward(mel, cond, voice, mask, backbone, mean_ratio, mean_bootstrap)
+            result = self._mean_forward(mel, cond, voice, mask, backbone, mean_ratio, mean_bootstrap)
+            if mean_reconstruction:
+                reconstruction = self.mean_reconstruction_loss(
+                    mel, content, f0, energy, target_speaker, mask, breathiness,
+                    key_shift, speed, voicing, tension,
+                )
+                return (*result, reconstruction)
+            return result
         t = self._times(mel.shape[0], mel.device)
         if self.dual_timestep:
             t2 = self._times(mel.shape[0], mel.device)
