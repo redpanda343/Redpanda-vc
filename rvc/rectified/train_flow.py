@@ -201,18 +201,26 @@ def preview(model, ema, vocoder, reference, data, writer, step):
             model.eval()
             generated = model.sample(content, f0, energy, speaker, mask,
                                      breathiness=breathiness.to(device), **variances)
+            predicted = model.predict_mel(content, f0, energy, speaker, mask,
+                                          breathiness=breathiness.to(device), **variances) if model.aux is not None else None
     finally:
         model.train(training)
     if not torch.isfinite(generated).all():
         raise FloatingPointError('Non-finite flow preview.')
     writer.add_image('mel/flow', (generated[0] / 6.0 + 0.5).clamp(0, 1).cpu(), step, dataformats='HW')
     writer.add_image('mel/reference', (normalize_mel(mel[0], data) / 6.0 + 0.5).clamp(0, 1).cpu(), step, dataformats='HW')
+    if predicted is not None:
+        if not torch.isfinite(predicted).all():
+            raise FloatingPointError('Non-finite direct mel preview.')
+        writer.add_image('mel/predictor', (predicted[0] / 6.0 + 0.5).clamp(0, 1).cpu(), step, dataformats='HW')
     if vocoder is None:
         return
     generated_audio = vocoder(generated, f0)[0]
     rendered_reference = vocoder(normalize_mel(mel.to(device), data), f0)[0]
-    for name, value in [('flow', generated_audio), ('reference', audio[0]),
-                        ('vocoder_on_real_mel', rendered_reference)]:
+    previews = [('flow', generated_audio), ('reference', audio[0]), ('vocoder_on_real_mel', rendered_reference)]
+    if predicted is not None:
+        previews.append(('predictor', vocoder(predicted, f0)[0]))
+    for name, value in previews:
         if not torch.isfinite(value).all():
             raise FloatingPointError(f'Non-finite {name} preview.')
         writer.add_audio(f'audio/{name}', value.clamp(-1, 1).cpu(), step, data['sample_rate'])
@@ -258,7 +266,7 @@ def evaluate(model, ema, loader, data, writer, step, mean_reconstruction=False):
     for fraction, value in zip(fractions, totals.tolist()):
         writer.add_scalar(f'val/flow_t{fraction:g}', value, step)
     if model.aux is not None:
-        writer.add_scalar('val/aux_mel_l1', aux_total / max(1, count), step)
+        writer.add_scalar(f'val/{model.aux_loss_name}', aux_total / max(1, count), step)
     if mean_reconstruction:
         writer.add_scalar('val/mean_reconstruction_l1', reconstruction_total / max(1.0, reconstruction_frames), step)
         speaker_errors = []
@@ -294,15 +302,23 @@ def configure_flow_mode(config, requested, existing_config, batch_size):
         data = config['data']
         data['mel_mean'] = -5.0 if mean_flow else -6.0
         data['mel_std'] = 2.5 if mean_flow else 6.0
-        model['dual_timestep'] = not mean_flow
+        model['dual_timestep'] = False
+        model['flow_conditioning'] = 'encoder' if mean_flow else 'aux_mel'
+        model['flow_loss'] = 'l2' if mean_flow else 'l2_lognorm'
+        model['aux_grad'] = 1.0
+        model['t_start'] = 0.4 if mean_flow else 0.0
+        model.setdefault('backbone_args', {})['adaln'] = mean_flow
+        settings['aux_mel_weight'] = 0.2 if mean_flow else 1.0
+        settings['speaker_dropout'] = 0.1 if mean_flow else 0.0
         if not mean_flow:
-            model['aux_grad'] = 0.1
             settings.update(learning_rate=0.0006, lr_schedule='step', decay_step=5000,
                             gamma=0.8, step_lr_offset=0)
         model.setdefault('backbone_args', {})['time_scale'] = 1.0 if mean_flow else 1000.0
         model['sampling_method'] = 'mean' if mean_flow else 'euler'
         model['sampling_steps'] = 1 if mean_flow else 20
         if mean_flow:
+            settings.update(learning_rate=0.0005, lr_schedule='step', decay_step=4000, gamma=0.9)
+            settings.pop('step_lr_offset', None)
             settings['mean_flow_ratio'] = 0.25
             settings['mean_flow_warmup_steps'] = 10000
             settings['mean_reconstruction_weight'] = 1.0
@@ -435,6 +451,8 @@ def train_rank(args, ranks):
             raise ValueError('Pretrained flow uses a different content embedder.')
         pretrained_model = state.get('config', {}).get('flow', {}).get('model', {})
         validate_model_config(pretrained_model)
+        if pretrained_model.get('flow_conditioning', 'encoder') != settings['model'].get('flow_conditioning', 'encoder'):
+            raise ValueError('Pretrained flow uses different conditioning. Use a matching mel-conditioned pretrained or start a new model from scratch.')
         if pretrained_model.get('conditioning_version', 1) != settings['model'].get('conditioning_version', 1):
             raise ValueError('Pretrained conditioning version differs. Start a new model or use a matching pretrained.')
         for name in ('voicing', 'tension', 'mean_flow'):
@@ -500,7 +518,7 @@ def train_rank(args, ranks):
                 media_step = bool((preview_interval and step % preview_interval == 0) or
                                   (held and settings.get('eval_interval', 0) and step % settings['eval_interval'] == 0))
                 if ranks.main:
-                    for tag, value in [('loss/flow', flow), ('loss/aux_mel_l1', auxiliary), ('grad_norm', norm), ('lr', current_lr)]:
+                    for tag, value in [('loss/flow', flow), (f'loss/{model.aux_loss_name}', auxiliary), ('grad_norm', norm), ('lr', current_lr)]:
                         writer.add_scalar(tag, value, step)
                     for tag, value in metrics.items():
                         writer.add_scalar(tag, value, step)

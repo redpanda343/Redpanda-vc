@@ -251,11 +251,11 @@ def rectified_train_tab():
             embedder = gr.Dropdown(label='Content embedder', choices=['contentvec', 'spin-v2'], value='contentvec')
         extract_button = gr.Button('Extract content and F0')
     with gr.Accordion('3. Train rectified flow', open=True):
-        gr.Markdown('Choose **standard Rectified Flow** for the normal velocity-matching objective and multi-step sampling, '
+        gr.Markdown('Choose **standard Rectified Flow** for a directly supervised ContentVec-to-mel predictor followed by flow refinement, '
                     'or **MeanFlow** for the one-step objective. Both use the same multispeaker conditioning-v2 frontend and balanced speaker sampling. '
                     'The mode is part of the model architecture, so an existing experiment cannot be switched in place.')
         flow_mode = gr.Dropdown(label='Flow training mode', choices=FLOW_MODE_CHOICES, value='Rectified Flow (standard)',
-                                info='New standard Rectified Flow experiments use DiffSinger-style mel normalization (-12..0 -> -1..1), dual timesteps, LR 0.0006 with 0.8 decay every 5000 updates, and 20-step Euler sampling. Existing experiments keep saved settings; MeanFlow keeps its original recipe.')
+                                info='New standard models use DDSP-SVC-style training: full predictor gradients, mel MSE with weight 1, predicted-mel flow conditioning, log-normal timestep weighting, and no speaker dropout. Defaults: LR 0.0006 with 0.8 decay every 5000 updates, 20-step Euler, and predictor audio previews. Use a new experiment or matching pretrained. Saved experiments keep their recipe; MeanFlow keeps its original training.')
         vocoder_mode = gr.Dropdown(label='Audio preview vocoder', choices=VOCODER_CHOICES, value='Default NSF-HiFiGAN',
                                    info='The default NSF-HiFiGAN downloads automatically on start. Choose mel previews only to skip audio rendering.')
         vocoder = gr.Textbox(label='Custom OpenVPI NSF-HiFiGAN checkpoint path', visible=False,
