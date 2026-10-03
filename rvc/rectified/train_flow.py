@@ -274,18 +274,40 @@ def train(args):
     launch(train_rank, args)
 
 
-def configure_mean_flow(config, requested, existing_config, batch_size):
+def configure_flow_mode(config, requested, existing_config, batch_size):
     settings = config['flow']
     model = settings['model']
-    if requested and existing_config and not model.get('mean_flow', False):
-        raise ValueError('MeanFlow needs a new experiment. Existing experiments keep their saved architecture.')
-    if requested and not existing_config:
-        model['mean_flow'] = True
-        model.setdefault('backbone_args', {})['time_scale'] = 1.0
-        model['sampling_method'] = 'mean'
-        model['sampling_steps'] = 1 if model.get('conditioning_version', 1) == 2 else 2
-        settings['mean_flow_ratio'] = 0.25
-        settings['mean_flow_warmup_steps'] = 10000
+    saved_mode = 'meanflow' if model.get('mean_flow', False) else 'rectified'
+    requested = requested or saved_mode
+    if existing_config and requested != saved_mode:
+        raise ValueError(
+            f'This experiment was created as {"MeanFlow" if saved_mode == "meanflow" else "standard Rectified Flow"}. '
+            'Changing the flow architecture requires a new experiment name.'
+        )
+    if not existing_config:
+        mean_flow = requested == 'meanflow'
+        model['mean_flow'] = mean_flow
+        # DiffSinger acoustic RF uses spec_min=-12 and spec_max=0:
+        # (mel - spec_min) / (spec_max - spec_min) * 2 - 1
+        # This is exactly (mel + 6) / 6, represented by RedPanda's existing
+        # mean/std normalization interface as mel_mean=-6 and mel_std=6.
+        data = config['data']
+        data['mel_mean'] = -5.0 if mean_flow else -6.0
+        data['mel_std'] = 2.5 if mean_flow else 6.0
+        # DiffSinger-style dual timestep is used by standard Rectified Flow only.
+        # MeanFlow keeps its original single-timestep recipe.
+        model['dual_timestep'] = not mean_flow
+        model.setdefault('backbone_args', {})['time_scale'] = 1.0 if mean_flow else 1000.0
+        model['sampling_method'] = 'mean' if mean_flow else 'euler'
+        model['sampling_steps'] = 1 if mean_flow else 20
+        if mean_flow:
+            settings['mean_flow_ratio'] = 0.25
+            settings['mean_flow_warmup_steps'] = 10000
+            settings['mean_reconstruction_weight'] = 1.0
+        else:
+            settings.pop('mean_flow_ratio', None)
+            settings.pop('mean_flow_warmup_steps', None)
+            settings.pop('mean_reconstruction_weight', None)
     if model.get('mean_flow', False):
         legacy = not any(model.get(name, False) for name in ('dual_timestep', 'voicing', 'tension'))
         settings.setdefault('mean_reconstruction_weight', 1.0 if legacy else 0.0)
@@ -319,8 +341,8 @@ def train_rank(args, ranks):
     if not existing_config:
         config_path = ROOT / 'rvc' / 'configs' / 'rectified' / '44100_multispeaker.json'
     config = json.loads(config_path.read_text(encoding='utf-8'))
+    configure_flow_mode(config, args.flow_mode, existing_config, args.batch_size)
     validate_model_config(config['flow']['model'])
-    configure_mean_flow(config, False, existing_config, args.batch_size)
     settings, data = config['flow'], config['data']
     multispeaker = settings['model'].get('conditioning_version', 1) == 2
     if data['sample_rate'] != 44100:
@@ -395,7 +417,7 @@ def train_rank(args, ranks):
             raise ValueError('Speaker IDs or extracted feature metadata changed. Use a new experiment.')
         if settings['model'].get('mean_flow', False):
             state['config']['flow'].setdefault('mean_reconstruction_weight', settings['mean_reconstruction_weight'])
-        configure_mean_flow(state['config'], False, True, args.batch_size)
+        configure_flow_mode(state['config'], args.flow_mode, True, args.batch_size)
         if state['config'] != config or state['embedder_model'] != embedder:
             raise ValueError('Resume config or embedder differs from the saved checkpoint.')
         model.load_state_dict(state['model'], strict=True)
@@ -413,13 +435,20 @@ def train_rank(args, ranks):
         validate_model_config(pretrained_model)
         if pretrained_model.get('conditioning_version', 1) != settings['model'].get('conditioning_version', 1):
             raise ValueError('Pretrained conditioning version differs. Start a new model or use a matching pretrained.')
-        for name in ('dual_timestep', 'voicing', 'tension', 'mean_flow'):
+        for name in ('voicing', 'tension', 'mean_flow'):
             if bool(pretrained_model.get(name, False)) != bool(settings['model'].get(name, False)):
                 raise ValueError(f'Pretrained flow differs in {name}. Use a matching pretrained or train a new model from scratch.')
         source_scale = float(pretrained_model.get('backbone_args', {}).get('time_scale', 1000.0))
         target_scale = float(settings['model'].get('backbone_args', {}).get('time_scale', 1000.0))
         if source_scale != target_scale:
             raise ValueError('Pretrained flow uses a different time embedding scale. Use a matching pretrained.')
+        pretrained_data = state.get('config', {}).get('data', {})
+        for name in ('mel_mean', 'mel_std'):
+            if name in pretrained_data and float(pretrained_data[name]) != float(data[name]):
+                raise ValueError(
+                    f'Pretrained flow uses different mel normalization ({name}={pretrained_data[name]} vs {data[name]}). '
+                    'Use a matching pretrained or start from scratch.'
+                )
         weights = state['ema']['shadow'] if state.get('ema') else state['model']
         speaker_init = model.encoder.speaker.weight if multispeaker else None
         model.load_state_dict(resize_speakers(weights, speakers, speaker_init), strict=True)
@@ -516,7 +545,7 @@ def train_rank(args, ranks):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train Multispeaker MeanFlow with an optional frozen OpenVPI NSF-HiFiGAN preview vocoder.')
+    parser = argparse.ArgumentParser(description='Train Multispeaker Rectified Flow or MeanFlow with an optional frozen OpenVPI NSF-HiFiGAN preview vocoder.')
     parser.add_argument('--model-name', required=True)
     parser.add_argument('--vocoder', default='')
     parser.add_argument('--batch-size', type=int, default=4)
@@ -525,6 +554,8 @@ def main():
     parser.add_argument('--device', default='cuda:0' if torch.cuda.is_available() else 'cpu',
                         help='cpu, one GPU such as cuda:0, or multiple GPUs such as cuda:0,cuda:1')
     parser.add_argument('--precision', choices=['fp32', 'fp16', 'bf16'], default='fp32')
+    parser.add_argument('--flow-mode', choices=['rectified', 'meanflow'], default=None,
+                        help='Training objective for a new experiment. Existing experiments keep their saved mode.')
     parser.add_argument('--pretrained-flow')
     parser.add_argument('--learning-rate', type=float)
     parser.add_argument('--seed', type=int, default=1234)

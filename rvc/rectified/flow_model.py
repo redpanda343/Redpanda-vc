@@ -328,7 +328,7 @@ class RectifiedFlow(nn.Module):
         voicing: bool = False,
         tension: bool = False,
         sampling_method: str = "euler",
-        sampling_steps: int = 16,
+        sampling_steps: int = 20,
         mean_flow: bool = False,
         conditioning_version: int = 2,
     ):
@@ -498,6 +498,10 @@ class RectifiedFlow(nn.Module):
         t = torch.sigmoid(math.sqrt(2.0) * torch.erfinv(2.0 * u - 1.0))
         return self.t_start + (1.0 - self.t_start) * t
 
+    def _uniform_times(self, batch, device):
+        t = torch.rand(batch, device=device)
+        return self.t_start + (1.0 - self.t_start) * t
+
     def forward(self, mel, content, f0, energy, speaker, mask, speaker_dropout=0.0,
                 breathiness=None, key_shift=None, speed=None, backbone=None, voicing=None, tension=None,
                 mean_ratio=0.25, mean_bootstrap=1.0, mean_reconstruction=False):
@@ -514,9 +518,9 @@ class RectifiedFlow(nn.Module):
                 )
                 return (*result, reconstruction)
             return result
-        t = self._times(mel.shape[0], mel.device)
+        t = self._uniform_times(mel.shape[0], mel.device)
         if self.dual_timestep:
-            t2 = self._times(mel.shape[0], mel.device)
+            t2 = self._uniform_times(mel.shape[0], mel.device)
             alternate = torch.rand(mel.shape[0], mel.shape[-1], device=mel.device) < 0.25
             t = torch.where(alternate & mask[:, 0].bool(), t2[:, None], t[:, None])
 
@@ -676,12 +680,16 @@ def resize_speakers(state_dict: dict, speaker_count: int, speaker_init=None) -> 
 
 
 def validate_model_config(model: dict):
-    if (model.get('conditioning_version') != 2 or not model.get('mean_flow', False)
-            or any(model.get(name, False) for name in ('dual_timestep', 'voicing', 'tension'))):
-        raise ValueError('Obsolete rectified-flow recipe or checkpoint. Only Multispeaker MeanFlow is supported; use a new experiment.')
+    if (model.get('conditioning_version') != 2
+            or any(model.get(name, False) for name in ('voicing', 'tension'))):
+        raise ValueError('Unsupported rectified-flow recipe or checkpoint. Use the Multispeaker conditioning-v2 recipe.')
+    if model.get('mean_flow', False) and model.get('dual_timestep', False):
+        raise ValueError('Dual timestep is enabled only for standard Rectified Flow; disable it for MeanFlow.')
     if (model.get('content_bottleneck', 0) or model.get('content_bottleneck_noise', 0)
             or model.get('speaker_channels', 384) != model.get('hidden_channels', 384)):
-        raise ValueError('Multispeaker MeanFlow requires full content features and hidden-width speaker embeddings.')
+        raise ValueError('Multispeaker rectified flow requires full content features and hidden-width speaker embeddings.')
+    if not model.get('mean_flow', False) and model.get('sampling_method', 'euler') == 'mean':
+        raise ValueError('Standard Rectified Flow cannot use MeanFlow sampling. Use Euler/Heun or a MeanFlow checkpoint.')
 
 
 def build_flow(config: dict, speaker_count: int) -> RectifiedFlow:
