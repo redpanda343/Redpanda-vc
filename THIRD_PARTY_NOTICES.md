@@ -35,10 +35,6 @@ SOFTWARE.
 The rectified-flow model, conditioning, mel processing, Muon optimizer, EMA,
 and OpenVPI NSF-HiFiGAN adapter in `rvc/rectified` are adapted from [ShiroRVC](https://github.com/ShiromiyaG/ShiroRVC).
 The flow configuration is adapted from its 44.1 kHz recipe.
-MeanFlow span conditioning, directional-derivative training, adaptive weighting
-and mean-velocity sampling are adapted from the user-supplied `shiro-new.zip`
-ShiroRVC source. The integration retains RedPanda conditioning, legacy sampling
-and checkpoint contracts.
 
 MIT License
 
@@ -64,14 +60,16 @@ SOFTWARE.
 
 ## DiffSinger rectified-flow quality features
 
+Shallow flow initialization, auxiliary mel supervision, cached conditioning,
 RK4 sampling, dual-timestep training and WORLD-based voicing/tension extraction
 in `rvc/rectified/flow_model.py` and `rvc/rectified/variance.py` are adapted from
 [OpenVPI DiffSinger](https://github.com/openvpi/DiffSinger), specifically
 `modules/core/reflow.py`, `modules/backbones/lynxnet2.py`,
+`modules/toplevel.py`, `modules/aux_decoder/convnext.py`,
 `utils/decomposed_waveform.py` and `utils/binarizer_utils.py`.
 The fundamental-harmonic extraction in DiffSinger credits yxlllc.
 
-The adaptations preserve RedPanda's time distribution, padding masks, adaptive
+The adaptations preserve RedPanda's padding masks, adaptive
 normalization, existing breathiness input and feature alignment. WORLD input
 dither is deterministic and silence/short-input handling is explicit.
 

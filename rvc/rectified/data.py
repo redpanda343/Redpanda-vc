@@ -160,7 +160,7 @@ class RectifiedDataset(Dataset):
         self.sample_rate = int(self.data["sample_rate"])
         self.mel = LogMel.from_config(self.data)
         self.content_channels = int(config["flow"]["model"]["content_channels"])
-        self.strict_features = config['flow']['model'].get('conditioning_version', 1) in (2, 3)
+        self.strict_features = config['flow']['model'].get('conditioning_version', 1) in (2, 3, 4)
         self.key_shift_range = float(config["flow"].get("key_shift_range", 0.0))
         self.key_shift_prob = float(config["flow"].get("key_shift_prob", 0.0))
         self.stretch_range = tuple(config["flow"].get("time_stretch_range", (1.0, 1.0)))

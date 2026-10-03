@@ -8,7 +8,7 @@ from torch.nn import functional as F
 
 LOG_F0_CENTER = math.log(200.0)
 LOG_F0_SCALE = 0.7
-SAMPLERS = ("euler", "heun", "rk4", "mean")
+SAMPLERS = ("euler", "heun", "rk4")
 
 
 SCHEDULES = ("uniform", "sway", "logit-normal")
@@ -116,7 +116,7 @@ class ConditionEncoder(nn.Module):
         conditioning_version: int = 2,
     ):
         super().__init__()
-        if conditioning_version not in (2, 3):
+        if conditioning_version not in (2, 3, 4):
             raise ValueError('Obsolete conditioning version. Train a new Multispeaker model.')
         if content_bottleneck or content_bottleneck_noise:
             raise ValueError('Project full content features directly to the encoder width; intermediate bottlenecks are unsupported.')
@@ -138,7 +138,7 @@ class ConditionEncoder(nn.Module):
         self.has_null_speaker = conditioning_version == 2
         self.speaker = nn.Embedding(self.speaker_count + int(self.has_null_speaker), speaker_channels)
         self.speaker_proj = (nn.Linear(speaker_channels, hidden_channels, bias=False)
-                             if conditioning_version == 3 else nn.Identity())
+                             if conditioning_version >= 3 else nn.Identity())
         self.blocks = nn.ModuleList([ConvNeXtBlock(hidden_channels) for _ in range(layers)])
         self.voicing = nn.Conv1d(1, hidden_channels, 3, padding=1) if voicing else None
         self.tension = nn.Conv1d(1, hidden_channels, 3, padding=1) if tension else None
@@ -250,7 +250,7 @@ class LYNXNet2Block(nn.Module):
 
 class LYNXNet2Backbone(nn.Module):
     def __init__(self, n_mels, cond_channels, channels=1024, layers=6, expansion=1, kernel_size=31,
-                 adaln=False, span=False, time_scale=1000.0, speaker_channels=None):
+                 adaln=False, time_scale=1000.0, speaker_channels=None):
         super().__init__()
         self.channels = int(channels)
         self.time_scale = float(time_scale)
@@ -259,13 +259,6 @@ class LYNXNet2Backbone(nn.Module):
         self.time_mlp = nn.Sequential(
             nn.Linear(channels, channels * 4), nn.GELU(), nn.Linear(channels * 4, channels)
         )
-        self.span_mlp = None
-        if span:
-            self.span_mlp = nn.Sequential(
-                nn.Linear(channels, channels * 4, bias=False), nn.GELU(),
-                nn.Linear(channels * 4, channels, bias=False),
-            )
-            nn.init.zeros_(self.span_mlp[-1].weight)
         self.layers = nn.ModuleList(
             [LYNXNet2Block(channels, expansion, kernel_size, adaln) for _ in range(layers)]
         )
@@ -278,28 +271,26 @@ class LYNXNet2Backbone(nn.Module):
         nn.init.zeros_(self.output.weight)
         nn.init.zeros_(self.output.bias)
 
-    def forward(self, x, t, cond, mask, voice=None, span=None):
+    def prepare_conditioning(self, cond, voice):
+        projected = self.input_cond(cond).transpose(1, 2)
+        speaker = self.voice(voice)[:, None, :] if self.voice is not None else None
+        return projected, speaker
+
+    def forward(self, x, t, cond, mask, voice=None, prepared=None):
         time = self.time_mlp(timestep_embedding(t.reshape(-1), self.channels, self.time_scale))
         time = time.view(t.shape[0], -1, self.channels)
-        if span is not None:
-            features = timestep_embedding(span.reshape(-1), self.channels, self.time_scale)
-            half = self.channels // 2
-            features = torch.cat((features[:, :half], 1.0 - features[:, half:]), dim=-1)
-            time = time + self.span_mlp(features).view(span.shape[0], -1, self.channels)
         frame_mask = mask.transpose(1, 2)
         with torch.autocast(x.device.type, enabled=False):
             h = self.input(x.transpose(1, 2).to(self.input.weight.dtype))
-        h = h + self.input_cond(cond).transpose(1, 2) + time
+        projected, speaker = self.prepare_conditioning(cond, voice) if prepared is None else prepared
+        h = h + projected + time
         h = h * frame_mask
         embedding = None
         if self.voice is not None:
-            embedding = time + self.voice(voice)[:, None, :]
+            embedding = time + speaker
         for layer in self.layers:
-            h = layer(h, frame_mask, embedding, fused=span is None)
-        if span is None:
-            h = self.norm(h)
-        else:
-            h = F.layer_norm(h, (self.channels,), eps=self.norm.eps) * self.norm.weight + self.norm.bias
+            h = layer(h, frame_mask, embedding)
+        h = self.norm(h)
         return (self.output(h) * frame_mask).transpose(1, 2)
 
 
@@ -348,7 +339,6 @@ class RectifiedFlow(nn.Module):
         tension: bool = False,
         sampling_method: str = "euler",
         sampling_steps: int = 20,
-        mean_flow: bool = False,
         conditioning_version: int = 2,
         flow_conditioning: str = "encoder",
         flow_loss: str = "l2",
@@ -364,14 +354,20 @@ class RectifiedFlow(nn.Module):
         if not math.isfinite(mel_mean) or not math.isfinite(mel_std) or mel_std <= 0:
             raise ValueError("Mel normalization must be finite with a positive scale.")
         adaln = bool((backbone_args or {}).get("adaln", False))
-        if direct_speaker_conditioning and (mean_flow or not adaln):
+        if direct_speaker_conditioning and not adaln:
             raise ValueError('Direct speaker conditioning requires standard flow with speaker AdaLN.')
         if conditioning_version == 3 and (
                 not direct_speaker_conditioning or flow_conditioning != 'encoder' or aux_decoder or t_start != 0.0):
             raise ValueError('Conditioning v3 requires direct encoder and speaker conditioning, no mel predictor, and t_start=0.')
         if flow_conditioning == "aux_mel" and (
-                mean_flow or not aux_decoder or aux_grad != 1.0 or adaln != bool(direct_speaker_conditioning)):
+                not aux_decoder or aux_grad != 1.0 or adaln != bool(direct_speaker_conditioning)):
             raise ValueError("Mel-conditioned flow requires standard flow, an auxiliary decoder, full gradients and matching speaker conditioning.")
+        if conditioning_version == 4 and (
+                not direct_speaker_conditioning or flow_conditioning != 'encoder' or not aux_decoder
+                or not 0.0 < t_start < 1.0 or flow_loss != 'l2'):
+            raise ValueError('Conditioning v4 requires speaker-conditioned shallow flow, encoder features, a mel predictor and L2 loss.')
+        if not 0.0 <= t_start < 1.0 or (t_start > 0 and not aux_decoder):
+            raise ValueError('Shallow flow requires a mel predictor and a start time between 0 and 1.')
         self.direct_speaker_conditioning = bool(direct_speaker_conditioning)
         self.flow_conditioning = flow_conditioning
         self.flow_loss = flow_loss
@@ -398,13 +394,13 @@ class RectifiedFlow(nn.Module):
         )
         cond_channels = n_mels if flow_conditioning == "aux_mel" else hidden_channels
         self.backbone = LYNXNet2Backbone(
-            n_mels, cond_channels, span=bool(mean_flow),
+            n_mels, cond_channels,
             speaker_channels=speaker_channels if self.direct_speaker_conditioning else None,
             **(backbone_args or {}),
         )
 
 
-        conditioning = [self.backbone.time_mlp, self.backbone.span_mlp, self.encoder.speaker_proj, self.backbone.voice]
+        conditioning = [self.backbone.time_mlp, self.encoder.speaker_proj, self.backbone.voice]
         conditioning += [layer.modulation for layer in self.backbone.layers]
         for module in filter(None, conditioning):
             for child in module.modules():
@@ -419,8 +415,6 @@ class RectifiedFlow(nn.Module):
         self.dual_timestep = bool(dual_timestep)
         if sampling_method not in SAMPLERS or int(sampling_steps) != sampling_steps or sampling_steps < 1:
             raise ValueError("Invalid flow sampling method or step count.")
-        if sampling_method == "mean" and not mean_flow:
-            raise ValueError("Mean sampling requires a MeanFlow-trained checkpoint.")
         self.sampling_method = sampling_method
         self.sampling_steps = int(sampling_steps)
 
@@ -477,127 +471,18 @@ class RectifiedFlow(nn.Module):
         cond = self.encoder(content, f0, energy, speaker, mask, breathiness, key_shift, speed, voicing, tension)
         return self.aux(cond, mask, self.encoder.voice(speaker))
 
-    def _flow_error(self, mel, cond, voice, mask, t, noise, backbone):
-        mix = t[:, None, None] if t.dim() == 1 else t[:, None, :]
-        x_t = (1.0 - mix) * noise + mix * mel
-        prediction = backbone(x_t, t, cond, mask, voice)
-        error = (prediction.float() - (mel - noise).float()).square() * mask
-        return error.sum((1, 2)) / (mask.sum((1, 2)) * self.n_mels).clamp_min(1.0)
-
-    def _aux_loss(self, mel, cond, mask):
-        _, prediction = self._conditioning(cond, mask)
-        return self._mel_loss(prediction, mel, mask)
-
-    def mean_reconstruction_loss(self, mel, content, f0, energy, speaker, mask,
-                                 breathiness=None, key_shift=None, speed=None,
-                                 voicing=None, tension=None, noise=None, reduction='mean'):
-        if self.backbone.span_mlp is None:
-            raise ValueError("Mean reconstruction requires a MeanFlow model.")
-        cond = self.encoder(content, f0, energy, speaker, mask, breathiness,
-                            key_shift, speed, voicing, tension)
-        voice = self.encoder.voice(speaker)
-        noise = torch.randn_like(mel) if noise is None else noise
-        start = self.t_start
-        x = noise
-        if start > 0:
-            x = (1.0 - start) * noise + start * self.aux(cond, mask)
-        x = x * mask
-        t = mel.new_full((mel.shape[0],), start)
-        span = torch.full_like(t, 1.0 - start)
-        velocity = self.backbone(x, t, cond, mask, voice, span)
-        generated = x + span[:, None, None] * velocity
-        error = (generated.float() - mel.float()).abs() * mask
-        if reduction == 'none':
-            return error.sum((1, 2)) / (mask.sum((1, 2)) * self.n_mels).clamp_min(1.0)
-        if reduction != 'mean':
-            raise ValueError('Unknown reconstruction reduction.')
-        return error.sum() / (mask.sum() * self.n_mels).clamp_min(1.0)
-
-    def mean_velocity(self, x, t, span, velocity, cond, mask, voice):
-
-        def field(x, t, span):
-            return self.backbone(x, t, cond, mask, voice, span)
-        tangents = (velocity, torch.ones_like(t), -torch.ones_like(span))
-        mean, derivative = torch.func.jvp(field, (x, t, span), tangents)
-        return (mean, derivative.detach())
-
-    def _mean_error(self, mel, cond, voice, mask, noise, mean_field, bootstrap=1.0):
-        first, second = (self._times(mel.shape[0], mel.device) for _ in range(2))
-        t, span = (torch.minimum(first, second), (first - second).abs())
-        x_t = (1.0 - t[:, None, None]) * noise + t[:, None, None] * mel
-        velocity = mel - noise
-        mean, derivative = mean_field(x_t, t, span, velocity, cond, mask, voice)
-        correction = span[:, None, None] * derivative.float() * mask
-        count = (mask.sum((1, 2)) * self.n_mels).clamp_min(1.0)
-        size = (correction.square().sum((1, 2)) / count).sqrt()
-        ratio = size / ((velocity.square() * mask).sum((1, 2)) / count).sqrt().clamp_min(1e-08)
-        correction = correction * (1.0 / ratio.clamp_min(1.0))[:, None, None]
-        target = velocity + bootstrap * correction
-        error = (mean.float() - target).square() * mask
-        return (error.sum((1, 2)) / count, ratio)
-
-    def _mean_forward(self, mel, cond, voice, mask, backbone, mean_ratio, mean_bootstrap):
-        if mel.shape[0] < 2 or not 0.0 < mean_ratio < 1.0:
-            raise ValueError("MeanFlow training requires batch size at least 2 and a ratio between 0 and 1.")
-        mean_field = self.mean_velocity
-        noise = torch.randn_like(mel)
-        batch = mel.shape[0]
-        mean_items = min(batch - 1, max(1, int(round(mean_ratio * batch))))
-        rest = slice(mean_items, None)
-        t = self._times(batch - mean_items, mel.device)
-        if self.dual_timestep:
-            other = self._times(batch - mean_items, mel.device)
-            swap = torch.rand(batch - mean_items, mel.shape[-1], device=mel.device) < 0.25
-            t = torch.where(swap & mask[rest, 0].bool(), other[:, None], t[:, None])
-        backbone = self.backbone if backbone is None else backbone
-        error = self._flow_error(mel[rest], cond[rest], voice[rest], mask[rest], t, noise[rest], backbone)
-
-        def pooled(error, frames, weighted=False):
-            weight = (error.detach() + 1e-3).reciprocal() if weighted else 1.0
-            return (weight * error * frames).sum() / frames.sum().clamp_min(1.0)
-        frames = mask[rest].sum((1, 2))
-        flow = pooled(error, frames)
-        head = slice(0, mean_items)
-        mean_error, bootstrap_ratio = self._mean_error(
-            mel[head], cond[head], voice[head], mask[head], noise[head], mean_field, mean_bootstrap
-        )
-        mean_frames = mask[head].sum((1, 2))
-        mean = torch.stack((
-            pooled(mean_error, mean_frames, True), flow.detach(),
-            pooled(mean_error, mean_frames).detach(), bootstrap_ratio.mean(),
-        ))
-        flow = pooled(error, frames, True)
-        return (flow, self._aux_loss(mel, cond, mask), mean)
-
-    def _times(self, batch, device):
-        u = (torch.arange(batch, device=device) + torch.rand(batch, device=device)) / batch
-        u = u[torch.randperm(batch, device=device)].clamp(1e-6, 1.0 - 1e-6)
-        t = torch.sigmoid(math.sqrt(2.0) * torch.erfinv(2.0 * u - 1.0))
-        return self.t_start + (1.0 - self.t_start) * t
-
     def _uniform_times(self, batch, device):
         t = torch.rand(batch, device=device)
         t = self.t_start + (1.0 - self.t_start) * t
         return t.clamp(1e-7, 1.0 - 1e-7) if self.flow_loss == "l2_lognorm" else t
 
     def forward(self, mel, content, f0, energy, speaker, mask, speaker_dropout=0.0,
-                breathiness=None, key_shift=None, speed=None, backbone=None, voicing=None, tension=None,
-                mean_ratio=0.25, mean_bootstrap=1.0, mean_reconstruction=False):
+                breathiness=None, key_shift=None, speed=None, backbone=None, voicing=None, tension=None):
         if (self.flow_conditioning == "aux_mel" or self.direct_speaker_conditioning) and speaker_dropout != 0:
             raise ValueError("Speaker-conditioned standard flow keeps the speaker ID present during training.")
-        target_speaker = speaker
         speaker = self._drop_speakers(speaker, speaker_dropout)
         cond = self.encoder(content, f0, energy, speaker, mask, breathiness, key_shift, speed, voicing, tension)
         voice = self.encoder.voice(speaker)
-        if self.backbone.span_mlp is not None:
-            result = self._mean_forward(mel, cond, voice, mask, backbone, mean_ratio, mean_bootstrap)
-            if mean_reconstruction:
-                reconstruction = self.mean_reconstruction_loss(
-                    mel, content, f0, energy, target_speaker, mask, breathiness,
-                    key_shift, speed, voicing, tension,
-                )
-                return (*result, reconstruction)
-            return result
         t = self._uniform_times(mel.shape[0], mel.device)
         if self.dual_timestep:
             t2 = self._uniform_times(mel.shape[0], mel.device)
@@ -649,8 +534,6 @@ class RectifiedFlow(nn.Module):
     ):
         method = self.sampling_method if method is None else method
         steps = self.sampling_steps if steps is None else steps
-        if method == "mean" and self.backbone.span_mlp is None:
-            raise ValueError("Mean sampling requires a MeanFlow-trained checkpoint.")
         if method not in SAMPLERS:
             raise ValueError(f"method must be one of {SAMPLERS}, not {method!r}.")
         if rescale_mode not in RESCALE_MODES:
@@ -691,12 +574,15 @@ class RectifiedFlow(nn.Module):
             frames = mask.sum((1, 2)).clamp_min(1.0) * self.n_mels
             return ((y.square() * mask).sum((1, 2)) / frames).sqrt()[:, None, None]
 
-        def field(x, t, span=None):
+        prepared = self.backbone.prepare_conditioning(cond, voice)
+        primary = tuple(value[:batch] if value is not None else None for value in prepared)
+
+        def field(x, t):
             now = float(t[0])
 
             if count == 1 or not (guide_from <= now and (now < guide_until or guide_until >= 1.0)):
-                return self.backbone(x, t, cond[:batch], mask, voice[:batch], span)
-            v = self.backbone(repeat(x), repeat(t), cond, masks, voice, repeat(span)).chunk(count)
+                return self.backbone(x, t, cond[:batch], mask, voice[:batch], prepared=primary)
+            v = self.backbone(repeat(x), repeat(t), cond, masks, voice, prepared=prepared).chunk(count)
             guided, index = v[0], 1
             if cfg_scale != 1.0:
                 guided = guided + (cfg_scale - 1.0) * (v[0] - v[index])
@@ -715,7 +601,7 @@ class RectifiedFlow(nn.Module):
         t0 = 0.0
         if self.t_start > 0:
             t0 = self.t_start if start is None else min(max(self.t_start, float(start)), 0.99)
-            initial = self.aux(cond[:batch], mask) if initial_mel is None else initial_mel[:batch]
+            initial = self.aux(cond[:batch], mask, voice[:batch]) if initial_mel is None else initial_mel[:batch]
             x = ((1.0 - t0) * noise + t0 * initial) * mask
         else:
             x = noise * mask
@@ -731,7 +617,7 @@ class RectifiedFlow(nn.Module):
                 now = back
             t = torch.full((batch,), now, device=x.device, dtype=times.dtype)
             dt = times[index + 1] - now
-            v = field(x, t, dt.expand(batch) if method == "mean" else None)
+            v = field(x, t)
             if method == "heun":
                 v_next = field(x + dt * v, times[index + 1].expand(batch))
                 v = 0.5 * (v + v_next)
@@ -770,7 +656,9 @@ def validate_model_config(model: dict):
     source = model.get('flow_conditioning', 'encoder')
     direct = bool(model.get('direct_speaker_conditioning', False))
     adaln = bool(model.get('backbone_args', {}).get('adaln', False))
-    if direct and (model.get('mean_flow', False) or not adaln):
+    if model.get('mean_flow', False):
+        raise ValueError('MeanFlow checkpoints are no longer supported. Train a new standard flow experiment.')
+    if direct and not adaln:
         raise ValueError('Direct speaker conditioning requires standard flow with speaker AdaLN.')
     version = model.get('conditioning_version')
     if version == 3 and (
@@ -779,25 +667,29 @@ def validate_model_config(model: dict):
     if source not in {'encoder', 'aux_mel'} or model.get('flow_loss', 'l2') not in {'l2', 'l2_lognorm'}:
         raise ValueError('Unsupported flow conditioning or loss.')
     if source == 'aux_mel' and (
-            model.get('mean_flow', False) or not model.get('aux_decoder')
+            not model.get('aux_decoder')
             or model.get('aux_grad', 0.1) != 1.0 or adaln != direct):
         raise ValueError('Mel-conditioned flow requires a standard model with a fully trained mel predictor and matching speaker conditioning.')
-    if (version not in (2, 3)
+    if (version not in (2, 3, 4)
             or any(model.get(name, False) for name in ('voicing', 'tension'))):
-        raise ValueError('Unsupported rectified-flow recipe or checkpoint. Use a Multispeaker conditioning-v2 or conditioning-v3 recipe.')
-    if model.get('mean_flow', False) and model.get('dual_timestep', False):
-        raise ValueError('Dual timestep is enabled only for standard Rectified Flow; disable it for MeanFlow.')
+        raise ValueError('Unsupported rectified-flow recipe or checkpoint. Use a supported standard-flow recipe.')
     if model.get('content_bottleneck', 0) or model.get('content_bottleneck_noise', 0):
         raise ValueError('Project full content features directly to the encoder width; intermediate bottlenecks are unsupported.')
     if version == 2 and model.get('speaker_channels', 384) != model.get('hidden_channels', 384):
         raise ValueError('Conditioning v2 requires hidden-width speaker embeddings.')
-    if not model.get('mean_flow', False) and model.get('sampling_method', 'euler') == 'mean':
-        raise ValueError('Standard Rectified Flow cannot use MeanFlow sampling. Use Euler/Heun or a MeanFlow checkpoint.')
+    if model.get('sampling_method', 'euler') not in SAMPLERS:
+        raise ValueError(f'Flow sampler must be one of {SAMPLERS}.')
+    if version == 4 and (
+            not direct or source != 'encoder' or not model.get('aux_decoder')
+            or not 0.0 < model.get('t_start', 0.0) < 1.0 or model.get('flow_loss', 'l2') != 'l2'):
+        raise ValueError('Conditioning v4 requires speaker-conditioned shallow flow, encoder features, a mel predictor and L2 loss.')
+
 
 
 def build_flow(config: dict, speaker_count: int) -> RectifiedFlow:
     model = dict(config["flow"]["model"])
     validate_model_config(model)
+    model.pop("mean_flow", None)
     data = config["data"]
     if model.get('flow_conditioning', 'encoder') == 'aux_mel':
         model['mel_mean'] = float(data['mel_mean'])
