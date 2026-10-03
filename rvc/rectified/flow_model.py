@@ -116,10 +116,12 @@ class ConditionEncoder(nn.Module):
         conditioning_version: int = 2,
     ):
         super().__init__()
-        if conditioning_version != 2:
+        if conditioning_version not in (2, 3):
             raise ValueError('Obsolete conditioning version. Train a new Multispeaker model.')
-        if content_bottleneck or content_bottleneck_noise or speaker_channels != hidden_channels:
-            raise ValueError('Conditioning v2 requires full content features and hidden-width speaker embeddings.')
+        if content_bottleneck or content_bottleneck_noise:
+            raise ValueError('Project full content features directly to the encoder width; intermediate bottlenecks are unsupported.')
+        if conditioning_version == 2 and speaker_channels != hidden_channels:
+            raise ValueError('Conditioning v2 requires hidden-width speaker embeddings.')
         self.conditioning_version = conditioning_version
         self.speaker_count = int(speaker_count)
         self.bottleneck = None
@@ -133,18 +135,20 @@ class ConditionEncoder(nn.Module):
         self.breathiness = nn.Conv1d(1, hidden_channels, 3, padding=1) if breathiness else None
         self.key_shift = nn.Linear(1, hidden_channels) if key_shift else None
         self.speed = nn.Linear(1, hidden_channels) if speed else None
-        self.speaker = nn.Embedding(self.speaker_count + 1, speaker_channels)
-        self.speaker_proj = nn.Identity()
+        self.has_null_speaker = conditioning_version == 2
+        self.speaker = nn.Embedding(self.speaker_count + int(self.has_null_speaker), speaker_channels)
+        self.speaker_proj = (nn.Linear(speaker_channels, hidden_channels, bias=False)
+                             if conditioning_version == 3 else nn.Identity())
         self.blocks = nn.ModuleList([ConvNeXtBlock(hidden_channels) for _ in range(layers)])
         self.voicing = nn.Conv1d(1, hidden_channels, 3, padding=1) if voicing else None
         self.tension = nn.Conv1d(1, hidden_channels, 3, padding=1) if tension else None
         self.content_norm = nn.LayerNorm(content_channels)
-        nn.init.normal_(self.speaker.weight, std=hidden_channels ** -0.5)
+        nn.init.normal_(self.speaker.weight, std=speaker_channels ** -0.5)
         nn.init.xavier_uniform_(self.content.weight)
         nn.init.zeros_(self.content.bias)
 
     def voice(self, speaker: torch.Tensor) -> torch.Tensor:
-        return self.speaker_proj(self.speaker(speaker))
+        return self.speaker(speaker)
 
     def encode_content(self, content, mask):
         x = self.content(self.content_norm(content)).transpose(1, 2) * mask
@@ -182,7 +186,7 @@ class ConditionEncoder(nn.Module):
             if speed is None:
                 speed = torch.ones(content.shape[0], device=content.device)
             x = x + self.speed(speed.float().view(-1, 1)).unsqueeze(-1)
-        x = x + self.voice(speaker).unsqueeze(-1)
+        x = x + self.speaker_proj(self.voice(speaker)).unsqueeze(-1)
         x = x * mask
         return x
 
@@ -360,8 +364,11 @@ class RectifiedFlow(nn.Module):
         if not math.isfinite(mel_mean) or not math.isfinite(mel_std) or mel_std <= 0:
             raise ValueError("Mel normalization must be finite with a positive scale.")
         adaln = bool((backbone_args or {}).get("adaln", False))
-        if direct_speaker_conditioning and (mean_flow or flow_conditioning != 'aux_mel' or not adaln):
-            raise ValueError('Direct speaker conditioning requires standard mel-conditioned flow with speaker AdaLN.')
+        if direct_speaker_conditioning and (mean_flow or not adaln):
+            raise ValueError('Direct speaker conditioning requires standard flow with speaker AdaLN.')
+        if conditioning_version == 3 and (
+                not direct_speaker_conditioning or flow_conditioning != 'encoder' or aux_decoder or t_start != 0.0):
+            raise ValueError('Conditioning v3 requires direct encoder and speaker conditioning, no mel predictor, and t_start=0.')
         if flow_conditioning == "aux_mel" and (
                 mean_flow or not aux_decoder or aux_grad != 1.0 or adaln != bool(direct_speaker_conditioning)):
             raise ValueError("Mel-conditioned flow requires standard flow, an auxiliary decoder, full gradients and matching speaker conditioning.")
@@ -576,8 +583,8 @@ class RectifiedFlow(nn.Module):
     def forward(self, mel, content, f0, energy, speaker, mask, speaker_dropout=0.0,
                 breathiness=None, key_shift=None, speed=None, backbone=None, voicing=None, tension=None,
                 mean_ratio=0.25, mean_bootstrap=1.0, mean_reconstruction=False):
-        if self.flow_conditioning == "aux_mel" and speaker_dropout != 0:
-            raise ValueError("Mel-conditioned flow keeps the speaker ID present during training.")
+        if (self.flow_conditioning == "aux_mel" or self.direct_speaker_conditioning) and speaker_dropout != 0:
+            raise ValueError("Speaker-conditioned standard flow keeps the speaker ID present during training.")
         target_speaker = speaker
         speaker = self._drop_speakers(speaker, speaker_dropout)
         cond = self.encoder(content, f0, energy, speaker, mask, breathiness, key_shift, speed, voicing, tension)
@@ -649,8 +656,8 @@ class RectifiedFlow(nn.Module):
         if rescale_mode not in RESCALE_MODES:
             raise ValueError(f"rescale_mode must be one of {RESCALE_MODES}, not {rescale_mode!r}.")
         batch = content.shape[0]
-        if self.flow_conditioning == "aux_mel" and cfg_scale != 1.0:
-            raise ValueError("Mel-conditioned flow trains without speaker dropout; use cfg_scale=1.")
+        if (self.flow_conditioning == "aux_mel" or self.direct_speaker_conditioning) and cfg_scale != 1.0:
+            raise ValueError("Speaker-conditioned standard flow trains without speaker dropout; use cfg_scale=1.")
         null = torch.full_like(speaker, self.speaker_count)
 
         variants = [(content, speaker)]
@@ -740,21 +747,22 @@ class RectifiedFlow(nn.Module):
         return x * mask
 
 
-def resize_speakers(state_dict: dict, speaker_count: int, speaker_init=None) -> dict:
+def resize_speakers(state_dict: dict, speaker_count: int, speaker_init=None, null_speaker: bool = True) -> dict:
     key = "encoder.speaker.weight"
     table = state_dict[key]
     if speaker_init is not None:
-        if speaker_init.shape != (speaker_count + 1, table.shape[1]):
+        if speaker_init.shape != (speaker_count + int(null_speaker), table.shape[1]):
             raise ValueError('Invalid target speaker initialization.')
         state_dict = dict(state_dict)
-        state_dict[key] = torch.cat((speaker_init[:-1].detach().to(table).clone(), table[-1:]), dim=0)
+        rows = speaker_init.detach().to(table).clone()
+        state_dict[key] = torch.cat((rows[:-1], table[-1:]), dim=0) if null_speaker else rows
         return state_dict
-    if table.shape[0] == speaker_count + 1:
+    if table.shape[0] == speaker_count + int(null_speaker):
         return state_dict
-    trained, null = table[:-1], table[-1:]
+    trained = table[:-1] if null_speaker else table
     rows = trained.mean(0, keepdim=True).expand(speaker_count, -1).clone()
     state_dict = dict(state_dict)
-    state_dict[key] = torch.cat((rows, null), dim=0)
+    state_dict[key] = torch.cat((rows, table[-1:]), dim=0) if null_speaker else rows
     return state_dict
 
 
@@ -762,22 +770,27 @@ def validate_model_config(model: dict):
     source = model.get('flow_conditioning', 'encoder')
     direct = bool(model.get('direct_speaker_conditioning', False))
     adaln = bool(model.get('backbone_args', {}).get('adaln', False))
-    if direct and (model.get('mean_flow', False) or source != 'aux_mel' or not adaln):
-        raise ValueError('Direct speaker conditioning requires standard mel-conditioned flow with speaker AdaLN.')
+    if direct and (model.get('mean_flow', False) or not adaln):
+        raise ValueError('Direct speaker conditioning requires standard flow with speaker AdaLN.')
+    version = model.get('conditioning_version')
+    if version == 3 and (
+            not direct or source != 'encoder' or model.get('aux_decoder') or model.get('t_start', 0.0) != 0.0):
+        raise ValueError('Conditioning v3 requires direct encoder and speaker conditioning, no mel predictor, and t_start=0.')
     if source not in {'encoder', 'aux_mel'} or model.get('flow_loss', 'l2') not in {'l2', 'l2_lognorm'}:
         raise ValueError('Unsupported flow conditioning or loss.')
     if source == 'aux_mel' and (
             model.get('mean_flow', False) or not model.get('aux_decoder')
             or model.get('aux_grad', 0.1) != 1.0 or adaln != direct):
         raise ValueError('Mel-conditioned flow requires a standard model with a fully trained mel predictor and matching speaker conditioning.')
-    if (model.get('conditioning_version') != 2
+    if (version not in (2, 3)
             or any(model.get(name, False) for name in ('voicing', 'tension'))):
-        raise ValueError('Unsupported rectified-flow recipe or checkpoint. Use the Multispeaker conditioning-v2 recipe.')
+        raise ValueError('Unsupported rectified-flow recipe or checkpoint. Use a Multispeaker conditioning-v2 or conditioning-v3 recipe.')
     if model.get('mean_flow', False) and model.get('dual_timestep', False):
         raise ValueError('Dual timestep is enabled only for standard Rectified Flow; disable it for MeanFlow.')
-    if (model.get('content_bottleneck', 0) or model.get('content_bottleneck_noise', 0)
-            or model.get('speaker_channels', 384) != model.get('hidden_channels', 384)):
-        raise ValueError('Multispeaker rectified flow requires full content features and hidden-width speaker embeddings.')
+    if model.get('content_bottleneck', 0) or model.get('content_bottleneck_noise', 0):
+        raise ValueError('Project full content features directly to the encoder width; intermediate bottlenecks are unsupported.')
+    if version == 2 and model.get('speaker_channels', 384) != model.get('hidden_channels', 384):
+        raise ValueError('Conditioning v2 requires hidden-width speaker embeddings.')
     if not model.get('mean_flow', False) and model.get('sampling_method', 'euler') == 'mean':
         raise ValueError('Standard Rectified Flow cannot use MeanFlow sampling. Use Euler/Heun or a MeanFlow checkpoint.')
 

@@ -303,16 +303,22 @@ def configure_flow_mode(config, requested, existing_config, batch_size):
         data['mel_mean'] = -5.0 if mean_flow else -6.0
         data['mel_std'] = 2.5 if mean_flow else 6.0
         model['dual_timestep'] = False
-        model['flow_conditioning'] = 'encoder' if mean_flow else 'aux_mel'
+        direct_encoder = model.get('conditioning_version') == 3 and not mean_flow
+        model['flow_conditioning'] = 'encoder' if mean_flow or direct_encoder else 'aux_mel'
         model['flow_loss'] = 'l2' if mean_flow else 'l2_lognorm'
-        model['aux_grad'] = 1.0
+        if direct_encoder:
+            model.pop('aux_decoder', None)
+            model.pop('aux_grad', None)
+            settings.pop('aux_mel_weight', None)
+        else:
+            model['aux_grad'] = 1.0
+            settings['aux_mel_weight'] = 0.2 if mean_flow else 1.0
         model['t_start'] = 0.4 if mean_flow else 0.0
         model.setdefault('backbone_args', {})['adaln'] = True
         if mean_flow:
             model.pop('direct_speaker_conditioning', None)
         else:
             model['direct_speaker_conditioning'] = True
-        settings['aux_mel_weight'] = 0.2 if mean_flow else 1.0
         settings['speaker_dropout'] = 0.1 if mean_flow else 0.0
         if not mean_flow:
             settings.update(learning_rate=0.0005, lr_schedule='step', decay_step=4000,
@@ -367,12 +373,13 @@ def train_rank(args, ranks):
     config_path = experiment / 'rectified_config.json'
     existing_config = config_path.exists()
     if not existing_config:
-        config_path = ROOT / 'rvc' / 'configs' / 'rectified' / '44100_multispeaker.json'
+        template = '44100_multispeaker.json' if args.flow_mode == 'meanflow' else '44100_standard.json'
+        config_path = ROOT / 'rvc' / 'configs' / 'rectified' / template
     config = json.loads(config_path.read_text(encoding='utf-8'))
     configure_flow_mode(config, args.flow_mode, existing_config, args.batch_size)
     validate_model_config(config['flow']['model'])
     settings, data = config['flow'], config['data']
-    multispeaker = settings['model'].get('conditioning_version', 1) == 2
+    multispeaker = settings['model'].get('conditioning_version', 1) in (2, 3)
     if data['sample_rate'] != 44100:
         raise ValueError('This recipe requires 44100 Hz audio and a matching NSF-HiFiGAN vocoder.')
     device = ranks.device
@@ -462,7 +469,7 @@ def train_rank(args, ranks):
         pretrained_model = state.get('config', {}).get('flow', {}).get('model', {})
         validate_model_config(pretrained_model)
         if pretrained_model.get('flow_conditioning', 'encoder') != settings['model'].get('flow_conditioning', 'encoder'):
-            raise ValueError('Pretrained flow uses different conditioning. Use a matching mel-conditioned pretrained or start a new model from scratch.')
+            raise ValueError('Pretrained flow uses different conditioning. Use a pretrained with the same conditioning path or start a new model from scratch.')
         if pretrained_model.get('conditioning_version', 1) != settings['model'].get('conditioning_version', 1):
             raise ValueError('Pretrained conditioning version differs. Start a new model or use a matching pretrained.')
         for name in ('voicing', 'tension', 'mean_flow', 'direct_speaker_conditioning'):
@@ -481,7 +488,9 @@ def train_rank(args, ranks):
                 )
         weights = state['ema']['shadow'] if state.get('ema') else state['model']
         speaker_init = model.encoder.speaker.weight if multispeaker else None
-        model.load_state_dict(resize_speakers(weights, speakers, speaker_init), strict=True)
+        model.load_state_dict(resize_speakers(
+            weights, speakers, speaker_init, null_speaker=model.encoder.has_null_speaker,
+        ), strict=True)
         ema.reseed(model)
         del state, weights
     with ranks.main_work('training output setup') as main:
@@ -502,9 +511,10 @@ def train_rank(args, ranks):
     if ranks.main:
         print(f'Rectified flow: {sum(p.numel() for p in model.parameters()):,} parameters, {precision_label}, {device}, batch {args.batch_size}, {segment} frames, {ranks.world} device(s)', flush=True)
         if multispeaker:
-            print(f'Multispeaker conditioning v2: {speakers} speakers, {len(held)} held-out clips, balanced sampling={settings.get("speaker_balanced_sampling", False)}. Clips per speaker: {inventory}', flush=True)
+            print(f'Multispeaker conditioning v{model.encoder.conditioning_version}: {speakers} speakers, {len(held)} held-out clips, balanced sampling={settings.get("speaker_balanced_sampling", False)}. Clips per speaker: {inventory}', flush=True)
             if settings['model'].get('direct_speaker_conditioning', False):
-                print('Standard flow: direct speaker conditioning in every mel-predictor and flow block.', flush=True)
+                predictor = str(model.aux.input.out_channels) if model.aux is not None else 'none'
+                print(f'Standard flow: direct speaker conditioning in every flow block. Content {model.encoder.content.in_features} -> {model.hidden_channels}; speaker {model.encoder.speaker.embedding_dim}; mel predictor {predictor}; flow {model.backbone.channels}.', flush=True)
             if finetune and first_epoch == 1:
                 print('Initialized independent speaker embeddings for the new dataset.', flush=True)
         if settings.get('mean_reconstruction_weight', 0.0) > 0:
@@ -531,11 +541,14 @@ def train_rank(args, ranks):
                 media_step = bool((preview_interval and step % preview_interval == 0) or
                                   (held and settings.get('eval_interval', 0) and step % settings['eval_interval'] == 0))
                 if ranks.main:
-                    for tag, value in [('loss/flow', flow), (f'loss/{model.aux_loss_name}', auxiliary), ('grad_norm', norm), ('lr', current_lr)]:
+                    for tag, value in [('loss/flow', flow), ('grad_norm', norm), ('lr', current_lr)]:
                         writer.add_scalar(tag, value, step)
+                    if model.aux is not None:
+                        writer.add_scalar(f'loss/{model.aux_loss_name}', auxiliary, step)
                     for tag, value in metrics.items():
                         writer.add_scalar(tag, value, step)
-                    print(f'epoch={epoch} step={step}/{total} flow={flow:.6f} aux={auxiliary:.6f} grad_norm={norm:.6f}', flush=True)
+                    aux_status = f' aux={auxiliary:.6f}' if model.aux is not None else ''
+                    print(f'epoch={epoch} step={step}/{total} flow={flow:.6f}{aux_status} grad_norm={norm:.6f}', flush=True)
                     if step % 50 == 0:
                         for tag, value in conditioning_norms(model).items():
                             writer.add_scalar(tag, value, step)
