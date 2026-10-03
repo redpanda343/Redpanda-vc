@@ -312,13 +312,14 @@ def configure_flow_mode(config, requested, existing_config, batch_size):
         settings['speaker_dropout'] = 0.1 if mean_flow else 0.0
         if not mean_flow:
             settings.update(learning_rate=0.0006, lr_schedule='step', decay_step=5000,
-                            gamma=0.8, step_lr_offset=0)
+                            gamma=0.8, step_lr_offset=0, min_learning_rate=0.0001)
         model.setdefault('backbone_args', {})['time_scale'] = 1.0 if mean_flow else 1000.0
         model['sampling_method'] = 'mean' if mean_flow else 'euler'
         model['sampling_steps'] = 1 if mean_flow else 20
         if mean_flow:
             settings.update(learning_rate=0.0005, lr_schedule='step', decay_step=4000, gamma=0.9)
             settings.pop('step_lr_offset', None)
+            settings.pop('min_learning_rate', None)
             settings['mean_flow_ratio'] = 0.25
             settings['mean_flow_warmup_steps'] = 10000
             settings['mean_reconstruction_weight'] = 1.0
@@ -326,6 +327,8 @@ def configure_flow_mode(config, requested, existing_config, batch_size):
             settings.pop('mean_flow_ratio', None)
             settings.pop('mean_flow_warmup_steps', None)
             settings.pop('mean_reconstruction_weight', None)
+    if not model.get('mean_flow', False):
+        settings.setdefault('min_learning_rate', 0.0001)
     if model.get('mean_flow', False):
         legacy = not any(model.get(name, False) for name in ('dual_timestep', 'voicing', 'tension'))
         settings.setdefault('mean_reconstruction_weight', 1.0 if legacy else 0.0)
@@ -509,6 +512,7 @@ def train_rank(args, ranks):
                     decay_step=settings.get('decay_step', 4000),
                     gamma=settings.get('gamma', 0.9),
                     step_offset=settings.get('step_lr_offset', 1),
+                    min_lr=float(settings.get('min_learning_rate', 0.0)),
                 )
                 for group in optimizer.param_groups:
                     group['lr'] = current_lr
