@@ -70,7 +70,7 @@
         "layers": 6,
         "expansion": 1,
         "kernel_size": 31,
-        "adaln": false,
+        "adaln": true,
         "time_scale": 1000.0
       },
       "aux_decoder": {
@@ -81,7 +81,8 @@
       "t_start": 0.0,
       "aux_grad": 1.0,
       "conditioning_version": 2,
-      "mean_flow": false
+      "mean_flow": false,
+      "direct_speaker_conditioning": true
     },
     "finetune_preview_interval": 500,
     "speaker_balanced_sampling": true

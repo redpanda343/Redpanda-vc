@@ -307,7 +307,11 @@ def configure_flow_mode(config, requested, existing_config, batch_size):
         model['flow_loss'] = 'l2' if mean_flow else 'l2_lognorm'
         model['aux_grad'] = 1.0
         model['t_start'] = 0.4 if mean_flow else 0.0
-        model.setdefault('backbone_args', {})['adaln'] = mean_flow
+        model.setdefault('backbone_args', {})['adaln'] = True
+        if mean_flow:
+            model.pop('direct_speaker_conditioning', None)
+        else:
+            model['direct_speaker_conditioning'] = True
         settings['aux_mel_weight'] = 0.2 if mean_flow else 1.0
         settings['speaker_dropout'] = 0.1 if mean_flow else 0.0
         if not mean_flow:
@@ -461,7 +465,7 @@ def train_rank(args, ranks):
             raise ValueError('Pretrained flow uses different conditioning. Use a matching mel-conditioned pretrained or start a new model from scratch.')
         if pretrained_model.get('conditioning_version', 1) != settings['model'].get('conditioning_version', 1):
             raise ValueError('Pretrained conditioning version differs. Start a new model or use a matching pretrained.')
-        for name in ('voicing', 'tension', 'mean_flow'):
+        for name in ('voicing', 'tension', 'mean_flow', 'direct_speaker_conditioning'):
             if bool(pretrained_model.get(name, False)) != bool(settings['model'].get(name, False)):
                 raise ValueError(f'Pretrained flow differs in {name}. Use a matching pretrained or train a new model from scratch.')
         source_scale = float(pretrained_model.get('backbone_args', {}).get('time_scale', 1000.0))
@@ -499,6 +503,8 @@ def train_rank(args, ranks):
         print(f'Rectified flow: {sum(p.numel() for p in model.parameters()):,} parameters, {precision_label}, {device}, batch {args.batch_size}, {segment} frames, {ranks.world} device(s)', flush=True)
         if multispeaker:
             print(f'Multispeaker conditioning v2: {speakers} speakers, {len(held)} held-out clips, balanced sampling={settings.get("speaker_balanced_sampling", False)}. Clips per speaker: {inventory}', flush=True)
+            if settings['model'].get('direct_speaker_conditioning', False):
+                print('Standard flow: direct speaker conditioning in every mel-predictor and flow block.', flush=True)
             if finetune and first_epoch == 1:
                 print('Initialized independent speaker embeddings for the new dataset.', flush=True)
         if settings.get('mean_reconstruction_weight', 0.0) > 0:
