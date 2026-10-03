@@ -1,6 +1,12 @@
 import math
 
-def learning_rate(base, step, warmup, total, final_ratio):
+def learning_rate(base, step, warmup, total, final_ratio, schedule="cosine", decay_step=4000, gamma=0.9):
+    if schedule == "step":
+        if decay_step <= 0 or not math.isfinite(gamma) or not 0.0 < gamma <= 1.0:
+            raise ValueError("Step LR requires a positive decay_step and gamma between 0 and 1.")
+        return base * gamma ** max((step - 1) // decay_step, 0)
+    if schedule != "cosine":
+        raise ValueError(f"Unsupported LR schedule: {schedule}")
     if warmup and step < warmup:
         return base * (step + 1) / warmup
     progress = min(1.0, max(0.0, (step - warmup) / max(1, total - warmup)))

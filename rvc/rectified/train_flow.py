@@ -454,7 +454,12 @@ def train_rank(args, ranks):
             if sampler is not None:
                 sampler.set_epoch(epoch)
             for batch in loader:
-                current_lr = learning_rate(lr, step, warmup, total, settings['lr_final_ratio'])
+                current_lr = learning_rate(
+                    lr, step, warmup, total, settings['lr_final_ratio'],
+                    schedule=settings.get('lr_schedule', 'cosine'),
+                    decay_step=settings.get('decay_step', 4000),
+                    gamma=settings.get('gamma', 0.9),
+                )
                 for group in optimizer.param_groups:
                     group['lr'] = current_lr
                 metrics = {}
