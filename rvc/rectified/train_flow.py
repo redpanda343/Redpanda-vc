@@ -311,8 +311,8 @@ def configure_flow_mode(config, requested, existing_config, batch_size):
         settings['aux_mel_weight'] = 0.2 if mean_flow else 1.0
         settings['speaker_dropout'] = 0.1 if mean_flow else 0.0
         if not mean_flow:
-            settings.update(learning_rate=0.0006, lr_schedule='step', decay_step=5000,
-                            gamma=0.8, step_lr_offset=0, min_learning_rate=0.0001)
+            settings.update(learning_rate=0.0005, lr_schedule='step', decay_step=4000,
+                            gamma=0.9, step_lr_offset=0, min_learning_rate=0.0001)
         model.setdefault('backbone_args', {})['time_scale'] = 1.0 if mean_flow else 1000.0
         model['sampling_method'] = 'mean' if mean_flow else 'euler'
         model['sampling_steps'] = 1 if mean_flow else 20
@@ -328,6 +328,9 @@ def configure_flow_mode(config, requested, existing_config, batch_size):
             settings.pop('mean_flow_warmup_steps', None)
             settings.pop('mean_reconstruction_weight', None)
     if not model.get('mean_flow', False):
+        if (existing_config and settings.get('lr_schedule') == 'step'
+                and (settings.get('learning_rate'), settings.get('decay_step'), settings.get('gamma')) == (0.0006, 5000, 0.8)):
+            settings.update(learning_rate=0.0005, decay_step=4000, gamma=0.9)
         settings.setdefault('min_learning_rate', 0.0001)
     if model.get('mean_flow', False):
         legacy = not any(model.get(name, False) for name in ('dual_timestep', 'voicing', 'tension'))
