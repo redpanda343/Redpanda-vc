@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[2]
 _lock = threading.Lock()
 _pretrain_lock = threading.Lock()
 VOCODER_CHOICES = ['Default NSF-HiFiGAN', 'Custom NSF-HiFiGAN', 'Mel previews only']
+FLOW_MODE_CHOICES = ['Rectified Flow (standard)', 'MeanFlow (1-step)']
 _process = None
 _log_handle = None
 _log_path = None
@@ -167,7 +168,7 @@ def resolve_pretrained(directory, enabled, path):
     return path
 
 
-def start(name, vocoder, pretrained, batch, epochs, save_every, device, compile_backbone=False,
+def start(name, vocoder, pretrained, batch, epochs, save_every, device, flow_mode, compile_backbone=False,
           use_pretrained=False, vocoder_mode='Default NSF-HiFiGAN'):
     directory = experiment_path(name)
     device_id(device)
@@ -176,6 +177,7 @@ def start(name, vocoder, pretrained, batch, epochs, save_every, device, compile_
     precision = get_precision() or 'fp32'
     if precision not in {'fp32', 'fp16', 'bf16'}:
         raise gr.Error(f'Unsupported training precision: {precision}')
+    mode = 'meanflow' if flow_mode == 'MeanFlow (1-step)' else 'rectified'
     config_path = directory / 'rectified_config.json'
     config = json.loads(config_path.read_text(encoding='utf-8')) if config_path.is_file() else None
     if config:
@@ -185,14 +187,19 @@ def start(name, vocoder, pretrained, batch, epochs, save_every, device, compile_
             validate_model_config(config['flow']['model'])
         except ValueError as error:
             raise gr.Error(str(error)) from error
-    if int(positive_integer(batch, 'Batch size')) < 2:
+        saved_mode = 'meanflow' if config['flow']['model'].get('mean_flow', False) else 'rectified'
+        if mode != saved_mode:
+            saved_label = 'MeanFlow (1-step)' if saved_mode == 'meanflow' else 'Rectified Flow (standard)'
+            raise gr.Error(f'This experiment already uses {saved_label}. Choose that mode to resume, or use a new model name.')
+    if mode == 'meanflow' and int(positive_integer(batch, 'Batch size')) < 2:
         raise gr.Error('MeanFlow requires batch size at least 2 per GPU; use 4 when possible.')
     vocoder = resolve_vocoder(vocoder_mode, vocoder)
     arguments = ['--model-name', str(name).strip(), '--vocoder', vocoder,
                  '--batch-size', positive_integer(batch, 'Batch size'),
                  '--epochs', positive_integer(epochs, 'Total epochs'),
                  '--save-every', positive_integer(save_every, 'Save interval'),
-                 '--device', str(device).strip().lower(), '--precision', precision]
+                 '--device', str(device).strip().lower(), '--precision', precision,
+                 '--flow-mode', mode]
     if compile_backbone:
         arguments.append('--compile')
     pretrained = resolve_pretrained(directory, use_pretrained, pretrained)
@@ -244,8 +251,11 @@ def rectified_train_tab():
             embedder = gr.Dropdown(label='Content embedder', choices=['contentvec', 'spin-v2'], value='contentvec')
         extract_button = gr.Button('Extract content and F0')
     with gr.Accordion('3. Train rectified flow', open=True):
-        gr.Markdown('**Multispeaker MeanFlow** trains separate content and speaker conditioning with balanced speaker sampling. '
-                    'One-step MeanFlow is enabled automatically. WORLD features are disabled. Older recipes and checkpoints are no longer supported.')
+        gr.Markdown('Choose **standard Rectified Flow** for the normal velocity-matching objective and multi-step sampling, '
+                    'or **MeanFlow** for the one-step objective. Both use the same multispeaker conditioning-v2 frontend and balanced speaker sampling. '
+                    'The mode is part of the model architecture, so an existing experiment cannot be switched in place.')
+        flow_mode = gr.Dropdown(label='Flow training mode', choices=FLOW_MODE_CHOICES, value='Rectified Flow (standard)',
+                                info='Standard Rectified Flow uses DiffSinger-style mel normalization (-12..0 -> -1..1), uniform dual timesteps, and Euler sampling with 20 steps. MeanFlow keeps its original normalization and one-step mean recipe.')
         vocoder_mode = gr.Dropdown(label='Audio preview vocoder', choices=VOCODER_CHOICES, value='Default NSF-HiFiGAN',
                                    info='The default NSF-HiFiGAN downloads automatically on start. Choose mel previews only to skip audio rendering.')
         vocoder = gr.Textbox(label='Custom OpenVPI NSF-HiFiGAN checkpoint path', visible=False,
@@ -257,7 +267,7 @@ def rectified_train_tab():
             pretrained = gr.Textbox(label='Custom pretrained flow path',
                                     info='Choose a flow checkpoint compatible with the experiment configuration and content embedder.')
         with gr.Row():
-            batch = gr.Number(label='Batch size per GPU', value=4, minimum=2, precision=0)
+            batch = gr.Number(label='Batch size per GPU', value=4, minimum=1, precision=0)
             epochs = gr.Number(label='Total epochs', value=100, minimum=1, precision=0)
             save_every = gr.Number(label='Save every N epochs', value=10, minimum=1, precision=0)
         compile_backbone = gr.Checkbox(label='Compile flow backbone', value=False,
@@ -276,7 +286,7 @@ def rectified_train_tab():
     pretrained_upload.upload(lambda path: path or '', [pretrained_upload], [pretrained], queue=False)
     vocoder_mode.change(lambda mode: gr.update(visible=mode == 'Custom NSF-HiFiGAN'),
                         [vocoder_mode], [vocoder], queue=False)
-    train_button.click(start, [name, vocoder, pretrained, batch, epochs, save_every, device, compile_backbone,
+    train_button.click(start, [name, vocoder, pretrained, batch, epochs, save_every, device, flow_mode, compile_backbone,
                                use_pretrained, vocoder_mode], outputs, queue=False)
     stop_button.click(stop, [], outputs, queue=False)
     gr.Timer(2).tick(status, [], outputs, queue=False)
