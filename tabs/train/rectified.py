@@ -255,7 +255,7 @@ def rectified_train_tab():
                     'or **MeanFlow** for the one-step objective. Both use the same multispeaker conditioning-v2 frontend and balanced speaker sampling. '
                     'The mode is part of the model architecture, so an existing experiment cannot be switched in place.')
         flow_mode = gr.Dropdown(label='Flow training mode', choices=FLOW_MODE_CHOICES, value='Rectified Flow (standard)',
-                                info='Standard Rectified Flow uses DiffSinger-style mel normalization (-12..0 -> -1..1), uniform dual timesteps, and Euler sampling with 20 steps. MeanFlow keeps its original normalization and one-step mean recipe.')
+                                info='Standard Rectified Flow uses DiffSinger-style mel normalization (-12..0 -> -1..1), uniform timesteps, and Euler sampling with 20 steps. MeanFlow keeps its original normalization and one-step mean recipe.')
         vocoder_mode = gr.Dropdown(label='Audio preview vocoder', choices=VOCODER_CHOICES, value='Default NSF-HiFiGAN',
                                    info='The default NSF-HiFiGAN downloads automatically on start. Choose mel previews only to skip audio rendering.')
         vocoder = gr.Textbox(label='Custom OpenVPI NSF-HiFiGAN checkpoint path', visible=False,

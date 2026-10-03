@@ -294,9 +294,9 @@ def configure_flow_mode(config, requested, existing_config, batch_size):
         data = config['data']
         data['mel_mean'] = -5.0 if mean_flow else -6.0
         data['mel_std'] = 2.5 if mean_flow else 6.0
-        # DiffSinger-style dual timestep is used by standard Rectified Flow only.
-        # MeanFlow keeps its original single-timestep recipe.
-        model['dual_timestep'] = not mean_flow
+        model['dual_timestep'] = False
+        if not mean_flow:
+            model['aux_grad'] = 0.1
         model.setdefault('backbone_args', {})['time_scale'] = 1.0 if mean_flow else 1000.0
         model['sampling_method'] = 'mean' if mean_flow else 'euler'
         model['sampling_steps'] = 1 if mean_flow else 20
