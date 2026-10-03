@@ -294,9 +294,11 @@ def configure_flow_mode(config, requested, existing_config, batch_size):
         data = config['data']
         data['mel_mean'] = -5.0 if mean_flow else -6.0
         data['mel_std'] = 2.5 if mean_flow else 6.0
-        model['dual_timestep'] = False
+        model['dual_timestep'] = not mean_flow
         if not mean_flow:
             model['aux_grad'] = 0.1
+            settings.update(learning_rate=0.0006, lr_schedule='step', decay_step=5000,
+                            gamma=0.8, step_lr_offset=0)
         model.setdefault('backbone_args', {})['time_scale'] = 1.0 if mean_flow else 1000.0
         model['sampling_method'] = 'mean' if mean_flow else 'euler'
         model['sampling_steps'] = 1 if mean_flow else 20
@@ -488,6 +490,7 @@ def train_rank(args, ranks):
                     schedule=settings.get('lr_schedule', 'cosine'),
                     decay_step=settings.get('decay_step', 4000),
                     gamma=settings.get('gamma', 0.9),
+                    step_offset=settings.get('step_lr_offset', 1),
                 )
                 for group in optimizer.param_groups:
                     group['lr'] = current_lr
