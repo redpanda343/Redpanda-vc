@@ -489,7 +489,7 @@ def train_rank(args, ranks):
                         if any(not torch.isfinite(value).all() for value in model.state_dict().values()):
                             raise FloatingPointError('Non-finite trained model weights.')
                         metadata = dict(config=config, speaker_count=speakers, embedder_model=embedder,
-                                        vocoder=str(Path(args.vocoder).resolve()) if args.vocoder else '', epoch=epoch, step=step)
+                                        epoch=epoch, step=step)
                         if multispeaker:
                             metadata.update(speaker_ids=sorted(inventory), feature_metadata=feature_metadata)
                         atomic_save(dict(model=model.state_dict(), optimizer=optimizer.state_dict(),
