@@ -1,6 +1,7 @@
 import math
 import os
 import random
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -99,6 +100,114 @@ class SpeakerBalancedSampler(Sampler):
         return iter(indices[self.rank::self.world])
 
 
+def clip_samples(entries, workers: int = 8):
+    """Sample count of every training clip, read from the audio headers only."""
+    def count(entry):
+        return sf.info(entry[0]).frames
+    with ThreadPoolExecutor(workers) as pool:
+        return np.fromiter(pool.map(count, entries), dtype=np.int64, count=len(entries))
+
+
+def stretched_hop(base_hop: int, stretch_range, probability: float, rng) -> int:
+    """Hop length for one clip: the base hop, or a randomly time-stretched one."""
+    if probability > 0 and rng.random() < probability:
+        low, high = stretch_range
+        return int(round(base_hop * low * (high / low) ** rng.random()))
+    return base_hop
+
+
+class FlowBatchSampler(Sampler):
+    """Batches of whole utterances under a padded-frame budget.
+
+    A batch is closed when it holds `max_items` clips, or when
+    (clips x longest clip) would pass `max_frames`. Clips of similar length are
+    batched together to keep padding low. The time-stretch hop of every clip is
+    drawn here instead of in the dataset, so each clip's exact frame count is
+    known and the budget also holds for stretched clips.
+
+    All ranks build the same global batch list (same seed and epoch) and take
+    every `world`-th batch, so every rank runs the same number of steps.
+
+    The first epoch that is iterated starts with the rank's largest batch, so
+    a GPU out-of-memory error appears on the first step instead of hours in.
+    """
+
+    POOL_BATCHES = 64
+
+    def __init__(self, dataset, max_frames, max_items, seed=1234, rank=0, world=1,
+                 balanced=False, shuffle=True):
+        if int(max_frames) < 1 or int(max_items) < 1:
+            raise ValueError('Batch limits must be positive.')
+        if not 0 <= rank < world:
+            raise ValueError('Invalid sampler rank.')
+        self.dataset = dataset
+        self.max_frames, self.max_items = int(max_frames), int(max_items)
+        self.seed, self.rank, self.world = seed, rank, world
+        self.shuffle = shuffle
+        self.samples = clip_samples(dataset.entries)
+        self.balancer = SpeakerBalancedSampler(dataset.entries, seed, 0, 1) if balanced else None
+        self.epoch = 0
+        self._formed = None
+        self._probe = shuffle
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+    def _hop(self, rng):
+        dataset = self.dataset
+        if not dataset.augment:
+            return dataset.hop
+        return stretched_hop(dataset.hop, dataset.stretch_range, dataset.stretch_prob, rng)
+
+    def _form(self):
+        if self._formed is not None and self._formed[0] == self.epoch:
+            return self._formed
+        rng = random.Random(self.seed * 1000003 + self.epoch)
+        if self.balancer is not None:
+            self.balancer.set_epoch(self.epoch)
+            order = list(self.balancer)
+        else:
+            order = list(range(len(self.dataset)))
+            if self.shuffle:
+                rng.shuffle(order)
+        hops = [self._hop(rng) for _ in order]
+        # samples // hop is an upper bound of the clip's frames, so the budget is never exceeded.
+        frames = [min(max(1, int(self.samples[index]) // hop), self.max_frames)
+                  for index, hop in zip(order, hops)]
+        batches = []
+        pool = self.max_items * self.POOL_BATCHES
+        for first in range(0, len(order), pool):
+            ranked = sorted(range(first, min(first + pool, len(order))), key=frames.__getitem__)
+            batch, longest = [], 0
+            for k in ranked:
+                if batch and (len(batch) >= self.max_items
+                              or (len(batch) + 1) * max(longest, frames[k]) > self.max_frames):
+                    batches.append((len(batch) * longest, batch))
+                    batch, longest = [], 0
+                batch.append((order[k], hops[k]))
+                longest = max(longest, frames[k])
+            if batch:
+                batches.append((len(batch) * longest, batch))
+        if self.shuffle:
+            rng.shuffle(batches)
+        if len(batches) < self.world:
+            raise ValueError('The training split is too small for the selected GPUs at these batch limits.')
+        batches = batches[:len(batches) - len(batches) % self.world][self.rank::self.world]
+        self._formed = (self.epoch, [batch for _, batch in batches], [cost for cost, _ in batches])
+        return self._formed
+
+    def __len__(self):
+        return len(self._form()[1])
+
+    def __iter__(self):
+        _, batches, costs = self._form()
+        if self._probe and batches:
+            self._probe = False
+            largest = max(range(len(batches)), key=costs.__getitem__)
+            batches = [batches[largest]] + batches[:largest] + batches[largest + 1:]
+        return iter(batches)
+
+
 def speaker_inventory(entries):
     assignments = {}
     counts = {}
@@ -152,10 +261,10 @@ def unpack_flow(batch, device, non_blocking=False):
     return values
 
 class RectifiedDataset(Dataset):
-    def __init__(self, entries, config: dict, segment_frames: int, augment: bool = True):
+    def __init__(self, entries, config: dict, max_frames: int, augment: bool = True):
         self.entries = entries
         self.data = config["data"]
-        self.segment_frames = int(segment_frames)
+        self.max_frames = int(max_frames)
         self.hop = int(self.data["hop_length"])
         self.sample_rate = int(self.data["sample_rate"])
         self.mel = LogMel.from_config(self.data)
@@ -192,6 +301,7 @@ class RectifiedDataset(Dataset):
         return to_mel_rate(share.unsqueeze(-1), frames, self.sample_rate, hop)[..., 0]
 
     def __getitem__(self, index):
+        index, hop = index if isinstance(index, tuple) else (index, None)
         wav_path, content_path, _, f0_path, sid = self.entries[index]
         audio = self._audio(wav_path)
         source_f0 = torch.from_numpy(np.load(f0_path, allow_pickle=False).astype(np.float32))
@@ -209,15 +319,15 @@ class RectifiedDataset(Dataset):
             seconds = audio.numel() / self.sample_rate
             if any(abs(value.shape[0] / FEATURE_RATE - seconds) > 0.25 for value in (source_f0, content)):
                 raise ValueError(f'Content or pitch duration does not match audio; re-extract features: {wav_path}')
-        return self._flow_item(audio, source_f0, content, int(sid))
+        return self._flow_item(audio, source_f0, content, int(sid), hop)
 
-    def _flow_item(self, audio, source_f0, content, sid):
-        key_shift, hop = 0.0, self.hop
+    def _flow_item(self, audio, source_f0, content, sid, hop=None):
+        key_shift = 0.0
         if self.augment and self.key_shift_range > 0 and random.random() < self.key_shift_prob:
             key_shift = random.uniform(-self.key_shift_range, self.key_shift_range)
-        if self.augment and self.stretch_prob > 0 and random.random() < self.stretch_prob:
-            low, high = self.stretch_range
-            hop = int(round(self.hop * low * (high / low) ** random.random()))
+        if hop is None:
+            hop = (stretched_hop(self.hop, self.stretch_range, self.stretch_prob, random)
+                   if self.augment else self.hop)
         speed = hop / self.hop
 
         frames = min(
@@ -235,7 +345,7 @@ class RectifiedDataset(Dataset):
         energy = self._energy(audio.unsqueeze(0), frames, hop)[0]
         breathiness = self._breathiness(audio.unsqueeze(0), source_f0.unsqueeze(0), frames, hop)[0]
 
-        length = min(frames, self.segment_frames)
+        length = min(frames, self.max_frames)
         start = random.randint(0, frames - length) if self.augment else 0
         stop = start + length
         item = (

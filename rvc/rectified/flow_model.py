@@ -65,12 +65,28 @@ class HarmonicPrior(nn.Module):
         return prior * (f0 > 0).float()[:, None, :]
 
 
+class MixedPrecisionLayerNorm(nn.LayerNorm):
+    """LayerNorm that keeps fp16/bf16 activations under AMP autocast"""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            weight = self.weight
+            bias = self.bias
+            if weight is not None and weight.dtype != x.dtype:
+                weight = weight.to(x.dtype)
+            if bias is not None and bias.dtype != x.dtype:
+                bias = bias.to(x.dtype)
+            return F.layer_norm(
+                x, self.normalized_shape, weight, bias, self.eps
+            )
+
+
 class ConvNeXtBlock(nn.Module):
     def __init__(self, channels: int, layer_scale: float = 0.0, dropout: float = 0.0,
                  speaker_channels: int = 0):
         super().__init__()
         self.depthwise = nn.Conv1d(channels, channels, 7, padding=3, groups=channels)
-        self.norm = nn.LayerNorm(channels)
+        self.norm = MixedPrecisionLayerNorm(channels)
         self.up = nn.Linear(channels, channels * 4)
         self.down = nn.Linear(channels * 4, channels)
         self.gamma = nn.Parameter(torch.full((channels,), layer_scale)) if layer_scale > 0 else None
@@ -224,7 +240,7 @@ class LYNXNet2Block(nn.Module):
     def __init__(self, channels, expansion, kernel_size, adaln=False):
         super().__init__()
         inner = int(channels * expansion)
-        self.norm = nn.LayerNorm(channels, elementwise_affine=not adaln)
+        self.norm = MixedPrecisionLayerNorm(channels, elementwise_affine=not adaln)
         self.depthwise = nn.Conv1d(channels, channels, kernel_size, padding=kernel_size // 2, groups=channels)
         self.up = nn.Linear(channels, inner * 2)
         self.mid = nn.Linear(inner, inner * 2)
@@ -280,8 +296,7 @@ class LYNXNet2Backbone(nn.Module):
         time = self.time_mlp(timestep_embedding(t.reshape(-1), self.channels, self.time_scale))
         time = time.view(t.shape[0], -1, self.channels)
         frame_mask = mask.transpose(1, 2)
-        with torch.autocast(x.device.type, enabled=False):
-            h = self.input(x.transpose(1, 2).to(self.input.weight.dtype))
+        h = self.input(x.transpose(1, 2))
         projected, speaker = self.prepare_conditioning(cond, voice) if prepared is None else prepared
         h = h + projected + time
         h = h * frame_mask

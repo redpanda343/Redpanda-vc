@@ -5,7 +5,6 @@ import os
 import random
 import sys
 from contextlib import nullcontext
-from functools import partial
 from pathlib import Path
 
 import numpy as np
@@ -14,7 +13,7 @@ from torch._functorch import config as aot_config
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-from rvc.rectified.data import RectifiedDataset, SpeakerBalancedSampler, collate_flow, read_filelist, speaker_inventory, split_holdout, unpack_flow
+from rvc.rectified.data import FlowBatchSampler, RectifiedDataset, collate_flow, read_filelist, speaker_inventory, split_holdout, unpack_flow
 from rvc.rectified.distributed import launch
 from rvc.rectified.ema import WeightEMA
 from rvc.rectified.flow_model import build_flow, resize_speakers, validate_model_config
@@ -47,7 +46,7 @@ def precision_setup(precision, device):
             return None, None
         return torch.bfloat16, None
     if precision == 'fp16':
-        return torch.float16, torch.amp.GradScaler('cuda', init_scale=1024.0)
+        return torch.float16, torch.amp.GradScaler('cuda')
     return None, None
 
 
@@ -79,7 +78,7 @@ def compiled_backbone(model, enabled: bool, mode: str, device):
         print(f"Triton is unavailable ({error}); training uncompiled.", flush=True)
         return None
     print(f"Flow backbone compilation requested (Inductor, {mode}). The first training step compiles forward and backward graphs.", flush=True)
-    return torch.compile(model.backbone, backend="inductor", mode=mode)
+    return torch.compile(model.backbone, backend="inductor", mode=mode, dynamic=True)
 
 
 def train_step(model, optimizer, ema, batch, data, settings, device, speaker_dropout, amp_dtype=None, scaler=None, backbone=None, ranks=None):
@@ -219,9 +218,10 @@ def evaluate(model, ema, loader, data, writer, step):
                 noise, fractions,
                 voicing=voicing, tension=tension,
             )
-            totals += losses.float() * mel.shape[0]
-            aux_total += (float(auxiliary) if auxiliary is not None else 0.0) * mel.shape[0]
-            count += mel.shape[0]
+            weight = float(mask.sum())
+            totals += losses.float() * weight
+            aux_total += (float(auxiliary) if auxiliary is not None else 0.0) * weight
+            count += weight
         model.train()
     totals /= max(1, count)
     writer.add_scalar('val/flow', float(totals.mean()), step)
@@ -238,15 +238,14 @@ def train(args):
 def configure_flow(config, existing_config):
     settings = config['flow']
     validate_model_config(settings['model'])
-    if (existing_config and settings.get('lr_schedule') == 'step'
-            and (settings.get('learning_rate'), settings.get('decay_step'), settings.get('gamma')) == (0.0006, 5000, 0.8)):
-        settings.update(learning_rate=0.0005, decay_step=4000, gamma=0.9)
-    settings.setdefault('min_learning_rate', 0.0001)
+    settings.setdefault('min_learning_rate', 0.0)
+    settings.setdefault('max_batch_frames', 50000)
+    settings.setdefault('max_batch_size', 64)
 
 
 def train_rank(args, ranks):
-    if args.batch_size < 1 or args.epochs < 1 or args.save_every < 1:
-        raise ValueError('Batch size, epochs and save interval must be positive.')
+    if any(value is not None and value < 1 for value in (args.batch_size, args.max_batch_frames)) or args.epochs < 1 or args.save_every < 1:
+        raise ValueError('Batch limits, epochs and save interval must be positive.')
     if Path(args.model_name).name != args.model_name or args.model_name in {'.', '..'}:
         raise ValueError('Use a model name, not a path.')
     random.seed(args.seed)
@@ -285,21 +284,22 @@ def train_rank(args, ranks):
     inventory = speaker_inventory(entries) if multispeaker else None
     speakers = max(int(entry[4]) for entry in entries) + 1
     entries, held = split_holdout(entries, int(settings.get('holdout_clips', 0)), stratified=multispeaker)
-    segment = int(settings['segment_frames'])
-    dataset = RectifiedDataset(entries, config, segment)
-    if len(dataset) // ranks.world < args.batch_size:
-        raise ValueError('The training split has fewer clips than one full batch per selected GPU.')
+    max_items = int(args.batch_size or settings['max_batch_size'])
+    max_frames = int(args.max_batch_frames or settings['max_batch_frames'])
+    dataset = RectifiedDataset(entries, config, max_frames)
     workers = int(settings.get('num_workers', 4))
-    collate = partial(collate_flow, frames=segment)
-    sampler = (SpeakerBalancedSampler(entries, args.seed, ranks.rank, ranks.world)
-               if settings.get('speaker_balanced_sampling', False) else ranks.sampler(dataset, args.seed))
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=sampler is None,
-                        sampler=sampler, drop_last=True,
-                        num_workers=workers, collate_fn=collate,
+    if ranks.main:
+        print(f'Whole-utterance batching: up to {max_items} clips and {max_frames} padded frames per batch and GPU. Measuring {len(entries):,} clip lengths...', flush=True)
+    batcher = FlowBatchSampler(dataset, max_frames, max_items, args.seed, ranks.rank, ranks.world,
+                               balanced=settings.get('speaker_balanced_sampling', False))
+    loader = DataLoader(dataset, batch_sampler=batcher,
+                        num_workers=workers, collate_fn=collate_flow,
                         pin_memory=device.type == 'cuda', persistent_workers=workers > 0,
                         multiprocessing_context='spawn' if workers > 0 else None)
-    held_loader = DataLoader(RectifiedDataset(held, config, segment, augment=False),
-                             batch_size=args.batch_size, collate_fn=collate) if held and ranks.main else None
+    held_dataset = RectifiedDataset(held, config, max_frames, augment=False)
+    held_loader = DataLoader(held_dataset,
+                             batch_sampler=FlowBatchSampler(held_dataset, max_frames, max_items, args.seed, shuffle=False),
+                             collate_fn=collate_flow) if held and ranks.main else None
     reference = None
     with ranks.main_work('preview reference preparation') as main:
         if main:
@@ -391,7 +391,7 @@ def train_rank(args, ranks):
     total = args.epochs * len(loader)
     warmup = 0 if finetune else settings['warmup_steps']
     if ranks.main:
-        print(f'Rectified flow: {sum(p.numel() for p in model.parameters()):,} parameters, {precision_label}, {device}, batch {args.batch_size}, {segment} frames, {ranks.world} device(s)', flush=True)
+        print(f'Rectified flow: {sum(p.numel() for p in model.parameters()):,} parameters, {precision_label}, {device}, whole utterances, up to {max_items} clips / {max_frames} frames per batch, {len(loader)} batches per epoch and GPU, {ranks.world} device(s)', flush=True)
         if multispeaker:
             print(f'Multispeaker conditioning v{model.encoder.conditioning_version}: {speakers} speakers, {len(held)} held-out clips, balanced sampling={settings.get("speaker_balanced_sampling", False)}. Clips per speaker: {inventory}', flush=True)
             if settings['model'].get('direct_speaker_conditioning', False):
@@ -402,8 +402,7 @@ def train_rank(args, ranks):
     with SummaryWriter(str(output)) if ranks.main else nullcontext(None) as writer:
         model.train()
         for epoch in range(first_epoch, args.epochs + 1):
-            if sampler is not None:
-                sampler.set_epoch(epoch)
+            batcher.set_epoch(epoch)
             for batch in loader:
                 current_lr = learning_rate(
                     lr, step, warmup, total, settings['lr_final_ratio'],
@@ -471,7 +470,8 @@ def main():
     parser = argparse.ArgumentParser(description='Train Multispeaker Rectified Flow with an optional frozen OpenVPI NSF-HiFiGAN preview vocoder.')
     parser.add_argument('--model-name', required=True)
     parser.add_argument('--vocoder', default='')
-    parser.add_argument('--batch-size', type=int, default=4)
+    parser.add_argument('--batch-size', type=int, help='Maximum clips per batch and GPU (default: max_batch_size in the config).')
+    parser.add_argument('--max-batch-frames', type=int, help='Maximum padded frames per batch and GPU (default: max_batch_frames in the config).')
     parser.add_argument('--epochs', type=int, default=100)
     parser.add_argument('--save-every', type=int, default=10)
     parser.add_argument('--device', default='cuda:0' if torch.cuda.is_available() else 'cpu',
