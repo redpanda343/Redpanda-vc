@@ -269,6 +269,7 @@ def configure_flow(config, existing_config):
     settings.setdefault('min_learning_rate', 0.0)
     settings.setdefault('max_batch_frames', 50000)
     settings.setdefault('max_batch_size', 64)
+    settings.pop('speaker_balanced_sampling', None)
     configure_augmentation(settings)
 
 
@@ -321,8 +322,7 @@ def train_rank(args, ranks):
     workers = int(settings.get('num_workers', 4))
     if ranks.main:
         print(f'Whole-utterance batching: up to {max_items} clips and {max_frames} padded frames per batch and GPU. Measuring {len(entries):,} clip lengths...', flush=True)
-    batcher = FlowBatchSampler(dataset, max_frames, max_items, args.seed, ranks.rank, ranks.world,
-                               balanced=settings.get('speaker_balanced_sampling', False))
+    batcher = FlowBatchSampler(dataset, max_frames, max_items, args.seed, ranks.rank, ranks.world)
     loader = DataLoader(dataset, batch_sampler=batcher,
                         num_workers=workers, collate_fn=collate_flow,
                         pin_memory=device.type == 'cuda', persistent_workers=workers > 0,
@@ -424,7 +424,7 @@ def train_rank(args, ranks):
     if ranks.main:
         print(f'Rectified flow: {sum(p.numel() for p in model.parameters()):,} parameters, {precision_label}, {device}, whole utterances, up to {max_items} clips / {max_frames} frames per batch, {len(loader)} batches per epoch and GPU, {ranks.world} device(s)', flush=True)
         if multispeaker:
-            print(f'Multispeaker conditioning v{model.encoder.conditioning_version}: {speakers} speakers, {len(held)} held-out clips, balanced sampling={settings.get("speaker_balanced_sampling", False)}. Clips per speaker: {inventory}', flush=True)
+            print(f'Multispeaker conditioning v{model.encoder.conditioning_version}: {speakers} speakers, {len(held)} held-out clips. Clips per speaker: {inventory}', flush=True)
             if settings['model'].get('direct_speaker_conditioning', False):
                 predictor = str(model.aux.input.out_channels) if model.aux is not None else 'none'
                 print(f'Standard flow: direct speaker conditioning in every flow block. Content {model.encoder.content.in_features} -> {model.hidden_channels}; speaker {model.encoder.speaker.embedding_dim}; mel predictor {predictor}; flow {model.backbone.channels}.', flush=True)
@@ -433,7 +433,7 @@ def train_rank(args, ranks):
     with SummaryWriter(str(output)) if ranks.main else nullcontext(None) as writer:
         model.train()
         for epoch in range(first_epoch, args.epochs + 1):
-            batcher.set_epoch(epoch)
+            batcher.set_epoch(epoch - 1)
             for batch in loader:
                 current_lr = learning_rate(
                     lr, step, warmup, total, settings['lr_final_ratio'],

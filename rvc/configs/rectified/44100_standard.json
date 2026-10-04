@@ -94,7 +94,6 @@
       }
     },
     "finetune_preview_interval": 500,
-    "speaker_balanced_sampling": true,
     "aux_mel_weight": 0.2
   }
 }

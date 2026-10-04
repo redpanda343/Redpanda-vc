@@ -64,42 +64,6 @@ def split_holdout(entries, count: int, seed: int = 1234, stratified: bool = Fals
     return train, [entries[i] for i in sorted(held)]
 
 
-class SpeakerBalancedSampler(Sampler):
-    def __init__(self, entries, seed=1234, rank=0, world=1):
-        if not 0 <= rank < world:
-            raise ValueError('Invalid sampler rank.')
-        self.groups = {}
-        for index, entry in enumerate(entries):
-            self.groups.setdefault(int(entry[4]), []).append(index)
-        if not self.groups:
-            raise ValueError('Speaker sampling requires training clips.')
-        self.seed, self.rank, self.world = seed, rank, world
-        self.epoch = 0
-        self.samples = len(entries) // world
-
-    def set_epoch(self, epoch):
-        self.epoch = int(epoch)
-
-    def __len__(self):
-        return self.samples
-
-    def __iter__(self):
-        rng = random.Random(self.seed + self.epoch)
-        speakers = sorted(self.groups)
-        pools = {sid: [] for sid in speakers}
-        indices = []
-        while len(indices) < self.samples * self.world:
-            rng.shuffle(speakers)
-            for sid in speakers:
-                if len(indices) == self.samples * self.world:
-                    break
-                if not pools[sid]:
-                    pools[sid] = list(self.groups[sid])
-                    rng.shuffle(pools[sid])
-                indices.append(pools[sid].pop())
-        return iter(indices[self.rank::self.world])
-
-
 def clip_samples(entries, workers: int = 8):
     """Sample count of every training clip, read from the audio headers only."""
     def count(entry):
@@ -112,23 +76,8 @@ def clip_samples(entries, workers: int = 8):
 
 
 class FlowBatchSampler(Sampler):
-    """Batches of whole utterances under a padded-frame budget.
-
-    A batch is closed when it holds `max_items` clips, or when
-    (clips x longest clip) would pass `max_frames`. Clips of similar length are
-    batched together to keep padding low.
-
-    All ranks build the same global batch list (same seed and epoch) and take
-    every `world`-th batch, so every rank runs the same number of steps.
-
-    The first epoch that is iterated starts with the rank's largest batch, so
-    a GPU out-of-memory error appears on the first step instead of hours in.
-    """
-
-    POOL_BATCHES = 64
-
     def __init__(self, dataset, max_frames, max_items, seed=1234, rank=0, world=1,
-                 balanced=False, shuffle=True):
+                 shuffle=True):
         if int(max_frames) < 1 or int(max_items) < 1:
             raise ValueError('Batch limits must be positive.')
         if not 0 <= rank < world:
@@ -138,10 +87,10 @@ class FlowBatchSampler(Sampler):
         self.seed, self.rank, self.world = seed, rank, world
         self.shuffle = shuffle
         self.samples = clip_samples(dataset.entries)
-        self.balancer = SpeakerBalancedSampler(dataset.entries, seed, 0, 1) if balanced else None
+        self.frames = np.minimum(np.maximum(1, self.samples // dataset.hop), self.max_frames)
+        self.measured_max_frames = None
         self.epoch = 0
         self._formed = None
-        self._probe = shuffle
 
     def set_epoch(self, epoch):
         self.epoch = int(epoch)
@@ -149,50 +98,50 @@ class FlowBatchSampler(Sampler):
     def _form(self):
         if self._formed is not None and self._formed[0] == self.epoch:
             return self._formed
-        rng = random.Random(self.seed * 1000003 + self.epoch)
-        if self.balancer is not None:
-            self.balancer.set_epoch(self.epoch)
-            order = list(self.balancer)
-        else:
-            order = list(range(len(self.dataset)))
-            if self.shuffle:
-                rng.shuffle(order)
-        hops = [self.dataset.hop for _ in order]
-        # samples // hop is an upper bound of the clip's frames, so the budget is never exceeded.
-        frames = [min(max(1, int(self.samples[index]) // hop), self.max_frames)
-                  for index, hop in zip(order, hops)]
-        batches = []
-        pool = self.max_items * self.POOL_BATCHES
-        for first in range(0, len(order), pool):
-            ranked = sorted(range(first, min(first + pool, len(order))), key=frames.__getitem__)
-            batch, longest = [], 0
-            for k in ranked:
-                if batch and (len(batch) >= self.max_items
-                              or (len(batch) + 1) * max(longest, frames[k]) > self.max_frames):
-                    batches.append((len(batch) * longest, batch))
-                    batch, longest = [], 0
-                batch.append((order[k], hops[k]))
-                longest = max(longest, frames[k])
-            if batch:
-                batches.append((len(batch) * longest, batch))
+        rng = np.random.default_rng(self.seed + self.epoch)
+        order = rng.permutation(len(self.dataset)) if self.shuffle else np.arange(len(self.dataset))
         if self.shuffle:
-            rng.shuffle(batches)
+            sizes = (np.round(self.frames[order] / 6) * 6).clip(6, None)
+            order = order[np.argsort(-sizes, kind='mergesort')]
+        maximum = self.measured_max_frames if self.measured_max_frames is not None else self.max_frames
+        batches = []
+        batch, longest = [], 0
+        for index in order.tolist():
+            frames = int(self.frames[index])
+            if batch and (len(batch) == self.max_items
+                          or (len(batch) + 1) * max(longest, frames) > maximum):
+                batches.append(batch)
+                batch, longest = [], 0
+            batch.append(index)
+            longest = max(longest, frames)
+        if batch:
+            batches.append(batch)
+        if self.shuffle and self.measured_max_frames is None:
+            costs = [len(batch) * max(self.frames[index] for index in batch) for batch in batches]
+            self.measured_max_frames = max(costs) if costs else self.max_frames
+            batches = [batches[index] for index in sorted(range(len(batches)), key=lambda index: -costs[index])]
         if len(batches) < self.world:
             raise ValueError('The training split is too small for the selected GPUs at these batch limits.')
-        batches = batches[:len(batches) - len(batches) % self.world][self.rank::self.world]
-        self._formed = (self.epoch, [batch for _, batch in batches], [cost for cost, _ in batches])
+        floored = len(batches) // self.world * self.world
+        leftovers = ((rng.permutation(len(batches) - floored) + floored).tolist()
+                     if self.shuffle else list(range(floored, len(batches))))
+        assignment = np.arange(floored).reshape(-1, self.world).transpose()
+        assignment = (rng.permuted(assignment, axis=0)[self.rank].tolist()
+                      if self.shuffle else assignment[self.rank].tolist())
+        if self.rank < len(leftovers):
+            assignment.append(leftovers[self.rank])
+        elif leftovers and self.shuffle:
+            assignment.append(assignment[self.epoch % len(assignment)])
+        batches = [batches[index] for index in assignment]
+        costs = [len(batch) * max(self.frames[index] for index in batch) for batch in batches]
+        self._formed = (self.epoch, [[(index, self.dataset.hop) for index in batch] for batch in batches], costs)
         return self._formed
 
     def __len__(self):
         return len(self._form()[1])
 
     def __iter__(self):
-        _, batches, costs = self._form()
-        if self._probe and batches:
-            self._probe = False
-            largest = max(range(len(batches)), key=costs.__getitem__)
-            batches = [batches[largest]] + batches[:largest] + batches[largest + 1:]
-        return iter(batches)
+        return iter(self._form()[1])
 
 
 def speaker_inventory(entries):
