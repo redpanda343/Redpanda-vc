@@ -153,6 +153,7 @@ class RealTimeRVC:
         seed=0,
         rectified_vocoder_path="",
         rectified_steps=0,
+        rectified_cuda_graph=True,
     ):
         self.converter = VoiceConverter()
         self.converter.get_vc(model_path, speaker_id)
@@ -219,10 +220,12 @@ class RealTimeRVC:
             from torchaudio.transforms import Resample
             from rvc.rectified.resources import default_vocoder
             from rvc.rectified.vocoder import load_vocoder
+            from rvc.rectified.realtime import RealtimeFlowSampler
 
             if int(rectified_steps) != rectified_steps or not 0 <= rectified_steps <= 1000:
                 raise ValueError("Flow steps must be an integer between 0 and 1000.")
             self.rectified_steps = int(rectified_steps) or None
+            self.flow_sampler = RealtimeFlowSampler(self.model, enabled=rectified_cuda_graph)
             self.pipeline.set_vocoder(rectified_vocoder_path)
             path = self.pipeline.vocoder_path or default_vocoder(self.pipeline.checkpoint_vocoder)
             vocoder, _ = load_vocoder(path, self.pipeline.data)
@@ -437,7 +440,7 @@ class RealTimeRVC:
                 ("voicing", "tension"), variance_curves(waveform, source_f0, frames, rate, hop)
             ))
         mask = torch.ones(1, 1, frames, device=self.device)
-        mel = self.model.sample(
+        mel = self.flow_sampler(
             content, f0, energy, speaker, mask, steps=self.rectified_steps,
             breathiness=breathiness, **variances,
         )

@@ -583,9 +583,11 @@ class RectifiedFlow(nn.Module):
         primary = tuple(value[:batch] if value is not None else None for value in prepared)
 
         def field(x, t):
+            if count == 1:
+                return self.backbone(x, t, cond[:batch], mask, voice[:batch], prepared=primary)
             now = float(t[0])
 
-            if count == 1 or not (guide_from <= now and (now < guide_until or guide_until >= 1.0)):
+            if not (guide_from <= now and (now < guide_until or guide_until >= 1.0)):
                 return self.backbone(x, t, cond[:batch], mask, voice[:batch], prepared=primary)
             v = self.backbone(repeat(x), repeat(t), cond, masks, voice, prepared=prepared).chunk(count)
             guided, index = v[0], 1
