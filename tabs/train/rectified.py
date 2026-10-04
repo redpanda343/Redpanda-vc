@@ -8,16 +8,13 @@ from pathlib import Path
 import gradio as gr
 import psutil
 import torch
-from tqdm import tqdm
 
 from tabs.settings.sections.precision import get_precision
 from rvc.rectified.distributed import parse_devices
-from rvc.rectified.resources import VOCODER_FILENAME, VOCODER_URL, VOCODER_SHA256
-from rvc.lib.tools.prerequisites_download import _sha256, download_file
+from rvc.rectified.resources import default_vocoder
 
 ROOT = Path(__file__).resolve().parents[2]
 _lock = threading.Lock()
-_pretrain_lock = threading.Lock()
 VOCODER_CHOICES = ['Default NSF-HiFiGAN', 'Custom NSF-HiFiGAN', 'Mel previews only']
 _process = None
 _log_handle = None
@@ -132,18 +129,6 @@ def toggle_pretrained(enabled):
     return gr.update(visible=enabled)
 
 
-def download_checkpoint(destination, url, checksum, size, label):
-    with _pretrain_lock:
-        if not destination.is_file() or _sha256(destination) != checksum:
-            gr.Info(f'Downloading {label}. It will be reused for future runs.')
-            try:
-                with tqdm(total=size, unit='B', unit_scale=True, desc=label) as progress:
-                    download_file(url, str(destination), progress, expected_sha256=checksum)
-            except Exception as error:
-                raise gr.Error(f'Could not download {label}: {error}') from error
-    return str(destination)
-
-
 def resolve_vocoder(mode, path):
     if mode == 'Mel previews only':
         return ''
@@ -154,8 +139,10 @@ def resolve_vocoder(mode, path):
         return path
     if mode != 'Default NSF-HiFiGAN':
         raise gr.Error('Choose a supported vocoder option.')
-    destination = ROOT / 'rvc' / 'models' / 'pretraineds' / 'rectified' / VOCODER_FILENAME
-    return download_checkpoint(destination, VOCODER_URL, VOCODER_SHA256, 56600485, 'NSF-HiFiGAN vocoder')
+    try:
+        return default_vocoder()
+    except Exception as error:
+        raise gr.Error(f'Could not download NSF-HiFiGAN vocoder: {error}') from error
 
 
 def resolve_pretrained(directory, enabled, path):
