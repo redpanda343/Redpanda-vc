@@ -21,7 +21,7 @@ from rvc.rectified.ema import WeightEMA
 from rvc.rectified.flow_model import build_flow, resize_speakers, validate_model_config
 from rvc.rectified.mel import normalize_mel
 from rvc.rectified.muon import MuonAdamW
-from rvc.rectified.schedule import freeze_voice, learning_rate
+from rvc.rectified.schedule import learning_rate
 from rvc.rectified.vocoder import load_vocoder
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -239,18 +239,31 @@ def evaluate(model, ema, loader, data, writer, step):
         writer.add_scalar(f'val/{model.aux_loss_name}', aux_total / max(1, aux_count), step)
 
 
+def load_training_config(experiment, pretrained_flow=None):
+    config_path = experiment / 'rectified_config.json'
+    existing = config_path.exists()
+    if not existing:
+        filename = '44100_finetune.json' if pretrained_flow else '44100_standard.json'
+        config_path = ROOT / 'rvc' / 'configs' / 'rectified' / filename
+    config = json.loads(config_path.read_text(encoding='utf-8'))
+    if pretrained_flow and not existing:
+        checkpoint = torch.load(pretrained_flow, map_location='cpu', weights_only=True)
+        source = resolve_config(checkpoint.get('config', {}))
+        if 'data' not in source or 'flow' not in source or 'model' not in checkpoint:
+            raise ValueError('Choose a Rectified Flow voice checkpoint for fine-tuning.')
+        config['data'] = source['data']
+        config['flow']['model'] = source['flow']['model']
+    configure_flow(config, existing)
+    return config
+
+
 def train(args):
     if Path(args.model_name).name != args.model_name or args.model_name in {'.', '..'}:
         raise ValueError('Use a model name, not a path.')
     if any(value is not None and value < 1 for value in (args.batch_size, args.max_batch_frames)) or args.epochs < 1 or args.save_every < 1:
         raise ValueError('Batch limits, epochs and save interval must be positive.')
     experiment = ROOT / 'logs' / args.model_name
-    config_path = experiment / 'rectified_config.json'
-    existing = config_path.exists()
-    if not existing:
-        config_path = ROOT / 'rvc/configs/rectified/44100_standard.json'
-    config = json.loads(config_path.read_text(encoding='utf-8'))
-    configure_flow(config, existing)
+    config = load_training_config(experiment, args.pretrained_flow)
     if config['data']['sample_rate'] != 44100:
         raise ValueError('This recipe requires 44100 Hz audio.')
     originals = read_filelist(experiment / 'filelist.txt', ROOT, originals_only=True)
@@ -280,6 +293,9 @@ def configure_flow(config, existing_config):
     settings.setdefault('max_batch_frames', 50000)
     settings.setdefault('max_batch_size', 64)
     settings.pop('speaker_balanced_sampling', None)
+    warmup = settings.get('finetune_warmup_steps', 0)
+    if isinstance(warmup, bool) or not isinstance(warmup, int) or warmup < 0:
+        raise ValueError('finetune_warmup_steps must be a nonnegative integer.')
     configure_augmentation(settings)
 
 
@@ -294,12 +310,7 @@ def train_rank(args, ranks):
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     experiment = ROOT / 'logs' / args.model_name
-    config_path = experiment / 'rectified_config.json'
-    existing_config = config_path.exists()
-    if not existing_config:
-        config_path = ROOT / 'rvc' / 'configs' / 'rectified' / '44100_standard.json'
-    config = json.loads(config_path.read_text(encoding='utf-8'))
-    configure_flow(config, existing_config)
+    config = load_training_config(experiment, args.pretrained_flow)
     validate_model_config(config['flow']['model'])
     settings, data = config['flow'], config['data']
     multispeaker = settings['model'].get('conditioning_version', 1) in (2, 3, 4)
@@ -357,9 +368,6 @@ def train_rank(args, ranks):
     state = torch.load(resume_path, map_location='cpu', weights_only=True) if resume_path.exists() and not args.fresh else None
     finetune = bool(state.get('finetune', False)) if state else bool(args.pretrained_flow)
     dropout = float(settings['speaker_dropout'])
-    if finetune and speakers == 1 and settings.get('finetune_freeze_voice', True):
-        freeze_voice(model)
-        dropout = 0.0
     lr = args.learning_rate or settings['finetune_learning_rate' if finetune else 'learning_rate']
     if settings['optimizer'] == 'muon':
         optimizer = MuonAdamW(model, lr, muon_weight_decay=settings['weight_decay'],
@@ -430,9 +438,11 @@ def train_rank(args, ranks):
     preview_interval = int(settings.get('finetune_preview_interval', 500) if finetune
                            else settings.get('preview_interval', 1000))
     total = args.epochs * len(loader)
-    warmup = 0 if finetune else settings['warmup_steps']
+    warmup = settings.get('finetune_warmup_steps', 0) if finetune else settings['warmup_steps']
     if ranks.main:
         print(f'Rectified flow: {sum(p.numel() for p in model.parameters()):,} parameters, {precision_label}, {device}, whole utterances, up to {max_items} clips / {max_frames} frames per batch, {len(loader)} batches per epoch and GPU, {ranks.world} device(s)', flush=True)
+        if finetune:
+            print(f'Fine-tuning: fresh-run LR {lr:g}, warmup {warmup} steps, {settings.get("lr_schedule", "cosine")} decay, minimum LR {settings.get("min_learning_rate", 0.0):g}.', flush=True)
         if multispeaker:
             print(f'Multispeaker conditioning v{model.encoder.conditioning_version}: {speakers} speakers, {len(held)} held-out clips. Clips per speaker: {inventory}', flush=True)
             if settings['model'].get('direct_speaker_conditioning', False):
@@ -452,6 +462,7 @@ def train_rank(args, ranks):
                     gamma=settings.get('gamma', 0.9),
                     step_offset=settings.get('step_lr_offset', 1),
                     min_lr=float(settings.get('min_learning_rate', 0.0)),
+                    step_warmup=finetune,
                 )
                 for group in optimizer.param_groups:
                     group['lr'] = current_lr

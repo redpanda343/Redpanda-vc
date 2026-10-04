@@ -33,7 +33,6 @@ STANDARD_PRESET = {
         'ema_decay': 0.9999,
         'finetune_ema_decay': 0.999,
         'speaker_dropout': 0.0,
-        'finetune_freeze_voice': False,
         'augmentation_args': {
             'random_pitch_shifting': {'enabled': True, 'range': [-5.0, 5.0], 'scale': 0.75},
             'fixed_pitch_shifting': {'enabled': False, 'targets': [-5.0, 5.0], 'scale': 0.5},
@@ -126,6 +125,12 @@ def compact_config(config):
         return resolved
     flow = resolved['flow']
     visible = {key: deepcopy(flow[key]) for key in EDITABLE_FLOW_KEYS}
+    if 'finetune_warmup_steps' in flow:
+        visible.update({key: deepcopy(flow[key]) for key in (
+            'finetune_learning_rate', 'min_learning_rate', 'finetune_warmup_steps',
+            'finetune_ema_decay',
+            'finetune_preview_interval',
+        ) if key in flow})
     visible['augmentation_args'] = {
         key: deepcopy(flow['augmentation_args'][key])
         for key in ('random_pitch_shifting', 'random_time_stretching')

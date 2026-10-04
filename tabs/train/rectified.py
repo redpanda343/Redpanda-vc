@@ -126,7 +126,11 @@ def device_id(device):
 
 
 def toggle_pretrained(enabled):
-    return gr.update(visible=enabled)
+    from rvc.rectified.config import resolve_config
+
+    filename = '44100_finetune.json' if enabled else '44100_standard.json'
+    config = resolve_config(json.loads((ROOT / 'rvc' / 'configs' / 'rectified' / filename).read_text(encoding='utf-8')))
+    return gr.update(value=config['flow']['max_batch_size'])
 
 
 def resolve_vocoder(mode, path):
@@ -145,16 +149,16 @@ def resolve_vocoder(mode, path):
         raise gr.Error(f'Could not download NSF-HiFiGAN vocoder: {error}') from error
 
 
-def resolve_pretrained(directory, enabled, path):
+def resolve_pretrained(directory, enabled):
     if not enabled or (directory / 'flow' / 'checkpoint.pth').is_file():
         return ''
-    path = str(path or '').strip().strip('"')
-    if not path or not Path(path).is_file():
-        raise gr.Error('Choose a matching Multispeaker pretrained checkpoint, or disable Pretrained.')
-    return path
+    path = ROOT / 'rvc' / 'models' / 'pretrained' / 'rectified' / 'pretrained.pth'
+    if not path.is_file():
+        raise gr.Error(f'Pretrained model not found. Place your Rectified Flow checkpoint at {path}.')
+    return str(path)
 
 
-def start(name, vocoder, pretrained, batch, max_frames, epochs, save_every, device, compile_backbone=False,
+def start(name, vocoder, batch, max_frames, epochs, save_every, device, compile_backbone=False,
           use_pretrained=False, vocoder_mode='Default NSF-HiFiGAN'):
     directory = experiment_path(name)
     device_id(device)
@@ -174,6 +178,7 @@ def start(name, vocoder, pretrained, batch, max_frames, epochs, save_every, devi
             validate_model_config(config['flow']['model'])
         except ValueError as error:
             raise gr.Error(str(error)) from error
+    pretrained = resolve_pretrained(directory, use_pretrained)
     vocoder = resolve_vocoder(vocoder_mode, vocoder)
     arguments = ['--model-name', str(name).strip(), '--vocoder', vocoder,
                  '--batch-size', positive_integer(batch, 'Max clips per batch'),
@@ -183,7 +188,6 @@ def start(name, vocoder, pretrained, batch, max_frames, epochs, save_every, devi
                  '--device', str(device).strip().lower(), '--precision', precision]
     if compile_backbone:
         arguments.append('--compile')
-    pretrained = resolve_pretrained(directory, use_pretrained, pretrained)
     if pretrained:
         arguments.extend(['--pretrained-flow', pretrained])
     return launch(name, 'rvc.rectified.train_flow', arguments, 'Training rectified flow')
@@ -236,10 +240,6 @@ def rectified_train_tab():
         vocoder = gr.Textbox(label='Custom OpenVPI NSF-HiFiGAN checkpoint path', visible=False,
                             info='Use a compatible .ckpt or converted .pth export: 44.1 kHz, 128 mel bins, hop 512. Keep config.json beside raw checkpoints when provided.')
         use_pretrained = gr.Checkbox(label='Pretrained', value=False)
-        with gr.Column(visible=False) as custom_pretrained_settings:
-            pretrained_upload = gr.File(label='Upload custom flow pretrained', file_types=['.pth'], type='filepath')
-            pretrained = gr.Textbox(label='Custom pretrained flow path',
-                                    info='Choose a flow checkpoint compatible with the experiment configuration and content embedder.')
         with gr.Row():
             batch = gr.Number(label='Max clips per batch (per GPU)', value=64, minimum=1, precision=0,
                               info='Clips are trained whole, never cropped. A batch is closed at this many clips or at the frame limit.')
@@ -257,11 +257,10 @@ def rectified_train_tab():
     outputs = [state, log, preprocess_button, extract_button, train_button, stop_button]
     preprocess_button.click(preprocess, [name, dataset, workers, slicing], outputs, queue=False)
     extract_button.click(extract, [name, method, workers, device, embedder], outputs, queue=False)
-    use_pretrained.change(toggle_pretrained, [use_pretrained], [custom_pretrained_settings], queue=False)
-    pretrained_upload.upload(lambda path: path or '', [pretrained_upload], [pretrained], queue=False)
+    use_pretrained.change(toggle_pretrained, [use_pretrained], [batch], queue=False)
     vocoder_mode.change(lambda mode: gr.update(visible=mode == 'Custom NSF-HiFiGAN'),
                         [vocoder_mode], [vocoder], queue=False)
-    train_button.click(start, [name, vocoder, pretrained, batch, max_frames, epochs, save_every, device, compile_backbone,
+    train_button.click(start, [name, vocoder, batch, max_frames, epochs, save_every, device, compile_backbone,
                                use_pretrained, vocoder_mode], outputs, queue=False)
     stop_button.click(stop, [], outputs, queue=False)
     gr.Timer(2).tick(status, [], outputs, queue=False)

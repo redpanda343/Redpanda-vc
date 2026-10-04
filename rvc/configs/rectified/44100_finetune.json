@@ -1,0 +1,42 @@
+{
+  "preset": "standard-v1",
+  "flow": {
+    "finetune_learning_rate": 0.0001,
+    "min_learning_rate": 2e-05,
+    "finetune_warmup_steps": 500,
+    "lr_schedule": "step",
+    "decay_step": 2000,
+    "gamma": 0.8,
+    "step_lr_offset": 0,
+    "max_batch_frames": 50000,
+    "max_batch_size": 32,
+    "finetune_ema_decay": 0.999,
+    "augmentation_max_examples": 20000,
+    "num_workers": 4,
+    "finetune_preview_interval": 500,
+    "eval_interval": 500,
+    "holdout_clips": 32,
+    "augmentation_args": {
+      "random_pitch_shifting": {
+        "enabled": true,
+        "range": [
+          -5.0,
+          5.0
+        ],
+        "scale": 0.75
+      },
+      "random_time_stretching": {
+        "enabled": true,
+        "range": [
+          0.5,
+          2.0
+        ],
+        "scale": 0.75
+      }
+    },
+    "model": {
+      "sampling_method": "euler",
+      "sampling_steps": 20
+    }
+  }
+}
