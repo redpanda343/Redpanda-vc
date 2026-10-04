@@ -26,6 +26,7 @@ DEFAULT_AUGMENTATION = {
 def configure_augmentation(settings):
     if 'augmentation_args' not in settings:
         settings['augmentation_args'] = copy.deepcopy(DEFAULT_AUGMENTATION)
+    settings.setdefault('augmentation_max_examples', 40000)
     for name in ('key_shift_range', 'key_shift_prob', 'time_stretch_range', 'time_stretch_prob'):
         settings.pop(name, None)
 
@@ -34,7 +35,16 @@ def is_augmented(entry):
     return str(entry[1]).endswith('.flow.npz')
 
 
-def augmentation_plan(entries, settings, seed):
+def augmentation_indices(tasks, settings, seed):
+    maximum = settings.get('augmentation_max_examples', 40000)
+    if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 0:
+        raise ValueError('Maximum augmented examples must be a nonnegative integer.')
+    if len(tasks) <= maximum:
+        return range(len(tasks))
+    return sorted(random.Random(seed).sample(range(len(tasks)), maximum))
+
+
+def augmentation_plan(entries, settings, seed, capped=True):
     if not entries:
         raise ValueError('Augmentation requires original training examples.')
     args = settings['augmentation_args']
@@ -92,7 +102,7 @@ def augmentation_plan(entries, settings, seed):
                 tasks.append(item)
             else:
                 chosen_item['speed'] = speed
-    return tasks
+    return [tasks[index] for index in augmentation_indices(tasks, settings, seed)] if capped else tasks
 
 
 def interpolate_f0(f0):
@@ -276,7 +286,10 @@ def generate_groups(dataset, entries, grouped, pitch, device, speed_embed, worke
 
 
 def prepare_augmentation(experiment, root, originals, train_entries, config, seed, device, pitch=None):
-    tasks = augmentation_plan(train_entries, config['flow'], seed)
+    tasks = augmentation_plan(train_entries, config['flow'], seed, capped=False)
+    selected = augmentation_indices(tasks, config['flow'], seed)
+    if len(selected) < len(tasks):
+        print(f'Using {len(selected):,} of {len(tasks):,} planned augmented examples.', flush=True)
     info_path = experiment / 'model_info.json'
     info = json.loads(info_path.read_text(encoding='utf-8')) if info_path.exists() else {}
     method = info.get('f0_method', 'rmvpe')
@@ -300,7 +313,8 @@ def prepare_augmentation(experiment, root, originals, train_entries, config, see
         os.replace(temporary, backup)
     dataset = RectifiedDataset(train_entries, config, 2 ** 31, augment=False)
     grouped, rows = {}, []
-    for number, task in enumerate(tasks):
+    for number in selected:
+        task = tasks[number]
         entry = train_entries[task['index']]
         path = folder / f'{number:08d}.flow.npz'
         coarse, f0 = path.with_suffix('.coarse.npy'), path.with_suffix('.f0.npy')
@@ -312,19 +326,19 @@ def prepare_augmentation(experiment, root, originals, train_entries, config, see
         if requested < 0:
             raise ValueError('Augmentation workers cannot be negative.')
         workers = max(1, min(requested, os.cpu_count() or 1, len(grouped)))
-        print(f'Generating {len(tasks):,} DiffSinger-style augmented examples before training using {method}, '
+        print(f'Generating {len(rows):,} DiffSinger-style augmented examples before training using {method}, '
               f'{workers} preparation workers, {workers} file writers and uncompressed features.', flush=True)
         pitch = pitch or AugmentationPitch(method, device, root)
-        completed = len(tasks) - sum(len(values) for values in grouped.values())
+        completed = len(rows) - sum(len(values) for values in grouped.values())
         last_report = time.monotonic()
         for count in generate_groups(dataset, train_entries, grouped, pitch, device,
                                      config['flow']['model'].get('speed', False), workers):
             completed += count
-            if completed == len(tasks) or time.monotonic() - last_report >= 5:
-                print(f'Augmentation: {completed:,}/{len(tasks):,}', flush=True)
+            if completed == len(rows) or time.monotonic() - last_report >= 5:
+                print(f'Augmentation: {completed:,}/{len(rows):,}', flush=True)
                 last_report = time.monotonic()
     temporary = folder / 'manifest.json.tmp'
-    temporary.write_text(json.dumps(dict(fingerprint=fingerprint, examples=len(tasks)), indent=2), encoding='utf-8')
+    temporary.write_text(json.dumps(dict(fingerprint=fingerprint, examples=len(rows)), indent=2), encoding='utf-8')
     os.replace(temporary, folder / 'manifest.json')
     temporary = filelist.with_suffix('.txt.tmp')
     original_lines = [line for line in filelist.read_text(encoding='utf-8').splitlines()
