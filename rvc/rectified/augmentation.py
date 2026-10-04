@@ -23,10 +23,17 @@ DEFAULT_AUGMENTATION = {
 }
 
 
+def augmentation_maximum(settings):
+    maximum = settings.get('augmentation_max_examples', 20000)
+    if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 0:
+        raise ValueError('Maximum augmented examples must be a nonnegative integer.')
+    return min(maximum, 20000)
+
+
 def configure_augmentation(settings):
     if 'augmentation_args' not in settings:
         settings['augmentation_args'] = copy.deepcopy(DEFAULT_AUGMENTATION)
-    settings.setdefault('augmentation_max_examples', 40000)
+    settings['augmentation_max_examples'] = augmentation_maximum(settings)
     for name in ('key_shift_range', 'key_shift_prob', 'time_stretch_range', 'time_stretch_prob'):
         settings.pop(name, None)
 
@@ -36,9 +43,7 @@ def is_augmented(entry):
 
 
 def augmentation_indices(tasks, settings, seed):
-    maximum = settings.get('augmentation_max_examples', 40000)
-    if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 0:
-        raise ValueError('Maximum augmented examples must be a nonnegative integer.')
+    maximum = augmentation_maximum(settings)
     if len(tasks) <= maximum:
         return range(len(tasks))
     return sorted(random.Random(seed).sample(range(len(tasks)), maximum))
