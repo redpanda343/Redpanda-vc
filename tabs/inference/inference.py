@@ -1,4 +1,5 @@
 import datetime
+from functools import lru_cache
 import os
 import shutil
 import sys
@@ -356,21 +357,47 @@ def match_index(model_file_value, available_indexes=None):
     return ""
 
 
-def get_speakers_id(model):
+@lru_cache(maxsize=32)
+def read_model_info(path, modified, size):
+    model_data = torch.load(path, map_location="cpu", weights_only=True)
+    config = model_data.get("config")
+    rectified = model_data.get("kind") == "rectified_flow" or (
+        isinstance(config, dict)
+        and "flow" in config
+        and "data" in config
+        and "model" in model_data
+    )
+    speakers = model_data.get("speaker_count", model_data.get("speakers_id")) or 1
+    return rectified, speakers
+
+
+def get_model_info(model):
     if model:
         try:
-            model_data = torch.load(
-                os.path.join(now_dir, model), map_location="cpu", weights_only=True
-            )
-            speakers_id = model_data.get("speaker_count", model_data.get("speakers_id"))
-            if speakers_id:
-                return list(range(speakers_id))
-            else:
-                return [0]
+            path = os.path.abspath(os.path.join(now_dir, model))
+            stat = os.stat(path)
+            return read_model_info(path, stat.st_mtime_ns, stat.st_size)
         except Exception:
-            return [0]
-    else:
-        return [0]
+            pass
+    return False, 1
+
+
+def get_speakers_id(model):
+    return list(range(get_model_info(model)[1]))
+
+
+def get_vocoders():
+    root = os.path.join(now_dir, "rvc", "models", "pretraineds", "rectified")
+    return sorted(
+        os.path.relpath(os.path.join(folder, name), now_dir)
+        for folder, _, files in os.walk(root)
+        for name in files
+        if name.lower().endswith((".pth", ".ckpt"))
+    )
+
+
+def update_vocoder_visibility(model):
+    return gr.update(visible=get_model_info(model)[0])
 
 
 def filter_dropdowns(filter_text):
@@ -420,6 +447,23 @@ def inference_tab():
                 interactive=True,
                 allow_custom_value=True,
             )
+        rectified_vocoder_path = gr.Dropdown(
+            label=i18n("Rectified Flow Vocoder"),
+            info=i18n(
+                "Optional: select a compatible NSF-HiFiGAN vocoder or enter its .pth/.ckpt path. Leave empty to use the model's recorded vocoder or the default. Keep any config.json beside the vocoder."
+            ),
+            choices=get_vocoders(),
+            value=None,
+            interactive=True,
+            allow_custom_value=True,
+            visible=get_model_info(default_weight)[0],
+        )
+        model_file.change(
+            fn=update_vocoder_visibility,
+            inputs=[model_file],
+            outputs=[rectified_vocoder_path],
+            show_progress=False,
+        )
         filter_box_inf.blur(
             fn=filter_dropdowns,
             inputs=[filter_box_inf],
@@ -434,6 +478,12 @@ def inference_tab():
         with gr.Row():
             unload_button = gr.Button(i18n("Unload Voice"))
             refresh_button = gr.Button(i18n("Refresh"))
+            refresh_button.click(
+                fn=lambda: gr.update(choices=get_vocoders()),
+                inputs=[],
+                outputs=[rectified_vocoder_path],
+                show_progress=False,
+            )
 
             unload_button.click(
                 fn=lambda: (
@@ -2203,6 +2253,7 @@ def inference_tab():
             delay_mix,
             sid,
             seed,
+            rectified_vocoder_path,
         ],
         outputs=[vc_output1, vc_output2],
     )
@@ -2265,6 +2316,7 @@ def inference_tab():
             delay_mix_batch,
             sid_batch,
             seed_batch,
+            rectified_vocoder_path,
         ],
         outputs=[vc_output3],
     ).then(
