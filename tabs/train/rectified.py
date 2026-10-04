@@ -167,7 +167,7 @@ def resolve_pretrained(directory, enabled, path):
     return path
 
 
-def start(name, vocoder, pretrained, batch, epochs, save_every, device, compile_backbone=False,
+def start(name, vocoder, pretrained, batch, max_frames, epochs, save_every, device, compile_backbone=False,
           use_pretrained=False, vocoder_mode='Default NSF-HiFiGAN'):
     directory = experiment_path(name)
     device_id(device)
@@ -187,7 +187,8 @@ def start(name, vocoder, pretrained, batch, epochs, save_every, device, compile_
             raise gr.Error(str(error)) from error
     vocoder = resolve_vocoder(vocoder_mode, vocoder)
     arguments = ['--model-name', str(name).strip(), '--vocoder', vocoder,
-                 '--batch-size', positive_integer(batch, 'Batch size'),
+                 '--batch-size', positive_integer(batch, 'Max clips per batch'),
+                 '--max-batch-frames', positive_integer(max_frames, 'Max frames per batch'),
                  '--epochs', positive_integer(epochs, 'Total epochs'),
                  '--save-every', positive_integer(save_every, 'Save interval'),
                  '--device', str(device).strip().lower(), '--precision', precision]
@@ -256,7 +257,10 @@ def rectified_train_tab():
             pretrained = gr.Textbox(label='Custom pretrained flow path',
                                     info='Choose a flow checkpoint compatible with the experiment configuration and content embedder.')
         with gr.Row():
-            batch = gr.Number(label='Batch size per GPU', value=4, minimum=1, precision=0)
+            batch = gr.Number(label='Max clips per batch (per GPU)', value=64, minimum=1, precision=0,
+                              info='Clips are trained whole, never cropped. A batch is closed at this many clips or at the frame limit.')
+            max_frames = gr.Number(label='Max frames per batch (per GPU)', value=50000, minimum=1, precision=0,
+                                   info='Padded frames (clips x longest clip, 1 frame = 11.6 ms). Lower it if you run out of GPU memory.')
             epochs = gr.Number(label='Total epochs', value=100, minimum=1, precision=0)
             save_every = gr.Number(label='Save every N epochs', value=10, minimum=1, precision=0)
         compile_backbone = gr.Checkbox(label='Compile flow backbone', value=False,
@@ -275,7 +279,7 @@ def rectified_train_tab():
     pretrained_upload.upload(lambda path: path or '', [pretrained_upload], [pretrained], queue=False)
     vocoder_mode.change(lambda mode: gr.update(visible=mode == 'Custom NSF-HiFiGAN'),
                         [vocoder_mode], [vocoder], queue=False)
-    train_button.click(start, [name, vocoder, pretrained, batch, epochs, save_every, device, compile_backbone,
+    train_button.click(start, [name, vocoder, pretrained, batch, max_frames, epochs, save_every, device, compile_backbone,
                                use_pretrained, vocoder_mode], outputs, queue=False)
     stop_button.click(stop, [], outputs, queue=False)
     gr.Timer(2).tick(status, [], outputs, queue=False)
