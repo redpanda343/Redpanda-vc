@@ -132,8 +132,11 @@ def train_step(model, optimizer, ema, batch, data, settings, device, speaker_dro
         retry = ' after an FP32 retry' if retried else ''
         raise FloatingPointError(f'Non-finite rectified-flow loss{retry}. Non-finite values: {details}.')
     frames = mask.sum().detach()
+    padded_frames = frames.new_tensor(mask.numel())
     if ranks is not None and ranks.world > 1:
-        loss = loss * (frames * ranks.world / ranks.sum(frames).clamp_min(1.0))
+        loss = flow * (padded_frames * ranks.world / ranks.sum(padded_frames).clamp_min(1.0))
+        if auxiliary is not None:
+            loss = loss + settings['aux_mel_weight'] * auxiliary * (frames * ranks.world / ranks.sum(frames).clamp_min(1.0))
     if scaler is None:
         loss.backward()
         norm = torch.nn.utils.clip_grad_norm_(
@@ -153,10 +156,11 @@ def train_step(model, optimizer, ema, batch, data, settings, device, speaker_dro
         else:
             print('FP16 overflow: skipped optimizer and EMA update; reduced gradient scale.', flush=True)
     if ranks is not None and ranks.world > 1:
-        stats = torch.stack([flow.detach() * frames,
-                             auxiliary.detach() * frames if auxiliary is not None else frames * 0, frames])
+        stats = torch.stack([flow.detach() * padded_frames,
+                             auxiliary.detach() * frames if auxiliary is not None else frames * 0,
+                             padded_frames, frames])
         stats = ranks.sum(stats)
-        return float(stats[0] / stats[2].clamp_min(1.0)), float(stats[1] / stats[2].clamp_min(1.0)), float(norm)
+        return float(stats[0] / stats[2].clamp_min(1.0)), float(stats[1] / stats[3].clamp_min(1.0)), float(norm)
     return float(flow.detach()), float(auxiliary.detach()) if auxiliary is not None else 0.0, float(norm)
 
 
@@ -206,7 +210,7 @@ def evaluate(model, ema, loader, data, writer, step):
     device = next(model.parameters()).device
     fractions = (0.1, 0.3, 0.5, 0.7, 0.9)
     totals = torch.zeros(len(fractions), device=device)
-    aux_total, count = 0.0, 0
+    aux_total, count, aux_count = 0.0, 0, 0
     with ema.applied(model):
         model.eval()
         for index, batch in enumerate(loader):
@@ -219,17 +223,19 @@ def evaluate(model, ema, loader, data, writer, step):
                 noise, fractions,
                 voicing=voicing, tension=tension,
             )
-            weight = float(mask.sum())
+            weight = mask.numel()
+            aux_weight = float(mask.sum())
             totals += losses.float() * weight
-            aux_total += (float(auxiliary) if auxiliary is not None else 0.0) * weight
+            aux_total += (float(auxiliary) if auxiliary is not None else 0.0) * aux_weight
             count += weight
+            aux_count += aux_weight
         model.train()
     totals /= max(1, count)
     writer.add_scalar('val/flow', float(totals.mean()), step)
     for fraction, value in zip(fractions, totals.tolist()):
         writer.add_scalar(f'val/flow_t{fraction:g}', value, step)
     if model.aux is not None:
-        writer.add_scalar(f'val/{model.aux_loss_name}', aux_total / max(1, count), step)
+        writer.add_scalar(f'val/{model.aux_loss_name}', aux_total / max(1, aux_count), step)
 
 
 def train(args):

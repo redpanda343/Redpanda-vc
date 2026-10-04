@@ -8,10 +8,10 @@ from torch.nn import functional as F
 
 LOG_F0_CENTER = math.log(200.0)
 LOG_F0_SCALE = 0.7
-SAMPLERS = ("euler", "heun", "rk4")
+SAMPLERS = ("euler", "rk2", "rk4", "rk5")
 
 
-SCHEDULES = ("uniform", "sway", "logit-normal")
+SCHEDULES = ("uniform",)
 
 RESCALE_MODES = ("global", "frame")
 
@@ -19,15 +19,7 @@ RESCALE_MODES = ("global", "frame")
 def time_grid(schedule: str, steps: int, start: float, device) -> torch.Tensor:
     if schedule not in SCHEDULES:
         raise ValueError(f"schedule must be one of {SCHEDULES}, not {schedule!r}.")
-    u = torch.linspace(0.0, 1.0, steps + 1, device=device)
-    if schedule == "sway":
-        g = 1.0 - torch.cos(0.5 * math.pi * u)
-    elif schedule == "logit-normal":
-        g = torch.sigmoid(math.sqrt(2.0) * torch.erfinv((2.0 * u - 1.0).clamp(-1.0, 1.0)))
-    else:
-        g = u
-    g[0], g[-1] = 0.0, 1.0
-    return start + (1.0 - start) * g
+    return start + torch.arange(steps + 1, device=device) * ((1.0 - start) / steps)
 
 
 def pitch_features(f0: torch.Tensor, fourier: int = 0) -> torch.Tensor:
@@ -251,17 +243,17 @@ class LYNXNet2Block(nn.Module):
             nn.init.zeros_(self.modulation.weight)
             nn.init.zeros_(self.modulation.bias)
 
-    def forward(self, x, mask, embedding=None, fused=True):
+    def forward(self, x, embedding=None, fused=True):
         y = self.norm(x)
         gate = None
         if self.modulation is not None:
             shift, scale, gate = self.modulation(F.silu(embedding)).chunk(3, dim=-1)
             y = y + y * scale + shift
-        y = self.depthwise((y * mask).transpose(1, 2)).transpose(1, 2)
+        y = self.depthwise(y.transpose(1, 2)).transpose(1, 2)
         y = self.down(atan_glu(self.mid(atan_glu(self.up(y), fused)), fused))
         if gate is not None:
             y = y + gate * y
-        return (x + y) * mask
+        return x + y
 
 
 class LYNXNet2Backbone(nn.Module):
@@ -295,18 +287,16 @@ class LYNXNet2Backbone(nn.Module):
     def forward(self, x, t, cond, mask, voice=None, prepared=None):
         time = self.time_mlp(timestep_embedding(t.reshape(-1), self.channels, self.time_scale))
         time = time.view(t.shape[0], -1, self.channels)
-        frame_mask = mask.transpose(1, 2)
         h = self.input(x.transpose(1, 2))
         projected, speaker = self.prepare_conditioning(cond, voice) if prepared is None else prepared
         h = h + projected + time
-        h = h * frame_mask
         embedding = None
         if self.voice is not None:
             embedding = time + speaker
         for layer in self.layers:
-            h = layer(h, frame_mask, embedding)
+            h = layer(h, embedding)
         h = self.norm(h)
-        return (self.output(h) * frame_mask).transpose(1, 2)
+        return self.output(h).transpose(1, 2)
 
 
 class AuxDecoder(nn.Module):
@@ -453,8 +443,8 @@ class RectifiedFlow(nn.Module):
             times = t.float().clamp(1e-7, 1.0 - 1e-7)
             weights = 0.398942 / times / (1.0 - times) * torch.exp(-0.5 * torch.log(times / (1.0 - times)).square())
             error = error * (weights[:, None, None] if t.ndim == 1 else weights[:, None, :])
+        flow = error.mean()
         count = (mask.sum((1, 2)) * self.n_mels).clamp_min(1.0)
-        flow = error.sum((1, 2)) / count
         aux = self._mel_loss(predicted_mel, mel, mask, count.sum())
         return flow, aux
 
@@ -506,7 +496,7 @@ class RectifiedFlow(nn.Module):
 
         backbone = self.backbone if backbone is None else backbone
         flow, aux = self._losses(mel, cond, voice, mask, t, torch.randn_like(mel), backbone)
-        return (flow * mask.sum((1, 2))).sum() / mask.sum().clamp_min(1.0), aux
+        return flow, aux
 
     @torch.no_grad()
     def validation_losses(self, mel, content, f0, energy, speaker, mask, breathiness, key_shift,
@@ -517,7 +507,7 @@ class RectifiedFlow(nn.Module):
         for fraction in fractions:
             t = torch.full((mel.shape[0],), self.t_start + (1.0 - self.t_start) * fraction, device=mel.device)
             flow, aux = self._losses(mel, cond, voice, mask, t, noise, self.backbone)
-            losses.append((flow * mask.sum((1, 2))).sum() / mask.sum().clamp_min(1.0))
+            losses.append(flow)
         return torch.stack(losses), aux
 
     @torch.no_grad()
@@ -542,8 +532,6 @@ class RectifiedFlow(nn.Module):
         guidance_interval: tuple = (0.0, 1.0),
         rescale_mode: str = "global",
         schedule: str = "uniform",
-        churn: float = 0.0,
-        churn_noise: Optional[Callable[[int], torch.Tensor]] = None,
         voicing: Optional[torch.Tensor] = None,
         tension: Optional[torch.Tensor] = None,
     ):
@@ -621,27 +609,26 @@ class RectifiedFlow(nn.Module):
         else:
             x = noise * mask
         times = time_grid(schedule, max(1, int(steps)), t0, x.device)
+        dt = (1.0 - t0) / (times.shape[0] - 1)
         for index in range(times.shape[0] - 1):
-            now = float(times[index])
-            back = max(self.t_start, now - float(churn) * float(times[index + 1] - times[index]))
-            if churn > 0 and 0 < back < now:
-                fresh = torch.randn_like(x) if churn_noise is None else churn_noise(index)
-                scale = back / now
-                top_up = math.sqrt(max((1.0 - back) ** 2 - (scale * (1.0 - now)) ** 2, 0.0))
-                x = (scale * x + float(temperature) * top_up * fresh) * mask
-                now = back
-            t = torch.full((batch,), now, device=x.device, dtype=times.dtype)
-            dt = times[index + 1] - now
+            t = times[index].expand(batch)
             v = field(x, t)
-            if method == "heun":
-                v_next = field(x + dt * v, times[index + 1].expand(batch))
-                v = 0.5 * (v + v_next)
+            if method == "rk2":
+                v = field(x + 0.5 * dt * v, t + 0.5 * dt)
             elif method == "rk4":
                 middle = t + 0.5 * dt
                 k2 = field(x + 0.5 * dt * v, middle)
                 k3 = field(x + 0.5 * dt * k2, middle)
-                k4 = field(x + dt * k3, times[index + 1].expand(batch))
+                k4 = field(x + dt * k3, t + dt)
                 v = (v + 2.0 * k2 + 2.0 * k3 + k4) / 6.0
+            elif method == "rk5":
+                k2 = field(x + 0.25 * v * dt, t + 0.25 * dt)
+                k3 = field(x + 0.125 * (k2 + v) * dt, t + 0.25 * dt)
+                k4 = field(x + 0.5 * (-k2 + 2.0 * k3) * dt, t + 0.5 * dt)
+                k5 = field(x + 0.0625 * (3.0 * v + 9.0 * k4) * dt, t + 0.75 * dt)
+                k6 = field(x + (-3.0 * v + 2.0 * k2 + 12.0 * k3 - 12.0 * k4 + 8.0 * k5) * dt / 7.0,
+                           t + dt)
+                v = (7.0 * v + 32.0 * k3 + 12.0 * k4 + 32.0 * k5 + 7.0 * k6) / 90.0
             x = x + dt * v
             if callback is not None:
                 callback()
