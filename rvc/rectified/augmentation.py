@@ -5,6 +5,8 @@ import math
 import os
 import random
 import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import librosa
@@ -153,7 +155,7 @@ def resample_curve(curve, frames, speed):
     return torch.from_numpy(np.interp(positions, np.arange(len(curve)), curve).astype(np.float32))
 
 
-def generate_features(dataset, entry, tasks, paths, pitch, device, speed_embed=True):
+def prepare_source(dataset, entry):
     audio = dataset._audio(entry[0])
     source_f0 = torch.from_numpy(np.load(entry[3], allow_pickle=False).astype(np.float32))
     content = upsample_content(torch.from_numpy(np.load(entry[1], allow_pickle=False).astype(np.float32)),
@@ -175,6 +177,30 @@ def generate_features(dataset, entry, tasks, paths, pitch, device, speed_embed=T
 
         variances = variance_curves(audio.unsqueeze(0), source_f0.unsqueeze(0), frames,
                                    dataset.sample_rate, dataset.hop)
+    return audio, source_f0, content, energy, breathiness, variances
+
+
+def save_features(path, values):
+    f0_mel = 1127 * np.log1p(values['f0'] / 700)
+    low, high = 1127 * np.log1p(np.array([50.0, 1100.0]) / 700)
+    coarse = np.rint(np.clip((f0_mel - low) * 254 / (high - low) + 1, 1, 255)).astype(np.int64)
+    for destination, value in ((path.with_suffix('.f0.npy'), values['f0']),
+                               (path.with_suffix('.coarse.npy'), coarse)):
+        temporary = destination.with_suffix(destination.suffix + '.tmp')
+        with temporary.open('wb') as stream:
+            np.save(stream, value, allow_pickle=False)
+        os.replace(temporary, destination)
+    temporary = path.with_suffix(path.suffix + '.tmp')
+    with temporary.open('wb') as stream:
+        np.savez(stream, **values)
+    os.replace(temporary, path)
+
+
+def generate_features(dataset, entry, tasks, paths, pitch, device, speed_embed=True,
+                      source=None, writer=None):
+    audio, source_f0, content, energy, breathiness, variances = (
+        prepare_source(dataset, entry) if source is None else source
+    )
     mel_extractor = dataset.mel.to(device)
     for task, path in zip(tasks, paths):
         hop = int(round(dataset.hop * task.get('speed', 1.0)))
@@ -200,18 +226,53 @@ def generate_features(dataset, entry, tasks, paths, pitch, device, speed_embed=T
         values = {name: value.numpy() if torch.is_tensor(value) else value for name, value in values.items()}
         if not all(np.isfinite(value).all() for value in values.values()) or length < 4:
             raise ValueError(f'Invalid augmented features: {entry[0]}')
-        f0_mel = 1127 * np.log1p(values['f0'] / 700)
-        low, high = 1127 * np.log1p(np.array([50.0, 1100.0]) / 700)
-        coarse = np.rint(np.clip((f0_mel - low) * 254 / (high - low) + 1, 1, 255)).astype(np.int64)
-        for destination, value in ((path.with_suffix('.f0.npy'), values['f0']),
-                                   (path.with_suffix('.coarse.npy'), coarse)):
-            with destination.with_suffix(destination.suffix + '.tmp').open('wb') as stream:
-                np.save(stream, value, allow_pickle=False)
-            os.replace(destination.with_suffix(destination.suffix + '.tmp'), destination)
-        temporary = path.with_suffix(path.suffix + '.tmp')
-        with temporary.open('wb') as stream:
-            np.savez_compressed(stream, **values)
-        os.replace(temporary, path)
+        if writer is None:
+            save_features(path, values)
+        else:
+            writer(path, values)
+
+
+def generate_groups(dataset, entries, grouped, pitch, device, speed_embed, workers):
+    if workers < 2:
+        for index, items in grouped.items():
+            generate_features(dataset, entries[index], [task for task, _ in items],
+                              [path for _, path in items], pitch, device, speed_embed=speed_embed)
+            yield len(items)
+        return
+    previous_threads = torch.get_num_threads()
+    torch.set_num_threads(max(1, min(previous_threads, (os.cpu_count() or 1) // workers)))
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as readers, ThreadPoolExecutor(max_workers=workers) as writers:
+            jobs = iter(grouped.items())
+            pending_sources, pending_writes = deque(), deque()
+
+            def submit_source():
+                job = next(jobs, None)
+                if job is None:
+                    return
+                index, items = job
+                pending_sources.append((index, items, readers.submit(prepare_source, dataset, entries[index])))
+
+            def submit_write(path, values):
+                if len(pending_writes) >= workers * 2:
+                    pending_writes.popleft().result()
+                pending_writes.append(writers.submit(save_features, path, values))
+
+            for _ in range(workers):
+                submit_source()
+            while pending_sources:
+                index, items, future = pending_sources.popleft()
+                source = future.result()
+                generate_features(dataset, entries[index], [task for task, _ in items],
+                                  [path for _, path in items], pitch, device, speed_embed=speed_embed,
+                                  source=source, writer=submit_write)
+                submit_source()
+                if not pending_sources:
+                    while pending_writes:
+                        pending_writes.popleft().result()
+                yield len(items)
+    finally:
+        torch.set_num_threads(previous_threads)
 
 
 def prepare_augmentation(experiment, root, originals, train_entries, config, seed, device, pitch=None):
@@ -247,15 +308,18 @@ def prepare_augmentation(experiment, root, originals, train_entries, config, see
         if not all(value.exists() for value in (path, coarse, f0)):
             grouped.setdefault(task['index'], []).append((task, path))
     if grouped:
-        print(f'Generating {len(tasks):,} DiffSinger-style augmented examples before training using {method}.', flush=True)
+        requested = int(config['flow'].get('augmentation_workers', config['flow'].get('num_workers', 4)))
+        if requested < 0:
+            raise ValueError('Augmentation workers cannot be negative.')
+        workers = max(1, min(requested, os.cpu_count() or 1, len(grouped)))
+        print(f'Generating {len(tasks):,} DiffSinger-style augmented examples before training using {method}, '
+              f'{workers} preparation workers, {workers} file writers and uncompressed features.', flush=True)
         pitch = pitch or AugmentationPitch(method, device, root)
         completed = len(tasks) - sum(len(values) for values in grouped.values())
         last_report = time.monotonic()
-        for index, items in grouped.items():
-            generate_features(dataset, train_entries[index], [task for task, _ in items],
-                              [path for _, path in items], pitch, device,
-                              speed_embed=config['flow']['model'].get('speed', False))
-            completed += len(items)
+        for count in generate_groups(dataset, train_entries, grouped, pitch, device,
+                                     config['flow']['model'].get('speed', False), workers):
+            completed += count
             if completed == len(tasks) or time.monotonic() - last_report >= 5:
                 print(f'Augmentation: {completed:,}/{len(tasks):,}', flush=True)
                 last_report = time.monotonic()
