@@ -104,6 +104,8 @@ class AudioEngine:
             pitch=settings["pitch"],
             speaker_id=settings["speaker_id"],
             embedder_model=settings["embedder_model"],
+            rectified_vocoder_path=settings.get("rectified_vocoder_path", ""),
+            rectified_steps=settings.get("rectified_steps", 0),
         )
         input_info = sd.query_devices(settings["input_device"])
         output_info = sd.query_devices(settings["output_device"])
@@ -542,6 +544,8 @@ class RealtimeGUI:
         value = self.saved
         self.model_path = tk.StringVar(value=value.get("model_path", ""))
         self.index_path = tk.StringVar(value=value.get("index_path", ""))
+        self.rectified_vocoder_path = tk.StringVar(value=value.get("rectified_vocoder_path", ""))
+        self.rectified_steps = tk.IntVar(value=value.get("rectified_steps", 0))
         self.embedder_model = tk.StringVar(
             value=value.get("embedder_model", "contentvec")
         )
@@ -571,7 +575,7 @@ class RealtimeGUI:
         self.monitor_input = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="Ready")
         self.latency = tk.StringVar(value="Estimated latency: 0 ms")
-        self.infer_time = tk.StringVar(value="Processing: 0 ms (RVC: 0 ms)")
+        self.infer_time = tk.StringVar(value="Processing: 0 ms (Model: 0 ms)")
 
     def _build(self):
         root = ttk.Frame(self.root, padding=12)
@@ -600,6 +604,18 @@ class RealtimeGUI:
                 variable=self.embedder_model,
                 value=embedder,
             ).pack(side="left", padx=(0, 10))
+        ttk.Label(model, text="Flow vocoder (optional)").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(model, textvariable=self.rectified_vocoder_path).grid(
+            row=3, column=1, sticky="ew", padx=8, pady=(8, 0)
+        )
+        ttk.Button(model, text="Browse", command=self._browse_vocoder).grid(
+            row=3, column=2, pady=(8, 0)
+        )
+        ttk.Label(model, text="Flow steps").grid(row=4, column=0, sticky="w", pady=(8, 0))
+        flow_settings = ttk.Frame(model)
+        flow_settings.grid(row=4, column=1, columnspan=2, sticky="w", padx=8, pady=(8, 0))
+        ttk.Spinbox(flow_settings, from_=0, to=1000, textvariable=self.rectified_steps, width=6).pack(side="left")
+        ttk.Label(flow_settings, text="0 uses model settings; fewer steps process faster").pack(side="left", padx=8)
         model.columnconfigure(1, weight=1)
         devices = ttk.LabelFrame(root, text="Audio devices", padding=10)
         devices.pack(fill="x", pady=(0, 8))
@@ -699,10 +715,18 @@ class RealtimeGUI:
     def _browse_model(self):
         path = filedialog.askopenfilename(
             initialdir=ROOT / "logs",
-            filetypes=(("RVC model", "*.pth"), ("All files", "*.*")),
+            filetypes=(("RVC / Rectified Flow model", "*.pth"), ("All files", "*.*")),
         )
         if path:
             self.model_path.set(path)
+
+    def _browse_vocoder(self):
+        path = filedialog.askopenfilename(
+            initialdir=ROOT / "rvc" / "models" / "pretraineds" / "rectified",
+            filetypes=(("Flow vocoder", "*.pth"), ("All files", "*.*")),
+        )
+        if path:
+            self.rectified_vocoder_path.set(path)
 
     def _browse_index(self):
         path = filedialog.askopenfilename(
@@ -784,6 +808,8 @@ class RealtimeGUI:
         return {
             "model_path": self.model_path.get().strip(),
             "index_path": index_path,
+            "rectified_vocoder_path": self.rectified_vocoder_path.get().strip(),
+            "rectified_steps": self.rectified_steps.get(),
             "embedder_model": self.embedder_model.get(),
             "host_api": self.host_api.get(),
             "input_device": self.input_devices[self.input_device.get()],
@@ -857,7 +883,7 @@ class RealtimeGUI:
     def _poll(self):
         self.infer_time.set(
             f"Processing: {self.engine.last_block_ms} ms "
-            f"(RVC: {self.engine.last_infer_ms} ms)"
+            f"(Model: {self.engine.last_infer_ms} ms)"
         )
         self.latency.set(
             f"Estimated latency: {self.engine.algorithm_latency_ms} ms"

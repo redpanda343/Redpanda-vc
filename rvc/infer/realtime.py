@@ -1,3 +1,4 @@
+import math
 import os
 import threading
 import time
@@ -150,13 +151,16 @@ class RealTimeRVC:
         speaker_id=0,
         embedder_model="contentvec",
         seed=0,
+        rectified_vocoder_path="",
+        rectified_steps=0,
     ):
         self.converter = VoiceConverter()
         self.converter.get_vc(model_path, speaker_id)
         if self.converter.cpt is None:
             raise FileNotFoundError(f"Voice model not found: {model_path}")
         self.vocoder = self.converter.vocoder
-        if self.vocoder not in SUPPORTED_VOCODERS:
+        self.is_rectified = isinstance(self.converter.cpt.get("config"), dict)
+        if not self.is_rectified and self.vocoder not in SUPPORTED_VOCODERS:
             supported = ", ".join(sorted(SUPPORTED_VOCODERS))
             raise ValueError(
                 f"Real-time mode supports {supported}; this model uses {self.vocoder}."
@@ -206,7 +210,40 @@ class RealTimeRVC:
         self.embedder = self.converter.hubert_model.to(
             device=self.device, dtype=torch.float32
         )
-        self.expected_feature_dim = int(self.model.enc_p.emb_phone.in_features)
+        self.expected_feature_dim = (
+            self.pipeline.content_channels
+            if self.is_rectified
+            else int(self.model.enc_p.emb_phone.in_features)
+        )
+        if self.is_rectified:
+            from torchaudio.transforms import Resample
+            from rvc.rectified.resources import default_vocoder
+            from rvc.rectified.vocoder import load_vocoder
+
+            if int(rectified_steps) != rectified_steps or not 0 <= rectified_steps <= 1000:
+                raise ValueError("Flow steps must be an integer between 0 and 1000.")
+            self.rectified_steps = int(rectified_steps) or None
+            self.pipeline.set_vocoder(rectified_vocoder_path)
+            path = self.pipeline.vocoder_path or default_vocoder(self.pipeline.checkpoint_vocoder)
+            vocoder, _ = load_vocoder(path, self.pipeline.data)
+            self.pipeline.vocoder_model = vocoder.to(self.device).float()
+            self.flow_resampler = Resample(16000, self.sample_rate).to(self.device)
+            generator = vocoder.generator
+            radius = generator.conv_pre.kernel_size[0] // 2
+            scale = 1
+            for stage, up in enumerate(generator.ups):
+                scale *= up.stride[0]
+                radius += (up.kernel_size[0] - 1) / scale
+                blocks = generator.resblocks[
+                    stage * generator.num_kernels:(stage + 1) * generator.num_kernels
+                ]
+                radius += max(
+                    sum((layer.kernel_size[0] - 1) * layer.dilation[0] / 2
+                        for layer in block.modules() if isinstance(layer, torch.nn.Conv1d))
+                    for block in blocks
+                ) / scale
+            radius += (generator.conv_post.kernel_size[0] // 2) / scale
+            self.vocoder_context_frames = math.ceil(radius) + 2
         if index_path:
             self._load_index(index_path)
         if self.index_rate > 0 and self.index is None:
@@ -262,6 +299,8 @@ class RealTimeRVC:
                 f"{self.embedder_name} outputs {features.shape[-1]} channels, but "
                 f"this model expects {self.expected_feature_dim}."
             )
+        if self.is_rectified:
+            return features
         return torch.cat((features, features[:, -1:, :]), dim=1)
 
     def _apply_index(self, features, skip_head):
@@ -364,6 +403,54 @@ class RealTimeRVC:
             self.cache_pitch[-count:] = usable_pitch[-count:]
             self.cache_pitchf[-count:] = usable_pitchf[-count:]
 
+    def _infer_rectified(self, features, input_wav, speaker, skip_head, return_length):
+        from rvc.rectified.aperiodicity import aperiodicity
+        from rvc.rectified.data import (
+            f0_to_mel_rate, smooth_curve, to_mel_rate, upsample_content, variance_curves,
+        )
+        from rvc.rectified.energy import frame_energy
+
+        rate = self.sample_rate
+        hop = int(self.pipeline.data["hop_length"])
+        waveform = self.flow_resampler(input_wav.float()).view(1, -1)
+        length = waveform.shape[-1]
+        start = round(skip_head * rate / 100)
+        count = round(return_length * rate / 100)
+        if start < 0 or count < 1 or start + count > length:
+            raise ValueError("The requested flow output exceeds the input context.")
+        frames = math.ceil(length / hop)
+        feature_frames = max(1, input_wav.shape[0] // 160)
+        if feature_frames > self.cache_pitchf.numel():
+            raise ValueError("Flow input context exceeds the pitch cache capacity.")
+        pitchf = self.cache_pitchf[None, -feature_frames:]
+        source_f0 = pitchf / (2 ** (self.pitch / 12))
+        content = upsample_content(features.float(), self.pipeline.data["content_interpolation"])
+        content = to_mel_rate(content, frames, rate, hop)
+        f0 = f0_to_mel_rate(pitchf, frames, rate, hop)
+        energy = smooth_curve(frame_energy(waveform, rate, feature_frames))
+        energy = to_mel_rate(energy.unsqueeze(-1), frames, rate, hop)[..., 0]
+        breathiness = smooth_curve(aperiodicity(waveform, rate, source_f0, feature_frames))
+        breathiness = to_mel_rate(breathiness.unsqueeze(-1), frames, rate, hop)[..., 0]
+        variances = {}
+        if self.model.encoder.voicing is not None or self.model.encoder.tension is not None:
+            variances = dict(zip(
+                ("voicing", "tension"), variance_curves(waveform, source_f0, frames, rate, hop)
+            ))
+        mask = torch.ones(1, 1, frames, device=self.device)
+        mel = self.model.sample(
+            content, f0, energy, speaker, mask, steps=self.rectified_steps,
+            breathiness=breathiness, **variances,
+        )
+        first_frame = max(0, start // hop - self.vocoder_context_frames)
+        audio = self.pipeline.vocoder_model(mel[..., first_frame:], f0[..., first_frame:])[0, 0]
+        start -= first_frame * hop
+        audio = audio[start:start + count]
+        if audio.numel() != count:
+            raise RuntimeError("The flow vocoder returned an incomplete audio block.")
+        if not torch.isfinite(audio).all():
+            raise FloatingPointError("Non-finite Rectified Flow audio output.")
+        return audio
+
     @torch.inference_mode()
     def infer(
         self,
@@ -383,17 +470,24 @@ class RealTimeRVC:
                 torch.manual_seed(self.seed)
                 features = self._extract_features(input_wav)
                 features = self._apply_index(features, skip_head)
-                p_len = min(input_wav.shape[0] // 160, features.shape[1] * 2)
                 self._update_pitch(input_wav, block_frame_16k, f0_method)
+                speaker = torch.tensor(
+                    [self.speaker_id], device=self.device, dtype=torch.long
+                )
+                if self.is_rectified:
+                    audio = self._infer_rectified(
+                        features, input_wav, speaker, skip_head, int(return_length)
+                    )
+                    if torch.device(self.device).type == "cuda":
+                        torch.cuda.synchronize(self.device)
+                    return audio.float(), time.perf_counter() - started
+                p_len = min(input_wav.shape[0] // 160, features.shape[1] * 2)
                 features = F.interpolate(
                     features.permute(0, 2, 1), scale_factor=2
                 ).permute(0, 2, 1)
                 features = features[:, :p_len]
                 lengths = torch.tensor(
                     [p_len], device=self.device, dtype=torch.long
-                )
-                speaker = torch.tensor(
-                    [self.speaker_id], device=self.device, dtype=torch.long
                 )
                 coarse = self.cache_pitch[None, -p_len:]
                 continuous = self.cache_pitchf[None, -p_len:]
