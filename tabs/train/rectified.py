@@ -45,7 +45,7 @@ def _status():
     status = _description
     if _process is not None:
         if code == 0 and _description.startswith('Preprocessing:'):
-            status += ' Slicing completed. Ready to extract content and F0.'
+            status += ' Dataset preparation completed. Ready to extract content and F0.'
         else:
             status += ' Running.' if active else f' Finished with exit code {code}.'
     log = ''
@@ -64,7 +64,7 @@ def status():
 def print_job_completion(process, description):
     code = process.wait()
     if code == 0 and description.startswith('Preprocessing:'):
-        message = 'Slicing completed. Ready to extract content and F0.'
+        message = 'Dataset preparation completed. Ready to extract content and F0.'
     else:
         message = f'Finished with exit code {code}.'
     print(f'{description} {message}', flush=True)
@@ -97,14 +97,14 @@ def launch(name, module, arguments, description):
         return _status()
 
 
-def preprocess(name, dataset, workers):
+def preprocess(name, dataset, workers, slicing=True):
     directory = experiment_path(name)
     dataset = str(dataset).strip().strip('"')
     if not Path(dataset).is_dir():
         raise gr.Error('The dataset folder does not exist.')
     return launch(name, 'rvc.train.preprocess.preprocess',
                   [str(directory), dataset, '44100', positive_integer(workers, 'CPU workers'),
-                   'Automatic', 'False', 'False', '0.0', '10.0', '0.3', 'none', 'WAV'], 'Preprocessing')
+                   'Automatic' if slicing else 'Skip', 'False', 'False', '0.0', '10.0', '0.3', 'none', 'WAV'], 'Preprocessing')
 
 
 def extract(name, method, workers, device, embedder):
@@ -215,8 +215,7 @@ def stop():
 
 
 def rectified_train_tab():
-    gr.Markdown('### Rectified Flow\nTrain Shiro rectified flow at **44.1 kHz** using the saved Settings > Precision selection. '
-                'An optional frozen OpenVPI NSF-HiFiGAN vocoder renders audio previews. Use a separate experiment from RVC training.')
+    gr.Markdown('### Rectified Flow')
     with gr.Row():
         name = gr.Textbox(label='Model name', value='my-flow')
         device = gr.Textbox(label='Device', value=','.join(f'cuda:{index}' for index in range(torch.cuda.device_count())) or 'cpu',
@@ -224,23 +223,19 @@ def rectified_train_tab():
     with gr.Accordion('1. Prepare dataset', open=True):
         dataset = gr.Textbox(label='Dataset folder')
         workers = gr.Number(label='CPU workers', value=4, minimum=1, precision=0)
-        gr.Markdown('Automatic slicing, 44.1 kHz WAV, up to 10 seconds per slice. No normalization or noise reduction.')
+        slicing = gr.Checkbox(label='Slice dataset', value=True,
+                              info='Disable to keep full clips. Audio is always resampled to 44.1 kHz.')
         preprocess_button = gr.Button('Preprocess dataset')
-    with gr.Accordion('2. Extract features', open=True):
         with gr.Row():
             method = gr.Dropdown(label='Pitch extractor', choices=['rmvpe', 'swift', 'pm'], value='rmvpe')
             embedder = gr.Dropdown(label='Content embedder', choices=['contentvec', 'spin-v2'], value='contentvec')
         extract_button = gr.Button('Extract content and F0')
-    with gr.Accordion('3. Train rectified flow', open=True):
-        gr.Markdown('New models use speaker-conditioned shallow Rectified Flow: a mel predictor supplies the starting spectrum, '
-                    'then flow refines it with full content, pitch and speaker conditioning. '
-                    'Start a new experiment to use this architecture; existing standard models retain their saved architecture.')
-        vocoder_mode = gr.Dropdown(label='Audio preview vocoder', choices=VOCODER_CHOICES, value='Default NSF-HiFiGAN',
+    with gr.Accordion('2. Train rectified flow', open=True):
+        vocoder_mode = gr.Dropdown(label='Audio preview vocoder', choices=VOCODER_CHOICES, value='Default NSF-HiFiGAN', visible=False,
                                    info='The default NSF-HiFiGAN downloads automatically on start. Choose mel previews only to skip audio rendering.')
         vocoder = gr.Textbox(label='Custom OpenVPI NSF-HiFiGAN checkpoint path', visible=False,
                             info='Use a compatible .ckpt or converted .pth export: 44.1 kHz, 128 mel bins, hop 512. Keep config.json beside raw checkpoints when provided.')
-        use_pretrained = gr.Checkbox(label='Pretrained', value=False,
-                                     info='Use a matching Multispeaker checkpoint. Speaker identities initialize independently for the new dataset. Leave disabled to train from scratch.')
+        use_pretrained = gr.Checkbox(label='Pretrained', value=False)
         with gr.Column(visible=False) as custom_pretrained_settings:
             pretrained_upload = gr.File(label='Upload custom flow pretrained', file_types=['.pth'], type='filepath')
             pretrained = gr.Textbox(label='Custom pretrained flow path',
@@ -252,17 +247,15 @@ def rectified_train_tab():
                                    info='Padded frames (clips x longest clip, 1 frame = 11.6 ms). Lower it if you run out of GPU memory.')
             epochs = gr.Number(label='Total epochs', value=100, minimum=1, precision=0)
             save_every = gr.Number(label='Save every N epochs', value=10, minimum=1, precision=0)
-        compile_backbone = gr.Checkbox(label='Compile flow backbone', value=False,
+        compile_backbone = gr.Checkbox(label='Compile flow backbone', value=False, visible=False,
                                        info='Requires Linux, CUDA and Triton 3.6.0. NVIDIA GPUs need compute capability 8.0 or newer. The first step takes longer to compile. Unsupported setups train uncompiled.')
-        gr.Markdown('Precision follows **Settings > Precision** when you start or resume. Click Update precision there to save it. '
-                    'Existing runs resume from the last saved epoch. Stopping discards unsaved steps. Checkpoints and TensorBoard previews are saved in logs/<model name>/flow.')
         with gr.Row():
             train_button = gr.Button('Start / resume rectified training', variant='primary')
             stop_button = gr.Button('Stop current rectified job', interactive=False)
     state = gr.Textbox(label='Rectified job status', interactive=False)
     log = gr.Textbox(label='Rectified job log', lines=12, max_lines=20, interactive=False)
     outputs = [state, log, preprocess_button, extract_button, train_button, stop_button]
-    preprocess_button.click(preprocess, [name, dataset, workers], outputs, queue=False)
+    preprocess_button.click(preprocess, [name, dataset, workers, slicing], outputs, queue=False)
     extract_button.click(extract, [name, method, workers, device, embedder], outputs, queue=False)
     use_pretrained.change(toggle_pretrained, [use_pretrained], [custom_pretrained_settings], queue=False)
     pretrained_upload.upload(lambda path: path or '', [pretrained_upload], [pretrained], queue=False)
