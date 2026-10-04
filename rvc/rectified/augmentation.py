@@ -311,8 +311,6 @@ def prepare_augmentation(experiment, root, originals, train_entries, config, see
         if requested < 0:
             raise ValueError('Augmentation workers cannot be negative.')
         workers = max(1, min(requested, os.cpu_count() or 1, len(grouped)))
-        print(f'Generating {len(rows):,} DiffSinger-style augmented examples before training using {method}, '
-              f'{workers} preparation workers, {workers} file writers and uncompressed features.', flush=True)
         pitch = pitch or AugmentationPitch(method, device, root)
         completed = len(rows) - sum(len(values) for values in grouped.values())
         last_report = time.monotonic()
