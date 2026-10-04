@@ -14,13 +14,10 @@ import numpy as np
 import torch
 
 from rvc.rectified.data import RectifiedDataset, read_filelist, upsample_content, to_mel_rate
+from rvc.rectified.config import STANDARD_PRESET, resolve_config
 
 
-DEFAULT_AUGMENTATION = {
-    'random_pitch_shifting': {'enabled': True, 'range': [-5.0, 5.0], 'scale': 0.75},
-    'fixed_pitch_shifting': {'enabled': False, 'targets': [-5.0, 5.0], 'scale': 0.5},
-    'random_time_stretching': {'enabled': True, 'range': [0.5, 2.0], 'scale': 0.75},
-}
+DEFAULT_AUGMENTATION = copy.deepcopy(STANDARD_PRESET['flow']['augmentation_args'])
 
 
 def augmentation_maximum(settings):
@@ -291,6 +288,7 @@ def generate_groups(dataset, entries, grouped, pitch, device, speed_embed, worke
 
 
 def prepare_augmentation(experiment, root, originals, train_entries, config, seed, device, pitch=None):
+    config = resolve_config(config)
     tasks = augmentation_plan(train_entries, config['flow'], seed, capped=False)
     selected = augmentation_indices(tasks, config['flow'], seed)
     if len(selected) < len(tasks):

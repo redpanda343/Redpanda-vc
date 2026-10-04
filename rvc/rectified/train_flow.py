@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from rvc.rectified.augmentation import configure_augmentation, is_augmented, prepare_augmentation
+from rvc.rectified.config import compact_config, resolve_config
 from rvc.rectified.data import FlowBatchSampler, RectifiedDataset, collate_flow, read_filelist, speaker_inventory, split_holdout, unpack_flow
 from rvc.rectified.distributed import launch
 from rvc.rectified.ema import WeightEMA
@@ -270,6 +271,9 @@ def train(args):
 
 
 def configure_flow(config, existing_config):
+    resolved = resolve_config(config)
+    config.clear()
+    config.update(resolved)
     settings = config['flow']
     validate_model_config(settings['model'])
     settings.setdefault('min_learning_rate', 0.0)
@@ -368,10 +372,9 @@ def train_rank(args, ranks):
     ema = WeightEMA(model, decay)
     first_epoch, step = 1, 0
     if state:
-        validate_model_config(state['config']['flow']['model'])
+        configure_flow(state['config'], True)
         if multispeaker and (state.get('speaker_ids') != sorted(inventory) or state.get('feature_metadata') != feature_metadata):
             raise ValueError('Speaker IDs or extracted feature metadata changed. Use a new experiment.')
-        configure_flow(state['config'], True)
         if state['config'] != config or state['embedder_model'] != embedder:
             raise ValueError('Resume config or embedder differs from the saved checkpoint.')
         model.load_state_dict(state['model'], strict=True)
@@ -383,6 +386,7 @@ def train_rank(args, ranks):
         del state
     elif args.pretrained_flow:
         state = torch.load(args.pretrained_flow, map_location='cpu', weights_only=True)
+        state['config'] = resolve_config(state.get('config', {}))
         if state.get('embedder_model', embedder) != embedder:
             raise ValueError('Pretrained flow uses a different content embedder.')
         pretrained_model = state.get('config', {}).get('flow', {}).get('model', {})
@@ -415,7 +419,7 @@ def train_rank(args, ranks):
     with ranks.main_work('training output setup') as main:
         if main:
             output.mkdir(parents=True, exist_ok=True)
-            (experiment / 'rectified_config.json').write_text(json.dumps(config, indent=4) + '\n', encoding='utf-8')
+            (experiment / 'rectified_config.json').write_text(json.dumps(compact_config(config), indent=2) + '\n', encoding='utf-8')
     backbone = compiled_backbone(model, getattr(args, 'compile', False),
                                  getattr(args, 'torch_compile_mode', 'default'), device)
     train_model = ranks.wrap(model)

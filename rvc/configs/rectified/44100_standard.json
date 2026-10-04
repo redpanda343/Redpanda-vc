@@ -1,99 +1,37 @@
 {
-  "data": {
-    "sample_rate": 44100,
-    "hop_length": 512,
-    "n_fft": 2048,
-    "win_length": 2048,
-    "n_mels": 128,
-    "mel_fmin": 40.0,
-    "mel_fmax": 16000.0,
-    "mel_mean": -6.0,
-    "mel_std": 6.0,
-    "content_interpolation": "linear"
-  },
+  "preset": "standard-v1",
   "flow": {
-    "optimizer": "muon",
     "learning_rate": 0.0006,
-    "min_learning_rate": 0.0,
-    "finetune_learning_rate": 0.0001,
-    "lr_final_ratio": 0.1,
-    "lr_schedule": "step",
     "decay_step": 5000,
     "gamma": 0.8,
-    "step_lr_offset": 0,
-    "betas": [
-      0.9,
-      0.999
-    ],
-    "weight_decay": 0.1,
-    "warmup_steps": 0,
     "max_batch_frames": 50000,
     "max_batch_size": 64,
-    "grad_clip": 1.0,
-    "ema_decay": 0.9999,
-    "finetune_ema_decay": 0.999,
-    "speaker_dropout": 0.0,
-    "finetune_freeze_voice": false,
-    "augmentation_args": {
-      "random_pitch_shifting": {
-        "enabled": true,
-        "range": [-5.0, 5.0],
-        "scale": 0.75
-      },
-      "fixed_pitch_shifting": {
-        "enabled": false,
-        "targets": [-5.0, 5.0],
-        "scale": 0.5
-      },
-      "random_time_stretching": {
-        "enabled": true,
-        "range": [0.5, 2.0],
-        "scale": 0.75
-      }
-    },
+    "augmentation_max_examples": 20000,
+    "num_workers": 4,
     "preview_interval": 1000,
     "eval_interval": 1000,
     "holdout_clips": 32,
-    "num_workers": 4,
-    "augmentation_workers": 4,
-    "augmentation_max_examples": 20000,
-    "model": {
-      "dual_timestep": true,
-      "voicing": false,
-      "tension": false,
-      "sampling_method": "euler",
-      "sampling_steps": 20,
-      "flow_conditioning": "encoder",
-      "flow_loss": "l2",
-      "content_channels": 768,
-      "hidden_channels": 384,
-      "encoder_layers": 4,
-      "speaker_channels": 256,
-      "pitch_fourier": 6,
-      "harmonic_prior": true,
-      "breathiness": true,
-      "key_shift": true,
-      "speed": true,
-      "backbone": "lynxnet2",
-      "backbone_args": {
-        "channels": 1024,
-        "layers": 6,
-        "expansion": 1,
-        "kernel_size": 31,
-        "adaln": true,
-        "time_scale": 1000.0
+    "augmentation_args": {
+      "random_pitch_shifting": {
+        "enabled": true,
+        "range": [
+          -5.0,
+          5.0
+        ],
+        "scale": 0.75
       },
-      "t_start": 0.4,
-      "conditioning_version": 4,
-      "direct_speaker_conditioning": true,
-      "aux_grad": 0.1,
-      "aux_decoder": {
-        "channels": 512,
-        "layers": 6,
-        "dropout": 0.1
+      "random_time_stretching": {
+        "enabled": true,
+        "range": [
+          0.5,
+          2.0
+        ],
+        "scale": 0.75
       }
     },
-    "finetune_preview_interval": 500,
-    "aux_mel_weight": 0.2
+    "model": {
+      "sampling_method": "euler",
+      "sampling_steps": 20
+    }
   }
 }

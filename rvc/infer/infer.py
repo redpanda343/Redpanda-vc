@@ -664,11 +664,13 @@ class VoiceConverter:
         """
         if self.cpt is not None:
             if isinstance(self.cpt.get('config'), dict):
+                from rvc.rectified.config import resolve_config
                 from rvc.rectified.flow_model import build_flow
                 from rvc.rectified.infer import is_rectified
 
                 if not is_rectified(self.cpt):
                     raise ValueError('Select an RVC model or Rectified Flow voice checkpoint, not a vocoder checkpoint.')
+                self.cpt['config'] = resolve_config(self.cpt['config'])
                 weights = self.cpt['ema']['shadow'] if self.cpt.get('ema') else self.cpt['model']
                 self.n_spk = int(self.cpt.get('speaker_count', weights['encoder.speaker.weight'].shape[0] - 1))
                 self.tgt_sr = int(self.cpt['config']['data']['sample_rate'])

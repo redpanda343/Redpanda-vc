@@ -13,6 +13,7 @@ from torch.utils.data import Dataset, Sampler
 from rvc.rectified.energy import frame_energy
 from rvc.rectified.aperiodicity import aperiodicity
 from rvc.rectified.mel import LogMel
+from rvc.rectified.config import resolve_config
 
 FEATURE_RATE = 100
 SMOOTH_SECONDS = 0.06
@@ -198,6 +199,7 @@ def unpack_flow(batch, device, non_blocking=False):
 
 class RectifiedDataset(Dataset):
     def __init__(self, entries, config: dict, max_frames: int, augment: bool = True):
+        config = resolve_config(config)
         self.entries = entries
         self.data = config["data"]
         self.max_frames = int(max_frames)

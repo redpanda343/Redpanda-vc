@@ -6,6 +6,8 @@ from librosa.filters import mel as librosa_mel_fn
 from torch import nn
 from torch.nn import functional as F
 
+from rvc.rectified.config import resolve_config
+
 LOG_F0_CENTER = math.log(200.0)
 LOG_F0_SCALE = 0.7
 SAMPLERS = ("euler", "rk2", "rk4", "rk5")
@@ -689,6 +691,7 @@ def validate_model_config(model: dict):
 
 
 def build_flow(config: dict, speaker_count: int) -> RectifiedFlow:
+    config = resolve_config(config)
     model = dict(config["flow"]["model"])
     validate_model_config(model)
     model.pop("mean_flow", None)

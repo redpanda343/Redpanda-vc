@@ -179,9 +179,11 @@ def start(name, vocoder, pretrained, batch, max_frames, epochs, save_every, devi
     config_path = directory / 'rectified_config.json'
     config = json.loads(config_path.read_text(encoding='utf-8')) if config_path.is_file() else None
     if config:
+        from rvc.rectified.config import resolve_config
         from rvc.rectified.flow_model import validate_model_config
 
         try:
+            config = resolve_config(config)
             validate_model_config(config['flow']['model'])
         except ValueError as error:
             raise gr.Error(str(error)) from error
