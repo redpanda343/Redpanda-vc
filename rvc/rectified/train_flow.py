@@ -445,9 +445,6 @@ def train_rank(args, ranks):
             print(f'Fine-tuning: fresh-run LR {lr:g}, warmup {warmup} steps, {settings.get("lr_schedule", "cosine")} decay, minimum LR {settings.get("min_learning_rate", 0.0):g}.', flush=True)
         if multispeaker:
             print(f'Multispeaker conditioning v{model.encoder.conditioning_version}: {speakers} speakers, {len(held)} held-out clips. Clips per speaker: {inventory}', flush=True)
-            if settings['model'].get('direct_speaker_conditioning', False):
-                predictor = str(model.aux.input.out_channels) if model.aux is not None else 'none'
-                print(f'Standard flow: direct speaker conditioning in every flow block. Content {model.encoder.content.in_features} -> {model.hidden_channels}; speaker {model.encoder.speaker.embedding_dim}; mel predictor {predictor}; flow {model.backbone.channels}.', flush=True)
             if finetune and first_epoch == 1:
                 print('Initialized independent speaker embeddings for the new dataset.', flush=True)
     with SummaryWriter(str(output)) if ranks.main else nullcontext(None) as writer:
