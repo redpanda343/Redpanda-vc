@@ -6,7 +6,6 @@
     "gamma": 0.8,
     "max_batch_frames": 50000,
     "max_batch_size": 64,
-    "augmentation_max_examples": 20000,
     "num_workers": 4,
     "preview_interval": 1000,
     "eval_interval": 1000,

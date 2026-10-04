@@ -20,17 +20,10 @@ from rvc.rectified.config import STANDARD_PRESET, resolve_config
 DEFAULT_AUGMENTATION = copy.deepcopy(STANDARD_PRESET['flow']['augmentation_args'])
 
 
-def augmentation_maximum(settings):
-    maximum = settings.get('augmentation_max_examples', 20000)
-    if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 0:
-        raise ValueError('Maximum augmented examples must be a nonnegative integer.')
-    return min(maximum, 20000)
-
-
 def configure_augmentation(settings):
     if 'augmentation_args' not in settings:
         settings['augmentation_args'] = copy.deepcopy(DEFAULT_AUGMENTATION)
-    settings['augmentation_max_examples'] = augmentation_maximum(settings)
+    settings.pop('augmentation_max_examples', None)
     for name in ('key_shift_range', 'key_shift_prob', 'time_stretch_range', 'time_stretch_prob'):
         settings.pop(name, None)
 
@@ -39,14 +32,7 @@ def is_augmented(entry):
     return str(entry[1]).endswith('.flow.npz')
 
 
-def augmentation_indices(tasks, settings, seed):
-    maximum = augmentation_maximum(settings)
-    if len(tasks) <= maximum:
-        return range(len(tasks))
-    return sorted(random.Random(seed).sample(range(len(tasks)), maximum))
-
-
-def augmentation_plan(entries, settings, seed, capped=True):
+def augmentation_plan(entries, settings, seed):
     if not entries:
         raise ValueError('Augmentation requires original training examples.')
     args = settings['augmentation_args']
@@ -104,7 +90,7 @@ def augmentation_plan(entries, settings, seed, capped=True):
                 tasks.append(item)
             else:
                 chosen_item['speed'] = speed
-    return [tasks[index] for index in augmentation_indices(tasks, settings, seed)] if capped else tasks
+    return tasks
 
 
 def interpolate_f0(f0):
@@ -289,10 +275,7 @@ def generate_groups(dataset, entries, grouped, pitch, device, speed_embed, worke
 
 def prepare_augmentation(experiment, root, originals, train_entries, config, seed, device, pitch=None):
     config = resolve_config(config)
-    tasks = augmentation_plan(train_entries, config['flow'], seed, capped=False)
-    selected = augmentation_indices(tasks, config['flow'], seed)
-    if len(selected) < len(tasks):
-        print(f'Using {len(selected):,} of {len(tasks):,} planned augmented examples.', flush=True)
+    tasks = augmentation_plan(train_entries, config['flow'], seed)
     info_path = experiment / 'model_info.json'
     info = json.loads(info_path.read_text(encoding='utf-8')) if info_path.exists() else {}
     method = info.get('f0_method', 'rmvpe')
@@ -316,8 +299,7 @@ def prepare_augmentation(experiment, root, originals, train_entries, config, see
         os.replace(temporary, backup)
     dataset = RectifiedDataset(train_entries, config, 2 ** 31, augment=False)
     grouped, rows = {}, []
-    for number in selected:
-        task = tasks[number]
+    for number, task in enumerate(tasks):
         entry = train_entries[task['index']]
         path = folder / f'{number:08d}.flow.npz'
         coarse, f0 = path.with_suffix('.coarse.npy'), path.with_suffix('.f0.npy')

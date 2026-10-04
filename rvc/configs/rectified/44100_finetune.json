@@ -11,7 +11,6 @@
     "max_batch_frames": 50000,
     "max_batch_size": 32,
     "finetune_ema_decay": 0.999,
-    "augmentation_max_examples": 20000,
     "num_workers": 4,
     "finetune_preview_interval": 500,
     "eval_interval": 500,

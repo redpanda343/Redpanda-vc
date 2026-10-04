@@ -43,7 +43,6 @@ STANDARD_PRESET = {
         'holdout_clips': 32,
         'num_workers': 4,
         'augmentation_workers': 4,
-        'augmentation_max_examples': 20000,
         'model': {
             'dual_timestep': True,
             'voicing': False,
@@ -80,7 +79,7 @@ STANDARD_PRESET = {
 PRESET_NAME = 'standard-v1'
 EDITABLE_FLOW_KEYS = (
     'learning_rate', 'decay_step', 'gamma', 'max_batch_frames', 'max_batch_size',
-    'augmentation_max_examples', 'num_workers', 'preview_interval', 'eval_interval', 'holdout_clips',
+    'num_workers', 'preview_interval', 'eval_interval', 'holdout_clips',
 )
 
 
