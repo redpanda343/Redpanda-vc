@@ -152,7 +152,7 @@ def resolve_vocoder(mode, path):
 def resolve_pretrained(directory, enabled):
     if not enabled or (directory / 'flow' / 'checkpoint.pth').is_file():
         return ''
-    path = ROOT / 'rvc' / 'models' / 'pretrained' / 'rectified' / 'pretrained.pth'
+    path = ROOT / 'rvc' / 'models' / 'pretraineds' / 'rectified' / 'pretrained.pth'
     if not path.is_file():
         raise gr.Error(f'Pretrained model not found. Place your Rectified Flow checkpoint at {path}.')
     return str(path)
