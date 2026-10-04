@@ -103,17 +103,12 @@ class SpeakerBalancedSampler(Sampler):
 def clip_samples(entries, workers: int = 8):
     """Sample count of every training clip, read from the audio headers only."""
     def count(entry):
+        if str(entry[1]).endswith('.flow.npz'):
+            with np.load(entry[1], allow_pickle=False) as features:
+                return int(features['frames']) * int(features['hop'])
         return sf.info(entry[0]).frames
     with ThreadPoolExecutor(workers) as pool:
         return np.fromiter(pool.map(count, entries), dtype=np.int64, count=len(entries))
-
-
-def stretched_hop(base_hop: int, stretch_range, probability: float, rng) -> int:
-    """Hop length for one clip: the base hop, or a randomly time-stretched one."""
-    if probability > 0 and rng.random() < probability:
-        low, high = stretch_range
-        return int(round(base_hop * low * (high / low) ** rng.random()))
-    return base_hop
 
 
 class FlowBatchSampler(Sampler):
@@ -121,9 +116,7 @@ class FlowBatchSampler(Sampler):
 
     A batch is closed when it holds `max_items` clips, or when
     (clips x longest clip) would pass `max_frames`. Clips of similar length are
-    batched together to keep padding low. The time-stretch hop of every clip is
-    drawn here instead of in the dataset, so each clip's exact frame count is
-    known and the budget also holds for stretched clips.
+    batched together to keep padding low.
 
     All ranks build the same global batch list (same seed and epoch) and take
     every `world`-th batch, so every rank runs the same number of steps.
@@ -153,12 +146,6 @@ class FlowBatchSampler(Sampler):
     def set_epoch(self, epoch):
         self.epoch = int(epoch)
 
-    def _hop(self, rng):
-        dataset = self.dataset
-        if not dataset.augment:
-            return dataset.hop
-        return stretched_hop(dataset.hop, dataset.stretch_range, dataset.stretch_prob, rng)
-
     def _form(self):
         if self._formed is not None and self._formed[0] == self.epoch:
             return self._formed
@@ -170,7 +157,7 @@ class FlowBatchSampler(Sampler):
             order = list(range(len(self.dataset)))
             if self.shuffle:
                 rng.shuffle(order)
-        hops = [self._hop(rng) for _ in order]
+        hops = [self.dataset.hop for _ in order]
         # samples // hop is an upper bound of the clip's frames, so the budget is never exceeded.
         frames = [min(max(1, int(self.samples[index]) // hop), self.max_frames)
                   for index, hop in zip(order, hops)]
@@ -270,10 +257,6 @@ class RectifiedDataset(Dataset):
         self.mel = LogMel.from_config(self.data)
         self.content_channels = int(config["flow"]["model"]["content_channels"])
         self.strict_features = config['flow']['model'].get('conditioning_version', 1) in (2, 3, 4)
-        self.key_shift_range = float(config["flow"].get("key_shift_range", 0.0))
-        self.key_shift_prob = float(config["flow"].get("key_shift_prob", 0.0))
-        self.stretch_range = tuple(config["flow"].get("time_stretch_range", (1.0, 1.0)))
-        self.stretch_prob = float(config["flow"].get("time_stretch_prob", 0.0))
         self.augment = augment
         self.use_variances = any(config["flow"]["model"].get(name, False) for name in ("voicing", "tension"))
 
@@ -303,6 +286,8 @@ class RectifiedDataset(Dataset):
     def __getitem__(self, index):
         index, hop = index if isinstance(index, tuple) else (index, None)
         wav_path, content_path, _, f0_path, sid = self.entries[index]
+        if str(content_path).endswith('.flow.npz'):
+            return self._cached_item(content_path, int(sid))
         audio = self._audio(wav_path)
         source_f0 = torch.from_numpy(np.load(f0_path, allow_pickle=False).astype(np.float32))
         content = upsample_content(
@@ -323,11 +308,7 @@ class RectifiedDataset(Dataset):
 
     def _flow_item(self, audio, source_f0, content, sid, hop=None):
         key_shift = 0.0
-        if self.augment and self.key_shift_range > 0 and random.random() < self.key_shift_prob:
-            key_shift = random.uniform(-self.key_shift_range, self.key_shift_range)
-        if hop is None:
-            hop = (stretched_hop(self.hop, self.stretch_range, self.stretch_prob, random)
-                   if self.augment else self.hop)
+        hop = self.hop
         speed = hop / self.hop
 
         frames = min(
@@ -357,6 +338,26 @@ class RectifiedDataset(Dataset):
             item += tuple(curve[0, start:stop] for curve in curves)
         return item
 
+    def _cached_item(self, path, sid):
+        with np.load(path, allow_pickle=False) as values:
+            frames = int(values['frames'])
+            length = min(frames, self.max_frames)
+            start = random.randint(0, frames - length) if self.augment else 0
+            stop = start + length
+            mel = torch.from_numpy(values['mel'][:, start:stop].copy())
+            curves = tuple(torch.from_numpy(values[name][start:stop].copy())
+                           for name in ('content', 'f0', 'energy', 'breathiness'))
+            if mel.shape != (self.data['n_mels'], length) or curves[0].shape != (length, self.content_channels):
+                raise ValueError(f'Invalid augmented feature dimensions: {path}')
+            if any(value.shape[0] != length for value in curves[1:]):
+                raise ValueError(f'Invalid augmented curve lengths: {path}')
+            if not all(torch.isfinite(value).all() for value in (mel, *curves)) or (curves[1] < 0).any():
+                raise ValueError(f'Invalid augmented feature values: {path}')
+            item = (mel, *curves, float(values['key_shift']), float(values['speed']), sid)
+            if self.use_variances:
+                item += tuple(torch.from_numpy(values[name][start:stop].copy()) for name in ('voicing', 'tension'))
+            return item
+
     def _reference_item(self, audio, content, f0, sid, path, max_frames=None):
         frames = min(
             audio.shape[0] // self.hop,
@@ -384,7 +385,7 @@ class RectifiedDataset(Dataset):
         ordered = sorted(range(len(self.entries)), key=lambda i: self.entries[i][0])
         for index in ordered:
             wav_path, content_path, _, f0_path, sid = self.entries[index]
-            if "mute" in os.path.basename(wav_path):
+            if "mute" in os.path.basename(wav_path) or str(content_path).endswith('.flow.npz'):
                 continue
             audio = self._audio(wav_path)
             if audio.shape[0] < 2 * self.sample_rate:
@@ -432,7 +433,7 @@ def collate_flow(batch, frames=None):
     result = (mel, content, f0, energy, breathiness, key_shift, speed, speaker, mask)
     return (*result, voicing, tension) if extended else result
 
-def read_filelist(path, root):
+def read_filelist(path, root, originals_only=False):
     rows = []
     for number, line in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), 1):
         if not line.strip():
@@ -440,6 +441,8 @@ def read_filelist(path, root):
         fields = line.strip().split("|")
         if len(fields) != 5 or int(fields[4]) < 0:
             raise ValueError(f"Invalid filelist row {number}: expected audio|content|f0|f0_hz|speaker_id")
+        if originals_only and fields[1].endswith('.flow.npz'):
+            continue
         for column in range(4):
             fields[column] = os.path.normpath(os.path.join(root, fields[column]))
             if not os.path.isfile(fields[column]):

@@ -34,13 +34,23 @@
     "finetune_ema_decay": 0.999,
     "speaker_dropout": 0.0,
     "finetune_freeze_voice": false,
-    "key_shift_range": 5.0,
-    "key_shift_prob": 0.43,
-    "time_stretch_range": [
-      0.5,
-      2.0
-    ],
-    "time_stretch_prob": 0.43,
+    "augmentation_args": {
+      "random_pitch_shifting": {
+        "enabled": true,
+        "range": [-5.0, 5.0],
+        "scale": 0.75
+      },
+      "fixed_pitch_shifting": {
+        "enabled": false,
+        "targets": [-5.0, 5.0],
+        "scale": 0.5
+      },
+      "random_time_stretching": {
+        "enabled": true,
+        "range": [0.5, 2.0],
+        "scale": 0.75
+      }
+    },
     "preview_interval": 1000,
     "eval_interval": 1000,
     "holdout_clips": 32,

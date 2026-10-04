@@ -13,6 +13,7 @@ from torch._functorch import config as aot_config
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
+from rvc.rectified.augmentation import configure_augmentation, is_augmented, prepare_augmentation
 from rvc.rectified.data import FlowBatchSampler, RectifiedDataset, collate_flow, read_filelist, speaker_inventory, split_holdout, unpack_flow
 from rvc.rectified.distributed import launch
 from rvc.rectified.ema import WeightEMA
@@ -232,6 +233,33 @@ def evaluate(model, ema, loader, data, writer, step):
 
 
 def train(args):
+    if Path(args.model_name).name != args.model_name or args.model_name in {'.', '..'}:
+        raise ValueError('Use a model name, not a path.')
+    if any(value is not None and value < 1 for value in (args.batch_size, args.max_batch_frames)) or args.epochs < 1 or args.save_every < 1:
+        raise ValueError('Batch limits, epochs and save interval must be positive.')
+    experiment = ROOT / 'logs' / args.model_name
+    config_path = experiment / 'rectified_config.json'
+    existing = config_path.exists()
+    if not existing:
+        config_path = ROOT / 'rvc/configs/rectified/44100_standard.json'
+    config = json.loads(config_path.read_text(encoding='utf-8'))
+    configure_flow(config, existing)
+    if config['data']['sample_rate'] != 44100:
+        raise ValueError('This recipe requires 44100 Hz audio.')
+    originals = read_filelist(experiment / 'filelist.txt', ROOT, originals_only=True)
+    multispeaker = config['flow']['model'].get('conditioning_version', 1) in (2, 3, 4)
+    if multispeaker:
+        speaker_inventory(originals)
+    entries, _ = split_holdout(originals, int(config['flow'].get('holdout_clips', 0)), stratified=multispeaker)
+    from rvc.rectified.distributed import parse_devices
+
+    devices = parse_devices(args.device)
+    device = torch.device(devices[0])
+    if device.type == 'cuda' and (not torch.cuda.is_available() or any(int(value[5:]) >= torch.cuda.device_count() for value in devices)):
+        raise ValueError('A selected CUDA device is unavailable.')
+    prepare_augmentation(experiment, ROOT, originals, entries, config, args.seed, device)
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
     launch(train_rank, args)
 
 
@@ -241,6 +269,7 @@ def configure_flow(config, existing_config):
     settings.setdefault('min_learning_rate', 0.0)
     settings.setdefault('max_batch_frames', 50000)
     settings.setdefault('max_batch_size', 64)
+    configure_augmentation(settings)
 
 
 def train_rank(args, ranks):
@@ -281,9 +310,11 @@ def train_rank(args, ranks):
             else:
                 print('No vocoder selected: previews will show mel images only.', flush=True)
     entries = read_filelist(experiment / 'filelist.txt', ROOT)
-    inventory = speaker_inventory(entries) if multispeaker else None
+    originals = [entry for entry in entries if not is_augmented(entry)]
+    inventory = speaker_inventory(originals) if multispeaker else None
     speakers = max(int(entry[4]) for entry in entries) + 1
-    entries, held = split_holdout(entries, int(settings.get('holdout_clips', 0)), stratified=multispeaker)
+    originals, held = split_holdout(originals, int(settings.get('holdout_clips', 0)), stratified=multispeaker)
+    entries = originals + [entry for entry in entries if is_augmented(entry)]
     max_items = int(args.batch_size or settings['max_batch_size'])
     max_frames = int(args.max_batch_frames or settings['max_batch_frames'])
     dataset = RectifiedDataset(entries, config, max_frames)
