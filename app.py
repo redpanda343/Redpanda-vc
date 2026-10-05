@@ -2,6 +2,61 @@
 import os
 import shutil
 import sys
+import subprocess
+
+
+def pull_updates():
+    directory = os.path.dirname(os.path.abspath(__file__))
+    if shutil.which("git") is None:
+        print("Git is unavailable; starting the installed version.", flush=True)
+        return False
+    environment = dict(os.environ, GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="Never")
+
+    def git(*arguments, check=True):
+        command = ["git"]
+        if os.name == "nt":
+            command.extend(["-c", "http.sslBackend=openssl"])
+        result = subprocess.run(
+            [*command, *arguments], cwd=directory, env=environment,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
+        )
+        if check and result.returncode:
+            message = (result.stderr + result.stdout).strip()
+            raise RuntimeError(message or f"Git exited with code {result.returncode}.")
+        return result
+
+    root = git("rev-parse", "--show-toplevel", check=False)
+    if root.returncode or os.path.normcase(os.path.realpath(root.stdout.strip())) != os.path.normcase(os.path.realpath(directory)):
+        print("No Git checkout at the app folder; starting the installed version.", flush=True)
+        return False
+    if git("diff", "--name-only", "--diff-filter=U").stdout.strip():
+        raise SystemExit("Resolve the existing Git conflicts before starting the WebUI.")
+    if git("branch", "--show-current").stdout.strip() != "experimental":
+        print("Automatic updates apply to experimental checkouts only; starting the current branch.", flush=True)
+        return False
+    previous = git("rev-parse", "HEAD").stdout.strip()
+    print("Checking origin/experimental for updates...", flush=True)
+    result = git("pull", "--ff-only", "--autostash", "origin", "experimental", check=False)
+    message = (result.stdout + result.stderr).strip()
+    if message:
+        print(message, flush=True)
+    if git("diff", "--name-only", "--diff-filter=U").stdout.strip():
+        raise SystemExit("Git could not reapply local edits cleanly. Resolve the conflicts before starting the WebUI.")
+    if result.returncode:
+        raise RuntimeError(f"Experimental update failed with Git exit code {result.returncode}.")
+    return git("rev-parse", "HEAD").stdout.strip() != previous
+
+
+if __name__ == "__main__":
+    _app_path = os.path.abspath(__file__)
+    os.chdir(os.path.dirname(_app_path))
+    if os.environ.pop("REDPANDA_EXPERIMENTAL_UPDATE_RESTART", "") != _app_path:
+        try:
+            if pull_updates():
+                os.environ["REDPANDA_EXPERIMENTAL_UPDATE_RESTART"] = _app_path
+                os.execv(sys.executable, [sys.executable, _app_path, *sys.argv[1:]])
+        except (OSError, subprocess.SubprocessError, RuntimeError) as error:
+            print(f"Automatic update skipped: {error}. Starting the installed version.", file=sys.stderr, flush=True)
 
 
 # We need the CWD for finding the config file, but while we're at it, add it to sys.path
