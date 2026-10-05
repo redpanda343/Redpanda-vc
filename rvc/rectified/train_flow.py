@@ -7,6 +7,8 @@ import sys
 from contextlib import nullcontext
 from pathlib import Path
 
+os.environ.setdefault("TORCH_CUDNN_V8_API_ENABLED", "1")
+
 import numpy as np
 import torch
 from torch._functorch import config as aot_config
@@ -15,7 +17,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from rvc.rectified.augmentation import configure_augmentation, is_augmented, prepare_augmentation
 from rvc.rectified.config import compact_config, resolve_config
-from rvc.rectified.data import FlowBatchSampler, RectifiedDataset, collate_flow, read_filelist, speaker_inventory, split_holdout, unpack_flow
+from rvc.rectified.data import FlowBatchSampler, RectifiedDataset, collate_flow, prepare_training_cache, read_filelist, speaker_inventory, split_holdout, unpack_flow
 from rvc.rectified.distributed import launch
 from rvc.rectified.ema import WeightEMA
 from rvc.rectified.flow_model import build_flow, resize_speakers, validate_model_config
@@ -83,86 +85,51 @@ def compiled_backbone(model, enabled: bool, mode: str, device):
     return torch.compile(model.backbone, backend="inductor", mode=mode, dynamic=True)
 
 
-def train_step(model, optimizer, ema, batch, data, settings, device, speaker_dropout, amp_dtype=None, scaler=None, backbone=None, ranks=None):
-    mel, content, f0, energy, breathiness, key_shift, speed, speaker, mask, voicing, tension = unpack_flow(batch, device, True)
+def train_step(model, optimizer, batch, data, settings, device, speaker_dropout, amp_dtype=None,
+               scaler=None, backbone=None, ranks=None, collect_stats=False):
+    (mel, content, f0, energy, breathiness, key_shift, speed, speaker, mask, harmonic_prior,
+     voicing, tension) = unpack_flow(batch, device, True)
     mel = normalize_mel(mel, data) * mask
+    cached_harmonics = harmonic_prior if harmonic_prior.shape[1] else None
     optimizer.zero_grad(set_to_none=True)
-    rng_state = torch.get_rng_state() if amp_dtype == torch.float16 else None
-    cuda_rng_state = torch.cuda.get_rng_state(device) if rng_state is not None and device.type == 'cuda' else None
 
-    def forward_loss(dtype):
-        backward_context = aot_config.patch(backward_pass_autocast="off") if backbone is not None else nullcontext()
-        with backward_context, torch.autocast(device.type, dtype=dtype or torch.float32, enabled=dtype is not None):
-            result = model(
-                mel, content, f0, energy, speaker, mask,
-                speaker_dropout=speaker_dropout, breathiness=breathiness,
-                key_shift=key_shift, speed=speed, backbone=backbone,
-                voicing=voicing, tension=tension,
-            )
-            flow, auxiliary = result
-            loss = flow if auxiliary is None else flow + settings['aux_mel_weight'] * auxiliary
-        return flow, auxiliary, loss
+    backward_context = aot_config.patch(backward_pass_autocast="off") if backbone is not None else nullcontext()
+    with backward_context, torch.autocast(device.type, dtype=amp_dtype or torch.float32, enabled=amp_dtype is not None):
+        flow, auxiliary = model(
+            mel, content, f0, energy, speaker, mask,
+            speaker_dropout=speaker_dropout, breathiness=breathiness,
+            key_shift=key_shift, speed=speed, backbone=backbone,
+            voicing=voicing, tension=tension, harmonic_prior=cached_harmonics,
+        )
+        loss = flow if auxiliary is None else flow + settings['aux_mel_weight'] * auxiliary
 
-    flow, auxiliary, loss = forward_loss(amp_dtype)
-    finite = bool(torch.isfinite(loss))
-    if ranks is not None:
-        finite = ranks.all_true(finite)
-    retried = not finite and amp_dtype == torch.float16
-    if retried:
-        del flow, auxiliary, loss
-        torch.set_rng_state(rng_state)
-        if cuda_rng_state is not None:
-            torch.cuda.set_rng_state(cuda_rng_state, device)
-        if ranks is None or ranks.main:
-            print('FP16 forward overflow: retrying this batch in FP32 on all training ranks.', flush=True)
-        flow, auxiliary, loss = forward_loss(None)
-        finite = bool(torch.isfinite(loss))
-        if ranks is not None:
-            finite = ranks.all_true(finite)
-    if not finite:
-        inputs = dict(mel=mel, content=content, f0=f0, energy=energy, breathiness=breathiness,
-                      key_shift=key_shift, speed=speed, mask=mask)
-        inputs.update({name: value for name, value in (("voicing", voicing), ("tension", tension)) if value is not None})
-        invalid = [not bool(torch.isfinite(value).all()) for value in inputs.values()]
-        invalid.append(any(not bool(torch.isfinite(param).all()) for param in model.parameters()))
-        invalid = torch.tensor(invalid, device=device, dtype=torch.float32)
-        if ranks is not None and ranks.world > 1:
-            invalid = ranks.sum(invalid)
-        names = list(inputs) + ['model parameters']
-        details = ', '.join(name for name, flag in zip(names, invalid.tolist()) if flag) or 'none in inputs or model parameters'
-        retry = ' after an FP32 retry' if retried else ''
-        raise FloatingPointError(f'Non-finite rectified-flow loss{retry}. Non-finite values: {details}.')
     frames = mask.sum().detach()
     padded_frames = frames.new_tensor(mask.numel())
     if ranks is not None and ranks.world > 1:
-        loss = flow * (padded_frames * ranks.world / ranks.sum(padded_frames).clamp_min(1.0))
+        totals = ranks.sum(torch.stack((padded_frames, frames)))
+        loss = flow * (padded_frames * ranks.world / totals[0].clamp_min(1.0))
         if auxiliary is not None:
-            loss = loss + settings['aux_mel_weight'] * auxiliary * (frames * ranks.world / ranks.sum(frames).clamp_min(1.0))
+            loss = loss + settings['aux_mel_weight'] * auxiliary * (frames * ranks.world / totals[1].clamp_min(1.0))
+
     if scaler is None:
         loss.backward()
-        norm = torch.nn.utils.clip_grad_norm_(
-            model.parameters(), settings['grad_clip'], error_if_nonfinite=True
-        )
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), settings['grad_clip'], error_if_nonfinite=False)
         optimizer.step()
-        ema.update(model)
     else:
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), settings['grad_clip'])
-        previous_scale = scaler.get_scale()
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), settings['grad_clip'], error_if_nonfinite=False)
         scaler.step(optimizer)
         scaler.update()
-        if scaler.get_scale() >= previous_scale:
-            ema.update(model)
-        else:
-            print('FP16 overflow: skipped optimizer and EMA update; reduced gradient scale.', flush=True)
-    if ranks is not None and ranks.world > 1:
-        stats = torch.stack([flow.detach() * padded_frames,
-                             auxiliary.detach() * frames if auxiliary is not None else frames * 0,
-                             padded_frames, frames])
+
+    flow_stat = flow.detach()
+    aux_stat = auxiliary.detach() if auxiliary is not None else flow_stat.new_zeros(())
+    if collect_stats and ranks is not None and ranks.world > 1:
+        stats = torch.stack((flow_stat * padded_frames, aux_stat * frames, padded_frames, frames))
         stats = ranks.sum(stats)
-        return float(stats[0] / stats[2].clamp_min(1.0)), float(stats[1] / stats[3].clamp_min(1.0)), float(norm)
-    return float(flow.detach()), float(auxiliary.detach()) if auxiliary is not None else 0.0, float(norm)
+        flow_stat = stats[0] / stats[2].clamp_min(1.0)
+        aux_stat = stats[1] / stats[3].clamp_min(1.0)
+    return flow_stat, aux_stat, norm.detach()
 
 
 @torch.no_grad()
@@ -215,7 +182,8 @@ def evaluate(model, ema, loader, data, writer, step):
     with ema.applied(model):
         model.eval()
         for index, batch in enumerate(loader):
-            mel, content, f0, energy, breathiness, key_shift, speed, speaker, mask, voicing, tension = unpack_flow(batch, device)
+            (mel, content, f0, energy, breathiness, key_shift, speed, speaker, mask, harmonic_prior,
+             voicing, tension) = unpack_flow(batch, device)
             mel = normalize_mel(mel, data) * mask
             generator = torch.Generator(device=device).manual_seed(index)
             noise = torch.randn(mel.shape, device=device, generator=generator)
@@ -223,6 +191,7 @@ def evaluate(model, ema, loader, data, writer, step):
                 mel, content, f0, energy, speaker, mask, breathiness, key_shift, speed,
                 noise, fractions,
                 voicing=voicing, tension=tension,
+                harmonic_prior=harmonic_prior if harmonic_prior.shape[1] else None,
             )
             weight = mask.numel()
             aux_weight = float(mask.sum())
@@ -277,6 +246,7 @@ def train(args):
     device = torch.device(devices[0])
     if device.type == 'cuda' and (not torch.cuda.is_available() or any(int(value[5:]) >= torch.cuda.device_count() for value in devices)):
         raise ValueError('A selected CUDA device is unavailable.')
+    prepare_training_cache(originals, config, config['flow'].get('num_workers', 4))
     prepare_augmentation(experiment, ROOT, originals, entries, config, args.seed, device)
     if device.type == 'cuda':
         torch.cuda.empty_cache()
@@ -292,7 +262,14 @@ def configure_flow(config, existing_config):
     settings.setdefault('min_learning_rate', 0.0)
     settings.setdefault('max_batch_frames', 50000)
     settings.setdefault('max_batch_size', 64)
+    settings.setdefault('dataloader_prefetch_factor', 2)
+    settings.setdefault('log_interval', 100)
+    settings.setdefault('ema_update_interval', 10)
     settings.pop('speaker_balanced_sampling', None)
+    for name in ('dataloader_prefetch_factor', 'log_interval', 'ema_update_interval'):
+        value = settings[name]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f'{name} must be a positive integer.')
     warmup = settings.get('finetune_warmup_steps', 0)
     if isinstance(warmup, bool) or not isinstance(warmup, int) or warmup < 0:
         raise ValueError('finetune_warmup_steps must be a nonnegative integer.')
@@ -341,17 +318,31 @@ def train_rank(args, ranks):
     max_frames = int(args.max_batch_frames or settings['max_batch_frames'])
     dataset = RectifiedDataset(entries, config, max_frames)
     workers = int(settings.get('num_workers', 4))
+    prefetch = int(settings.get('dataloader_prefetch_factor', 2))
     if ranks.main:
         print(f'Whole-utterance batching: up to {max_items} clips and {max_frames} padded frames per batch and GPU. Measuring {len(entries):,} clip lengths...', flush=True)
     batcher = FlowBatchSampler(dataset, max_frames, max_items, args.seed, ranks.rank, ranks.world)
-    loader = DataLoader(dataset, batch_sampler=batcher,
-                        num_workers=workers, collate_fn=collate_flow,
-                        pin_memory=device.type == 'cuda', persistent_workers=workers > 0,
-                        multiprocessing_context='spawn' if workers > 0 else None)
+    loader_kwargs = dict(
+        num_workers=workers, collate_fn=collate_flow, pin_memory=device.type == 'cuda',
+        persistent_workers=workers > 0,
+    )
+    if workers > 0:
+        loader_kwargs.update(multiprocessing_context='spawn', prefetch_factor=prefetch)
+    loader = DataLoader(dataset, batch_sampler=batcher, **loader_kwargs)
     held_dataset = RectifiedDataset(held, config, max_frames, augment=False)
-    held_loader = DataLoader(held_dataset,
-                             batch_sampler=FlowBatchSampler(held_dataset, max_frames, max_items, args.seed, shuffle=False),
-                             collate_fn=collate_flow) if held and ranks.main else None
+    held_loader = None
+    if held and ranks.main:
+        held_kwargs = dict(
+            num_workers=workers, collate_fn=collate_flow, pin_memory=device.type == 'cuda',
+            persistent_workers=workers > 0,
+        )
+        if workers > 0:
+            held_kwargs.update(multiprocessing_context='spawn', prefetch_factor=prefetch)
+        held_loader = DataLoader(
+            held_dataset,
+            batch_sampler=FlowBatchSampler(held_dataset, max_frames, max_items, args.seed, shuffle=False),
+            **held_kwargs,
+        )
     reference = None
     with ranks.main_work('preview reference preparation') as main:
         if main:
@@ -371,7 +362,7 @@ def train_rank(args, ranks):
     lr = args.learning_rate or settings['finetune_learning_rate' if finetune else 'learning_rate']
     if settings['optimizer'] == 'muon':
         optimizer = MuonAdamW(model, lr, muon_weight_decay=settings['weight_decay'],
-                              betas=tuple(settings['betas']), iteration_dtype=amp_dtype or torch.float32)
+                              betas=tuple(settings['betas']), iteration_dtype=torch.float16 if device.type == 'cuda' else torch.float32)
     elif settings['optimizer'] == 'adamw':
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=tuple(settings['betas']), weight_decay=settings['weight_decay'])
     else:
@@ -439,6 +430,8 @@ def train_rank(args, ranks):
                            else settings.get('preview_interval', 1000))
     total = args.epochs * len(loader)
     warmup = settings.get('finetune_warmup_steps', 0) if finetune else settings['warmup_steps']
+    log_interval = int(settings.get('log_interval', 100))
+    ema_interval = int(settings.get('ema_update_interval', 10))
     if ranks.main:
         print(f'Rectified flow: {sum(p.numel() for p in model.parameters()):,} parameters, {precision_label}, {device}, whole utterances, up to {max_items} clips / {max_frames} frames per batch, {len(loader)} batches per epoch and GPU, {ranks.world} device(s)', flush=True)
         if finetune:
@@ -449,9 +442,12 @@ def train_rank(args, ranks):
                 print('Initialized independent speaker embeddings for the new dataset.', flush=True)
     with SummaryWriter(str(output)) if ranks.main else nullcontext(None) as writer:
         model.train()
+        ema_pending = 0
         for epoch in range(first_epoch, args.epochs + 1):
             batcher.set_epoch(epoch - 1)
             for batch in loader:
+                next_step = step + 1
+                should_log = next_step == 1 or next_step % log_interval == 0
                 current_lr = learning_rate(
                     lr, step, warmup, total, settings['lr_final_ratio'],
                     schedule=settings.get('lr_schedule', 'cosine'),
@@ -463,23 +459,38 @@ def train_rank(args, ranks):
                 )
                 for group in optimizer.param_groups:
                     group['lr'] = current_lr
-                flow, auxiliary, norm = train_step(train_model, optimizer, ema, batch, data, settings, device, dropout, amp_dtype, scaler, backbone, ranks)
-                step += 1
+                flow, auxiliary, norm = train_step(
+                    train_model, optimizer, batch, data, settings, device, dropout, amp_dtype, scaler,
+                    backbone, ranks, collect_stats=should_log,
+                )
+                step = next_step
+                ema_pending += 1
+                if ema_pending >= ema_interval:
+                    ema.update(model, steps=ema_pending)
+                    ema_pending = 0
+
                 media_step = bool((preview_interval and step % preview_interval == 0) or
                                   (held and settings.get('eval_interval', 0) and step % settings['eval_interval'] == 0))
-                if ranks.main:
-                    for tag, value in [('loss/flow', flow), ('grad_norm', norm), ('lr', current_lr)]:
-                        writer.add_scalar(tag, value, step)
+                if should_log and ranks.main:
+                    flow_value, aux_value, norm_value = float(flow), float(auxiliary), float(norm)
+                    if not np.isfinite((flow_value, aux_value, norm_value)).all():
+                        raise FloatingPointError('Non-finite rectified-flow training statistics.')
+                    writer.add_scalar('loss/flow', flow_value, step)
+                    writer.add_scalar('grad_norm', norm_value, step)
+                    writer.add_scalar('lr', current_lr, step)
                     if model.aux is not None:
-                        writer.add_scalar(f'loss/{model.aux_loss_name}', auxiliary, step)
-                    aux_status = f' aux={auxiliary:.6f}' if model.aux is not None else ''
-                    print(f'epoch={epoch} step={step}/{total} flow={flow:.6f}{aux_status} grad_norm={norm:.6f}', flush=True)
-                    if step % 50 == 0:
-                        for tag, value in conditioning_norms(model).items():
-                            writer.add_scalar(tag, value, step)
-                        if scaler is not None:
-                            writer.add_scalar("amp/scale", scaler.get_scale(), step)
+                        writer.add_scalar(f'loss/{model.aux_loss_name}', aux_value, step)
+                    aux_status = f' aux={aux_value:.6f}' if model.aux is not None else ''
+                    print(f'epoch={epoch} step={step}/{total} flow={flow_value:.6f}{aux_status} grad_norm={norm_value:.6f}', flush=True)
+                    for tag, value in conditioning_norms(model).items():
+                        writer.add_scalar(tag, value, step)
+                    if scaler is not None:
+                        writer.add_scalar("amp/scale", scaler.get_scale(), step)
+
                 if media_step:
+                    if ema_pending:
+                        ema.update(model, steps=ema_pending)
+                        ema_pending = 0
                     with ranks.main_work(f'preview/validation at step {step}') as main:
                         if main:
                             if preview_interval and step % preview_interval == 0:
@@ -490,7 +501,12 @@ def train_rank(args, ranks):
                                 print(f'Rank 0: starting validation at step {step}.', flush=True)
                                 evaluate(model, ema, held_loader, data, writer, step)
                                 print(f'Rank 0: validation finished at step {step}.', flush=True)
-            if epoch % args.save_every == 0 or epoch == args.epochs:
+
+            save_epoch = epoch % args.save_every == 0 or epoch == args.epochs
+            if save_epoch and ema_pending:
+                ema.update(model, steps=ema_pending)
+                ema_pending = 0
+            if save_epoch:
                 with ranks.main_work(f'checkpoint/preview at epoch {epoch}') as main:
                     if main:
                         print(f'Rank 0: saving checkpoint at epoch {epoch}.', flush=True)

@@ -1,6 +1,9 @@
+import hashlib
+import json
 import math
 import os
 import random
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -14,10 +17,12 @@ from rvc.rectified.energy import frame_energy
 from rvc.rectified.aperiodicity import aperiodicity
 from rvc.rectified.mel import LogMel
 from rvc.rectified.config import resolve_config
+from rvc.rectified.flow_model import HarmonicPrior
 
 FEATURE_RATE = 100
 SMOOTH_SECONDS = 0.06
 CONTENT_INTERPOLATIONS = ("nearest", "linear")
+ORIGINAL_CACHE_VERSION = 2
 
 def upsample_content(features: torch.Tensor, mode: str = "nearest") -> torch.Tensor:
     if mode not in CONTENT_INTERPOLATIONS:
@@ -191,9 +196,9 @@ def variance_curves(audio, f0, frames, sample_rate, hop):
 
 def unpack_flow(batch, device, non_blocking=False):
     values = tuple(item.to(device, non_blocking=non_blocking) for item in batch)
-    if len(values) == 9:
+    if len(values) == 10:
         return (*values, None, None)
-    if len(values) != 11:
+    if len(values) != 12:
         raise ValueError("Invalid rectified-flow batch.")
     return values
 
@@ -210,6 +215,27 @@ class RectifiedDataset(Dataset):
         self.strict_features = config['flow']['model'].get('conditioning_version', 1) in (2, 3, 4)
         self.augment = augment
         self.use_variances = any(config["flow"]["model"].get(name, False) for name in ("voicing", "tension"))
+        self.use_harmonics = bool(config["flow"]["model"].get("harmonic_prior", False))
+        self.harmonic_prior = (
+            HarmonicPrior(
+                sample_rate=self.sample_rate, n_fft=int(self.data["n_fft"]),
+                n_mels=int(self.data["n_mels"]), fmin=float(self.data["mel_fmin"]),
+                fmax=float(self.data["mel_fmax"]),
+            )
+            if self.use_harmonics else None
+        )
+        self._cache_recipe = json.dumps(
+            dict(
+                version=ORIGINAL_CACHE_VERSION,
+                data=self.data,
+                content_channels=self.content_channels,
+                use_variances=self.use_variances,
+                use_harmonics=self.use_harmonics,
+            ),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        self._original_cache = [self._cache_info(entry) for entry in self.entries]
 
     def __len__(self):
         return len(self.entries)
@@ -234,16 +260,71 @@ class RectifiedDataset(Dataset):
         share = smooth_curve(aperiodicity(audio, self.sample_rate, f0, feature_frames))
         return to_mel_rate(share.unsqueeze(-1), frames, self.sample_rate, hop)[..., 0]
 
-    def __getitem__(self, index):
-        index, hop = index if isinstance(index, tuple) else (index, None)
-        wav_path, content_path, _, f0_path, sid = self.entries[index]
-        if str(content_path).endswith('.flow.npz'):
-            return self._cached_item(content_path, int(sid))
-        audio = self._audio(wav_path)
-        source_f0 = torch.from_numpy(np.load(f0_path, allow_pickle=False).astype(np.float32))
-        content = upsample_content(
-            torch.from_numpy(np.load(content_path, allow_pickle=False).astype(np.float32)),
-            self.data["content_interpolation"],
+    @torch.no_grad()
+    def _harmonics(self, f0):
+        if self.harmonic_prior is None:
+            return torch.empty((0, f0.shape[-1]), dtype=torch.float32)
+        return self.harmonic_prior(f0.unsqueeze(0))[0]
+
+    def _cache_info(self, entry):
+        if str(entry[1]).endswith('.flow.npz'):
+            return None
+        sources = []
+        for path in (entry[0], entry[1], entry[3]):
+            value = Path(path)
+            stat = value.stat()
+            sources.append((str(value.resolve()), stat.st_size, stat.st_mtime_ns))
+        fingerprint = hashlib.sha256(
+            (self._cache_recipe + json.dumps(sources, separators=(",", ":"))).encode()
+        ).hexdigest()
+        return Path(str(entry[1]) + '.flow-cache.npz'), fingerprint
+
+    def _cache_valid(self, index):
+        info = self._original_cache[index]
+        if info is None:
+            return True
+        path, fingerprint = info
+        if not path.is_file():
+            return False
+        try:
+            with np.load(path, allow_pickle=False) as values:
+                return (
+                    'cache_fingerprint' in values.files
+                    and str(values['cache_fingerprint'].item()) == fingerprint
+                )
+        except Exception:
+            return False
+
+    def _write_cache(self, path, values):
+        temporary = Path(str(path) + f'.{os.getpid()}.tmp')
+        try:
+            with temporary.open('wb') as stream:
+                np.savez(stream, **values)
+            os.replace(temporary, path)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+
+    def _build_original_cache(self, index, audio=None, source_f0=None, content=None):
+        info = self._original_cache[index]
+        if info is None:
+            return None
+        path, fingerprint = info
+        if self._cache_valid(index):
+            return path
+
+        wav_path, content_path, _, f0_path, _ = self.entries[index]
+        audio = self._audio(wav_path) if audio is None else audio
+        source_f0 = (
+            torch.from_numpy(np.load(f0_path, allow_pickle=False).astype(np.float32))
+            if source_f0 is None else source_f0
+        )
+        content = (
+            upsample_content(
+                torch.from_numpy(np.load(content_path, allow_pickle=False).astype(np.float32)),
+                self.data["content_interpolation"],
+            )
+            if content is None else content
         )
         if content.ndim != 2 or content.shape[1] != self.content_channels:
             raise ValueError(f"Expected {self.content_channels}-wide content features: {content_path}")
@@ -255,7 +336,59 @@ class RectifiedDataset(Dataset):
             seconds = audio.numel() / self.sample_rate
             if any(abs(value.shape[0] / FEATURE_RATE - seconds) > 0.25 for value in (source_f0, content)):
                 raise ValueError(f'Content or pitch duration does not match audio; re-extract features: {wav_path}')
-        return self._flow_item(audio, source_f0, content, int(sid), hop)
+
+        frames = min(
+            audio.shape[0] // self.hop,
+            mel_frames(source_f0.shape[0], self.sample_rate, self.hop),
+            mel_frames(content.shape[0], self.sample_rate, self.hop),
+        )
+        if frames < 4:
+            raise ValueError("Training clips must contain at least four mel frames.")
+        audio = audio[: frames * self.hop]
+        content = to_mel_rate(content, frames, self.sample_rate, self.hop)
+        f0 = f0_to_mel_rate(source_f0, frames, self.sample_rate, self.hop)
+        with torch.no_grad():
+            mel = self.mel(audio.unsqueeze(0), 0.0, self.hop)[0, :, :frames]
+        energy = self._energy(audio.unsqueeze(0), frames, self.hop)[0]
+        breathiness = self._breathiness(audio.unsqueeze(0), source_f0.unsqueeze(0), frames, self.hop)[0]
+
+        values = dict(
+            mel=mel.numpy(),
+            content=content.numpy(),
+            f0=f0.numpy(),
+            energy=energy.numpy(),
+            breathiness=breathiness.numpy(),
+            harmonic_prior=self._harmonics(f0).numpy(),
+            key_shift=np.float32(0.0),
+            speed=np.float32(1.0),
+            frames=np.int64(frames),
+            hop=np.int64(self.hop),
+            cache_fingerprint=np.asarray(fingerprint),
+        )
+        if self.use_variances:
+            curves = variance_curves(audio.unsqueeze(0), source_f0.unsqueeze(0), frames, self.sample_rate, self.hop)
+            values.update(voicing=curves[0][0].numpy(), tension=curves[1][0].numpy())
+        if not all(np.isfinite(value).all() for name, value in values.items() if name != 'cache_fingerprint'):
+            raise ValueError(f'Invalid cached training features: {wav_path}')
+        self._write_cache(path, values)
+        return path
+
+    def ensure_cached(self, index):
+        index = index[0] if isinstance(index, tuple) else index
+        if self._original_cache[index] is None or self._cache_valid(index):
+            return False
+        self._build_original_cache(index)
+        return True
+
+    def __getitem__(self, index):
+        index, hop = index if isinstance(index, tuple) else (index, None)
+        _, content_path, _, _, sid = self.entries[index]
+        if str(content_path).endswith('.flow.npz'):
+            return self._cached_item(content_path, int(sid))
+        path, fingerprint = self._original_cache[index]
+        if not path.is_file():
+            path = self._build_original_cache(index)
+        return self._cached_item(path, int(sid), fingerprint)
 
     def _flow_item(self, audio, source_f0, content, sid, hop=None):
         key_shift = 0.0
@@ -282,15 +415,19 @@ class RectifiedDataset(Dataset):
         stop = start + length
         item = (
             mel[:, start:stop], content[start:stop], f0[start:stop], energy[start:stop],
-            breathiness[start:stop], key_shift, speed, sid,
+            breathiness[start:stop], key_shift, speed, sid, self._harmonics(f0)[..., start:stop],
         )
         if self.use_variances:
             curves = variance_curves(audio.unsqueeze(0), source_f0.unsqueeze(0), frames, self.sample_rate, hop)
             item += tuple(curve[0, start:stop] for curve in curves)
         return item
 
-    def _cached_item(self, path, sid):
+    def _cached_item(self, path, sid, expected_fingerprint=None):
         with np.load(path, allow_pickle=False) as values:
+            if expected_fingerprint is not None:
+                if ('cache_fingerprint' not in values.files
+                        or str(values['cache_fingerprint'].item()) != expected_fingerprint):
+                    raise ValueError(f'Stale training feature cache: {path}')
             frames = int(values['frames'])
             length = min(frames, self.max_frames)
             start = random.randint(0, frames - length) if self.augment else 0
@@ -304,7 +441,15 @@ class RectifiedDataset(Dataset):
                 raise ValueError(f'Invalid augmented curve lengths: {path}')
             if not all(torch.isfinite(value).all() for value in (mel, *curves)) or (curves[1] < 0).any():
                 raise ValueError(f'Invalid augmented feature values: {path}')
-            item = (mel, *curves, float(values['key_shift']), float(values['speed']), sid)
+            if self.use_harmonics:
+                if 'harmonic_prior' not in values.files:
+                    raise ValueError(f'Missing cached harmonic prior; rebuild training features: {path}')
+                harmonic = torch.from_numpy(values['harmonic_prior'][:, start:stop].copy())
+                if harmonic.shape != (self.data['n_mels'], length) or not torch.isfinite(harmonic).all():
+                    raise ValueError(f'Invalid cached harmonic-prior dimensions or values: {path}')
+            else:
+                harmonic = torch.empty((0, length), dtype=mel.dtype)
+            item = (mel, *curves, float(values['key_shift']), float(values['speed']), sid, harmonic)
             if self.use_variances:
                 item += tuple(torch.from_numpy(values[name][start:stop].copy()) for name in ('voicing', 'tension'))
             return item
@@ -351,6 +496,45 @@ class RectifiedDataset(Dataset):
         return None
 
 
+def prepare_training_cache(entries, config, workers=4):
+    """Build persistent original-clip features once instead of recomputing them every epoch."""
+    if not entries:
+        return
+    dataset = RectifiedDataset(entries, config, 2 ** 31, augment=False)
+    missing = [index for index in range(len(entries)) if not dataset._cache_valid(index)]
+    if not missing:
+        print(f'Training feature cache: {len(entries):,}/{len(entries):,} ready.', flush=True)
+        return
+    workers = max(1, min(int(workers), os.cpu_count() or 1, len(missing)))
+    print(
+        f'Training feature cache: building {len(missing):,} missing clip(s) with {workers} worker(s)...',
+        flush=True,
+    )
+    previous_threads = torch.get_num_threads()
+    torch.set_num_threads(max(1, previous_threads // workers))
+    completed = len(entries) - len(missing)
+    last_report = time.monotonic()
+    try:
+        if workers == 1:
+            iterator = map(dataset.ensure_cached, missing)
+            pool = None
+        else:
+            pool = ThreadPoolExecutor(max_workers=workers)
+            iterator = pool.map(dataset.ensure_cached, missing)
+        try:
+            for _ in iterator:
+                completed += 1
+                now = time.monotonic()
+                if completed == len(entries) or now - last_report >= 5:
+                    print(f'Training feature cache: {completed:,}/{len(entries):,}', flush=True)
+                    last_report = now
+        finally:
+            if pool is not None:
+                pool.shutdown(wait=True)
+    finally:
+        torch.set_num_threads(previous_threads)
+
+
 def collate_flow(batch, frames=None):
     frames = frames or max(item[0].shape[-1] for item in batch)
     size = len(batch)
@@ -363,13 +547,17 @@ def collate_flow(batch, frames=None):
     speed = torch.ones(size)
     mask = torch.zeros(size, 1, frames)
     speaker = torch.zeros(size, dtype=torch.long)
-    extended = len(batch[0]) == 10
+    harmonic_channels = batch[0][8].shape[0]
+    harmonic_prior = torch.zeros(size, harmonic_channels, frames)
+    extended = len(batch[0]) == 11
     voicing, tension = torch.zeros(size, frames), torch.zeros(size, frames)
     for i, item in enumerate(batch):
-        if len(item) != (10 if extended else 8):
+        if len(item) != (11 if extended else 9):
             raise ValueError("Mixed conditioning formats in rectified-flow batch.")
-        m, c, p, e, b, k, v, s = item[:8]
+        m, c, p, e, b, k, v, s, h = item[:9]
         n = m.shape[-1]
+        if h.shape != (harmonic_channels, n):
+            raise ValueError("Mixed harmonic-prior formats in rectified-flow batch.")
         mel[i, :, :n] = m
         content[i, :n] = c
         f0[i, :n] = p
@@ -379,9 +567,11 @@ def collate_flow(batch, frames=None):
         speed[i] = v
         mask[i, :, :n] = 1.0
         speaker[i] = s
+        if harmonic_channels:
+            harmonic_prior[i, :, :n] = h
         if extended:
-            voicing[i, :n], tension[i, :n] = item[8:]
-    result = (mel, content, f0, energy, breathiness, key_shift, speed, speaker, mask)
+            voicing[i, :n], tension[i, :n] = item[9:]
+    result = (mel, content, f0, energy, breathiness, key_shift, speed, speaker, mask, harmonic_prior)
     return (*result, voicing, tension) if extended else result
 
 def read_filelist(path, root, originals_only=False):

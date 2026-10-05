@@ -167,7 +167,7 @@ class ConditionEncoder(nn.Module):
         return x
 
     def forward(self, content, f0, energy, speaker, mask, breathiness=None, key_shift=None, speed=None,
-                voicing=None, tension=None):
+                voicing=None, tension=None, harmonic_prior=None):
         frame_mask = mask[:, 0]
         f0, energy = f0 * frame_mask, energy * frame_mask
         breathiness = None if breathiness is None else breathiness * frame_mask
@@ -176,7 +176,10 @@ class ConditionEncoder(nn.Module):
         x = self.encode_content(content, mask)
         x = x + self.pitch(pitch_features(f0, self.pitch_fourier))
         if self.harmonic_prior is not None:
-            x = x + self.harmonics(self.harmonic_prior(f0))
+            prior = self.harmonic_prior(f0) if harmonic_prior is None else harmonic_prior
+            if prior.shape[:2] != (f0.shape[0], self.harmonics.in_channels) or prior.shape[-1] != f0.shape[-1]:
+                raise ValueError("Invalid cached harmonic-prior dimensions.")
+            x = x + self.harmonics(prior)
         x = x + self.energy(energy.unsqueeze(1))
         for name, value in (("voicing", voicing), ("tension", tension)):
             projection = getattr(self, name)
@@ -289,7 +292,7 @@ class LYNXNet2Backbone(nn.Module):
     def forward(self, x, t, cond, mask, voice=None, prepared=None):
         time = self.time_mlp(timestep_embedding(t.reshape(-1), self.channels, self.time_scale))
         time = time.view(t.shape[0], -1, self.channels)
-        h = self.input(x.transpose(1, 2)).float()
+        h = self.input(x.transpose(1, 2))
         projected, speaker = self.prepare_conditioning(cond, voice) if prepared is None else prepared
         h = h + projected + time
         embedding = None
@@ -484,11 +487,13 @@ class RectifiedFlow(nn.Module):
         return t.clamp(1e-7, 1.0 - 1e-7) if self.flow_loss == "l2_lognorm" else t
 
     def forward(self, mel, content, f0, energy, speaker, mask, speaker_dropout=0.0,
-                breathiness=None, key_shift=None, speed=None, backbone=None, voicing=None, tension=None):
+                breathiness=None, key_shift=None, speed=None, backbone=None, voicing=None, tension=None,
+                harmonic_prior=None):
         if (self.flow_conditioning == "aux_mel" or self.direct_speaker_conditioning) and speaker_dropout != 0:
             raise ValueError("Speaker-conditioned standard flow keeps the speaker ID present during training.")
         speaker = self._drop_speakers(speaker, speaker_dropout)
-        cond = self.encoder(content, f0, energy, speaker, mask, breathiness, key_shift, speed, voicing, tension)
+        cond = self.encoder(content, f0, energy, speaker, mask, breathiness, key_shift, speed, voicing, tension,
+                            harmonic_prior=harmonic_prior)
         voice = self.encoder.voice(speaker)
         t = self._uniform_times(mel.shape[0], mel.device)
         if self.dual_timestep:
@@ -502,8 +507,9 @@ class RectifiedFlow(nn.Module):
 
     @torch.no_grad()
     def validation_losses(self, mel, content, f0, energy, speaker, mask, breathiness, key_shift,
-                          speed, noise, fractions, voicing=None, tension=None):
-        cond = self.encoder(content, f0, energy, speaker, mask, breathiness, key_shift, speed, voicing, tension)
+                          speed, noise, fractions, voicing=None, tension=None, harmonic_prior=None):
+        cond = self.encoder(content, f0, energy, speaker, mask, breathiness, key_shift, speed, voicing, tension,
+                            harmonic_prior=harmonic_prior)
         voice = self.encoder.voice(speaker)
         losses, aux = [], None
         for fraction in fractions:

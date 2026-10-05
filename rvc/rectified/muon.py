@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 
 MIN_FAN_IN = 16
@@ -9,18 +10,51 @@ def _iteration_dtype(device: torch.device, dtype: torch.dtype = torch.float32) -
     return dtype if device.type == "cuda" else torch.float32
 
 
-def orthogonalize(g: torch.Tensor, steps: int = 5, dtype: torch.dtype = torch.float32) -> torch.Tensor:
-    a, b, c = 3.4445, -4.7750, 2.0315
-    x = g.float()
-    x = x / x.flatten(-2).norm(dim=-1).clamp_min(1e-7)[..., None, None]
-    x = x.to(_iteration_dtype(g.device, dtype))
+def orthogonalize(g: torch.Tensor, steps: int = 5, dtype: torch.dtype = torch.float16) -> torch.Tensor:
+    """DiffSinger-style Gram Newton-Schulz orthogonalization.
+
+    For rectangular matrices, most Newton-Schulz iterations run on the smaller
+    Gram matrix, substantially reducing Muon FLOPs while preserving the same
+    quintic orthogonalization target.
+    """
+    if g.ndim != 3:
+        raise ValueError("Batched Muon orthogonalization expects a 3-D tensor.")
+    reset_iterations = (2,)
+    original_shape = g.shape
+    original_dtype = g.dtype
+
+    x = F.normalize(g.float(), p=2.0, dim=(-2, -1), eps=1e-7)
     transposed = x.shape[-2] > x.shape[-1]
     if transposed:
         x = x.mT
-    for _ in range(steps):
-        gram = x @ x.mT
-        x = a * x + (b * gram + c * gram @ gram) @ x
-    return (x.mT if transposed else x).to(g.dtype)
+    x = x.to(_iteration_dtype(g.device, dtype))
+
+    a, b, c = 3.4445, -4.7750, 2.0315
+    if x.shape[-2] != x.shape[-1]:
+        gram = torch.bmm(x, x.mT)
+        q = None
+        for index in range(steps):
+            if index in reset_iterations and index != 0:
+                x = torch.bmm(q, x)
+                gram = torch.bmm(x, x.mT)
+                q = None
+            z = torch.baddbmm(gram, gram, gram, beta=b, alpha=c)
+            if index != 0 and index not in reset_iterations:
+                q = torch.baddbmm(q, q, z, beta=a, alpha=1.0)
+            else:
+                q = z.clone()
+                q.diagonal(dim1=-2, dim2=-1).add_(a)
+            if index < steps - 1 and (index + 1) not in reset_iterations:
+                rz = torch.baddbmm(gram, gram, z, beta=a, alpha=1.0)
+                gram = torch.baddbmm(rz, z, rz, beta=a, alpha=1.0)
+        x = torch.bmm(q, x) if not transposed else torch.bmm(x.mT, q)
+    else:
+        for _ in range(steps):
+            gram = torch.bmm(x, x.mT)
+            z = torch.baddbmm(gram, gram, gram, beta=b, alpha=c)
+            x = torch.baddbmm(x, z, x, beta=a, alpha=1.0)
+
+    return x.to(original_dtype).view(original_shape)
 
 
 def muon_parameters(model: nn.Module) -> set:
@@ -36,7 +70,7 @@ def muon_parameters(model: nn.Module) -> set:
 
 class MuonAdamW(torch.optim.Optimizer):
     def __init__(self, model, lr, muon_weight_decay=0.1, adamw_weight_decay=0.0,
-                 momentum=0.95, betas=(0.9, 0.98), eps=1e-8, iteration_dtype=torch.float32):
+                 momentum=0.95, betas=(0.9, 0.98), eps=1e-8, iteration_dtype=torch.float16):
         if iteration_dtype not in {torch.float32, torch.float16, torch.bfloat16}:
             raise ValueError(f"Unsupported Muon iteration dtype: {iteration_dtype}")
         self.iteration_dtype = iteration_dtype

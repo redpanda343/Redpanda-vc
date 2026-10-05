@@ -12,7 +12,7 @@ STANDARD_PRESET = {
         'mel_fmax': 16000.0,
         'mel_mean': -6.0,
         'mel_std': 6.0,
-        'content_interpolation': 'nearest',
+        'content_interpolation': 'linear',
     },
     'flow': {
         'optimizer': 'muon',
@@ -42,6 +42,9 @@ STANDARD_PRESET = {
         'eval_interval': 1000,
         'holdout_clips': 32,
         'num_workers': 4,
+        'dataloader_prefetch_factor': 2,
+        'log_interval': 100,
+        'ema_update_interval': 10,
         'augmentation_workers': 4,
         'model': {
             'dual_timestep': True,
@@ -79,7 +82,8 @@ STANDARD_PRESET = {
 PRESET_NAME = 'standard-v1'
 EDITABLE_FLOW_KEYS = (
     'learning_rate', 'decay_step', 'gamma', 'max_batch_frames', 'max_batch_size',
-    'num_workers', 'preview_interval', 'eval_interval', 'holdout_clips',
+    'num_workers', 'dataloader_prefetch_factor', 'log_interval', 'ema_update_interval',
+    'preview_interval', 'eval_interval', 'holdout_clips',
 )
 
 

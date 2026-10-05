@@ -217,6 +217,7 @@ def generate_features(dataset, entry, tasks, paths, pitch, device, speed_embed=T
         values = dict(mel=mel, content=to_mel_rate(content, length, dataset.sample_rate, hop),
                       f0=f0, energy=resample_curve(energy, length, speed),
                       breathiness=resample_curve(breathiness, length, speed),
+                      harmonic_prior=dataset._harmonics(f0),
                       key_shift=np.float32(shift if 'speaker' not in task else 0.0),
                       speed=np.float32(speed), frames=np.int64(length), hop=np.int64(dataset.hop))
         for name, curve in zip(('voicing', 'tension'), variances):
@@ -281,10 +282,11 @@ def prepare_augmentation(experiment, root, originals, train_entries, config, see
     method = info.get('f0_method', 'rmvpe')
     sources = [[list(entry), [(Path(path).stat().st_size, Path(path).stat().st_mtime_ns)
                               for path in entry[:4]]] for entry in train_entries]
-    recipe = dict(version=1, sources=sources, tasks=tasks, data=config['data'],
+    recipe = dict(version=2, sources=sources, tasks=tasks, data=config['data'],
                   method=method, speed_embed=config['flow']['model'].get('speed', False),
                   variances=[config['flow']['model'].get(name, False)
-                                           for name in ('voicing', 'tension')])
+                                           for name in ('voicing', 'tension')],
+                  harmonic_prior=bool(config['flow']['model'].get('harmonic_prior', False)))
     checkpoint = root / 'rvc/models/predictors/rmvpe.pt'
     if method == 'rmvpe' and checkpoint.exists():
         recipe['pitch_checkpoint'] = [checkpoint.stat().st_size, checkpoint.stat().st_mtime_ns]

@@ -31,17 +31,25 @@ class WeightEMA:
             else:
                 self._other_keys.append(key)
 
-    def current_decay(self) -> float:
-        if not self.warmup or self.updates < 1:
+    def _decay_at(self, update: int) -> float:
+        if not self.warmup or update < 1:
             return self.decay
-        return min(self.decay, 1.0 - 1.0 / self.updates)
+        return min(self.decay, 1.0 - 1.0 / update)
+
+    def current_decay(self) -> float:
+        return self._decay_at(self.updates)
 
     @torch.no_grad()
-    def update(self, model) -> None:
-        self.updates += 1
-        decay = self.current_decay()
+    def update(self, model, steps: int = 1) -> None:
+        steps = int(steps)
+        if steps < 1:
+            return
+        effective_decay = 1.0
+        for update in range(self.updates + 1, self.updates + steps + 1):
+            effective_decay *= self._decay_at(update)
+        self.updates += steps
 
-        torch._foreach_lerp_(self._shadow_float, self._live_float, 1.0 - decay)
+        torch._foreach_lerp_(self._shadow_float, self._live_float, 1.0 - effective_decay)
         if self._other_keys:
             state = _unwrap(model).state_dict()
             for key in self._other_keys:
