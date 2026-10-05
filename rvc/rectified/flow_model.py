@@ -292,7 +292,7 @@ class LYNXNet2Backbone(nn.Module):
     def forward(self, x, t, cond, mask, voice=None, prepared=None):
         time = self.time_mlp(timestep_embedding(t.reshape(-1), self.channels, self.time_scale))
         time = time.view(t.shape[0], -1, self.channels)
-        h = self.input(x.transpose(1, 2))
+        h = self.input(x.transpose(1, 2)).float()
         projected, speaker = self.prepare_conditioning(cond, voice) if prepared is None else prepared
         h = h + projected + time
         embedding = None
@@ -301,7 +301,7 @@ class LYNXNet2Backbone(nn.Module):
         for layer in self.layers:
             h = layer(h, embedding)
         h = self.norm(h)
-        return self.output(h).float().transpose(1, 2)
+        return self.output(h.float()).transpose(1, 2)
 
 
 class AuxDecoder(nn.Module):
