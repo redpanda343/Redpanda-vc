@@ -78,9 +78,9 @@ class MixedPrecisionLayerNorm(nn.LayerNorm):
 
 class ConvNeXtBlock(nn.Module):
     def __init__(self, channels: int, layer_scale: float = 0.0, dropout: float = 0.0,
-                 speaker_channels: int = 0, reference=False):
+                 speaker_channels: int = 0, reference=False, kernel_size=7):
         super().__init__()
-        self.depthwise = nn.Conv1d(channels, channels, 7, padding=3, groups=channels)
+        self.depthwise = nn.Conv1d(channels, channels, kernel_size, padding=kernel_size // 2, groups=channels)
         self.norm = MixedPrecisionLayerNorm(channels, eps=1e-6 if reference else 1e-5)
         self.reference = reference
         self.up = nn.Linear(channels, channels * 4)
@@ -254,13 +254,14 @@ def softsign_glu(x, fused=True):
 
 
 class LYNXNet2Block(nn.Module):
-    def __init__(self, channels, expansion, kernel_size, adaln=False, glu_type='atanglu'):
+    def __init__(self, channels, expansion, kernel_size, adaln=False, glu_type='atanglu', dropout_rate=0.0):
         super().__init__()
         inner = int(channels * expansion)
         if glu_type not in {'atanglu', 'softsign_glu'}:
             raise ValueError(f'Unsupported flow activation: {glu_type!r}.')
         self.glu_type = glu_type
         self.use_fused_kernels = False
+        self.dropout = nn.Dropout(dropout_rate)
         self.norm = MixedPrecisionLayerNorm(channels, elementwise_affine=not adaln)
         self.depthwise = nn.Conv1d(channels, channels, kernel_size, padding=kernel_size // 2, groups=channels)
         self.up = nn.Linear(channels, inner * 2)
@@ -291,14 +292,16 @@ class LYNXNet2Block(nn.Module):
         y = self.down(y)
         if gate is not None:
             y = y + gate * y
-        return x + y
+        return x + self.dropout(y)
 
 
 class LYNXNet2Backbone(nn.Module):
     def __init__(self, n_mels, cond_channels, channels=1024, layers=6, expansion=1, kernel_size=31,
-                 adaln=False, time_scale=1000.0, speaker_channels=None, reference=False, glu_type='atanglu'):
+                 adaln=False, time_scale=1000.0, speaker_channels=None, reference=False, glu_type='atanglu',
+                 dropout_rate=0.0, use_conditioner_cache=True):
         super().__init__()
         self.channels = int(channels)
+        self.use_conditioner_cache = bool(use_conditioner_cache)
         self.time_scale = float(time_scale)
         self.reference = bool(reference)
         self.input = nn.Linear(n_mels, channels)
@@ -307,7 +310,7 @@ class LYNXNet2Backbone(nn.Module):
             nn.Linear(channels, channels * 4), nn.GELU(), nn.Linear(channels * 4, channels)
         )
         self.layers = nn.ModuleList(
-            [LYNXNet2Block(channels, expansion, kernel_size, adaln, glu_type) for _ in range(layers)]
+            [LYNXNet2Block(channels, expansion, kernel_size, adaln, glu_type, dropout_rate) for _ in range(layers)]
         )
         self.voice = nn.Linear(cond_channels if speaker_channels is None else speaker_channels, channels) if adaln else None
         self.norm = nn.LayerNorm(channels)
@@ -343,13 +346,13 @@ class LYNXNet2Backbone(nn.Module):
 
 class AuxDecoder(nn.Module):
     def __init__(self, cond_channels, n_mels, channels=512, layers=6, dropout=0.1,
-                 speaker_channels=0, reference=False):
+                 speaker_channels=0, reference=False, kernel_size=7):
         super().__init__()
         self.input = nn.Conv1d(cond_channels, channels, 7, padding=3)
         self.reference = bool(reference)
         self.blocks = nn.ModuleList(
             [ConvNeXtBlock(channels, layer_scale=1e-6, dropout=dropout,
-                           speaker_channels=speaker_channels, reference=reference) for _ in range(layers)]
+                           speaker_channels=speaker_channels, reference=reference, kernel_size=kernel_size) for _ in range(layers)]
         )
         self.output = nn.Conv1d(channels, n_mels, 7, padding=3)
         self.output.use_adamw = True
@@ -396,8 +399,28 @@ class RectifiedFlow(nn.Module):
         direct_speaker_conditioning: bool = False,
         energy: bool = True,
         use_spk_id: bool = True,
+        diffusion_type: str = 'reflow',
+        enc_ffn_kernel_size: int = 3,
+        use_rope: bool = True,
+        rope_interleaved: bool = False,
+        rope_theta: float = 10000.0,
+        use_variance_scaling: bool = True,
+        use_shallow_diffusion: Optional[bool] = None,
+        t_start_infer: Optional[float] = None,
+        train_aux_decoder: bool = True,
+        train_diffusion: bool = True,
+        val_gt_start: bool = False,
+        aux_decoder_arch: str = 'convnext',
     ):
         super().__init__()
+        if diffusion_type != 'reflow' or aux_decoder_arch != 'convnext':
+            raise ValueError('This trainer supports reflow with a ConvNeXt auxiliary decoder.')
+        if use_shallow_diffusion is False:
+            aux_decoder, t_start, t_start_infer = None, 0.0, 0.0
+        if use_shallow_diffusion is True and not aux_decoder:
+            raise ValueError('Shallow diffusion requires an auxiliary decoder configuration.')
+        if not train_diffusion and (not aux_decoder or not train_aux_decoder):
+            raise ValueError('Enable at least one training objective.')
         if backbone != "lynxnet2":
             raise ValueError(f"Only the lynxnet2 backbone is supported, not {backbone!r}.")
         if flow_conditioning not in {"encoder", "aux_mel"} or flow_loss not in {"l2", "l2_lognorm"}:
@@ -440,6 +463,8 @@ class RectifiedFlow(nn.Module):
         self.encoder = ContentConditionEncoder(
             content_channels, hidden_channels, speaker_count, encoder_layers,
             breathiness=breathiness, key_shift=key_shift, speed=speed, energy=energy, use_spk_id=self.use_spk_id,
+            enc_ffn_kernel_size=enc_ffn_kernel_size, use_rope=use_rope,
+            rope_interleaved=rope_interleaved, rope_theta=rope_theta, use_variance_scaling=use_variance_scaling,
         ) if self.reference else ConditionEncoder(
             content_channels,
             hidden_channels,
@@ -476,6 +501,16 @@ class RectifiedFlow(nn.Module):
             **aux_decoder,
         ) if aux_decoder else None
         self.t_start = float(t_start) if self.aux is not None else 0.0
+        self.t_start_infer = self.t_start if t_start_infer is None else float(t_start_infer)
+        if not 0.0 <= self.t_start_infer <= 1.0:
+            raise ValueError('Inference start time must be between 0 and 1.')
+        self.train_aux_decoder = bool(train_aux_decoder)
+        self.train_diffusion = bool(train_diffusion)
+        self.val_gt_start = bool(val_gt_start)
+        if self.aux is not None and not self.train_aux_decoder:
+            self.aux.requires_grad_(False)
+        if not self.train_diffusion:
+            self.backbone.requires_grad_(False)
         self.aux_grad = float(aux_grad)
         self.dual_timestep = bool(dual_timestep)
         if sampling_method not in SAMPLERS or int(sampling_steps) != sampling_steps or sampling_steps < 1:
@@ -496,9 +531,11 @@ class RectifiedFlow(nn.Module):
         return torch.where(dropped, torch.full_like(speaker, self.speaker_count), speaker)
 
     def _losses(self, mel, cond, voice, mask, t, noise, backbone):
-        cond, predicted_mel = self._conditioning(cond, mask, voice)
+        cond, predicted_mel = self._conditioning(cond, mask, voice, self.train_aux_decoder or self.flow_conditioning == 'aux_mel')
         mixing = t[:, None, None] if t.ndim == 1 else t[:, None, :]
         x_t = (1.0 - mixing) * noise + mixing * mel
+        if not self.train_diffusion:
+            return cond.sum() * 0.0, self._mel_loss(predicted_mel, mel, mask)
         prediction = backbone(x_t, t, cond, mask, voice)
         error = (prediction.float() - (mel - noise).float()).square() * mask
         if self.flow_loss == "l2_lognorm":
@@ -507,16 +544,16 @@ class RectifiedFlow(nn.Module):
             error = error * (weights[:, None, None] if t.ndim == 1 else weights[:, None, :])
         flow = error.mean()
         count = (mask.sum((1, 2)) * self.n_mels).clamp_min(1.0)
-        aux = self._mel_loss(predicted_mel, mel, mask, count.sum())
+        aux = self._mel_loss(predicted_mel, mel, mask, count.sum()) if self.train_aux_decoder else None
         return flow, aux
 
     @property
     def aux_loss_name(self):
         return "aux_mel_mse" if self.flow_conditioning == "aux_mel" else "aux_mel_l1"
 
-    def _conditioning(self, cond, mask, voice=None):
+    def _conditioning(self, cond, mask, voice=None, predict_aux=True):
         predicted_mel = None
-        if self.aux is not None:
+        if self.aux is not None and predict_aux:
             aux_cond = cond * mask if self.flow_conditioning == "aux_mel" else cond * self.aux_grad + cond.detach() * (1.0 - self.aux_grad)
             predicted_mel = self.aux(aux_cond, mask, voice)
         if self.flow_conditioning == "aux_mel":
@@ -595,6 +632,7 @@ class RectifiedFlow(nn.Module):
         content_guidance: float = 0.0,
         guidance_rescale: float = 0.0,
         temperature: float = 1.0,
+        source_mel: Optional[torch.Tensor] = None,
         start: Optional[float] = None,
         guidance_interval: tuple = (0.0, 1.0),
         rescale_mode: str = "global",
@@ -644,8 +682,8 @@ class RectifiedFlow(nn.Module):
             frames = mask.sum((1, 2)).clamp_min(1.0) * self.n_mels
             return ((y.square() * mask).sum((1, 2)) / frames).sqrt()[:, None, None]
 
-        prepared = self.backbone.prepare_conditioning(cond, voice)
-        primary = tuple(value[:batch] if value is not None else None for value in prepared)
+        prepared = self.backbone.prepare_conditioning(cond, voice) if self.backbone.use_conditioner_cache else None
+        primary = tuple(value[:batch] if value is not None else None for value in prepared) if prepared is not None else None
         primary_voice = voice[:batch] if voice is not None else None
 
         def field(x, t):
@@ -672,9 +710,11 @@ class RectifiedFlow(nn.Module):
             noise = torch.randn(shape, device=content.device)
         noise = noise * float(temperature)
         t0 = 0.0
-        if self.t_start > 0:
-            t0 = self.t_start if start is None else min(max(self.t_start, float(start)), 0.99)
-            initial = self.aux(cond[:batch], mask, primary_voice) if initial_mel is None else initial_mel[:batch]
+        if self.aux is not None:
+            t0 = self.t_start_infer if start is None else float(start)
+            if not 0.0 <= t0 <= 1.0:
+                raise ValueError('Inference start time must be between 0 and 1.')
+            initial = source_mel if source_mel is not None else (self.aux(cond[:batch], mask, primary_voice) if initial_mel is None else initial_mel[:batch])
             if self.reference:
                 initial = initial * mask + (1.0 - mask) * (-self.mel_mean / self.mel_std)
             x = (1.0 - t0) * noise + t0 * initial
@@ -731,6 +771,20 @@ def resize_speakers(state_dict: dict, speaker_count: int, speaker_init=None, nul
 
 
 def validate_model_config(model: dict):
+    for name in ('dual_timestep', 'use_rope', 'rope_interleaved', 'use_variance_scaling',
+                 'use_shallow_diffusion', 'train_aux_decoder', 'train_diffusion', 'val_gt_start'):
+        if name in model and not isinstance(model[name], bool):
+            raise ValueError(f'{name} must be a boolean.')
+    if model.get('diffusion_type', 'reflow') != 'reflow' or model.get('aux_decoder_arch', 'convnext') != 'convnext':
+        raise ValueError('This trainer supports reflow with a ConvNeXt auxiliary decoder.')
+    for section, key, fallback in ((model, 'enc_ffn_kernel_size', 3), (model.get('aux_decoder', {}), 'kernel_size', 7)):
+        value = section.get(key, fallback)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1 or value % 2 == 0:
+            raise ValueError(f'{key} must be a positive odd integer.')
+    if not math.isfinite(model.get('rope_theta', 10000.0)) or model.get('rope_theta', 10000.0) <= 0:
+        raise ValueError('rope_theta must be finite and positive.')
+    if model.get('use_stretch_embed', False):
+        raise ValueError('Phoneme stretch embeddings require phoneme alignment and do not apply to frame-level ContentVec.')
     use_spk_id = model.get('use_spk_id', True)
     if not isinstance(use_spk_id, bool):
         raise ValueError('use_spk_id must be a boolean.')
@@ -780,6 +834,7 @@ def build_flow(config: dict, speaker_count: int) -> RectifiedFlow:
     model = dict(config["flow"]["model"])
     validate_model_config(model)
     model.pop("mean_flow", None)
+    model.pop("use_stretch_embed", None)
     data = config["data"]
     if model.get('flow_conditioning', 'encoder') == 'aux_mel' or model.get('conditioning_version') == 5:
         model['mel_mean'] = float(data['mel_mean'])

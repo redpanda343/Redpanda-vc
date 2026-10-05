@@ -1,15 +1,37 @@
 {
-  "preset": "standard-v4",
+  "preset": "standard-v5",
+  "data": {
+    "sample_rate": 44100,
+    "hop_length": 512,
+    "n_fft": 2048,
+    "win_length": 2048,
+    "n_mels": 128,
+    "mel_fmin": 40.0,
+    "mel_fmax": 16000.0,
+    "mel_mean": -6.0,
+    "mel_std": 6.0,
+    "content_interpolation": "nearest"
+  },
   "flow": {
+    "optimizer": "muon",
     "learning_rate": 0.0006,
+    "min_learning_rate": 0.0,
+    "finetune_learning_rate": 0.0001,
+    "lr_final_ratio": 0.1,
+    "lr_schedule": "step",
     "decay_step": 5000,
     "gamma": 0.8,
+    "step_lr_offset": 0,
+    "betas": [
+      0.9,
+      0.98
+    ],
+    "weight_decay": 0.1,
+    "warmup_steps": 0,
     "max_batch_frames": 50000,
     "max_batch_size": 64,
-    "num_workers": 4,
-    "preview_interval": 1000,
-    "eval_interval": 1000,
-    "holdout_clips": 32,
+    "grad_clip": 1.0,
+    "speaker_dropout": 0.0,
     "augmentation_args": {
       "random_pitch_shifting": {
         "enabled": true,
@@ -18,6 +40,14 @@
           5.0
         ],
         "scale": 0.75
+      },
+      "fixed_pitch_shifting": {
+        "enabled": false,
+        "targets": [
+          -5.0,
+          5.0
+        ],
+        "scale": 0.5
       },
       "random_time_stretching": {
         "enabled": true,
@@ -28,10 +58,79 @@
         "scale": 0.75
       }
     },
+    "preview_interval": 4000,
+    "eval_interval": 4000,
+    "holdout_clips": 32,
+    "num_workers": 4,
+    "dataloader_prefetch_factor": 2,
+    "log_interval": 100,
+    "augmentation_workers": 4,
     "model": {
-      "use_spk_id": false,
+      "dual_timestep": true,
+      "voicing": false,
+      "tension": false,
       "sampling_method": "euler",
-      "sampling_steps": 20
-    }
+      "sampling_steps": 20,
+      "flow_conditioning": "encoder",
+      "flow_loss": "l2",
+      "content_channels": 768,
+      "hidden_channels": 384,
+      "encoder_layers": 4,
+      "speaker_channels": 384,
+      "pitch_fourier": 0,
+      "harmonic_prior": false,
+      "breathiness": false,
+      "key_shift": true,
+      "speed": true,
+      "backbone": "lynxnet2",
+      "backbone_args": {
+        "channels": 1024,
+        "layers": 6,
+        "expansion": 1,
+        "kernel_size": 31,
+        "adaln": false,
+        "time_scale": 1000.0,
+        "glu_type": "atanglu",
+        "dropout_rate": 0.0,
+        "use_conditioner_cache": true
+      },
+      "t_start": 0.4,
+      "conditioning_version": 5,
+      "direct_speaker_conditioning": false,
+      "aux_grad": 0.1,
+      "aux_decoder": {
+        "channels": 512,
+        "layers": 6,
+        "dropout": 0.1,
+        "kernel_size": 7
+      },
+      "energy": false,
+      "use_spk_id": false,
+      "diffusion_type": "reflow",
+      "enc_ffn_kernel_size": 3,
+      "use_rope": true,
+      "rope_interleaved": false,
+      "rope_theta": 10000.0,
+      "use_variance_scaling": true,
+      "use_shallow_diffusion": true,
+      "t_start_infer": 0.4,
+      "train_aux_decoder": true,
+      "train_diffusion": true,
+      "val_gt_start": false,
+      "aux_decoder_arch": "convnext"
+    },
+    "finetune_preview_interval": 500,
+    "aux_mel_weight": 0.2,
+    "adamw_weight_decay": 0.0,
+    "muon_min_fan_in": 0,
+    "max_updates": 100000,
+    "precision": "fp16",
+    "devices": "auto",
+    "checkpoint_interval": 4000,
+    "num_valid_plots": 10,
+    "val_with_vocoder": true,
+    "num_ckpt_keep": 8,
+    "permanent_ckpt_start": 60000,
+    "permanent_ckpt_interval": 10000
   }
 }

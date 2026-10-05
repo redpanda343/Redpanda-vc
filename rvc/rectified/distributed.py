@@ -11,6 +11,8 @@ from torch.utils.data import DistributedSampler
 
 
 def parse_devices(value):
+    if str(value).strip().lower() == 'auto':
+        return [f'cuda:{index}' for index in range(torch.cuda.device_count())] or ['cpu']
     items = [item.strip().lower() for item in str(value).split(',')]
     if items == ['cpu']:
         return items

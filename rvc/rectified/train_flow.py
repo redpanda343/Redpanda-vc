@@ -2,6 +2,8 @@ import argparse
 import json
 import os
 import random
+import re
+from copy import deepcopy
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
@@ -203,7 +205,7 @@ def train_step(model, optimizer, batch, data, settings, device, speaker_dropout,
 
 
 @torch.no_grad()
-def preview(model, vocoder, reference, data, writer, step):
+def preview(model, vocoder, reference, data, writer, step, index=None):
     if reference is None:
         return
     device = next(model.parameters()).device
@@ -213,23 +215,26 @@ def preview(model, vocoder, reference, data, writer, step):
     mask = torch.ones(1, 1, f0.shape[1], device=device)
     speaker = torch.tensor([sid], device=device)
     training = model.training
+    suffix = '' if index is None else f'/{index}'
     try:
         with evaluation_model(model):
             model.eval()
             generated = model.sample(content, f0, energy, speaker, mask,
-                                     breathiness=breathiness.to(device), **variances)
+                                     breathiness=breathiness.to(device),
+                                     source_mel=normalize_mel(mel.to(device), data) if model.val_gt_start else None,
+                                     **variances)
             predicted = model.predict_mel(content, f0, energy, speaker, mask,
                                           breathiness=breathiness.to(device), **variances) if model.aux is not None else None
     finally:
         model.train(training)
     if not torch.isfinite(generated).all():
         raise FloatingPointError('Non-finite flow preview.')
-    writer.add_image('mel/flow', (generated[0] / 6.0 + 0.5).clamp(0, 1).cpu(), step, dataformats='HW')
-    writer.add_image('mel/reference', (normalize_mel(mel[0], data) / 6.0 + 0.5).clamp(0, 1).cpu(), step, dataformats='HW')
+    writer.add_image(f'mel/flow{suffix}', (generated[0] / 6.0 + 0.5).clamp(0, 1).cpu(), step, dataformats='HW')
+    writer.add_image(f'mel/reference{suffix}', (normalize_mel(mel[0], data) / 6.0 + 0.5).clamp(0, 1).cpu(), step, dataformats='HW')
     if predicted is not None:
         if not torch.isfinite(predicted).all():
             raise FloatingPointError('Non-finite direct mel preview.')
-        writer.add_image('mel/predictor', (predicted[0] / 6.0 + 0.5).clamp(0, 1).cpu(), step, dataformats='HW')
+        writer.add_image(f'mel/predictor{suffix}', (predicted[0] / 6.0 + 0.5).clamp(0, 1).cpu(), step, dataformats='HW')
     if vocoder is None:
         return
     generated_audio = vocoder(generated, f0)[0]
@@ -240,7 +245,7 @@ def preview(model, vocoder, reference, data, writer, step):
     for name, value in previews:
         if not torch.isfinite(value).all():
             raise FloatingPointError(f'Non-finite {name} preview.')
-        writer.add_audio(f'audio/{name}', value.clamp(-1, 1).cpu(), step, data['sample_rate'])
+        writer.add_audio(f'audio/{name}{suffix}', value.clamp(-1, 1).cpu(), step, data['sample_rate'])
 
 
 @torch.no_grad()
@@ -300,10 +305,9 @@ def load_training_config(experiment, pretrained_flow=None):
 def train(args):
     if Path(args.model_name).name != args.model_name or args.model_name in {'.', '..'}:
         raise ValueError('Use a model name, not a path.')
-    if any(value is not None and value < 1 for value in (args.batch_size, args.max_batch_frames)) or args.epochs < 1 or args.save_every < 1:
-        raise ValueError('Batch limits, epochs and save interval must be positive.')
     experiment = ROOT / 'logs' / args.model_name
     config = load_training_config(experiment, args.pretrained_flow)
+    configure_arguments(args, config['flow'])
     if config['data']['sample_rate'] != 44100:
         raise ValueError('This recipe requires 44100 Hz audio.')
     if getattr(args, 'use_fused_kernels', False) and config['flow']['model'].get('backbone_args', {}).get('glu_type', 'atanglu') != 'softsign_glu':
@@ -351,11 +355,63 @@ def configure_flow(config, existing_config):
     if isinstance(warmup, bool) or not isinstance(warmup, int) or warmup < 0:
         raise ValueError('finetune_warmup_steps must be a nonnegative integer.')
     configure_augmentation(settings)
+    for name in ('max_updates', 'checkpoint_interval', 'num_ckpt_keep', 'permanent_ckpt_interval'):
+        if name in settings and (isinstance(settings[name], bool) or not isinstance(settings[name], int) or settings[name] < 1):
+            raise ValueError(f'{name} must be a positive integer.')
+    for name in ('preview_interval', 'eval_interval', 'num_valid_plots', 'permanent_ckpt_start'):
+        if name in settings and (isinstance(settings[name], bool) or not isinstance(settings[name], int) or settings[name] < 0):
+            raise ValueError(f'{name} must be a nonnegative integer.')
+    if settings.get('precision', 'fp32') not in {'fp32', 'fp16', 'bf16'}:
+        raise ValueError('precision must be fp32, fp16 or bf16.')
+    if not isinstance(settings.get('val_with_vocoder', True), bool):
+        raise ValueError('val_with_vocoder must be a boolean.')
+
+
+def configure_arguments(args, settings):
+    for name in ('batch_size', 'max_batch_frames', 'epochs', 'save_every', 'max_updates', 'checkpoint_interval'):
+        value = getattr(args, name, None)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+            raise ValueError(f'{name} must be a positive integer.')
+    if getattr(args, 'epochs', None) is None:
+        args.max_updates = getattr(args, 'max_updates', None) or settings.get('max_updates')
+        if args.max_updates is None:
+            args.epochs = 100
+    args.save_every = getattr(args, 'save_every', None) or 10
+    args.precision = getattr(args, 'precision', None) or settings.get('precision', 'fp32')
+    args.device = getattr(args, 'device', None) or settings.get('devices', 'auto')
+
+
+def resume_config(config):
+    result = deepcopy(config)
+    for name in ('max_updates', 'precision', 'devices', 'preview_interval', 'eval_interval',
+                 'checkpoint_interval', 'num_valid_plots', 'val_with_vocoder', 'num_ckpt_keep',
+                 'permanent_ckpt_start', 'permanent_ckpt_interval', 'finetune_preview_interval',
+                 'log_interval', 'num_workers', 'dataloader_prefetch_factor'):
+        result['flow'].pop(name, None)
+    return result
+
+
+def prune_checkpoints(output, model_name, settings):
+    keep = settings.get('num_ckpt_keep')
+    if keep is None:
+        return
+    start = settings.get('permanent_ckpt_start', 0)
+    interval = settings.get('permanent_ckpt_interval', 10000)
+    for suffix in (r'_flow_\d+e_(\d+)s\.pth', r'_trainer_(\d+)s\.pth'):
+        pattern = re.compile(re.escape(model_name) + suffix)
+        checkpoints = []
+        for path in output.iterdir():
+            match = pattern.fullmatch(path.name)
+            if path.is_file() and match:
+                checkpoints.append((int(match[1]), path))
+        checkpoints.sort(key=lambda item: item[0], reverse=True)
+        for step, path in checkpoints[keep:]:
+            permanent = start > 0 and step >= start and (step - start) % interval == 0
+            if not permanent:
+                path.unlink()
 
 
 def train_rank(args, ranks):
-    if any(value is not None and value < 1 for value in (args.batch_size, args.max_batch_frames)) or args.epochs < 1 or args.save_every < 1:
-        raise ValueError('Batch limits, epochs and save interval must be positive.')
     if Path(args.model_name).name != args.model_name or args.model_name in {'.', '..'}:
         raise ValueError('Use a model name, not a path.')
     random.seed(args.seed)
@@ -367,6 +423,9 @@ def train_rank(args, ranks):
     config = load_training_config(experiment, args.pretrained_flow)
     validate_model_config(config['flow']['model'])
     settings, data = config['flow'], config['data']
+    configure_arguments(args, settings)
+    update_limit = getattr(args, 'max_updates', None) if args.epochs is None else None
+    checkpoint_interval = getattr(args, 'checkpoint_interval', None) or settings.get('checkpoint_interval', 4000)
     multispeaker = settings['model'].get('conditioning_version', 1) in (2, 3, 4, 5)
     if data['sample_rate'] != 44100:
         raise ValueError('This recipe requires 44100 Hz audio and a matching NSF-HiFiGAN vocoder.')
@@ -380,7 +439,7 @@ def train_rank(args, ranks):
     vocoder = None
     with ranks.main_work('preview vocoder loading') as main:
         if main:
-            if args.vocoder:
+            if args.vocoder and settings.get('val_with_vocoder', True):
                 vocoder, _ = load_vocoder(args.vocoder, data)
                 vocoder = vocoder.to(device)
             else:
@@ -406,6 +465,9 @@ def train_rank(args, ranks):
     )
     if workers > 0:
         loader_kwargs.update(multiprocessing_context='spawn', prefetch_factor=prefetch)
+    loader_generator = torch.Generator().manual_seed(args.seed + ranks.rank) if update_limit is not None else None
+    if loader_generator is not None:
+        loader_kwargs['generator'] = loader_generator
     loader = DataLoader(dataset, batch_sampler=batcher, **loader_kwargs)
     held_dataset = RectifiedDataset(held, config, max_frames, augment=False, cache_path=cache_path)
     held_loader = None
@@ -422,9 +484,12 @@ def train_rank(args, ranks):
             **held_kwargs,
         )
     reference = None
+    references = []
     with ranks.main_work('preview reference preparation') as main:
         if main:
-            reference = dataset.reference()
+            reference = dataset.reference() if update_limit is None else None
+            if update_limit is not None:
+                references = (held_dataset if held else dataset).references(settings.get('num_valid_plots', 10))
     info_path = experiment / 'model_info.json'
     info = json.loads(info_path.read_text(encoding='utf-8')) if info_path.exists() else {}
     embedder = info.get('embedder_model', 'contentvec')
@@ -448,18 +513,23 @@ def train_rank(args, ranks):
     else:
         raise ValueError('Optimizer must be muon or adamw.')
     first_epoch, step = 1, 0
+    first_batch = 0
     resume_random = None
     if state:
         configure_flow(state['config'], True)
         if multispeaker and (state.get('speaker_ids') != sorted(inventory) or state.get('feature_metadata') != feature_metadata):
             raise ValueError('Speaker IDs or extracted feature metadata changed. Use a new experiment.')
-        if state['config'] != config or state['embedder_model'] != embedder:
+        if resume_config(state['config']) != resume_config(config) or state['embedder_model'] != embedder:
             raise ValueError('Resume config or embedder differs from the saved checkpoint.')
         model.load_state_dict(state['model'], strict=True)
         optimizer.load_state_dict(state['optimizer'])
         if scaler is not None and state.get('scaler'):
             scaler.load_state_dict(state['scaler'])
-        first_epoch, step = state['epoch'] + 1, state['step']
+        first_epoch = state['epoch'] + int(state.get('epoch_complete', True))
+        first_batch = 0 if state.get('epoch_complete', True) else state.get('batch_in_epoch', 0)
+        if first_batch and state.get('batch_limits', [max_items, max_frames]) != [max_items, max_frames]:
+            raise ValueError('Mid-epoch resume requires the saved batch limits.')
+        step = state['step']
         resume_random = state.get('random_states')
         del state
     elif args.pretrained_flow:
@@ -515,7 +585,7 @@ def train_rank(args, ranks):
         restore_random_state(resume_random[ranks.rank], device)
     preview_interval = int(settings.get('finetune_preview_interval', 500) if finetune
                            else settings.get('preview_interval', 1000))
-    total = args.epochs * len(loader)
+    total = update_limit if update_limit is not None else args.epochs * len(loader)
     warmup = settings.get('finetune_warmup_steps', 0) if finetune else settings['warmup_steps']
     log_interval = int(settings.get('log_interval', 100))
     if ranks.main:
@@ -528,11 +598,50 @@ def train_rank(args, ranks):
                 print('Initialized independent speaker embeddings for the new dataset.', flush=True)
         if not model.use_spk_id:
             print('Speaker IDs disabled: no speaker embeddings or target-speaker selection.', flush=True)
+    def save_progress(epoch, batch_index, epoch_complete):
+        random_states = [random_state(device)]
+        if ranks.world > 1:
+            local_state = random_states[0]
+            random_states = [None] * ranks.world
+            torch.distributed.all_gather_object(random_states, local_state, group=ranks.control_group)
+        with ranks.main_work(f'checkpoint/preview at epoch {epoch}') as main:
+            if main:
+                print(f'Rank 0: saving checkpoint at epoch {epoch}.', flush=True)
+                if any(not torch.isfinite(value).all() for value in model.state_dict().values()):
+                    raise FloatingPointError('Non-finite trained model weights.')
+                metadata = dict(config=config, speaker_count=model.speaker_count, embedder_model=embedder,
+                                epoch=epoch, step=step)
+                if multispeaker:
+                    metadata.update(speaker_ids=sorted(inventory), feature_metadata=feature_metadata)
+                checkpoint = dict(model=model.state_dict(), optimizer=optimizer.state_dict(),
+                                  finetune=finetune, batch_in_epoch=batch_index, epoch_complete=epoch_complete,
+                                  batch_limits=[max_items, max_frames],
+                                  scaler=scaler.state_dict() if scaler is not None else None,
+                                  random_states=random_states,
+                                  precision=args.precision, **metadata)
+                atomic_save(checkpoint, resume_path)
+                if settings.get('num_ckpt_keep') is not None:
+                    atomic_save(checkpoint, output / f'{args.model_name}_trainer_{step}s.pth')
+                weights = {key: value.detach().cpu() for key, value in model.state_dict().items()}
+                atomic_save(dict(kind='rectified_flow', model=weights, **metadata),
+                            output / f'{args.model_name}_flow_{epoch}e_{step}s.pth')
+                if update_limit is None:
+                    preview(model, vocoder, reference, data, writer, step)
+                prune_checkpoints(output, args.model_name, settings)
+                writer.flush()
+                print(f'Rank 0: epoch {epoch} checkpoint and preview finished.', flush=True)
+
     with SummaryWriter(str(output)) if ranks.main else nullcontext(None) as writer:
         model.train()
-        for epoch in range(first_epoch, args.epochs + 1):
+        epoch = first_epoch
+        while (step < update_limit if update_limit is not None else epoch <= args.epochs):
             batcher.set_epoch(epoch - 1)
-            for batch in loader:
+            if loader_generator is not None:
+                loader_generator.manual_seed(args.seed + ranks.rank + epoch * ranks.world)
+            epoch_start_step = step
+            for batch_index, batch in enumerate(loader):
+                if epoch == first_epoch and batch_index < first_batch:
+                    continue
                 next_step = step + 1
                 should_log = next_step == 1 or next_step % log_interval == 0
                 current_lr = learning_rate(
@@ -579,42 +688,29 @@ def train_rank(args, ranks):
                         if main:
                             if preview_interval and step % preview_interval == 0:
                                 print(f'Rank 0: starting preview at step {step}.', flush=True)
-                                preview(model, vocoder, reference, data, writer, step)
+                                if update_limit is None:
+                                    preview(model, vocoder, reference, data, writer, step)
+                                else:
+                                    for index, item in enumerate(references):
+                                        preview(model, vocoder, item, data, writer, step, index)
                                 print(f'Rank 0: preview finished at step {step}.', flush=True)
                             if held_loader is not None and settings.get('eval_interval', 0) and step % settings['eval_interval'] == 0:
                                 print(f'Rank 0: starting validation at step {step}.', flush=True)
                                 evaluate(model, held_loader, data, writer, step)
                                 print(f'Rank 0: validation finished at step {step}.', flush=True)
 
-            save_epoch = epoch % args.save_every == 0 or epoch == args.epochs
-            if save_epoch:
-                random_states = [random_state(device)]
-                if ranks.world > 1:
-                    local_state = random_states[0]
-                    random_states = [None] * ranks.world
-                    torch.distributed.all_gather_object(random_states, local_state, group=ranks.control_group)
-                with ranks.main_work(f'checkpoint/preview at epoch {epoch}') as main:
-                    if main:
-                        print(f'Rank 0: saving checkpoint at epoch {epoch}.', flush=True)
-                        if any(not torch.isfinite(value).all() for value in model.state_dict().values()):
-                            raise FloatingPointError('Non-finite trained model weights.')
-                        metadata = dict(config=config, speaker_count=model.speaker_count, embedder_model=embedder,
-                                        epoch=epoch, step=step)
-                        if multispeaker:
-                            metadata.update(speaker_ids=sorted(inventory), feature_metadata=feature_metadata)
-                        atomic_save(dict(model=model.state_dict(), optimizer=optimizer.state_dict(),
-                                         finetune=finetune,
-                                         scaler=scaler.state_dict() if scaler is not None else None,
-                                         random_states=random_states,
-                                         precision=args.precision, **metadata), resume_path)
-                        weights = {key: value.detach().cpu() for key, value in model.state_dict().items()}
-                        atomic_save(dict(kind='rectified_flow', model=weights, **metadata),
-                                    output / f'{args.model_name}_flow_{epoch}e_{step}s.pth')
-                        print(f'Rank 0: checkpoint saved; starting preview at step {step}.', flush=True)
-                        preview(model, vocoder, reference, data, writer, step)
-                        writer.flush()
-                        print(f'Rank 0: epoch {epoch} checkpoint and preview finished.', flush=True)
+                if update_limit is not None:
+                    finished = step >= update_limit
+                    if step % checkpoint_interval == 0 or finished:
+                        save_progress(epoch, batch_index + 1, batch_index + 1 == len(loader))
+                    if finished:
+                        break
+            if update_limit is not None and step == epoch_start_step:
+                raise FloatingPointError('No successful updates in this epoch; training cannot progress.')
+            if update_limit is None and (epoch % args.save_every == 0 or epoch == args.epochs):
+                save_progress(epoch, len(loader), True)
             ranks.barrier()
+            epoch += 1
     if ranks.main:
         print(f'Finished at step {step}. Checkpoints and TensorBoard previews: {output}', flush=True)
 
@@ -625,11 +721,13 @@ def main():
     parser.add_argument('--vocoder', default='')
     parser.add_argument('--batch-size', type=int, help='Maximum clips per batch and GPU (default: max_batch_size in the config).')
     parser.add_argument('--max-batch-frames', type=int, help='Maximum padded frames per batch and GPU (default: max_batch_frames in the config).')
-    parser.add_argument('--epochs', type=int, default=100)
-    parser.add_argument('--save-every', type=int, default=10)
-    parser.add_argument('--device', default='cuda:0' if torch.cuda.is_available() else 'cpu',
+    parser.add_argument('--epochs', type=int, help='Optional epoch limit instead of the configured update limit.')
+    parser.add_argument('--max-updates', type=int)
+    parser.add_argument('--checkpoint-interval', type=int)
+    parser.add_argument('--save-every', type=int)
+    parser.add_argument('--device', default=None,
                         help='cpu, one GPU such as cuda:0, or multiple GPUs such as cuda:0,cuda:1')
-    parser.add_argument('--precision', choices=['fp32', 'fp16', 'bf16'], default='fp32')
+    parser.add_argument('--precision', choices=['fp32', 'fp16', 'bf16'], default=None)
     parser.add_argument('--pretrained-flow')
     parser.add_argument('--learning-rate', type=float)
     parser.add_argument('--seed', type=int, default=1234)

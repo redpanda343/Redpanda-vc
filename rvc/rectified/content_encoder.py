@@ -28,29 +28,37 @@ def interpolate_pitch(f0, mask):
 
 
 class ContentAttention(nn.Module):
-    def __init__(self, channels, heads=2):
+    def __init__(self, channels, heads=2, use_rope=True, rope_interleaved=False, rope_theta=10000.0):
         super().__init__()
-        if channels % (heads * 2):
+        if channels % heads or use_rope and channels % (heads * 2):
             raise ValueError('Content encoder width must be divisible by twice the number of heads.')
+        self.use_rope = bool(use_rope)
+        self.rope_interleaved = bool(rope_interleaved)
         self.heads = heads
         self.head_dim = channels // heads
         self.in_proj = nn.Linear(channels, channels * 3, bias=False)
         self.out_proj = nn.Linear(channels, channels, bias=False)
         nn.init.xavier_uniform_(self.in_proj.weight)
         nn.init.xavier_uniform_(self.out_proj.weight)
-        self.register_buffer('inv_freq', 1.0 / (10000 ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim)), persistent=False)
+        self.register_buffer('inv_freq', 1.0 / (rope_theta ** (torch.arange(0, self.head_dim, 2).float() / self.head_dim)), persistent=False)
 
     def rotate(self, x):
         angles = torch.arange(x.shape[-2], device=x.device, dtype=torch.float32)[:, None] * self.inv_freq.float()[None]
-        angles = torch.cat((angles, angles), dim=-1)
-        first, second = x.chunk(2, dim=-1)
-        return x * angles.cos().to(x.dtype) + torch.cat((-second, first), dim=-1) * angles.sin().to(x.dtype)
+        if self.rope_interleaved:
+            angles = angles.repeat_interleave(2, dim=-1)
+            rotated = torch.stack((-x[..., 1::2], x[..., ::2]), dim=-1).flatten(-2)
+        else:
+            angles = torch.cat((angles, angles), dim=-1)
+            first, second = x.chunk(2, dim=-1)
+            rotated = torch.cat((-second, first), dim=-1)
+        return x * angles.cos().to(x.dtype) + rotated * angles.sin().to(x.dtype)
 
     def forward(self, x, padding):
         batch, frames, channels = x.shape
         q, k, v = [value.view(batch, frames, self.heads, self.head_dim).transpose(1, 2)
                    for value in self.in_proj(x).split(channels, dim=-1)]
-        q, k = self.rotate(q), self.rotate(k)
+        if self.use_rope:
+            q, k = self.rotate(q), self.rotate(k)
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
         scores = scores.masked_fill(padding[:, None, None], -torch.inf)
         weights = F.softmax(scores, dim=-1)
@@ -59,13 +67,15 @@ class ContentAttention(nn.Module):
 
 
 class ContentEncoderLayer(nn.Module):
-    def __init__(self, channels, heads=2, dropout=0.1):
+    def __init__(self, channels, heads=2, dropout=0.1, kernel_size=3, use_rope=True,
+                 rope_interleaved=False, rope_theta=10000.0):
         super().__init__()
         self.dropout = dropout
         self.layer_norm1 = nn.LayerNorm(channels)
-        self.self_attn = ContentAttention(channels, heads)
+        self.self_attn = ContentAttention(channels, heads, use_rope, rope_interleaved, rope_theta)
         self.layer_norm2 = nn.LayerNorm(channels)
-        self.ffn_1 = nn.Conv1d(channels, channels * 4, 3, padding=1)
+        self.ffn_scale = kernel_size ** -0.5
+        self.ffn_1 = nn.Conv1d(channels, channels * 4, kernel_size, padding=kernel_size // 2)
         self.ffn_2 = nn.Linear(channels * 4, channels)
         nn.init.xavier_uniform_(self.ffn_2.weight)
         nn.init.zeros_(self.ffn_2.bias)
@@ -74,7 +84,7 @@ class ContentEncoderLayer(nn.Module):
         mask = (~padding).unsqueeze(-1).to(x.dtype)
         y = self.self_attn(self.layer_norm1(x), padding)
         x = (x + F.dropout(y, self.dropout, training=self.training)) * mask
-        y = self.ffn_1(self.layer_norm2(x).transpose(1, 2)).transpose(1, 2) * (3 ** -0.5)
+        y = self.ffn_1(self.layer_norm2(x).transpose(1, 2)).transpose(1, 2) * self.ffn_scale
         y = F.dropout(F.gelu(y), self.dropout, training=self.training)
         y = self.ffn_2(y)
         return (x + F.dropout(y, self.dropout, training=self.training)) * mask
@@ -82,7 +92,9 @@ class ContentEncoderLayer(nn.Module):
 
 class ContentConditionEncoder(nn.Module):
     def __init__(self, content_channels, hidden_channels, speaker_count, layers,
-                 breathiness=False, key_shift=False, speed=False, energy=False, use_spk_id=True):
+                 breathiness=False, key_shift=False, speed=False, energy=False, use_spk_id=True,
+                 enc_ffn_kernel_size=3, use_rope=True, rope_interleaved=False, rope_theta=10000.0,
+                 use_variance_scaling=True):
         super().__init__()
         self.conditioning_version = 5
         self.speaker_count = int(speaker_count) if use_spk_id else 1
@@ -90,7 +102,11 @@ class ContentConditionEncoder(nn.Module):
         self.content = nn.Linear(content_channels, hidden_channels)
         nn.init.xavier_uniform_(self.content.weight)
         nn.init.zeros_(self.content.bias)
-        self.blocks = nn.ModuleList([ContentEncoderLayer(hidden_channels) for _ in range(layers)])
+        self.blocks = nn.ModuleList([
+            ContentEncoderLayer(hidden_channels, kernel_size=enc_ffn_kernel_size, use_rope=use_rope,
+                                rope_interleaved=rope_interleaved, rope_theta=rope_theta) for _ in range(layers)
+        ])
+        self.use_variance_scaling = bool(use_variance_scaling)
         self.norm = nn.LayerNorm(hidden_channels)
         self.embed_scale = math.sqrt(hidden_channels)
         self.pitch = adamw_linear(1, hidden_channels)
@@ -122,10 +138,10 @@ class ContentConditionEncoder(nn.Module):
                 if values is None:
                     raise ValueError('Missing required variance conditioning.')
                 db = (values - 1.0) * 35.0 if layer is self.energy else values
-                x = x + layer(db.unsqueeze(-1) * scale)
+                x = x + layer(db.unsqueeze(-1) * (scale if self.use_variance_scaling else 1.0))
         if self.key_shift is not None:
             values = f0.new_zeros(f0.shape[0]) if key_shift is None else key_shift
-            x = x + self.key_shift(values.reshape(-1, 1, 1) / 12.0)
+            x = x + self.key_shift(values.reshape(-1, 1, 1) / (12.0 if self.use_variance_scaling else 1.0))
         if self.speed is not None:
             values = f0.new_ones(f0.shape[0]) if speed is None else speed
             x = x + self.speed(values.reshape(-1, 1, 1))

@@ -125,14 +125,6 @@ def device_id(device):
     return '-' if devices == ['cpu'] else '-'.join(item[5:] for item in devices)
 
 
-def toggle_pretrained(enabled):
-    from rvc.rectified.config import resolve_config
-
-    filename = '44100_finetune.json' if enabled else '44100_standard.json'
-    config = resolve_config(json.loads((ROOT / 'rvc' / 'configs' / 'rectified' / filename).read_text(encoding='utf-8')))
-    return gr.update(value=config['flow']['max_batch_size'])
-
-
 def resolve_vocoder(mode, path):
     if mode == 'Mel previews only':
         return ''
@@ -158,15 +150,12 @@ def resolve_pretrained(directory, enabled):
     return str(path)
 
 
-def start(name, vocoder, batch, max_frames, epochs, save_every, device, use_fused_kernels=False,
-          use_pretrained=False, vocoder_mode='Default NSF-HiFiGAN'):
+def start(name, vocoder, batch, max_frames, max_updates, checkpoint_interval, device, use_fused_kernels=False,
+          use_pretrained=False, vocoder_mode='Default NSF-HiFiGAN', precision='Config default'):
     directory = experiment_path(name)
     device_id(device)
     if not (directory / 'filelist.txt').is_file():
         raise gr.Error('Extract features for this experiment first.')
-    precision = get_precision() or 'fp32'
-    if precision not in {'fp32', 'fp16', 'bf16'}:
-        raise gr.Error(f'Unsupported training precision: {precision}')
     config_path = directory / 'rectified_config.json'
     config = json.loads(config_path.read_text(encoding='utf-8')) if config_path.is_file() else None
     if config:
@@ -179,6 +168,13 @@ def start(name, vocoder, batch, max_frames, epochs, save_every, device, use_fuse
         except ValueError as error:
             raise gr.Error(str(error)) from error
     pretrained = resolve_pretrained(directory, use_pretrained)
+    from rvc.rectified.train_flow import load_training_config
+
+    selected = load_training_config(directory, pretrained or None)
+    if precision == 'Config default':
+        precision = selected['flow'].get('precision', get_precision() or 'fp32')
+    if precision not in {'fp32', 'fp16', 'bf16'}:
+        raise gr.Error(f'Unsupported training precision: {precision}')
     if use_fused_kernels:
         from rvc.rectified.train_flow import load_training_config
 
@@ -188,13 +184,17 @@ def start(name, vocoder, batch, max_frames, epochs, save_every, device, use_fuse
                 raise ValueError('Fused kernels require SoftSignGLU. Existing ATanGLU experiments must keep this option disabled.')
         except ValueError as error:
             raise gr.Error(str(error)) from error
-    vocoder = resolve_vocoder(vocoder_mode, vocoder)
+    vocoder = resolve_vocoder(vocoder_mode, vocoder) if selected['flow'].get('val_with_vocoder', True) else ''
     arguments = ['--model-name', str(name).strip(), '--vocoder', vocoder,
-                 '--batch-size', positive_integer(batch, 'Max clips per batch'),
-                 '--max-batch-frames', positive_integer(max_frames, 'Max frames per batch'),
-                 '--epochs', positive_integer(epochs, 'Total epochs'),
-                 '--save-every', positive_integer(save_every, 'Save interval'),
-                 '--device', str(device).strip().lower(), '--precision', precision]
+                 '--precision', precision]
+    for flag, value, label in (('--batch-size', batch, 'Max clips per batch'),
+                               ('--max-batch-frames', max_frames, 'Max frames per batch'),
+                               ('--max-updates', max_updates, 'Max training updates'),
+                               ('--checkpoint-interval', checkpoint_interval, 'Checkpoint interval')):
+        if value is not None:
+            arguments.extend([flag, positive_integer(value, label)])
+    if str(device).strip().lower() != 'auto':
+        arguments.extend(['--device', str(device).strip().lower()])
     if use_fused_kernels:
         arguments.append('--use-fused-kernels')
     if pretrained:
@@ -223,7 +223,7 @@ def stop():
                 _process.wait(timeout=5)
             except psutil.NoSuchProcess:
                 pass
-            _description = 'Stopped. Resume starts from the last saved epoch; unsaved steps are lost.'
+            _description = 'Stopped. Resume starts from the last saved checkpoint; unsaved steps are lost.'
         return _status()
 
 
@@ -231,8 +231,8 @@ def rectified_train_tab():
     gr.Markdown('### Rectified Flow')
     with gr.Row():
         name = gr.Textbox(label='Model name', value='my-flow')
-        device = gr.Textbox(label='Device', value=','.join(f'cuda:{index}' for index in range(torch.cuda.device_count())) or 'cpu',
-                            info='Detected GPUs are selected automatically. One GPU: cuda:0. Multiple GPUs: cuda:0,cuda:1. CPU: cpu.')
+        device = gr.Textbox(label='Device', value='auto',
+                            info='Auto uses the training config. Extraction selects detected GPUs. Examples: cuda:0, cuda:0,cuda:1, cpu.')
     with gr.Accordion('1. Prepare dataset', open=True):
         dataset = gr.Textbox(label='Dataset folder')
         workers = gr.Number(label='CPU workers', value=4, minimum=1, precision=0)
@@ -249,13 +249,17 @@ def rectified_train_tab():
         vocoder = gr.Textbox(label='Custom OpenVPI NSF-HiFiGAN checkpoint path', visible=False,
                             info='Use a compatible .ckpt or converted .pth export: 44.1 kHz, 128 mel bins, hop 512. Keep config.json beside raw checkpoints when provided.')
         use_pretrained = gr.Checkbox(label='Pretrained', value=False)
+        precision = gr.Dropdown(label='Training precision', choices=['Config default', 'fp32', 'fp16', 'bf16'],
+                                value='Config default', info='Config default uses flow.precision, FP16 for new experiments.')
         with gr.Row():
-            batch = gr.Number(label='Max clips per batch (per GPU)', value=64, minimum=1, precision=0,
-                              info='Clips are trained whole, never cropped. A batch is closed at this many clips or at the frame limit.')
-            max_frames = gr.Number(label='Max frames per batch (per GPU)', value=50000, minimum=1, precision=0,
-                                   info='Padded frames (clips x longest clip, 1 frame = 11.6 ms). Lower it if you run out of GPU memory.')
-            epochs = gr.Number(label='Total epochs', value=100, minimum=1, precision=0)
-            save_every = gr.Number(label='Save every N epochs', value=10, minimum=1, precision=0)
+            batch = gr.Number(label='Max clips per batch (per GPU)', value=None, minimum=1, precision=0,
+                              info='Blank uses config, default 64. Whole clips are trained without cropping.')
+            max_frames = gr.Number(label='Max frames per batch (per GPU)', value=None, minimum=1, precision=0,
+                                   info='Blank uses config, default 50000 padded frames. Lower to reduce GPU memory use.')
+            max_updates = gr.Number(label='Max training updates', value=None, minimum=1, precision=0,
+                               info='Blank uses config, default 100000 successful updates.')
+            checkpoint_interval = gr.Number(label='Checkpoint interval (updates)', value=None, minimum=1, precision=0,
+                                   info='Blank uses config, default 4000 updates.')
         use_fused_kernels = gr.Checkbox(label='Fused Linear + SoftSignGLU kernels', value=False,
                                        info='Optional acceleration for new SoftSignGLU experiments. Requires Triton and CUDA FP16 or BF16. Existing ATanGLU models must leave this disabled.')
         with gr.Row():
@@ -266,10 +270,9 @@ def rectified_train_tab():
     outputs = [state, log, preprocess_button, extract_button, train_button, stop_button]
     preprocess_button.click(preprocess, [name, dataset, workers, slicing], outputs, queue=False)
     extract_button.click(extract, [name, method, workers, device, embedder], outputs, queue=False)
-    use_pretrained.change(toggle_pretrained, [use_pretrained], [batch], queue=False)
     vocoder_mode.change(lambda mode: gr.update(visible=mode == 'Custom NSF-HiFiGAN'),
                         [vocoder_mode], [vocoder], queue=False)
-    train_button.click(start, [name, vocoder, batch, max_frames, epochs, save_every, device, use_fused_kernels,
-                               use_pretrained, vocoder_mode], outputs, queue=False)
+    train_button.click(start, [name, vocoder, batch, max_frames, max_updates, checkpoint_interval, device, use_fused_kernels,
+                               use_pretrained, vocoder_mode, precision], outputs, queue=False)
     stop_button.click(stop, [], outputs, queue=False)
     gr.Timer(2).tick(status, [], outputs, queue=False)

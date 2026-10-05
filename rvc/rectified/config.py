@@ -98,16 +98,29 @@ ATAN_PRESET = deepcopy(STANDARD_PRESET)
 STANDARD_PRESET['flow']['model']['backbone_args']['glu_type'] = 'softsign_glu'
 SOFTSIGN_PRESET = deepcopy(STANDARD_PRESET)
 STANDARD_PRESET['flow']['model']['use_spk_id'] = False
-PRESET_NAME = 'standard-v4'
+NO_SPEAKER_PRESET = deepcopy(STANDARD_PRESET)
+STANDARD_PRESET['flow'].update({
+    'max_updates': 100000, 'precision': 'fp16', 'devices': 'auto',
+    'preview_interval': 4000, 'eval_interval': 4000, 'checkpoint_interval': 4000,
+    'num_valid_plots': 10, 'val_with_vocoder': True, 'num_ckpt_keep': 8,
+    'permanent_ckpt_start': 60000, 'permanent_ckpt_interval': 10000,
+})
+STANDARD_PRESET['flow']['model'].update({
+    'diffusion_type': 'reflow', 'enc_ffn_kernel_size': 3, 'use_rope': True,
+    'rope_interleaved': False, 'rope_theta': 10000.0, 'use_variance_scaling': True,
+    'use_shallow_diffusion': True, 't_start_infer': 0.4,
+    'train_aux_decoder': True, 'train_diffusion': True, 'val_gt_start': False,
+    'aux_decoder_arch': 'convnext',
+})
+STANDARD_PRESET['flow']['model']['backbone_args'].update({
+    'glu_type': 'atanglu', 'dropout_rate': 0.0, 'use_conditioner_cache': True,
+})
+STANDARD_PRESET['flow']['model']['aux_decoder']['kernel_size'] = 7
+PRESET_NAME = 'standard-v5'
 PRESETS = {
     'standard-v1': LEGACY_PRESET, 'standard-v2': ATAN_PRESET,
-    'standard-v3': SOFTSIGN_PRESET, PRESET_NAME: STANDARD_PRESET,
+    'standard-v3': SOFTSIGN_PRESET, 'standard-v4': NO_SPEAKER_PRESET, PRESET_NAME: STANDARD_PRESET,
 }
-EDITABLE_FLOW_KEYS = (
-    'learning_rate', 'decay_step', 'gamma', 'max_batch_frames', 'max_batch_size',
-    'num_workers', 'dataloader_prefetch_factor', 'log_interval',
-    'preview_interval', 'eval_interval', 'holdout_clips',
-)
 
 
 def _merge(base, overrides):
@@ -150,17 +163,8 @@ def compact_config(config):
     if resolve_config(compact) != resolved:
         return resolved
     flow = resolved['flow']
-    visible = {key: deepcopy(flow[key]) for key in EDITABLE_FLOW_KEYS}
-    if 'finetune_warmup_steps' in flow:
-        visible.update({key: deepcopy(flow[key]) for key in (
-            'finetune_learning_rate', 'min_learning_rate', 'finetune_warmup_steps',
-            'finetune_preview_interval',
-        ) if key in flow})
-    visible['augmentation_args'] = {
-        key: deepcopy(flow['augmentation_args'][key])
-        for key in ('random_pitch_shifting', 'random_time_stretching')
-    }
-    visible['model'] = {key: flow['model'][key] for key in ('sampling_method', 'sampling_steps')}
-    visible['model']['use_spk_id'] = flow['model'].get('use_spk_id', True)
+    visible = {key: deepcopy(value) for key, value in flow.items() if key != 'model'}
+    visible['model'] = deepcopy(flow['model'])
+    compact['data'] = deepcopy(resolved['data'])
     compact['flow'] = _merge(visible, compact.get('flow', {}))
     return compact
