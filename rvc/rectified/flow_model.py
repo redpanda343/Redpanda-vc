@@ -7,6 +7,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from rvc.rectified.config import resolve_config
+from rvc.rectified.content_encoder import ContentConditionEncoder
 
 LOG_F0_CENTER = math.log(200.0)
 LOG_F0_SCALE = 0.7
@@ -77,10 +78,11 @@ class MixedPrecisionLayerNorm(nn.LayerNorm):
 
 class ConvNeXtBlock(nn.Module):
     def __init__(self, channels: int, layer_scale: float = 0.0, dropout: float = 0.0,
-                 speaker_channels: int = 0):
+                 speaker_channels: int = 0, reference=False):
         super().__init__()
         self.depthwise = nn.Conv1d(channels, channels, 7, padding=3, groups=channels)
-        self.norm = MixedPrecisionLayerNorm(channels)
+        self.norm = MixedPrecisionLayerNorm(channels, eps=1e-6 if reference else 1e-5)
+        self.reference = reference
         self.up = nn.Linear(channels, channels * 4)
         self.down = nn.Linear(channels * 4, channels)
         self.gamma = nn.Parameter(torch.full((channels,), layer_scale)) if layer_scale > 0 else None
@@ -93,7 +95,7 @@ class ConvNeXtBlock(nn.Module):
             nn.init.zeros_(self.speaker_modulation.bias)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor, voice=None) -> torch.Tensor:
-        y = self.depthwise(x * mask).transpose(1, 2)
+        y = self.depthwise(x if self.reference else x * mask).transpose(1, 2)
         y = self.norm(y)
         if self.speaker_modulation is not None:
             if voice is None:
@@ -103,7 +105,8 @@ class ConvNeXtBlock(nn.Module):
         y = self.down(F.gelu(self.up(y)))
         if self.gamma is not None:
             y = y * self.gamma
-        return (x + self.dropout(y.transpose(1, 2))) * mask
+        result = x + self.dropout(y.transpose(1, 2))
+        return result if self.reference else result * mask
 
 
 class ConditionEncoder(nn.Module):
@@ -204,11 +207,13 @@ class ConditionEncoder(nn.Module):
         return x
 
 
-def timestep_embedding(t: torch.Tensor, channels: int, scale: float = 1000.0) -> torch.Tensor:
+def timestep_embedding(t: torch.Tensor, channels: int, scale: float = 1000.0,
+                       reference: bool = False) -> torch.Tensor:
     half = channels // 2
-    frequencies = torch.exp(
-        -math.log(10000.0) * torch.arange(half, device=t.device, dtype=torch.float32) / half
-    )
+    if reference:
+        frequencies = torch.exp(torch.arange(half, device=t.device) * (-math.log(10000.0) / (half - 1)))
+    else:
+        frequencies = torch.exp(-math.log(10000.0) * torch.arange(half, device=t.device, dtype=torch.float32) / half)
     angles = (t.float() * scale)[:, None] * frequencies[None]
     return torch.cat((angles.sin(), angles.cos()), dim=-1)
 
@@ -248,7 +253,8 @@ class LYNXNet2Block(nn.Module):
             nn.init.zeros_(self.modulation.weight)
             nn.init.zeros_(self.modulation.bias)
 
-    def forward(self, x, embedding=None, fused=True):
+    def forward(self, x, embedding=None, fused=None):
+        fused = self.training if fused is None else fused
         y = self.norm(x)
         gate = None
         if self.modulation is not None:
@@ -263,10 +269,11 @@ class LYNXNet2Block(nn.Module):
 
 class LYNXNet2Backbone(nn.Module):
     def __init__(self, n_mels, cond_channels, channels=1024, layers=6, expansion=1, kernel_size=31,
-                 adaln=False, time_scale=1000.0, speaker_channels=None):
+                 adaln=False, time_scale=1000.0, speaker_channels=None, reference=False):
         super().__init__()
         self.channels = int(channels)
         self.time_scale = float(time_scale)
+        self.reference = bool(reference)
         self.input = nn.Linear(n_mels, channels)
         self.input_cond = nn.Conv1d(cond_channels, channels, 1)
         self.time_mlp = nn.Sequential(
@@ -290,9 +297,11 @@ class LYNXNet2Backbone(nn.Module):
         return projected, speaker
 
     def forward(self, x, t, cond, mask, voice=None, prepared=None):
-        time = self.time_mlp(timestep_embedding(t.reshape(-1), self.channels, self.time_scale))
+        time = self.time_mlp(timestep_embedding(t.reshape(-1), self.channels, self.time_scale, self.reference))
         time = time.view(t.shape[0], -1, self.channels)
-        h = self.input(x.transpose(1, 2)).float()
+        h = self.input(x.transpose(1, 2))
+        if not self.reference:
+            h = h.float()
         projected, speaker = self.prepare_conditioning(cond, voice) if prepared is None else prepared
         h = h + projected + time
         embedding = None
@@ -301,26 +310,31 @@ class LYNXNet2Backbone(nn.Module):
         for layer in self.layers:
             h = layer(h, embedding)
         h = self.norm(h)
-        return self.output(h).float().transpose(1, 2)
+        result = self.output(h).transpose(1, 2)
+        return result if self.reference else result.float()
 
 
 class AuxDecoder(nn.Module):
     def __init__(self, cond_channels, n_mels, channels=512, layers=6, dropout=0.1,
-                 speaker_channels=0):
+                 speaker_channels=0, reference=False):
         super().__init__()
         self.input = nn.Conv1d(cond_channels, channels, 7, padding=3)
+        self.reference = bool(reference)
         self.blocks = nn.ModuleList(
             [ConvNeXtBlock(channels, layer_scale=1e-6, dropout=dropout,
-                           speaker_channels=speaker_channels) for _ in range(layers)]
+                           speaker_channels=speaker_channels, reference=reference) for _ in range(layers)]
         )
         self.output = nn.Conv1d(channels, n_mels, 7, padding=3)
         self.output.use_adamw = True
 
     def forward(self, cond, mask, voice=None):
-        x = self.input(cond) * mask
+        x = self.input(cond)
+        if not self.reference:
+            x = x * mask
         for block in self.blocks:
             x = block(x, mask, voice)
-        return self.output(x) * mask
+        result = self.output(x)
+        return result if self.reference else result * mask
 
 
 class RectifiedFlow(nn.Module):
@@ -355,6 +369,7 @@ class RectifiedFlow(nn.Module):
         mel_mean: float = 0.0,
         mel_std: float = 1.0,
         direct_speaker_conditioning: bool = False,
+        energy: bool = True,
     ):
         super().__init__()
         if backbone != "lynxnet2":
@@ -363,6 +378,13 @@ class RectifiedFlow(nn.Module):
             raise ValueError("Invalid flow conditioning or loss.")
         if not math.isfinite(mel_mean) or not math.isfinite(mel_std) or mel_std <= 0:
             raise ValueError("Mel normalization must be finite with a positive scale.")
+        if conditioning_version == 5:
+            validate_model_config(dict(
+                conditioning_version=conditioning_version, flow_conditioning=flow_conditioning,
+                direct_speaker_conditioning=direct_speaker_conditioning, backbone_args=backbone_args or {},
+                harmonic_prior=bool(harmonic_prior), pitch_fourier=pitch_fourier, flow_loss=flow_loss,
+                speaker_channels=speaker_channels, hidden_channels=hidden_channels,
+            ))
         adaln = bool((backbone_args or {}).get("adaln", False))
         if direct_speaker_conditioning and not adaln:
             raise ValueError('Direct speaker conditioning requires standard flow with speaker AdaLN.')
@@ -384,8 +406,12 @@ class RectifiedFlow(nn.Module):
         self.mel_mean = float(mel_mean)
         self.mel_std = float(mel_std)
         self.n_mels = int(n_mels)
+        self.reference = conditioning_version == 5
         self.hidden_channels = int(hidden_channels)
-        self.encoder = ConditionEncoder(
+        self.encoder = ContentConditionEncoder(
+            content_channels, hidden_channels, speaker_count, encoder_layers,
+            breathiness=breathiness, key_shift=key_shift, speed=speed, energy=energy,
+        ) if self.reference else ConditionEncoder(
             content_channels,
             hidden_channels,
             speaker_count,
@@ -406,18 +432,20 @@ class RectifiedFlow(nn.Module):
         self.backbone = LYNXNet2Backbone(
             n_mels, cond_channels,
             speaker_channels=speaker_channels if self.direct_speaker_conditioning else None,
+            reference=self.reference,
             **(backbone_args or {}),
         )
 
 
-        conditioning = [self.backbone.time_mlp, self.encoder.speaker_proj, self.backbone.voice]
+        conditioning = [self.backbone.time_mlp, getattr(self.encoder, 'speaker_proj', None), self.backbone.voice]
         conditioning += [layer.modulation for layer in self.backbone.layers]
-        for module in filter(None, conditioning):
+        for module in filter(None, conditioning if not self.reference else []):
             for child in module.modules():
                 child.use_adamw = True
         self.aux = AuxDecoder(
             hidden_channels, n_mels,
             speaker_channels=speaker_channels if self.direct_speaker_conditioning else 0,
+            reference=self.reference,
             **aux_decoder,
         ) if aux_decoder else None
         self.t_start = float(t_start) if self.aux is not None else 0.0
@@ -435,6 +463,8 @@ class RectifiedFlow(nn.Module):
     def _drop_speakers(self, speaker, speaker_dropout):
         if speaker_dropout <= 0:
             return speaker
+        if not self.encoder.has_null_speaker:
+            raise ValueError('This conditioning version has no null speaker for dropout.')
         dropped = torch.rand(speaker.shape, device=speaker.device) < speaker_dropout
         return torch.where(dropped, torch.full_like(speaker, self.speaker_count), speaker)
 
@@ -469,6 +499,8 @@ class RectifiedFlow(nn.Module):
     def _mel_loss(self, prediction, target, mask, denominator=None):
         if prediction is None:
             return None
+        if self.reference:
+            return F.l1_loss(prediction, target)
         error = prediction.float() - target.float()
         error = (error * self.mel_std).square() if self.flow_conditioning == "aux_mel" else error.abs()
         denominator = (mask.sum() * self.n_mels).clamp_min(1.0) if denominator is None else denominator
@@ -479,7 +511,7 @@ class RectifiedFlow(nn.Module):
         if self.aux is None:
             raise ValueError("This model has no direct mel predictor.")
         cond = self.encoder(content, f0, energy, speaker, mask, breathiness, key_shift, speed, voicing, tension)
-        return self.aux(cond, mask, self.encoder.voice(speaker))
+        return self.aux(cond, mask, self.encoder.voice(speaker)) * mask
 
     def _uniform_times(self, batch, device):
         t = torch.rand(batch, device=device)
@@ -499,7 +531,8 @@ class RectifiedFlow(nn.Module):
         if self.dual_timestep:
             t2 = self._uniform_times(mel.shape[0], mel.device)
             alternate = torch.rand(mel.shape[0], mel.shape[-1], device=mel.device) < 0.25
-            t = torch.where(alternate & mask[:, 0].bool(), t2[:, None], t[:, None])
+            selection = alternate if self.reference else alternate & mask[:, 0].bool()
+            t = torch.where(selection, t2[:, None], t[:, None])
 
         backbone = self.backbone if backbone is None else backbone
         flow, aux = self._losses(mel, cond, voice, mask, t, torch.randn_like(mel), backbone)
@@ -615,9 +648,13 @@ class RectifiedFlow(nn.Module):
         if self.t_start > 0:
             t0 = self.t_start if start is None else min(max(self.t_start, float(start)), 0.99)
             initial = self.aux(cond[:batch], mask, voice[:batch]) if initial_mel is None else initial_mel[:batch]
-            x = ((1.0 - t0) * noise + t0 * initial) * mask
+            if self.reference:
+                initial = initial * mask + (1.0 - mask) * (-self.mel_mean / self.mel_std)
+            x = (1.0 - t0) * noise + t0 * initial
         else:
-            x = noise * mask
+            x = noise
+        if not self.reference:
+            x = x * mask
         times = time_grid(schedule, max(1, int(steps)), t0, x.device)
         dt = (1.0 - t0) / (times.shape[0] - 1)
         for index in range(times.shape[0] - 1):
@@ -682,7 +719,7 @@ def validate_model_config(model: dict):
             not model.get('aux_decoder')
             or model.get('aux_grad', 0.1) != 1.0 or adaln != direct):
         raise ValueError('Mel-conditioned flow requires a standard model with a fully trained mel predictor and matching speaker conditioning.')
-    if (version not in (2, 3, 4)
+    if (version not in (2, 3, 4, 5)
             or any(model.get(name, False) for name in ('voicing', 'tension'))):
         raise ValueError('Unsupported rectified-flow recipe or checkpoint. Use a supported standard-flow recipe.')
     if model.get('content_bottleneck', 0) or model.get('content_bottleneck_noise', 0):
@@ -695,6 +732,11 @@ def validate_model_config(model: dict):
             not direct or source != 'encoder' or not model.get('aux_decoder')
             or not 0.0 < model.get('t_start', 0.0) < 1.0 or model.get('flow_loss', 'l2') != 'l2'):
         raise ValueError('Conditioning v4 requires speaker-conditioned shallow flow, encoder features, a mel predictor and L2 loss.')
+    if version == 5 and (
+            direct or adaln or source != 'encoder' or model.get('harmonic_prior', False)
+            or model.get('pitch_fourier', 0) or model.get('flow_loss', 'l2') != 'l2'
+            or model.get('speaker_channels', 384) != model.get('hidden_channels', 384)):
+        raise ValueError('Conditioning v5 requires DiffSinger flow with hidden-width additive speakers and scalar pitch.')
 
 
 
@@ -704,7 +746,7 @@ def build_flow(config: dict, speaker_count: int) -> RectifiedFlow:
     validate_model_config(model)
     model.pop("mean_flow", None)
     data = config["data"]
-    if model.get('flow_conditioning', 'encoder') == 'aux_mel':
+    if model.get('flow_conditioning', 'encoder') == 'aux_mel' or model.get('conditioning_version') == 5:
         model['mel_mean'] = float(data['mel_mean'])
         model['mel_std'] = float(data['mel_std'])
     if model.pop("harmonic_prior", False):

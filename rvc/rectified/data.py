@@ -213,7 +213,7 @@ class RectifiedDataset(Dataset):
         self.sample_rate = int(self.data["sample_rate"])
         self.mel = LogMel.from_config(self.data)
         self.content_channels = int(config["flow"]["model"]["content_channels"])
-        self.strict_features = config['flow']['model'].get('conditioning_version', 1) in (2, 3, 4)
+        self.strict_features = config['flow']['model'].get('conditioning_version', 1) in (2, 3, 4, 5)
         self.augment = augment
         self.use_variances = any(config["flow"]["model"].get(name, False) for name in ("voicing", "tension"))
         self.use_harmonics = bool(config["flow"]["model"].get("harmonic_prior", False))

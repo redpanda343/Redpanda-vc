@@ -1,5 +1,5 @@
 {
-  "preset": "standard-v1",
+  "preset": "standard-v2",
   "flow": {
     "finetune_learning_rate": 0.00005,
     "min_learning_rate": 1e-05,
@@ -10,7 +10,6 @@
     "step_lr_offset": 0,
     "max_batch_frames": 50000,
     "max_batch_size": 32,
-    "finetune_ema_decay": 0.999,
     "num_workers": 4,
     "finetune_preview_interval": 500,
     "eval_interval": 500,

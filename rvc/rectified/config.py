@@ -30,8 +30,6 @@ STANDARD_PRESET = {
         'max_batch_frames': 50000,
         'max_batch_size': 64,
         'grad_clip': 1.0,
-        'ema_decay': 0.9999,
-        'finetune_ema_decay': 0.999,
         'speaker_dropout': 0.0,
         'augmentation_args': {
             'random_pitch_shifting': {'enabled': True, 'range': [-5.0, 5.0], 'scale': 0.75},
@@ -44,7 +42,6 @@ STANDARD_PRESET = {
         'num_workers': 4,
         'dataloader_prefetch_factor': 2,
         'log_interval': 100,
-        'ema_update_interval': 10,
         'augmentation_workers': 4,
         'model': {
             'dual_timestep': True,
@@ -79,10 +76,29 @@ STANDARD_PRESET = {
     },
 }
 
-PRESET_NAME = 'standard-v1'
+LEGACY_PRESET = deepcopy(STANDARD_PRESET)
+STANDARD_PRESET['flow'].update({
+    'betas': [0.9, 0.98],
+    'adamw_weight_decay': 0.0,
+    'muon_min_fan_in': 0,
+})
+STANDARD_PRESET['flow']['model'].update({
+    'conditioning_version': 5,
+    'speaker_channels': 384,
+    'pitch_fourier': 0,
+    'harmonic_prior': False,
+    'energy': False,
+    'breathiness': False,
+    'key_shift': True,
+    'speed': True,
+    'direct_speaker_conditioning': False,
+})
+STANDARD_PRESET['flow']['model']['backbone_args']['adaln'] = False
+PRESET_NAME = 'standard-v2'
+PRESETS = {'standard-v1': LEGACY_PRESET, PRESET_NAME: STANDARD_PRESET}
 EDITABLE_FLOW_KEYS = (
     'learning_rate', 'decay_step', 'gamma', 'max_batch_frames', 'max_batch_size',
-    'num_workers', 'dataloader_prefetch_factor', 'log_interval', 'ema_update_interval',
+    'num_workers', 'dataloader_prefetch_factor', 'log_interval',
     'preview_interval', 'eval_interval', 'holdout_clips',
 )
 
@@ -102,12 +118,12 @@ def resolve_config(config):
         raise ValueError('Rectified-flow config must be a JSON object.')
     if 'preset' not in config:
         return deepcopy(config)
-    if config['preset'] != PRESET_NAME:
+    if config['preset'] not in PRESETS:
         raise ValueError(f'Unknown rectified-flow preset: {config["preset"]!r}.')
     for key in ('data', 'flow'):
         if key in config and not isinstance(config[key], dict):
             raise ValueError(f'Rectified-flow {key} settings must be a JSON object.')
-    return _merge(STANDARD_PRESET, {key: value for key, value in config.items() if key != 'preset'})
+    return _merge(PRESETS[config['preset']], {key: value for key, value in config.items() if key != 'preset'})
 
 
 def _differences(config, defaults):
@@ -131,7 +147,6 @@ def compact_config(config):
     if 'finetune_warmup_steps' in flow:
         visible.update({key: deepcopy(flow[key]) for key in (
             'finetune_learning_rate', 'min_learning_rate', 'finetune_warmup_steps',
-            'finetune_ema_decay',
             'finetune_preview_interval',
         ) if key in flow})
     visible['augmentation_args'] = {

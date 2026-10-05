@@ -3,9 +3,6 @@ from torch import nn
 from torch.nn import functional as F
 
 
-MIN_FAN_IN = 16
-
-
 def _iteration_dtype(device: torch.device, dtype: torch.dtype = torch.float32) -> torch.dtype:
     return dtype if device.type == "cuda" else torch.float32
 
@@ -57,24 +54,25 @@ def orthogonalize(g: torch.Tensor, steps: int = 5, dtype: torch.dtype = torch.fl
     return x.to(original_dtype).view(original_shape)
 
 
-def muon_parameters(model: nn.Module) -> set:
+def muon_parameters(model: nn.Module, min_fan_in: int = 0) -> set:
     chosen = set()
     for module in model.modules():
         if isinstance(module, nn.Embedding) or getattr(module, "use_adamw", False):
             continue
         for param in module.parameters(recurse=False):
-            if param.requires_grad and param.dim() >= 2 and param[0].numel() >= MIN_FAN_IN:
+            if param.requires_grad and param.dim() >= 2 and param[0].numel() >= min_fan_in:
                 chosen.add(id(param))
     return chosen
 
 
 class MuonAdamW(torch.optim.Optimizer):
     def __init__(self, model, lr, muon_weight_decay=0.1, adamw_weight_decay=0.0,
-                 momentum=0.95, betas=(0.9, 0.98), eps=1e-8, iteration_dtype=torch.float16):
+                 momentum=0.95, betas=(0.9, 0.98), eps=1e-8, iteration_dtype=torch.float16,
+                 min_fan_in=0):
         if iteration_dtype not in {torch.float32, torch.float16, torch.bfloat16}:
             raise ValueError(f"Unsupported Muon iteration dtype: {iteration_dtype}")
         self.iteration_dtype = iteration_dtype
-        chosen = muon_parameters(model)
+        chosen = muon_parameters(model, min_fan_in)
         params = [p for p in model.parameters() if p.requires_grad]
         groups = [
             dict(params=[p for p in params if id(p) in chosen], muon=True,
@@ -110,7 +108,13 @@ class MuonAdamW(torch.optim.Optimizer):
             tall = update.shape[0] > update.shape[1]
             shapes.setdefault(tuple(sorted(update.shape)), []).append((p, update.mT if tall else update, tall))
         for shape, members in shapes.items():
-            orthogonal = orthogonalize(torch.stack([update for _, update, _ in members]), dtype=self.iteration_dtype).unbind(0)
+            updates = torch.stack([update for _, update, _ in members])
+            orthogonal = orthogonalize(updates, dtype=self.iteration_dtype)
+            if not torch.isfinite(orthogonal).all():
+                orthogonal = orthogonalize(updates, dtype=torch.float32)
+            if not torch.isfinite(orthogonal).all():
+                raise FloatingPointError('Non-finite Muon update after FP32 recovery.')
+            orthogonal = orthogonal.unbind(0)
             torch._foreach_add_(
                 [p for p, _, _ in members],
                 [(u.mT if tall else u).reshape(p.shape) for (p, _, tall), u in zip(members, orthogonal)],
