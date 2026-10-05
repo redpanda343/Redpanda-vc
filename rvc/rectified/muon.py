@@ -84,6 +84,10 @@ class MuonAdamW(torch.optim.Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
         for group in self.param_groups:
             params = [p for p in group["params"] if p.grad is not None]
             if not params:
@@ -95,6 +99,7 @@ class MuonAdamW(torch.optim.Optimizer):
                 self._muon(group, params, lr)
             else:
                 self._adamw(group, params, lr)
+        return loss
 
     def _muon(self, group, params, lr):
         grads = [p.grad for p in params]

@@ -19,6 +19,7 @@ soxr==1.1.0
 fireredvad==0.0.2
 
 torch==2.11.0
+lightning~=2.3.0
 triton==3.6.0; sys_platform == "linux"
 torchaudio==2.11.0
 torchvision==0.26.0

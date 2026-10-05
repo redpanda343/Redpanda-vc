@@ -140,7 +140,9 @@ def resolve_vocoder(mode, path):
 
 
 def resolve_pretrained(directory, enabled):
-    if not enabled or (directory / 'flow' / 'checkpoint.pth').is_file():
+    from rvc.rectified.lightning_train import latest_checkpoint
+
+    if not enabled or latest_checkpoint(directory / 'flow') or (directory / 'flow' / 'checkpoint.pth').is_file():
         return ''
     path = ROOT / 'rvc' / 'models' / 'pretraineds' / 'rectified' / 'pretrained.pth'
     if not path.is_file():
@@ -236,7 +238,7 @@ def rectified_train_tab():
             max_frames = gr.Number(label='Max frames per batch (per GPU)', value=None, minimum=1, precision=0,
                                    info='Blank uses config, default 50000 padded frames. Lower to reduce GPU memory use.')
             max_updates = gr.Number(label='Max training updates', value=None, minimum=1, precision=0,
-                               info='Blank uses config, default 100000 successful updates.')
+                               info='Blank uses config, default 100000 Lightning training steps.')
             checkpoint_interval = gr.Number(label='Checkpoint interval (updates)', value=None, minimum=1, precision=0,
                                    info='Blank uses config, default 4000 updates.')
         use_fused_kernels = gr.Checkbox(label='Fused Linear + SoftSignGLU kernels', value=False,

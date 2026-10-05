@@ -116,6 +116,13 @@ STANDARD_PRESET['flow']['model']['backbone_args'].update({
     'glu_type': 'atanglu', 'dropout_rate': 0.0, 'use_conditioner_cache': True,
 })
 STANDARD_PRESET['flow']['model']['aux_decoder']['kernel_size'] = 7
+STANDARD_PRESET['flow'].update({
+    'accelerator': 'auto', 'num_nodes': 1,
+    'strategy': {'name': 'auto', 'find_unused_parameters': False},
+    'accumulate_grad_batches': 1, 'num_sanity_val_steps': 1,
+    'max_val_batch_frames': 60000, 'max_val_batch_size': 1,
+    'sort_by_len': True, 'sampler_frame_count_grid': 6,
+})
 PRESET_NAME = 'standard-v5'
 PRESETS = {
     'standard-v1': LEGACY_PRESET, 'standard-v2': ATAN_PRESET,

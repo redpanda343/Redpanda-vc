@@ -84,7 +84,8 @@ def clip_samples(entries, workers: int = 8):
 
 class FlowBatchSampler(Sampler):
     def __init__(self, dataset, max_frames, max_items, seed=1234, rank=0, world=1,
-                 shuffle=True):
+                 shuffle=True, required_batch_count_multiple=1, disallow_empty_batch=True,
+                 pad_batch_assignment=True, sort_by_len=True, frame_count_grid=6):
         if int(max_frames) < 1 or int(max_items) < 1:
             raise ValueError('Batch limits must be positive.')
         if not 0 <= rank < world:
@@ -93,6 +94,13 @@ class FlowBatchSampler(Sampler):
         self.max_frames, self.max_items = int(max_frames), int(max_items)
         self.seed, self.rank, self.world = seed, rank, world
         self.shuffle = shuffle
+        self.required_batch_count_multiple = int(required_batch_count_multiple)
+        self.disallow_empty_batch = disallow_empty_batch
+        self.pad_batch_assignment = pad_batch_assignment
+        self.sort_by_len = sort_by_len
+        self.frame_count_grid = int(frame_count_grid)
+        if self.required_batch_count_multiple < 1 or self.frame_count_grid < 1:
+            raise ValueError('Sampler batch multiple and frame grid must be positive.')
         self.samples = clip_samples(dataset.entries)
         self.frames = np.minimum(np.maximum(1, self.samples // dataset.hop), self.max_frames)
         self.measured_max_frames = None
@@ -107,8 +115,9 @@ class FlowBatchSampler(Sampler):
             return self._formed
         rng = np.random.default_rng(self.seed + self.epoch)
         order = rng.permutation(len(self.dataset)) if self.shuffle else np.arange(len(self.dataset))
-        if self.shuffle:
-            sizes = (np.round(self.frames[order] / 6) * 6).clip(6, None)
+        if self.shuffle and self.sort_by_len:
+            grid = self.frame_count_grid
+            sizes = (np.round(self.frames[order] / grid) * grid).clip(grid, None)
             order = order[np.argsort(-sizes, kind='mergesort')]
         maximum = self.measured_max_frames if self.measured_max_frames is not None else self.max_frames
         batches = []
@@ -127,7 +136,7 @@ class FlowBatchSampler(Sampler):
             costs = [len(batch) * max(self.frames[index] for index in batch) for batch in batches]
             self.measured_max_frames = max(costs) if costs else self.max_frames
             batches = [batches[index] for index in sorted(range(len(batches)), key=lambda index: -costs[index])]
-        if len(batches) < self.world:
+        if len(batches) < self.world and self.disallow_empty_batch:
             raise ValueError('The training split is too small for the selected GPUs at these batch limits.')
         floored = len(batches) // self.world * self.world
         leftovers = ((rng.permutation(len(batches) - floored) + floored).tolist()
@@ -135,12 +144,23 @@ class FlowBatchSampler(Sampler):
         assignment = np.arange(floored).reshape(-1, self.world).transpose()
         assignment = (rng.permuted(assignment, axis=0)[self.rank].tolist()
                       if self.shuffle else assignment[self.rank].tolist())
+        floored_batch_count = len(assignment)
         if self.rank < len(leftovers):
             assignment.append(leftovers[self.rank])
-        elif leftovers and self.shuffle:
+            floored_batch_count += 1
+        elif leftovers and self.pad_batch_assignment:
+            if not assignment:
+                raise ValueError('Cannot pad an empty batch assignment.')
             assignment.append(assignment[self.epoch % len(assignment)])
+        count = len(assignment)
+        multiple = self.required_batch_count_multiple
+        if count and count % multiple:
+            for index in range(multiple - count % multiple):
+                assignment.append(assignment[(index + self.epoch * multiple) % floored_batch_count])
         batches = [batches[index] for index in assignment]
-        costs = [len(batch) * max(self.frames[index] for index in batch) for batch in batches]
+        if not batches:
+            batches = [[]]
+        costs = [len(batch) * max((self.frames[index] for index in batch), default=0) for batch in batches]
         self._formed = (self.epoch, [[(index, self.dataset.hop) for index in batch] for batch in batches], costs)
         return self._formed
 

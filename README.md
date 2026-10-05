@@ -26,12 +26,30 @@ validation and retention settings can change on resume. Rectified Flow uses the
 shared precision setting under Settings > Training > Precision. Command-line
 training uses `flow.precision` unless `--precision` is provided. Blank numeric
 overrides in the WebUI use the experiment config.
-New experiments default to 100000 successful updates, FP16 mixed precision,
+Rectified Flow uses `lightning.pytorch` with `lightning~=2.3.0`, matching the local
+DiffSinger trainer. Lightning owns automatic backward, AMP loss scaling, gradient
+clipping, gradient accumulation, optimizer steps, per-step LR scheduling and DDP.
+The shared `fp32`, `fp16` and `bf16` choices map to `32-true`, `16-mixed` and
+`bf16-mixed`. Validation loss and previews run in FP32, including the initial
+sanity validation. Training logs use `training/*` and `validation/*` in
+`logs/<model>/flow/lightning_logs/latest`.
+The config exposes accelerator, devices, nodes, strategy, accumulation, sanity
+validation, separate validation batch limits and length sorting. Multi-GPU
+training uses Lightning DDP with NCCL on Linux and Gloo on Windows/CPU.
+New experiments default to 100000 Lightning training steps, FP16 mixed precision,
 validation/preview/checkpoints every 4000 updates, up to 10 validation plots,
 vocoder previews and 8 recent resumable checkpoints plus voice exports.
 Checkpoints saved from step 60000 at
 10000-step multiples are retained permanently. The fine-tuning template retains
 its lower learning rate, warmup and disabled augmentation.
+Resumable training states are now `flow/model_ckpt_steps_<step>.ckpt` and
+`flow/last.ckpt`. Voice exports remain compatible `_flow_<epoch>e_<step>s.pth`
+files. Existing manual-loop `checkpoint.pth` files migrate automatically with
+weights, optimizer, scaler and step counters. Mid-epoch data replay follows
+Lightning 2.3 behavior and is not guaranteed to reproduce an uninterrupted run.
+`--fresh` archives previous checkpoints and exports inside the flow folder.
+As in DiffSinger, Lightning counts optimizer attempts when FP16 overflow skips
+an update. Unsupported precision/device combinations follow Lightning's behavior.
 DiffSinger's `K_step` fields are DDPM-only; reflow inference uses
 `flow.model.sampling_steps` instead. Phoneme stretch embeddings require phoneme
 alignment and have no equivalent for frame-level ContentVec.

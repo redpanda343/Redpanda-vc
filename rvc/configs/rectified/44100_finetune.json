@@ -124,6 +124,18 @@
     "num_ckpt_keep": 8,
     "permanent_ckpt_start": 60000,
     "permanent_ckpt_interval": 10000,
-    "finetune_warmup_steps": 500
+    "finetune_warmup_steps": 500,
+    "accelerator": "auto",
+    "num_nodes": 1,
+    "strategy": {
+      "name": "auto",
+      "find_unused_parameters": false
+    },
+    "accumulate_grad_batches": 1,
+    "num_sanity_val_steps": 1,
+    "max_val_batch_frames": 60000,
+    "max_val_batch_size": 1,
+    "sort_by_len": true,
+    "sampler_frame_count_grid": 6
   }
 }

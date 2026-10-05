@@ -4,27 +4,25 @@ import os
 import random
 import re
 from copy import deepcopy
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from pathlib import Path
 
 os.environ.setdefault("TORCH_CUDNN_V8_API_ENABLED", "1")
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 
-from rvc.rectified.augmentation import configure_augmentation, is_augmented, prepare_augmentation
+from rvc.rectified.augmentation import configure_augmentation
 from rvc.rectified.config import compact_config, resolve_config
-from rvc.rectified.data import FlowBatchSampler, RectifiedDataset, collate_flow, prepare_training_cache, read_filelist, speaker_inventory, split_holdout, unpack_flow
-from rvc.rectified.distributed import launch
-from rvc.rectified.flow_model import build_flow, resize_speakers, validate_model_config
+from rvc.rectified.flow_model import validate_model_config
 from rvc.rectified.mel import normalize_mel
-from rvc.rectified.muon import MuonAdamW
-from rvc.rectified.schedule import learning_rate
-from rvc.rectified.vocoder import load_vocoder
 
 ROOT = Path(__file__).resolve().parents[2]
+LIGHTNING_DEFAULTS = dict(accelerator='auto', num_nodes=1,
+                          strategy={'name': 'auto', 'find_unused_parameters': False},
+                          accumulate_grad_batches=1, num_sanity_val_steps=1,
+                          max_val_batch_frames=60000, max_val_batch_size=1,
+                          sort_by_len=True, sampler_frame_count_grid=6)
 
 
 def atomic_save(state, path):
@@ -60,38 +58,6 @@ def evaluation_model(model):
             yield
         finally:
             model.train(training)
-
-
-def precision_setup(precision, device):
-    if precision not in {'fp32', 'fp16', 'bf16'}:
-        raise ValueError(f'Unsupported precision: {precision}')
-    if device.type != 'cuda':
-        if precision != 'fp32':
-            print(f'{precision.upper()} requires CUDA in this trainer; using FP32.', flush=True)
-        return None, None
-    if precision == 'bf16':
-        with torch.cuda.device(device):
-            supported = torch.cuda.is_bf16_supported(including_emulation=False)
-        if not supported:
-            print('BF16 is not supported on this GPU; using FP32.', flush=True)
-            return None, None
-        return torch.bfloat16, None
-    if precision == 'fp16':
-        return torch.float16, torch.amp.GradScaler('cuda')
-    return None, None
-
-
-def conditioning_norms(model) -> dict:
-    backbone = model.backbone
-    norms = {"diag/time_mlp_norm": sum(p.norm().item() ** 2 for p in backbone.time_mlp.parameters()) ** 0.5}
-    modulation = [layer.modulation.weight.norm().item()
-                  for layer in backbone.layers if layer.modulation is not None]
-    if modulation:
-        norms["diag/adaln_norm_max"] = max(modulation)
-        norms["diag/adaln_norm_mean"] = sum(modulation) / len(modulation)
-    if backbone.voice is not None:
-        norms["diag/voice_proj_norm"] = backbone.voice.weight.norm().item()
-    return norms
 
 
 def configure_fused_backbone(model, enabled, device, amp_dtype, max_frames):
@@ -141,69 +107,6 @@ def warmup_fused_backbone(backbone, device, dtype, max_frames):
     torch.cuda.empty_cache()
 
 
-def train_step(model, optimizer, batch, data, settings, device, speaker_dropout, amp_dtype=None,
-               scaler=None, ranks=None, collect_stats=False):
-    (mel, content, f0, energy, breathiness, key_shift, speed, speaker, mask, harmonic_prior,
-     voicing, tension) = unpack_flow(batch, device, True)
-    mel = normalize_mel(mel, data)
-    reference = settings['model'].get('conditioning_version') == 5
-    if not reference:
-        mel = mel * mask
-    cached_harmonics = harmonic_prior if harmonic_prior.shape[1] else None
-    optimizer.zero_grad(set_to_none=True)
-
-    with torch.autocast(device.type, dtype=amp_dtype or torch.float32, enabled=amp_dtype is not None):
-        flow, auxiliary = model(
-            mel, content, f0, energy, speaker, mask,
-            speaker_dropout=speaker_dropout, breathiness=breathiness,
-            key_shift=key_shift, speed=speed,
-            voicing=voicing, tension=tension, harmonic_prior=cached_harmonics,
-        )
-        loss = flow if auxiliary is None else flow + settings['aux_mel_weight'] * auxiliary
-
-    finite = bool(torch.isfinite(loss.detach()))
-    if ranks is not None and ranks.world > 1:
-        finite = ranks.all_true(finite)
-    if not finite:
-        raise FloatingPointError('Non-finite rectified-flow loss; weights were not updated.')
-
-    frames = mask.sum().detach()
-    padded_frames = frames.new_tensor(mask.numel())
-    if not reference and ranks is not None and ranks.world > 1:
-        totals = ranks.sum(torch.stack((padded_frames, frames)))
-        loss = flow * (padded_frames * ranks.world / totals[0].clamp_min(1.0))
-        if auxiliary is not None:
-            loss = loss + settings['aux_mel_weight'] * auxiliary * (frames * ranks.world / totals[1].clamp_min(1.0))
-
-    if scaler is None:
-        loss.backward()
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), settings['grad_clip'], error_if_nonfinite=True)
-        optimizer.step()
-        updated = True
-    else:
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), settings['grad_clip'], error_if_nonfinite=False)
-        updated = bool(torch.isfinite(norm))
-        if ranks is not None and ranks.world > 1:
-            updated = ranks.all_true(updated)
-        if updated:
-            scaler.step(optimizer)
-        else:
-            scaler.update(new_scale=scaler.get_scale() * 0.5)
-        if updated:
-            scaler.update()
-
-    flow_stat = flow.detach()
-    aux_stat = auxiliary.detach() if auxiliary is not None else flow_stat.new_zeros(())
-    if collect_stats and ranks is not None and ranks.world > 1:
-        stats = torch.stack((flow_stat * padded_frames, aux_stat * frames, padded_frames, frames))
-        stats = ranks.sum(stats)
-        flow_stat = stats[0] / stats[2].clamp_min(1.0)
-        aux_stat = stats[1] / stats[3].clamp_min(1.0)
-    return flow_stat, aux_stat, norm.detach(), updated
-
-
 @torch.no_grad()
 def preview(model, vocoder, reference, data, writer, step, index=None):
     if reference is None:
@@ -248,42 +151,6 @@ def preview(model, vocoder, reference, data, writer, step, index=None):
         writer.add_audio(f'audio/{name}{suffix}', value.clamp(-1, 1).cpu(), step, data['sample_rate'])
 
 
-@torch.no_grad()
-def evaluate(model, loader, data, writer, step):
-    device = next(model.parameters()).device
-    fractions = (0.1, 0.3, 0.5, 0.7, 0.9)
-    totals = torch.zeros(len(fractions), device=device)
-    aux_total, count, aux_count = 0.0, 0, 0
-    with evaluation_model(model):
-        model.eval()
-        for index, batch in enumerate(loader):
-            (mel, content, f0, energy, breathiness, key_shift, speed, speaker, mask, harmonic_prior,
-             voicing, tension) = unpack_flow(batch, device)
-            mel = normalize_mel(mel, data)
-            if not model.reference:
-                mel = mel * mask
-            generator = torch.Generator(device=device).manual_seed(index)
-            noise = torch.randn(mel.shape, device=device, generator=generator)
-            losses, auxiliary = model.validation_losses(
-                mel, content, f0, energy, speaker, mask, breathiness, key_shift, speed,
-                noise, fractions,
-                voicing=voicing, tension=tension,
-                harmonic_prior=harmonic_prior if harmonic_prior.shape[1] else None,
-            )
-            weight = mask.numel()
-            aux_weight = weight if model.reference else float(mask.sum())
-            totals += losses.float() * weight
-            aux_total += (float(auxiliary) if auxiliary is not None else 0.0) * aux_weight
-            count += weight
-            aux_count += aux_weight
-    totals /= max(1, count)
-    writer.add_scalar('val/flow', float(totals.mean()), step)
-    for fraction, value in zip(fractions, totals.tolist()):
-        writer.add_scalar(f'val/flow_t{fraction:g}', value, step)
-    if model.aux is not None:
-        writer.add_scalar(f'val/{model.aux_loss_name}', aux_total / max(1, aux_count), step)
-
-
 def select_fused_activation(config, enabled):
     if enabled:
         config['flow']['model'].setdefault('backbone_args', {})['glu_type'] = 'softsign_glu'
@@ -309,6 +176,8 @@ def load_training_config(experiment, pretrained_flow=None, use_fused_kernels=Fal
 
 
 def train(args):
+    from rvc.rectified.lightning_train import fit
+
     if Path(args.model_name).name != args.model_name or args.model_name in {'.', '..'}:
         raise ValueError('Use a model name, not a path.')
     experiment = ROOT / 'logs' / args.model_name
@@ -316,22 +185,7 @@ def train(args):
     configure_arguments(args, config['flow'])
     if config['data']['sample_rate'] != 44100:
         raise ValueError('This recipe requires 44100 Hz audio.')
-    originals = read_filelist(experiment / 'filelist.txt', ROOT, originals_only=True)
-    multispeaker = config['flow']['model'].get('conditioning_version', 1) in (2, 3, 4, 5)
-    if multispeaker:
-        speaker_inventory(originals)
-    entries, _ = split_holdout(originals, int(config['flow'].get('holdout_clips', 0)), stratified=multispeaker)
-    from rvc.rectified.distributed import parse_devices
-
-    devices = parse_devices(args.device)
-    device = torch.device(devices[0])
-    if device.type == 'cuda' and (not torch.cuda.is_available() or any(int(value[5:]) >= torch.cuda.device_count() for value in devices)):
-        raise ValueError('A selected CUDA device is unavailable.')
-    prepare_training_cache(originals, config, experiment / 'rectified-flow.data', config['flow'].get('num_workers', 4))
-    prepare_augmentation(experiment, ROOT, originals, entries, config, args.seed, device)
-    if device.type == 'cuda':
-        torch.cuda.empty_cache()
-    launch(train_rank, args)
+    fit(args, config, ROOT)
 
 
 def configure_flow(config, existing_config):
@@ -345,13 +199,16 @@ def configure_flow(config, existing_config):
     settings.setdefault('max_batch_size', 64)
     settings.setdefault('dataloader_prefetch_factor', 2)
     settings.setdefault('log_interval', 100)
+    for name, value in LIGHTNING_DEFAULTS.items():
+        settings.setdefault(name, deepcopy(value))
     reference = settings['model'].get('conditioning_version') == 5
     settings.setdefault('muon_min_fan_in', 0 if reference else 16)
     settings.setdefault('adamw_weight_decay', 0.0)
     for name in ('use_ema', 'ema_decay', 'finetune_ema_decay', 'ema_update_interval'):
         settings.pop(name, None)
     settings.pop('speaker_balanced_sampling', None)
-    for name in ('dataloader_prefetch_factor', 'log_interval'):
+    for name in ('dataloader_prefetch_factor', 'log_interval', 'accumulate_grad_batches', 'num_nodes',
+                 'max_val_batch_frames', 'max_val_batch_size', 'sampler_frame_count_grid'):
         value = settings[name]
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError(f'{name} must be a positive integer.')
@@ -362,11 +219,17 @@ def configure_flow(config, existing_config):
     for name in ('max_updates', 'checkpoint_interval', 'num_ckpt_keep', 'permanent_ckpt_interval'):
         if name in settings and (isinstance(settings[name], bool) or not isinstance(settings[name], int) or settings[name] < 1):
             raise ValueError(f'{name} must be a positive integer.')
-    for name in ('preview_interval', 'eval_interval', 'num_valid_plots', 'permanent_ckpt_start'):
+    for name in ('preview_interval', 'eval_interval', 'num_valid_plots', 'permanent_ckpt_start', 'num_sanity_val_steps'):
         if name in settings and (isinstance(settings[name], bool) or not isinstance(settings[name], int) or settings[name] < 0):
             raise ValueError(f'{name} must be a nonnegative integer.')
     if settings.get('precision', 'fp32') not in {'fp32', 'fp16', 'bf16'}:
         raise ValueError('precision must be fp32, fp16 or bf16.')
+    if not isinstance(settings['sort_by_len'], bool):
+        raise ValueError('sort_by_len must be a boolean.')
+    if settings['accelerator'] not in {'auto', 'cpu', 'gpu', 'cuda'}:
+        raise ValueError('accelerator must be auto, cpu, gpu or cuda.')
+    if not isinstance(settings['strategy'], (str, dict)):
+        raise ValueError('strategy must be a name or a configuration object.')
     if not isinstance(settings.get('val_with_vocoder', True), bool):
         raise ValueError('val_with_vocoder must be a boolean.')
 
@@ -382,17 +245,7 @@ def configure_arguments(args, settings):
             args.epochs = 100
     args.save_every = getattr(args, 'save_every', None) or 10
     args.precision = getattr(args, 'precision', None) or settings.get('precision', 'fp32')
-    args.device = getattr(args, 'device', None) or settings.get('devices', 'auto')
-
-
-def resume_config(config):
-    result = deepcopy(config)
-    for name in ('max_updates', 'precision', 'devices', 'preview_interval', 'eval_interval',
-                 'checkpoint_interval', 'num_valid_plots', 'val_with_vocoder', 'num_ckpt_keep',
-                 'permanent_ckpt_start', 'permanent_ckpt_interval', 'finetune_preview_interval',
-                 'log_interval', 'num_workers', 'dataloader_prefetch_factor'):
-        result['flow'].pop(name, None)
-    return result
+    args.device = getattr(args, 'device', None) or 'auto'
 
 
 def prune_checkpoints(output, model_name, settings):
@@ -413,313 +266,6 @@ def prune_checkpoints(output, model_name, settings):
             permanent = start > 0 and step >= start and (step - start) % interval == 0
             if not permanent:
                 path.unlink()
-
-
-def train_rank(args, ranks):
-    if Path(args.model_name).name != args.model_name or args.model_name in {'.', '..'}:
-        raise ValueError('Use a model name, not a path.')
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
-    experiment = ROOT / 'logs' / args.model_name
-    config = load_training_config(experiment, args.pretrained_flow, getattr(args, 'use_fused_kernels', False))
-    validate_model_config(config['flow']['model'])
-    settings, data = config['flow'], config['data']
-    configure_arguments(args, settings)
-    update_limit = getattr(args, 'max_updates', None) if args.epochs is None else None
-    checkpoint_interval = getattr(args, 'checkpoint_interval', None) or settings.get('checkpoint_interval', 4000)
-    multispeaker = settings['model'].get('conditioning_version', 1) in (2, 3, 4, 5)
-    if data['sample_rate'] != 44100:
-        raise ValueError('This recipe requires 44100 Hz audio and a matching NSF-HiFiGAN vocoder.')
-    device = ranks.device
-    amp_dtype, scaler = precision_setup(args.precision, device)
-    if ranks.world > 1 and args.precision == 'bf16' and not ranks.all_true(amp_dtype == torch.bfloat16):
-        amp_dtype, scaler = None, None
-        if ranks.main:
-            print('At least one selected GPU cannot use BF16; all ranks will use FP32.', flush=True)
-    precision_label = str(amp_dtype).split(".")[-1].upper() if amp_dtype is not None else "FP32"
-    vocoder = None
-    with ranks.main_work('preview vocoder loading') as main:
-        if main:
-            if args.vocoder and settings.get('val_with_vocoder', True):
-                vocoder, _ = load_vocoder(args.vocoder, data)
-                vocoder = vocoder.to(device)
-            else:
-                print('No vocoder selected: previews will show mel images only.', flush=True)
-    entries = read_filelist(experiment / 'filelist.txt', ROOT)
-    originals = [entry for entry in entries if not is_augmented(entry)]
-    inventory = speaker_inventory(originals) if multispeaker else None
-    speakers = max(int(entry[4]) for entry in entries) + 1
-    originals, held = split_holdout(originals, int(settings.get('holdout_clips', 0)), stratified=multispeaker)
-    entries = originals + [entry for entry in entries if is_augmented(entry)]
-    max_items = int(args.batch_size or settings['max_batch_size'])
-    max_frames = int(args.max_batch_frames or settings['max_batch_frames'])
-    cache_path = experiment / 'rectified-flow.data'
-    dataset = RectifiedDataset(entries, config, max_frames, cache_path=cache_path)
-    workers = int(settings.get('num_workers', 4))
-    prefetch = int(settings.get('dataloader_prefetch_factor', 2))
-    if ranks.main:
-        print(f'Whole-utterance batching: up to {max_items} clips and {max_frames} padded frames per batch and GPU. Measuring {len(entries):,} clip lengths...', flush=True)
-    batcher = FlowBatchSampler(dataset, max_frames, max_items, args.seed, ranks.rank, ranks.world)
-    loader_kwargs = dict(
-        num_workers=workers, collate_fn=collate_flow, pin_memory=device.type == 'cuda',
-        persistent_workers=workers > 0,
-    )
-    if workers > 0:
-        loader_kwargs.update(multiprocessing_context='spawn', prefetch_factor=prefetch)
-    loader_generator = torch.Generator().manual_seed(args.seed + ranks.rank) if update_limit is not None else None
-    if loader_generator is not None:
-        loader_kwargs['generator'] = loader_generator
-    loader = DataLoader(dataset, batch_sampler=batcher, **loader_kwargs)
-    held_dataset = RectifiedDataset(held, config, max_frames, augment=False, cache_path=cache_path)
-    held_loader = None
-    if held and ranks.main:
-        held_kwargs = dict(
-            num_workers=workers, collate_fn=collate_flow, pin_memory=device.type == 'cuda',
-            persistent_workers=workers > 0,
-        )
-        if workers > 0:
-            held_kwargs.update(multiprocessing_context='spawn', prefetch_factor=prefetch)
-        held_loader = DataLoader(
-            held_dataset,
-            batch_sampler=FlowBatchSampler(held_dataset, max_frames, max_items, args.seed, shuffle=False),
-            **held_kwargs,
-        )
-    reference = None
-    references = []
-    with ranks.main_work('preview reference preparation') as main:
-        if main:
-            reference = dataset.reference() if update_limit is None else None
-            if update_limit is not None:
-                references = (held_dataset if held else dataset).references(settings.get('num_valid_plots', 10))
-    info_path = experiment / 'model_info.json'
-    info = json.loads(info_path.read_text(encoding='utf-8')) if info_path.exists() else {}
-    embedder = info.get('embedder_model', 'contentvec')
-    feature_metadata = {key: info[key] for key in ('embedder_model', 'version', 'feature_dim', 'feature_output', 'feature_fingerprint') if key in info}
-    if multispeaker and (info.get('version', 'v2') != 'v2' or int(info.get('feature_dim', settings['model']['content_channels'])) != settings['model']['content_channels']):
-        raise ValueError('Extraction metadata does not match the content encoder. Re-extract v2 features.')
-    model = build_flow(config, speakers).to(device).float()
-    output = experiment / 'flow'
-    resume_path = output / 'checkpoint.pth'
-    state = torch.load(resume_path, map_location='cpu', weights_only=True) if resume_path.exists() and not args.fresh else None
-    finetune = bool(state.get('finetune', False)) if state else bool(args.pretrained_flow)
-    dropout = float(settings['speaker_dropout'])
-    lr = args.learning_rate or settings['finetune_learning_rate' if finetune else 'learning_rate']
-    if settings['optimizer'] == 'muon':
-        optimizer = MuonAdamW(model, lr, muon_weight_decay=settings['weight_decay'],
-                              adamw_weight_decay=settings['adamw_weight_decay'],
-                              min_fan_in=settings['muon_min_fan_in'],
-                              betas=tuple(settings['betas']), iteration_dtype=torch.float16 if device.type == 'cuda' else torch.float32)
-    elif settings['optimizer'] == 'adamw':
-        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=tuple(settings['betas']), weight_decay=settings['weight_decay'])
-    else:
-        raise ValueError('Optimizer must be muon or adamw.')
-    first_epoch, step = 1, 0
-    first_batch = 0
-    resume_random = None
-    if state:
-        configure_flow(state['config'], True)
-        select_fused_activation(state['config'], getattr(args, 'use_fused_kernels', False))
-        if multispeaker and (state.get('speaker_ids') != sorted(inventory) or state.get('feature_metadata') != feature_metadata):
-            raise ValueError('Speaker IDs or extracted feature metadata changed. Use a new experiment.')
-        if resume_config(state['config']) != resume_config(config) or state['embedder_model'] != embedder:
-            raise ValueError('Resume config or embedder differs from the saved checkpoint.')
-        model.load_state_dict(state['model'], strict=True)
-        optimizer.load_state_dict(state['optimizer'])
-        if scaler is not None and state.get('scaler'):
-            scaler.load_state_dict(state['scaler'])
-        first_epoch = state['epoch'] + int(state.get('epoch_complete', True))
-        first_batch = 0 if state.get('epoch_complete', True) else state.get('batch_in_epoch', 0)
-        if first_batch and state.get('batch_limits', [max_items, max_frames]) != [max_items, max_frames]:
-            raise ValueError('Mid-epoch resume requires the saved batch limits.')
-        step = state['step']
-        resume_random = state.get('random_states')
-        del state
-    elif args.pretrained_flow:
-        state = torch.load(args.pretrained_flow, map_location='cpu', weights_only=True)
-        state['config'] = resolve_config(state.get('config', {}))
-        if state.get('embedder_model', embedder) != embedder:
-            raise ValueError('Pretrained flow uses a different content embedder.')
-        pretrained_model = state.get('config', {}).get('flow', {}).get('model', {})
-        validate_model_config(pretrained_model)
-        if pretrained_model.get('flow_conditioning', 'encoder') != settings['model'].get('flow_conditioning', 'encoder'):
-            raise ValueError('Pretrained flow uses different conditioning. Use a pretrained with the same conditioning path or start a new model from scratch.')
-        if pretrained_model.get('conditioning_version', 1) != settings['model'].get('conditioning_version', 1):
-            raise ValueError('Pretrained conditioning version differs. Start a new model or use a matching pretrained.')
-        if pretrained_model.get('use_spk_id', True) != settings['model'].get('use_spk_id', True):
-            raise ValueError('Pretrained flow uses a different speaker-ID setting. Use a matching pretrained.')
-        for name in ('voicing', 'tension', 'direct_speaker_conditioning'):
-            if bool(pretrained_model.get(name, False)) != bool(settings['model'].get(name, False)):
-                raise ValueError(f'Pretrained flow differs in {name}. Use a matching pretrained or train a new model from scratch.')
-        source_glu = pretrained_model.get('backbone_args', {}).get('glu_type', 'atanglu')
-        if getattr(args, 'use_fused_kernels', False):
-            source_glu = 'softsign_glu'
-        target_glu = settings['model'].get('backbone_args', {}).get('glu_type', 'atanglu')
-        if source_glu != target_glu:
-            raise ValueError('Pretrained flow uses a different GLU activation. Use a matching pretrained.')
-        source_scale = float(pretrained_model.get('backbone_args', {}).get('time_scale', 1000.0))
-        target_scale = float(settings['model'].get('backbone_args', {}).get('time_scale', 1000.0))
-        if source_scale != target_scale:
-            raise ValueError('Pretrained flow uses a different time embedding scale. Use a matching pretrained.')
-        pretrained_data = state.get('config', {}).get('data', {})
-        for name in ('mel_mean', 'mel_std'):
-            if name in pretrained_data and float(pretrained_data[name]) != float(data[name]):
-                raise ValueError(
-                    f'Pretrained flow uses different mel normalization ({name}={pretrained_data[name]} vs {data[name]}). '
-                    'Use a matching pretrained or start from scratch.'
-                )
-        weights = state['ema']['shadow'] if state.get('ema') else state['model']
-        speaker_init = model.encoder.speaker.weight if multispeaker and model.use_spk_id else None
-        model.load_state_dict(resize_speakers(
-            weights, speakers, speaker_init, null_speaker=model.encoder.has_null_speaker,
-        ), strict=True)
-        del state, weights
-    with ranks.main_work('training output setup') as main:
-        if main:
-            output.mkdir(parents=True, exist_ok=True)
-            (experiment / 'rectified_config.json').write_text(json.dumps(compact_config(config), indent=2) + '\n', encoding='utf-8')
-    configure_fused_backbone(model, getattr(args, 'use_fused_kernels', False), device, amp_dtype, max_frames)
-    train_model = ranks.wrap(model)
-    if ranks.world > 1:
-        random.seed(args.seed + ranks.rank)
-        np.random.seed(args.seed + ranks.rank)
-        torch.manual_seed(args.seed + ranks.rank)
-    if resume_random is not None:
-        if len(resume_random) != ranks.world:
-            raise ValueError('Resume requires the same number of training devices.')
-        restore_random_state(resume_random[ranks.rank], device)
-    preview_interval = int(settings.get('finetune_preview_interval', 500) if finetune
-                           else settings.get('preview_interval', 1000))
-    total = update_limit if update_limit is not None else args.epochs * len(loader)
-    warmup = settings.get('finetune_warmup_steps', 0) if finetune else settings['warmup_steps']
-    log_interval = int(settings.get('log_interval', 100))
-    if ranks.main:
-        print(f'Rectified flow: {sum(p.numel() for p in model.parameters()):,} parameters, {precision_label}, {device}, whole utterances, up to {max_items} clips / {max_frames} frames per batch, {len(loader)} batches per epoch and GPU, {ranks.world} device(s)', flush=True)
-        if finetune:
-            print(f'Fine-tuning: fresh-run LR {lr:g}, warmup {warmup} steps, {settings.get("lr_schedule", "cosine")} decay, minimum LR {settings.get("min_learning_rate", 0.0):g}.', flush=True)
-        if multispeaker and model.use_spk_id:
-            print(f'Multispeaker conditioning v{model.encoder.conditioning_version}: {speakers} speakers, {len(held)} held-out clips. Clips per speaker: {inventory}', flush=True)
-            if finetune and first_epoch == 1:
-                print('Initialized independent speaker embeddings for the new dataset.', flush=True)
-        if not model.use_spk_id:
-            print('Speaker IDs disabled: no speaker embeddings or target-speaker selection.', flush=True)
-    def save_progress(epoch, batch_index, epoch_complete):
-        random_states = [random_state(device)]
-        if ranks.world > 1:
-            local_state = random_states[0]
-            random_states = [None] * ranks.world
-            torch.distributed.all_gather_object(random_states, local_state, group=ranks.control_group)
-        with ranks.main_work(f'checkpoint/preview at epoch {epoch}') as main:
-            if main:
-                print(f'Rank 0: saving checkpoint at epoch {epoch}.', flush=True)
-                if any(not torch.isfinite(value).all() for value in model.state_dict().values()):
-                    raise FloatingPointError('Non-finite trained model weights.')
-                metadata = dict(config=config, speaker_count=model.speaker_count, embedder_model=embedder,
-                                epoch=epoch, step=step)
-                if multispeaker:
-                    metadata.update(speaker_ids=sorted(inventory), feature_metadata=feature_metadata)
-                checkpoint = dict(model=model.state_dict(), optimizer=optimizer.state_dict(),
-                                  finetune=finetune, batch_in_epoch=batch_index, epoch_complete=epoch_complete,
-                                  batch_limits=[max_items, max_frames],
-                                  scaler=scaler.state_dict() if scaler is not None else None,
-                                  random_states=random_states,
-                                  precision=args.precision, **metadata)
-                atomic_save(checkpoint, resume_path)
-                if settings.get('num_ckpt_keep') is not None:
-                    atomic_save(checkpoint, output / f'{args.model_name}_trainer_{step}s.pth')
-                weights = {key: value.detach().cpu() for key, value in model.state_dict().items()}
-                atomic_save(dict(kind='rectified_flow', model=weights, **metadata),
-                            output / f'{args.model_name}_flow_{epoch}e_{step}s.pth')
-                if update_limit is None:
-                    preview(model, vocoder, reference, data, writer, step)
-                prune_checkpoints(output, args.model_name, settings)
-                writer.flush()
-                print(f'Rank 0: epoch {epoch} checkpoint and preview finished.', flush=True)
-
-    with SummaryWriter(str(output)) if ranks.main else nullcontext(None) as writer:
-        model.train()
-        epoch = first_epoch
-        while (step < update_limit if update_limit is not None else epoch <= args.epochs):
-            batcher.set_epoch(epoch - 1)
-            if loader_generator is not None:
-                loader_generator.manual_seed(args.seed + ranks.rank + epoch * ranks.world)
-            epoch_start_step = step
-            for batch_index, batch in enumerate(loader):
-                if epoch == first_epoch and batch_index < first_batch:
-                    continue
-                next_step = step + 1
-                should_log = next_step == 1 or next_step % log_interval == 0
-                current_lr = learning_rate(
-                    lr, step, warmup, total, settings['lr_final_ratio'],
-                    schedule=settings.get('lr_schedule', 'cosine'),
-                    decay_step=settings.get('decay_step', 4000),
-                    gamma=settings.get('gamma', 0.9),
-                    step_offset=settings.get('step_lr_offset', 1),
-                    min_lr=float(settings.get('min_learning_rate', 0.0)),
-                    step_warmup=finetune,
-                )
-                for group in optimizer.param_groups:
-                    group['lr'] = current_lr
-                flow, auxiliary, norm, updated = train_step(
-                    train_model, optimizer, batch, data, settings, device, dropout, amp_dtype, scaler,
-                    ranks=ranks, collect_stats=should_log,
-                )
-                if not updated:
-                    if ranks.main:
-                        print(f'Skipped non-finite FP16 gradients at step {next_step}; loss scale reduced.', flush=True)
-                    continue
-                step = next_step
-
-                media_step = bool((preview_interval and step % preview_interval == 0) or
-                                  (held and settings.get('eval_interval', 0) and step % settings['eval_interval'] == 0))
-                if should_log and ranks.main:
-                    flow_value, aux_value, norm_value = float(flow), float(auxiliary), float(norm)
-                    if not np.isfinite((flow_value, aux_value, norm_value)).all():
-                        raise FloatingPointError('Non-finite rectified-flow training statistics.')
-                    writer.add_scalar('loss/flow', flow_value, step)
-                    writer.add_scalar('grad_norm', norm_value, step)
-                    writer.add_scalar('lr', current_lr, step)
-                    if model.aux is not None:
-                        writer.add_scalar(f'loss/{model.aux_loss_name}', aux_value, step)
-                    aux_status = f' aux={aux_value:.6f}' if model.aux is not None else ''
-                    print(f'epoch={epoch} step={step}/{total} flow={flow_value:.6f}{aux_status} grad_norm={norm_value:.6f}', flush=True)
-                    for tag, value in conditioning_norms(model).items():
-                        writer.add_scalar(tag, value, step)
-                    if scaler is not None:
-                        writer.add_scalar("amp/scale", scaler.get_scale(), step)
-
-                if media_step:
-                    with ranks.main_work(f'preview/validation at step {step}') as main:
-                        if main:
-                            if preview_interval and step % preview_interval == 0:
-                                print(f'Rank 0: starting preview at step {step}.', flush=True)
-                                if update_limit is None:
-                                    preview(model, vocoder, reference, data, writer, step)
-                                else:
-                                    for index, item in enumerate(references):
-                                        preview(model, vocoder, item, data, writer, step, index)
-                                print(f'Rank 0: preview finished at step {step}.', flush=True)
-                            if held_loader is not None and settings.get('eval_interval', 0) and step % settings['eval_interval'] == 0:
-                                print(f'Rank 0: starting validation at step {step}.', flush=True)
-                                evaluate(model, held_loader, data, writer, step)
-                                print(f'Rank 0: validation finished at step {step}.', flush=True)
-
-                if update_limit is not None:
-                    finished = step >= update_limit
-                    if step % checkpoint_interval == 0 or finished:
-                        save_progress(epoch, batch_index + 1, batch_index + 1 == len(loader))
-                    if finished:
-                        break
-            if update_limit is not None and step == epoch_start_step:
-                raise FloatingPointError('No successful updates in this epoch; training cannot progress.')
-            if update_limit is None and (epoch % args.save_every == 0 or epoch == args.epochs):
-                save_progress(epoch, len(loader), True)
-            ranks.barrier()
-            epoch += 1
-    if ranks.main:
-        print(f'Finished at step {step}. Checkpoints and TensorBoard previews: {output}', flush=True)
 
 
 def main():
