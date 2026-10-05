@@ -22,8 +22,10 @@ All recipe settings are exposed in `rvc/configs/rectified/44100_standard.json`
 and copied to `logs/<model>/rectified_config.json`. Edit the experiment config to
 change the model, optimizer, scheduler, batching, validation or checkpoint policy.
 Architecture changes require a new experiment. Training budgets, precision,
-validation and retention settings can change on resume. The WebUI precision
-selector supports FP32, FP16 and BF16; blank numeric overrides use the config.
+validation and retention settings can change on resume. Rectified Flow uses the
+shared precision setting under Settings > Training > Precision. Command-line
+training uses `flow.precision` unless `--precision` is provided. Blank numeric
+overrides in the WebUI use the experiment config.
 New experiments default to 100000 successful updates, FP16 mixed precision,
 validation/preview/checkpoints every 4000 updates, up to 10 validation plots,
 vocoder previews and 8 recent resumable checkpoints plus voice exports.
@@ -37,9 +39,11 @@ alignment and have no equivalent for frame-level ContentVec.
 The training tab's optional **Fused Linear + SoftSignGLU kernels** switch
 replaces `torch.compile` for Rectified Flow. It uses DiffSinger's Triton forward
 and elementwise backward kernels with cuBLAS gradient matrix multiplications,
-and is off by default. Set `flow.model.backbone_args.glu_type` to
-`softsign_glu` for a new experiment before enabling it. Evaluation and inference
-use eager kernels.
+and is off by default. Enabling it overrides `flow.model.backbone_args.glu_type`
+with `softsign_glu`, including for resume and fine-tuning. The effective activation
+is saved with the experiment and checkpoints. Disabling the switch later turns
+off fused kernels and keeps the saved activation. Evaluation and inference use
+eager kernels.
 Fused CUDA FP16/BF16 training requires a working Triton installation; CPU/FP32 and
 unsupported GPUs use the eager path. The port in `rvc/rectified/kernels` is
 adapted from [DiffSinger](https://github.com/openvpi/DiffSinger) under Apache 2.0;

@@ -284,7 +284,12 @@ def evaluate(model, loader, data, writer, step):
         writer.add_scalar(f'val/{model.aux_loss_name}', aux_total / max(1, aux_count), step)
 
 
-def load_training_config(experiment, pretrained_flow=None):
+def select_fused_activation(config, enabled):
+    if enabled:
+        config['flow']['model'].setdefault('backbone_args', {})['glu_type'] = 'softsign_glu'
+
+
+def load_training_config(experiment, pretrained_flow=None, use_fused_kernels=False):
     config_path = experiment / 'rectified_config.json'
     existing = config_path.exists()
     if not existing:
@@ -298,6 +303,7 @@ def load_training_config(experiment, pretrained_flow=None):
             raise ValueError('Choose a Rectified Flow voice checkpoint for fine-tuning.')
         config['data'] = source['data']
         config['flow']['model'] = source['flow']['model']
+    select_fused_activation(config, use_fused_kernels)
     configure_flow(config, existing)
     return config
 
@@ -306,12 +312,10 @@ def train(args):
     if Path(args.model_name).name != args.model_name or args.model_name in {'.', '..'}:
         raise ValueError('Use a model name, not a path.')
     experiment = ROOT / 'logs' / args.model_name
-    config = load_training_config(experiment, args.pretrained_flow)
+    config = load_training_config(experiment, args.pretrained_flow, getattr(args, 'use_fused_kernels', False))
     configure_arguments(args, config['flow'])
     if config['data']['sample_rate'] != 44100:
         raise ValueError('This recipe requires 44100 Hz audio.')
-    if getattr(args, 'use_fused_kernels', False) and config['flow']['model'].get('backbone_args', {}).get('glu_type', 'atanglu') != 'softsign_glu':
-        raise ValueError('Fused kernels require SoftSignGLU. Existing ATanGLU experiments must keep this option disabled.')
     originals = read_filelist(experiment / 'filelist.txt', ROOT, originals_only=True)
     multispeaker = config['flow']['model'].get('conditioning_version', 1) in (2, 3, 4, 5)
     if multispeaker:
@@ -420,7 +424,7 @@ def train_rank(args, ranks):
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     experiment = ROOT / 'logs' / args.model_name
-    config = load_training_config(experiment, args.pretrained_flow)
+    config = load_training_config(experiment, args.pretrained_flow, getattr(args, 'use_fused_kernels', False))
     validate_model_config(config['flow']['model'])
     settings, data = config['flow'], config['data']
     configure_arguments(args, settings)
@@ -517,6 +521,7 @@ def train_rank(args, ranks):
     resume_random = None
     if state:
         configure_flow(state['config'], True)
+        select_fused_activation(state['config'], getattr(args, 'use_fused_kernels', False))
         if multispeaker and (state.get('speaker_ids') != sorted(inventory) or state.get('feature_metadata') != feature_metadata):
             raise ValueError('Speaker IDs or extracted feature metadata changed. Use a new experiment.')
         if resume_config(state['config']) != resume_config(config) or state['embedder_model'] != embedder:
@@ -549,6 +554,8 @@ def train_rank(args, ranks):
             if bool(pretrained_model.get(name, False)) != bool(settings['model'].get(name, False)):
                 raise ValueError(f'Pretrained flow differs in {name}. Use a matching pretrained or train a new model from scratch.')
         source_glu = pretrained_model.get('backbone_args', {}).get('glu_type', 'atanglu')
+        if getattr(args, 'use_fused_kernels', False):
+            source_glu = 'softsign_glu'
         target_glu = settings['model'].get('backbone_args', {}).get('glu_type', 'atanglu')
         if source_glu != target_glu:
             raise ValueError('Pretrained flow uses a different GLU activation. Use a matching pretrained.')
@@ -732,7 +739,7 @@ def main():
     parser.add_argument('--learning-rate', type=float)
     parser.add_argument('--seed', type=int, default=1234)
     parser.add_argument('--use-fused-kernels', action='store_true',
-                        help='Use DiffSinger Triton Linear + SoftSignGLU kernels during CUDA mixed-precision training.')
+                        help='Override the activation with SoftSignGLU and use DiffSinger Triton kernels during CUDA mixed-precision training.')
     parser.add_argument('--fresh', action='store_true')
     train(parser.parse_args())
 
