@@ -86,7 +86,7 @@ class RectifiedPipeline(Pipeline):
         breathiness = to_mel_rate(breathiness.unsqueeze(-1), frames, rate, hop)[..., 0]
         mask = torch.ones(1, 1, frames, device=self.device)
         variances = {}
-        if net_g.encoder.voicing is not None or net_g.encoder.tension is not None:
+        if any(getattr(net_g.encoder, name, None) is not None for name in ('voicing', 'tension')):
             variances = dict(zip(('voicing', 'tension'), variance_curves(waveform, source_f0, frames, rate, hop)))
         with _INFERENCE_RNG_LOCK:
             if inference_rng is not None:

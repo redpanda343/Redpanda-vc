@@ -435,7 +435,7 @@ class RealTimeRVC:
         breathiness = smooth_curve(aperiodicity(waveform, rate, source_f0, feature_frames))
         breathiness = to_mel_rate(breathiness.unsqueeze(-1), frames, rate, hop)[..., 0]
         variances = {}
-        if self.model.encoder.voicing is not None or self.model.encoder.tension is not None:
+        if any(getattr(self.model.encoder, name, None) is not None for name in ('voicing', 'tension')):
             variances = dict(zip(
                 ("voicing", "tension"), variance_curves(waveform, source_f0, frames, rate, hop)
             ))
