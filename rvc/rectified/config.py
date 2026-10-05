@@ -12,7 +12,7 @@ STANDARD_PRESET = {
         'mel_fmax': 16000.0,
         'mel_mean': -6.0,
         'mel_std': 6.0,
-        'content_interpolation': 'linear',
+        'content_interpolation': 'nearest',
     },
     'flow': {
         'optimizer': 'muon',
