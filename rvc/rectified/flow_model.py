@@ -117,12 +117,10 @@ class ConditionEncoder(nn.Module):
         speaker_count: int,
         speaker_channels: int,
         layers: int,
-        content_bottleneck: int = 0,
         pitch_fourier: int = 0,
         harmonic_prior: Optional[HarmonicPrior] = None,
         breathiness: bool = False,
         key_shift: bool = False,
-        content_bottleneck_noise: float = 0.0,
         speed: bool = False,
         voicing: bool = False,
         tension: bool = False,
@@ -131,13 +129,10 @@ class ConditionEncoder(nn.Module):
         super().__init__()
         if conditioning_version not in (2, 3, 4):
             raise ValueError('Obsolete conditioning version. Train a new Multispeaker model.')
-        if content_bottleneck or content_bottleneck_noise:
-            raise ValueError('Project full content features directly to the encoder width; intermediate bottlenecks are unsupported.')
         if conditioning_version == 2 and speaker_channels != hidden_channels:
             raise ValueError('Conditioning v2 requires hidden-width speaker embeddings.')
         self.conditioning_version = conditioning_version
         self.speaker_count = int(speaker_count)
-        self.bottleneck = None
         self.content = nn.Linear(content_channels, hidden_channels)
         self.pitch_fourier = int(pitch_fourier)
         self.pitch = nn.Conv1d(2 + 2 * self.pitch_fourier, hidden_channels, 3, padding=1)
@@ -345,8 +340,6 @@ class RectifiedFlow(nn.Module):
         content_channels: int = 768,
         hidden_channels: int = 384,
         encoder_layers: int = 4,
-        content_bottleneck: int = 0,
-        content_bottleneck_noise: float = 0.0,
         speaker_channels: int = 384,
         pitch_fourier: int = 0,
         harmonic_prior: Optional[dict] = None,
@@ -417,12 +410,10 @@ class RectifiedFlow(nn.Module):
             speaker_count,
             speaker_channels,
             encoder_layers,
-            content_bottleneck,
             pitch_fourier,
             HarmonicPrior(n_mels=n_mels, **harmonic_prior) if harmonic_prior else None,
             breathiness,
             key_shift,
-            content_bottleneck_noise,
             speed,
             voicing,
             tension,
@@ -722,8 +713,6 @@ def validate_model_config(model: dict):
     if (version not in (2, 3, 4, 5)
             or any(model.get(name, False) for name in ('voicing', 'tension'))):
         raise ValueError('Unsupported rectified-flow recipe or checkpoint. Use a supported standard-flow recipe.')
-    if model.get('content_bottleneck', 0) or model.get('content_bottleneck_noise', 0):
-        raise ValueError('Project full content features directly to the encoder width; intermediate bottlenecks are unsupported.')
     if version == 2 and model.get('speaker_channels', 384) != model.get('hidden_channels', 384):
         raise ValueError('Conditioning v2 requires hidden-width speaker embeddings.')
     if model.get('sampling_method', 'euler') not in SAMPLERS:
