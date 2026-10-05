@@ -246,7 +246,7 @@ def train(args):
     device = torch.device(devices[0])
     if device.type == 'cuda' and (not torch.cuda.is_available() or any(int(value[5:]) >= torch.cuda.device_count() for value in devices)):
         raise ValueError('A selected CUDA device is unavailable.')
-    prepare_training_cache(originals, config, config['flow'].get('num_workers', 4))
+    prepare_training_cache(originals, config, experiment / 'rectified-flow.data', config['flow'].get('num_workers', 4))
     prepare_augmentation(experiment, ROOT, originals, entries, config, args.seed, device)
     if device.type == 'cuda':
         torch.cuda.empty_cache()
@@ -316,7 +316,8 @@ def train_rank(args, ranks):
     entries = originals + [entry for entry in entries if is_augmented(entry)]
     max_items = int(args.batch_size or settings['max_batch_size'])
     max_frames = int(args.max_batch_frames or settings['max_batch_frames'])
-    dataset = RectifiedDataset(entries, config, max_frames)
+    cache_path = experiment / 'rectified-flow.data'
+    dataset = RectifiedDataset(entries, config, max_frames, cache_path=cache_path)
     workers = int(settings.get('num_workers', 4))
     prefetch = int(settings.get('dataloader_prefetch_factor', 2))
     if ranks.main:
@@ -329,7 +330,7 @@ def train_rank(args, ranks):
     if workers > 0:
         loader_kwargs.update(multiprocessing_context='spawn', prefetch_factor=prefetch)
     loader = DataLoader(dataset, batch_sampler=batcher, **loader_kwargs)
-    held_dataset = RectifiedDataset(held, config, max_frames, augment=False)
+    held_dataset = RectifiedDataset(held, config, max_frames, augment=False, cache_path=cache_path)
     held_loader = None
     if held and ranks.main:
         held_kwargs = dict(

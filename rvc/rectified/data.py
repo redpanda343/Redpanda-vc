@@ -18,11 +18,12 @@ from rvc.rectified.aperiodicity import aperiodicity
 from rvc.rectified.mel import LogMel
 from rvc.rectified.config import resolve_config
 from rvc.rectified.flow_model import HarmonicPrior
+from rvc.rectified.indexed_dataset import IndexedDataset, IndexedDatasetBuilder
 
 FEATURE_RATE = 100
 SMOOTH_SECONDS = 0.06
 CONTENT_INTERPOLATIONS = ("nearest", "linear")
-ORIGINAL_CACHE_VERSION = 2
+ORIGINAL_CACHE_VERSION = 3
 
 def upsample_content(features: torch.Tensor, mode: str = "nearest") -> torch.Tensor:
     if mode not in CONTENT_INTERPOLATIONS:
@@ -203,7 +204,7 @@ def unpack_flow(batch, device, non_blocking=False):
     return values
 
 class RectifiedDataset(Dataset):
-    def __init__(self, entries, config: dict, max_frames: int, augment: bool = True):
+    def __init__(self, entries, config: dict, max_frames: int, augment: bool = True, cache_path=None):
         config = resolve_config(config)
         self.entries = entries
         self.data = config["data"]
@@ -235,7 +236,9 @@ class RectifiedDataset(Dataset):
             sort_keys=True,
             separators=(",", ":"),
         )
-        self._original_cache = [self._cache_info(entry) for entry in self.entries]
+        self._cache_recipe_hash = hashlib.sha256(self._cache_recipe.encode()).hexdigest()
+        self._original_keys = [self._cache_key(entry) for entry in self.entries]
+        self._indexed_cache = IndexedDataset(cache_path, self._cache_recipe_hash) if cache_path is not None else None
 
     def __len__(self):
         return len(self.entries)
@@ -266,7 +269,7 @@ class RectifiedDataset(Dataset):
             return torch.empty((0, f0.shape[-1]), dtype=torch.float32)
         return self.harmonic_prior(f0.unsqueeze(0))[0]
 
-    def _cache_info(self, entry):
+    def _cache_key(self, entry):
         if str(entry[1]).endswith('.flow.npz'):
             return None
         sources = []
@@ -274,45 +277,13 @@ class RectifiedDataset(Dataset):
             value = Path(path)
             stat = value.stat()
             sources.append((str(value.resolve()), stat.st_size, stat.st_mtime_ns))
-        fingerprint = hashlib.sha256(
+        return hashlib.sha256(
             (self._cache_recipe + json.dumps(sources, separators=(",", ":"))).encode()
         ).hexdigest()
-        return Path(str(entry[1]) + '.flow-cache.npz'), fingerprint
 
-    def _cache_valid(self, index):
-        info = self._original_cache[index]
-        if info is None:
-            return True
-        path, fingerprint = info
-        if not path.is_file():
-            return False
-        try:
-            with np.load(path, allow_pickle=False) as values:
-                return (
-                    'cache_fingerprint' in values.files
-                    and str(values['cache_fingerprint'].item()) == fingerprint
-                )
-        except Exception:
-            return False
-
-    def _write_cache(self, path, values):
-        temporary = Path(str(path) + f'.{os.getpid()}.tmp')
-        try:
-            with temporary.open('wb') as stream:
-                np.savez(stream, **values)
-            os.replace(temporary, path)
-        finally:
-            if temporary.exists():
-                temporary.unlink()
-
-    def _build_original_cache(self, index, audio=None, source_f0=None, content=None):
-        info = self._original_cache[index]
-        if info is None:
+    def _build_original_values(self, index, audio=None, source_f0=None, content=None):
+        if self._original_keys[index] is None:
             return None
-        path, fingerprint = info
-        if self._cache_valid(index):
-            return path
-
         wav_path, content_path, _, f0_path, _ = self.entries[index]
         audio = self._audio(wav_path) if audio is None else audio
         source_f0 = (
@@ -363,32 +334,30 @@ class RectifiedDataset(Dataset):
             speed=np.float32(1.0),
             frames=np.int64(frames),
             hop=np.int64(self.hop),
-            cache_fingerprint=np.asarray(fingerprint),
         )
         if self.use_variances:
             curves = variance_curves(audio.unsqueeze(0), source_f0.unsqueeze(0), frames, self.sample_rate, self.hop)
             values.update(voicing=curves[0][0].numpy(), tension=curves[1][0].numpy())
-        if not all(np.isfinite(value).all() for name, value in values.items() if name != 'cache_fingerprint'):
+        if not all(np.isfinite(value).all() for value in values.values()):
             raise ValueError(f'Invalid cached training features: {wav_path}')
-        self._write_cache(path, values)
-        return path
-
-    def ensure_cached(self, index):
-        index = index[0] if isinstance(index, tuple) else index
-        if self._original_cache[index] is None or self._cache_valid(index):
-            return False
-        self._build_original_cache(index)
-        return True
+        return values
 
     def __getitem__(self, index):
         index, hop = index if isinstance(index, tuple) else (index, None)
         _, content_path, _, _, sid = self.entries[index]
         if str(content_path).endswith('.flow.npz'):
-            return self._cached_item(content_path, int(sid))
-        path, fingerprint = self._original_cache[index]
-        if not path.is_file():
-            path = self._build_original_cache(index)
-        return self._cached_item(path, int(sid), fingerprint)
+            return self._npz_item(content_path, int(sid))
+        if self._indexed_cache is None:
+            values = self._build_original_values(index)
+        else:
+            key = self._original_keys[index]
+            try:
+                values = self._indexed_cache[key]
+            except (FileNotFoundError, KeyError, OSError, ValueError) as error:
+                raise RuntimeError(
+                    f'Indexed training feature cache is missing or stale for {self.entries[index][0]}; rebuild it before training.'
+                ) from error
+        return self._cached_values(values, int(sid), str(self._indexed_cache.path) if self._indexed_cache is not None else self.entries[index][0])
 
     def _flow_item(self, audio, source_f0, content, sid, hop=None):
         key_shift = 0.0
@@ -422,37 +391,37 @@ class RectifiedDataset(Dataset):
             item += tuple(curve[0, start:stop] for curve in curves)
         return item
 
-    def _cached_item(self, path, sid, expected_fingerprint=None):
+    def _npz_item(self, path, sid):
         with np.load(path, allow_pickle=False) as values:
-            if expected_fingerprint is not None:
-                if ('cache_fingerprint' not in values.files
-                        or str(values['cache_fingerprint'].item()) != expected_fingerprint):
-                    raise ValueError(f'Stale training feature cache: {path}')
-            frames = int(values['frames'])
-            length = min(frames, self.max_frames)
-            start = random.randint(0, frames - length) if self.augment else 0
-            stop = start + length
-            mel = torch.from_numpy(values['mel'][:, start:stop].copy())
-            curves = tuple(torch.from_numpy(values[name][start:stop].copy())
-                           for name in ('content', 'f0', 'energy', 'breathiness'))
-            if mel.shape != (self.data['n_mels'], length) or curves[0].shape != (length, self.content_channels):
-                raise ValueError(f'Invalid augmented feature dimensions: {path}')
-            if any(value.shape[0] != length for value in curves[1:]):
-                raise ValueError(f'Invalid augmented curve lengths: {path}')
-            if not all(torch.isfinite(value).all() for value in (mel, *curves)) or (curves[1] < 0).any():
-                raise ValueError(f'Invalid augmented feature values: {path}')
-            if self.use_harmonics:
-                if 'harmonic_prior' not in values.files:
-                    raise ValueError(f'Missing cached harmonic prior; rebuild training features: {path}')
-                harmonic = torch.from_numpy(values['harmonic_prior'][:, start:stop].copy())
-                if harmonic.shape != (self.data['n_mels'], length) or not torch.isfinite(harmonic).all():
-                    raise ValueError(f'Invalid cached harmonic-prior dimensions or values: {path}')
-            else:
-                harmonic = torch.empty((0, length), dtype=mel.dtype)
-            item = (mel, *curves, float(values['key_shift']), float(values['speed']), sid, harmonic)
-            if self.use_variances:
-                item += tuple(torch.from_numpy(values[name][start:stop].copy()) for name in ('voicing', 'tension'))
-            return item
+            loaded = {name: values[name] for name in values.files}
+        return self._cached_values(loaded, sid, path)
+
+    def _cached_values(self, values, sid, source):
+        frames = int(values['frames'])
+        length = min(frames, self.max_frames)
+        start = random.randint(0, frames - length) if self.augment else 0
+        stop = start + length
+        mel = torch.from_numpy(np.asarray(values['mel'])[:, start:stop].copy())
+        curves = tuple(torch.from_numpy(np.asarray(values[name])[start:stop].copy())
+                       for name in ('content', 'f0', 'energy', 'breathiness'))
+        if mel.shape != (self.data['n_mels'], length) or curves[0].shape != (length, self.content_channels):
+            raise ValueError(f'Invalid augmented feature dimensions: {source}')
+        if any(value.shape[0] != length for value in curves[1:]):
+            raise ValueError(f'Invalid augmented curve lengths: {source}')
+        if not all(torch.isfinite(value).all() for value in (mel, *curves)) or (curves[1] < 0).any():
+            raise ValueError(f'Invalid augmented feature values: {source}')
+        if self.use_harmonics:
+            if 'harmonic_prior' not in values:
+                raise ValueError(f'Missing cached harmonic prior; rebuild training features: {source}')
+            harmonic = torch.from_numpy(np.asarray(values['harmonic_prior'])[:, start:stop].copy())
+            if harmonic.shape != (self.data['n_mels'], length) or not torch.isfinite(harmonic).all():
+                raise ValueError(f'Invalid cached harmonic-prior dimensions or values: {source}')
+        else:
+            harmonic = torch.empty((0, length), dtype=mel.dtype)
+        item = (mel, *curves, float(values['key_shift']), float(values['speed']), sid, harmonic)
+        if self.use_variances:
+            item += tuple(torch.from_numpy(np.asarray(values[name])[start:stop].copy()) for name in ('voicing', 'tension'))
+        return item
 
     def _reference_item(self, audio, content, f0, sid, path, max_frames=None):
         frames = min(
@@ -496,44 +465,53 @@ class RectifiedDataset(Dataset):
         return None
 
 
-def prepare_training_cache(entries, config, workers=4):
-    """Build persistent original-clip features once instead of recomputing them every epoch."""
+def prepare_training_cache(entries, config, cache_path, workers=4):
     if not entries:
         return
     dataset = RectifiedDataset(entries, config, 2 ** 31, augment=False)
-    missing = [index for index in range(len(entries)) if not dataset._cache_valid(index)]
-    if not missing:
-        print(f'Training feature cache: {len(entries):,}/{len(entries):,} ready.', flush=True)
+    keys = dataset._original_keys
+    cache_path = Path(cache_path)
+    if IndexedDataset.matches(cache_path, dataset._cache_recipe_hash, keys):
+        print(f'Training feature index: {len(entries):,}/{len(entries):,} ready.', flush=True)
         return
-    workers = max(1, min(int(workers), os.cpu_count() or 1, len(missing)))
+    workers = max(1, min(int(workers), os.cpu_count() or 1, len(entries)))
     print(
-        f'Training feature cache: building {len(missing):,} missing clip(s) with {workers} worker(s)...',
+        f'Training feature index: building {len(entries):,} clip(s) with {workers} worker(s)...',
         flush=True,
     )
+    temporary = Path(str(cache_path) + f'.{os.getpid()}.tmp')
+    if temporary.exists():
+        temporary.unlink()
+    builder = IndexedDatasetBuilder(temporary, dataset._cache_recipe_hash, len(entries))
     previous_threads = torch.get_num_threads()
     torch.set_num_threads(max(1, previous_threads // workers))
-    completed = len(entries) - len(missing)
+    completed = 0
     last_report = time.monotonic()
     try:
         if workers == 1:
-            iterator = map(dataset.ensure_cached, missing)
+            iterator = map(dataset._build_original_values, range(len(entries)))
             pool = None
         else:
             pool = ThreadPoolExecutor(max_workers=workers)
-            iterator = pool.map(dataset.ensure_cached, missing)
+            iterator = pool.map(dataset._build_original_values, range(len(entries)))
         try:
-            for _ in iterator:
+            for index, values in enumerate(iterator):
+                builder.add_item(index, keys[index], values)
                 completed += 1
                 now = time.monotonic()
                 if completed == len(entries) or now - last_report >= 5:
-                    print(f'Training feature cache: {completed:,}/{len(entries):,}', flush=True)
+                    print(f'Training feature index: {completed:,}/{len(entries):,}', flush=True)
                     last_report = now
         finally:
             if pool is not None:
                 pool.shutdown(wait=True)
+        builder.finalize()
+        os.replace(temporary, cache_path)
+    except Exception:
+        builder.abort()
+        raise
     finally:
         torch.set_num_threads(previous_threads)
-
 
 def collate_flow(batch, frames=None):
     frames = frames or max(item[0].shape[-1] for item in batch)
