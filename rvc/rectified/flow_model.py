@@ -398,6 +398,8 @@ class RectifiedFlow(nn.Module):
         mel_std: float = 1.0,
         direct_speaker_conditioning: bool = False,
         energy: bool = True,
+        use_phonation: bool = False,
+        use_continuous_f0: Optional[bool] = None,
         use_spk_id: bool = True,
         diffusion_type: str = 'reflow',
         enc_ffn_kernel_size: int = 3,
@@ -458,6 +460,10 @@ class RectifiedFlow(nn.Module):
         self.mel_std = float(mel_std)
         self.n_mels = int(n_mels)
         self.reference = conditioning_version == 5
+        self.use_phonation = bool(use_phonation)
+        self.use_continuous_f0 = self.reference if use_continuous_f0 is None else bool(use_continuous_f0)
+        if self.use_phonation and not self.reference:
+            raise ValueError('Phonation conditioning requires conditioning version 5.')
         self.hidden_channels = int(hidden_channels)
         self.use_spk_id = bool(use_spk_id)
         self.encoder = ContentConditionEncoder(
@@ -465,6 +471,7 @@ class RectifiedFlow(nn.Module):
             breathiness=breathiness, key_shift=key_shift, speed=speed, energy=energy, use_spk_id=self.use_spk_id,
             enc_ffn_kernel_size=enc_ffn_kernel_size, use_rope=use_rope,
             rope_interleaved=rope_interleaved, rope_theta=rope_theta, use_variance_scaling=use_variance_scaling,
+            use_phonation=self.use_phonation,
         ) if self.reference else ConditionEncoder(
             content_channels,
             hidden_channels,
@@ -571,10 +578,11 @@ class RectifiedFlow(nn.Module):
         return (error * mask).sum() / denominator
 
     def predict_mel(self, content, f0, energy, speaker, mask, breathiness=None, key_shift=None,
-                    speed=None, voicing=None, tension=None):
+                    speed=None, voicing=None, tension=None, phonation=None):
         if self.aux is None:
             raise ValueError("This model has no direct mel predictor.")
-        cond = self.encoder(content, f0, energy, speaker, mask, breathiness, key_shift, speed, voicing, tension)
+        extra = {'phonation': phonation} if self.use_phonation else {}
+        cond = self.encoder(content, f0, energy, speaker, mask, breathiness, key_shift, speed, voicing, tension, **extra)
         return self.aux(cond, mask, self.encoder.voice(speaker)) * mask
 
     def _uniform_times(self, batch, device):
@@ -584,12 +592,13 @@ class RectifiedFlow(nn.Module):
 
     def forward(self, mel, content, f0, energy, speaker, mask, speaker_dropout=0.0,
                 breathiness=None, key_shift=None, speed=None, voicing=None, tension=None,
-                harmonic_prior=None):
+                harmonic_prior=None, phonation=None):
         if (self.flow_conditioning == "aux_mel" or self.direct_speaker_conditioning) and speaker_dropout != 0:
             raise ValueError("Speaker-conditioned standard flow keeps the speaker ID present during training.")
         speaker = self._drop_speakers(speaker, speaker_dropout)
+        extra = {'phonation': phonation} if self.use_phonation else {}
         cond = self.encoder(content, f0, energy, speaker, mask, breathiness, key_shift, speed, voicing, tension,
-                            harmonic_prior=harmonic_prior)
+                            harmonic_prior=harmonic_prior, **extra)
         voice = self.encoder.voice(speaker)
         t = self._uniform_times(mel.shape[0], mel.device)
         if self.dual_timestep:
@@ -603,9 +612,10 @@ class RectifiedFlow(nn.Module):
 
     @torch.no_grad()
     def validation_losses(self, mel, content, f0, energy, speaker, mask, breathiness, key_shift,
-                          speed, noise, fractions, voicing=None, tension=None, harmonic_prior=None):
+                          speed, noise, fractions, voicing=None, tension=None, harmonic_prior=None, phonation=None):
+        extra = {'phonation': phonation} if self.use_phonation else {}
         cond = self.encoder(content, f0, energy, speaker, mask, breathiness, key_shift, speed, voicing, tension,
-                            harmonic_prior=harmonic_prior)
+                            harmonic_prior=harmonic_prior, **extra)
         voice = self.encoder.voice(speaker)
         losses, aux = [], None
         for fraction in fractions:
@@ -639,6 +649,7 @@ class RectifiedFlow(nn.Module):
         schedule: str = "uniform",
         voicing: Optional[torch.Tensor] = None,
         tension: Optional[torch.Tensor] = None,
+        phonation: Optional[torch.Tensor] = None,
     ):
         method = self.sampling_method if method is None else method
         steps = self.sampling_steps if steps is None else steps
@@ -664,10 +675,12 @@ class RectifiedFlow(nn.Module):
         def repeat(value):
             return None if value is None else value.repeat(count, *([1] * (value.dim() - 1)))
 
+        extra = {'phonation': repeat(phonation)} if self.use_phonation else {}
         cond = self.encoder(
             torch.cat([c for c, _ in variants]), repeat(f0), repeat(energy),
             torch.cat([s for _, s in variants]), repeat(mask), repeat(breathiness), repeat(key_shift),
             voicing=repeat(voicing), tension=repeat(tension),
+            **extra,
         )
         voice = self.encoder.voice(torch.cat([s for _, s in variants]))
         masks = repeat(mask)
@@ -771,6 +784,11 @@ def resize_speakers(state_dict: dict, speaker_count: int, speaker_init=None, nul
 
 
 def validate_model_config(model: dict):
+    for name in ('use_phonation', 'use_continuous_f0'):
+        if name in model and not isinstance(model[name], bool):
+            raise ValueError(f'{name} must be a boolean.')
+    if model.get('use_phonation', False) and model.get('conditioning_version') != 5:
+        raise ValueError('Phonation conditioning requires conditioning version 5.')
     for name in ('dual_timestep', 'use_rope', 'rope_interleaved', 'use_variance_scaling',
                  'use_shallow_diffusion', 'train_aux_decoder', 'train_diffusion', 'val_gt_start'):
         if name in model and not isinstance(model[name], bool):

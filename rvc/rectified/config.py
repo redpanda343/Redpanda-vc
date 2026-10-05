@@ -78,7 +78,7 @@ STANDARD_PRESET = {
 
 LEGACY_PRESET = deepcopy(STANDARD_PRESET)
 STANDARD_PRESET['flow'].update({
-    'betas': [0.9, 0.98],
+    'betas': [0.9, 0.999],
     'adamw_weight_decay': 0.0,
     'muon_min_fan_in': 0,
 })
@@ -116,6 +116,7 @@ STANDARD_PRESET['flow']['model']['backbone_args'].update({
     'glu_type': 'atanglu', 'dropout_rate': 0.0, 'use_conditioner_cache': True,
 })
 STANDARD_PRESET['flow']['model']['aux_decoder']['kernel_size'] = 7
+STANDARD_PRESET['flow']['model'].update({'use_phonation': False, 'use_continuous_f0': True})
 STANDARD_PRESET['flow'].update({
     'accelerator': 'auto', 'num_nodes': 1,
     'strategy': {'name': 'auto', 'find_unused_parameters': False},

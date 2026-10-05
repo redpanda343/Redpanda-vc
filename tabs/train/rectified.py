@@ -139,28 +139,31 @@ def resolve_vocoder(mode, path):
         raise gr.Error(f'Could not download NSF-HiFiGAN vocoder: {error}') from error
 
 
-def resolve_pretrained(directory, enabled):
+def resolve_pretrained(directory, enabled, preferred=''):
     from rvc.rectified.lightning_train import latest_checkpoint
 
     if not enabled or latest_checkpoint(directory / 'flow') or (directory / 'flow' / 'checkpoint.pth').is_file():
         return ''
-    path = ROOT / 'rvc' / 'models' / 'pretraineds' / 'rectified' / 'pretrained.pth'
+    path = Path(str(preferred).strip().strip('"')) if str(preferred).strip() else ROOT / 'rvc' / 'models' / 'pretraineds' / 'rectified' / 'pretrained.pth'
     if not path.is_file():
         raise gr.Error(f'Pretrained model not found. Place your Rectified Flow checkpoint at {path}.')
     return str(path)
 
 
 def start(name, vocoder, batch, max_frames, max_updates, checkpoint_interval, device, use_fused_kernels=False,
-          use_pretrained=False, vocoder_mode='Default NSF-HiFiGAN'):
+          use_pretrained=False, vocoder_mode='Default NSF-HiFiGAN', phonation_mode='Config default', pretrained_path=''):
     directory = experiment_path(name)
     device_id(device)
     if not (directory / 'filelist.txt').is_file():
         raise gr.Error('Extract features for this experiment first.')
-    pretrained = resolve_pretrained(directory, use_pretrained)
+    pretrained = resolve_pretrained(directory, use_pretrained, pretrained_path)
+    if phonation_mode not in {'Config default', 'Enabled', 'Disabled'}:
+        raise gr.Error('Choose a valid phonation conditioning setting.')
+    phonation = None if phonation_mode == 'Config default' else phonation_mode == 'Enabled'
     from rvc.rectified.train_flow import load_training_config
 
     try:
-        selected = load_training_config(directory, pretrained or None, use_fused_kernels)
+        selected = load_training_config(directory, pretrained or None, use_fused_kernels, phonation)
     except ValueError as error:
         raise gr.Error(str(error)) from error
     precision = get_precision() or selected['flow'].get('precision', 'fp32')
@@ -181,6 +184,8 @@ def start(name, vocoder, batch, max_frames, max_updates, checkpoint_interval, de
         arguments.append('--use-fused-kernels')
     if pretrained:
         arguments.extend(['--pretrained-flow', pretrained])
+    if phonation is not None:
+        arguments.append('--use-phonation' if phonation else '--no-phonation')
     return launch(name, 'rvc.rectified.train_flow', arguments, 'Training rectified flow')
 
 
@@ -231,6 +236,11 @@ def rectified_train_tab():
         vocoder = gr.Textbox(label='Custom OpenVPI NSF-HiFiGAN checkpoint path', visible=False,
                             info='Use a compatible .ckpt or converted .pth export: 44.1 kHz, 128 mel bins, hop 512. Keep config.json beside raw checkpoints when provided.')
         use_pretrained = gr.Checkbox(label='Pretrained', value=False)
+        pretrained_path = gr.Textbox(label='Voice checkpoint to fine-tune', value='',
+                                    info='Optional exported flow .pth path, used when Pretrained is checked. Start a new experiment to add phonation conditioning.')
+        phonation_mode = gr.Dropdown(label='Phonation conditioning (experimental)',
+                                     choices=['Config default', 'Enabled', 'Disabled'], value='Config default',
+                                     info='Adds automatic source vocal texture cues to both conversion paths. Requires training or fine-tuning; it does not guarantee improved vocal fry.')
         gr.Markdown('Training precision follows **Settings → Training → Precision**.')
         with gr.Row():
             batch = gr.Number(label='Max clips per batch (per GPU)', value=None, minimum=1, precision=0,
@@ -254,6 +264,6 @@ def rectified_train_tab():
     vocoder_mode.change(lambda mode: gr.update(visible=mode == 'Custom NSF-HiFiGAN'),
                         [vocoder_mode], [vocoder], queue=False)
     train_button.click(start, [name, vocoder, batch, max_frames, max_updates, checkpoint_interval, device, use_fused_kernels,
-                               use_pretrained, vocoder_mode], outputs, queue=False)
+                               use_pretrained, vocoder_mode, phonation_mode, pretrained_path], outputs, queue=False)
     stop_button.click(stop, [], outputs, queue=False)
     gr.Timer(2).tick(status, [], outputs, queue=False)

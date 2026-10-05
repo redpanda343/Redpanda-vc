@@ -158,7 +158,7 @@ class FlowTask(pl.LightningModule):
 
     def run_model(self, batch):
         (mel, content, f0, energy, breathiness, key_shift, speed, speaker, mask,
-         harmonic_prior, voicing, tension) = unpack_flow(batch, self.device, True)
+         harmonic_prior, voicing, tension, phonation) = unpack_flow(batch, self.device, True)
         mel = normalize_mel(mel, self.data)
         if not self.model.reference:
             mel = mel * mask
@@ -167,6 +167,7 @@ class FlowTask(pl.LightningModule):
             speaker_dropout=self.settings['speaker_dropout'] if self.training else 0.0,
             breathiness=breathiness, key_shift=key_shift, speed=speed, voicing=voicing, tension=tension,
             harmonic_prior=harmonic_prior if harmonic_prior.shape[1] else None,
+            phonation=phonation,
         )
         aux = flow.new_zeros(()) if auxiliary is None else auxiliary * self.settings['aux_mel_weight']
         return dict(mel_loss=flow, aux_mel_loss=aux, total_loss=flow + aux)
@@ -269,9 +270,11 @@ class FlowTask(pl.LightningModule):
 
     def on_load_checkpoint(self, checkpoint):
         saved = resolve_config(checkpoint['config'])
+        saved['flow']['model'].setdefault('use_phonation', False)
+        saved['flow']['model'].setdefault('use_continuous_f0', saved['flow']['model'].get('conditioning_version') == 5)
         select_fused_activation(saved, getattr(self.args, 'use_fused_kernels', False))
         if saved['data'] != self.data or saved['flow']['model'] != self.settings['model']:
-            raise ValueError('Resume architecture or audio configuration differs from the checkpoint.')
+            raise ValueError('Resume architecture or audio configuration differs from the checkpoint. Enable phonation in a new experiment and fine-tune from the voice .pth export.')
         if saved['flow']['optimizer'] != self.settings['optimizer']:
             raise ValueError('Resume requires the same optimizer type. Use the voice export to fine-tune with a different optimizer.')
         data = self.data_module
@@ -305,12 +308,21 @@ class FlowTask(pl.LightningModule):
         source = resolve_config(state.get('config', {}))
         select_fused_activation(source, getattr(self.args, 'use_fused_kernels', False))
         source_model, target_model = deepcopy(source['flow']['model']), deepcopy(self.settings['model'])
+        add_phonation = target_model.get('use_phonation', False) and not source_model.get('use_phonation', False)
+        for candidate in (source_model, target_model):
+            candidate.pop('use_phonation', None)
+            candidate.pop('use_continuous_f0', None)
         if source['data'] != self.data or source_model != target_model:
             raise ValueError('Pretrained architecture or audio configuration differs from the experiment.')
         if state.get('embedder_model', self.data_module.embedder) != self.data_module.embedder:
             raise ValueError('Pretrained flow uses a different content embedder.')
         speaker_init = self.model.encoder.speaker.weight if self.model.use_spk_id else None
-        self.model.load_state_dict(resize_speakers(state['model'], self.model.speaker_count, speaker_init,
+        weights = state['model']
+        if add_phonation:
+            from rvc.rectified.phonation import initialize_phonation_weights
+
+            weights = initialize_phonation_weights(weights, self.model)
+        self.model.load_state_dict(resize_speakers(weights, self.model.speaker_count, speaker_init,
                                                   null_speaker=self.model.encoder.has_null_speaker), strict=True)
 
 

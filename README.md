@@ -9,7 +9,7 @@ This project is a fork of [Applio](https://github.com/IAHispano/Applio), with ch
 New Rectified Flow experiments use the `standard-v5` preset: a DiffSinger-style
 transformer condition encoder with ContentVec input, LYNXNet2 ATanGLU backbone,
 shallow flow and ConvNeXt auxiliary mel decoder. Muon/AdamW uses betas
-`(0.9, 0.98)`, Muon weight decay `0.1`, AdamW weight decay `0`, and no EMA.
+`(0.9, 0.999)`, Muon weight decay `0.1`, AdamW weight decay `0`, and no EMA.
 Random pitch and time augmentation keep their key-shift and speed embeddings.
 New experiments default to `flow.model.use_spk_id: false`, matching DiffSinger.
 These models have no speaker embedding table and ignore the target speaker ID.
@@ -66,6 +66,25 @@ Fused CUDA FP16/BF16 training requires a working Triton installation; CPU/FP32 a
 unsupported GPUs use the eager path. The port in `rvc/rectified/kernels` is
 adapted from [DiffSinger](https://github.com/openvpi/DiffSinger) under Apache 2.0;
 its license is included in that directory.
+
+New v5 experiments interpolate unvoiced F0 in log frequency before aligning it
+to mel frames, and use this continuous pitch for conditioning and the vocoder.
+Set `flow.model.use_continuous_f0` to `false` to retain raw unvoiced zeros.
+
+Optional `flow.model.use_phonation` adds four frame-level waveform cues:
+normalized periodicity and evidence of repeating patterns across two, three and
+four pitch cycles. This is an experimental phonation input, not a labeled fry
+classifier. It defaults to `false`. Enable **Phonation conditioning** in the
+training tab for a new experiment, enable **Pretrained**, and enter an existing
+voice export in **Voice checkpoint to fine-tune**. The new projection starts at
+zero so the pretrained conditioning is preserved initially. Native checkpoint
+resume requires the same architecture.
+Training caches these cues for originals and augmented examples. File conversion
+and realtime extract the same cues automatically, using an 80 ms history window
+without adding another audio buffer. **Phonation strength** scales the input from
+0 to 2, with 1 as the default. Realtime still depends on the model's inference
+speed. Learning useful fry control requires training examples containing fry;
+startup checks do not establish audible improvement.
 
  ## Credits
 

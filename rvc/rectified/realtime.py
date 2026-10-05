@@ -58,7 +58,7 @@ class RealtimeFlowSampler:
 
     @torch.inference_mode()
     def __call__(self, content, f0, energy, speaker, mask, steps=None,
-                 breathiness=None, voicing=None, tension=None):
+                 breathiness=None, voicing=None, tension=None, phonation=None):
         args = (content, f0, energy, speaker, mask)
         kwargs = {
             "steps": self.model.sampling_steps if steps is None else int(steps),
@@ -66,12 +66,13 @@ class RealtimeFlowSampler:
             "breathiness": breathiness,
             "voicing": voicing,
             "tension": tension,
+            "phonation": phonation,
         }
         if not self.enabled or self.failed or content.device.type != "cuda":
             return self.model.sample(*args, **kwargs)
         signature = (
             tuple(_tensor_signature(value) for value in args),
-            tuple(_tensor_signature(kwargs[key]) for key in ("breathiness", "voicing", "tension")),
+            tuple(_tensor_signature(kwargs[key]) for key in ("breathiness", "voicing", "tension", "phonation")),
             kwargs["steps"], kwargs["method"], self.model.t_start,
         )
         if signature != self.signature:

@@ -24,7 +24,7 @@
     "step_lr_offset": 0,
     "betas": [
       0.9,
-      0.98
+      0.999
     ],
     "weight_decay": 0.1,
     "warmup_steps": 0,
@@ -88,6 +88,8 @@
       },
       "t_start": 0.4,
       "conditioning_version": 5,
+      "use_phonation": false,
+      "use_continuous_f0": true,
       "direct_speaker_conditioning": false,
       "aux_grad": 0.1,
       "aux_decoder": {

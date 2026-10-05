@@ -67,7 +67,7 @@ def muon_parameters(model: nn.Module, min_fan_in: int = 0) -> set:
 
 class MuonAdamW(torch.optim.Optimizer):
     def __init__(self, model, lr, muon_weight_decay=0.1, adamw_weight_decay=0.0,
-                 momentum=0.95, betas=(0.9, 0.98), eps=1e-8, iteration_dtype=torch.float16,
+                 momentum=0.95, betas=(0.9, 0.999), eps=1e-8, iteration_dtype=torch.float16,
                  min_fan_in=0):
         if iteration_dtype not in {torch.float32, torch.float16, torch.bfloat16}:
             raise ValueError(f"Unsupported Muon iteration dtype: {iteration_dtype}")

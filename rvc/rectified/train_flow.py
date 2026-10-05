@@ -113,7 +113,9 @@ def preview(model, vocoder, reference, data, writer, step, index=None):
         return
     device = next(model.parameters()).device
     mel, content, f0, energy, breathiness, audio, sid, path = reference[:8]
-    variances = dict(zip(("voicing", "tension"), (value.to(device) for value in reference[8:])))
+    extras = reference[8:-1] if model.use_phonation else reference[8:]
+    variances = dict(zip(("voicing", "tension"), (value.to(device) for value in extras)))
+    phonation = reference[-1].to(device) if model.use_phonation else None
     content, f0, energy = content.to(device), f0.to(device), energy.to(device)
     mask = torch.ones(1, 1, f0.shape[1], device=device)
     speaker = torch.tensor([sid], device=device)
@@ -125,9 +127,10 @@ def preview(model, vocoder, reference, data, writer, step, index=None):
             generated = model.sample(content, f0, energy, speaker, mask,
                                      breathiness=breathiness.to(device),
                                      source_mel=normalize_mel(mel.to(device), data) if model.val_gt_start else None,
+                                     phonation=phonation,
                                      **variances)
             predicted = model.predict_mel(content, f0, energy, speaker, mask,
-                                          breathiness=breathiness.to(device), **variances) if model.aux is not None else None
+                                          breathiness=breathiness.to(device), phonation=phonation, **variances) if model.aux is not None else None
     finally:
         model.train(training)
     if not torch.isfinite(generated).all():
@@ -156,7 +159,7 @@ def select_fused_activation(config, enabled):
         config['flow']['model'].setdefault('backbone_args', {})['glu_type'] = 'softsign_glu'
 
 
-def load_training_config(experiment, pretrained_flow=None, use_fused_kernels=False):
+def load_training_config(experiment, pretrained_flow=None, use_fused_kernels=False, use_phonation=None):
     config_path = experiment / 'rectified_config.json'
     existing = config_path.exists()
     if not existing:
@@ -171,6 +174,8 @@ def load_training_config(experiment, pretrained_flow=None, use_fused_kernels=Fal
         config['data'] = source['data']
         config['flow']['model'] = source['flow']['model']
     select_fused_activation(config, use_fused_kernels)
+    if use_phonation is not None:
+        config['flow']['model']['use_phonation'] = bool(use_phonation)
     configure_flow(config, existing)
     return config
 
@@ -181,7 +186,8 @@ def train(args):
     if Path(args.model_name).name != args.model_name or args.model_name in {'.', '..'}:
         raise ValueError('Use a model name, not a path.')
     experiment = ROOT / 'logs' / args.model_name
-    config = load_training_config(experiment, args.pretrained_flow, getattr(args, 'use_fused_kernels', False))
+    config = load_training_config(experiment, args.pretrained_flow, getattr(args, 'use_fused_kernels', False),
+                                  getattr(args, 'use_phonation', None))
     configure_arguments(args, config['flow'])
     if config['data']['sample_rate'] != 44100:
         raise ValueError('This recipe requires 44100 Hz audio.')
@@ -193,6 +199,8 @@ def configure_flow(config, existing_config):
     config.clear()
     config.update(resolved)
     settings = config['flow']
+    settings['model'].setdefault('use_phonation', False)
+    settings['model'].setdefault('use_continuous_f0', settings['model'].get('conditioning_version') == 5)
     validate_model_config(settings['model'])
     settings.setdefault('min_learning_rate', 0.0)
     settings.setdefault('max_batch_frames', 50000)
@@ -282,6 +290,10 @@ def main():
                         help='cpu, one GPU such as cuda:0, or multiple GPUs such as cuda:0,cuda:1')
     parser.add_argument('--precision', choices=['fp32', 'fp16', 'bf16'], default=None)
     parser.add_argument('--pretrained-flow')
+    phonation = parser.add_mutually_exclusive_group()
+    phonation.add_argument('--use-phonation', dest='use_phonation', action='store_true')
+    phonation.add_argument('--no-phonation', dest='use_phonation', action='store_false')
+    parser.set_defaults(use_phonation=None)
     parser.add_argument('--learning-rate', type=float)
     parser.add_argument('--seed', type=int, default=1234)
     parser.add_argument('--use-fused-kernels', action='store_true',

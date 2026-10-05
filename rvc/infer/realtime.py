@@ -154,6 +154,7 @@ class RealTimeRVC:
         rectified_vocoder_path="",
         rectified_steps=0,
         rectified_cuda_graph=True,
+        rectified_phonation_scale=1.0,
     ):
         self.converter = VoiceConverter()
         self.converter.get_vc(model_path, speaker_id)
@@ -225,6 +226,9 @@ class RealTimeRVC:
             if int(rectified_steps) != rectified_steps or not 0 <= rectified_steps <= 1000:
                 raise ValueError("Flow steps must be an integer between 0 and 1000.")
             self.rectified_steps = int(rectified_steps) or None
+            self.phonation_scale = float(rectified_phonation_scale)
+            if not math.isfinite(self.phonation_scale) or not 0 <= self.phonation_scale <= 2:
+                raise ValueError('Phonation strength must be between 0 and 2.')
             self.flow_sampler = RealtimeFlowSampler(self.model, enabled=rectified_cuda_graph)
             self.pipeline.set_vocoder(rectified_vocoder_path)
             path = self.pipeline.vocoder_path or default_vocoder(self.pipeline.checkpoint_vocoder)
@@ -429,7 +433,13 @@ class RealTimeRVC:
         source_f0 = pitchf / (2 ** (self.pitch / 12))
         content = upsample_content(features.float(), self.pipeline.data["content_interpolation"])
         content = to_mel_rate(content, frames, rate, hop)
-        f0 = f0_to_mel_rate(pitchf, frames, rate, hop)
+        f0 = f0_to_mel_rate(pitchf, frames, rate, hop, self.model.use_continuous_f0)
+        phonation = None
+        if self.model.use_phonation:
+            from rvc.rectified.phonation import phonation_features
+
+            raw_f0 = f0_to_mel_rate(source_f0, frames, rate, hop)
+            phonation = phonation_features(waveform, rate, raw_f0, frames, hop) * self.phonation_scale
         energy = smooth_curve(frame_energy(waveform, rate, feature_frames))
         energy = to_mel_rate(energy.unsqueeze(-1), frames, rate, hop)[..., 0]
         breathiness = smooth_curve(aperiodicity(waveform, rate, source_f0, feature_frames))
@@ -443,6 +453,7 @@ class RealTimeRVC:
         mel = self.flow_sampler(
             content, f0, energy, speaker, mask, steps=self.rectified_steps,
             breathiness=breathiness, **variances,
+            phonation=phonation,
         )
         first_frame = max(0, start // hop - self.vocoder_context_frames)
         audio = self.pipeline.vocoder_model(mel[..., first_frame:], f0[..., first_frame:])[0, 0]

@@ -400,6 +400,17 @@ def update_vocoder_visibility(model):
     return gr.update(visible=get_model_info(model)[0])
 
 
+def update_phonation_visibility(model):
+    if not model:
+        return gr.update(visible=False)
+    try:
+        state = torch.load(model, map_location='cpu', weights_only=True)
+        enabled = state.get('config', {}).get('flow', {}).get('model', {}).get('use_phonation', False)
+    except Exception:
+        enabled = False
+    return gr.update(visible=enabled)
+
+
 def filter_dropdowns(filter_text):
     ft = (filter_text or "").lower()
     all_models = sorted(get_files("model"), key=extract_model_and_epoch)
@@ -464,6 +475,11 @@ def inference_tab():
             outputs=[rectified_vocoder_path],
             show_progress=False,
         )
+        rectified_phonation_scale = gr.Slider(label='Phonation strength', minimum=0, maximum=2, step=0.05,
+                                              value=1, visible=update_phonation_visibility(default_weight)['visible'],
+                                              info='1 follows source vocal texture cues. Requires a model trained with phonation conditioning.')
+        model_file.change(fn=update_phonation_visibility, inputs=[model_file], outputs=[rectified_phonation_scale],
+                          show_progress=False)
         filter_box_inf.blur(
             fn=filter_dropdowns,
             inputs=[filter_box_inf],
@@ -2254,6 +2270,7 @@ def inference_tab():
             sid,
             seed,
             rectified_vocoder_path,
+            rectified_phonation_scale,
         ],
         outputs=[vc_output1, vc_output2],
     )
@@ -2317,6 +2334,7 @@ def inference_tab():
             sid_batch,
             seed_batch,
             rectified_vocoder_path,
+            rectified_phonation_scale,
         ],
         outputs=[vc_output3],
     ).then(
