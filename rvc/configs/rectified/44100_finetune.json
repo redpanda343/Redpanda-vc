@@ -1,5 +1,5 @@
 {
-  "preset": "standard-v2",
+  "preset": "standard-v3",
   "flow": {
     "finetune_learning_rate": 0.00005,
     "min_learning_rate": 1e-05,

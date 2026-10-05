@@ -1,5 +1,5 @@
 {
-  "preset": "standard-v2",
+  "preset": "standard-v3",
   "flow": {
     "learning_rate": 0.0006,
     "decay_step": 5000,

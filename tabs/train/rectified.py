@@ -158,7 +158,7 @@ def resolve_pretrained(directory, enabled):
     return str(path)
 
 
-def start(name, vocoder, batch, max_frames, epochs, save_every, device, compile_backbone=False,
+def start(name, vocoder, batch, max_frames, epochs, save_every, device, use_fused_kernels=False,
           use_pretrained=False, vocoder_mode='Default NSF-HiFiGAN'):
     directory = experiment_path(name)
     device_id(device)
@@ -179,6 +179,15 @@ def start(name, vocoder, batch, max_frames, epochs, save_every, device, compile_
         except ValueError as error:
             raise gr.Error(str(error)) from error
     pretrained = resolve_pretrained(directory, use_pretrained)
+    if use_fused_kernels:
+        from rvc.rectified.train_flow import load_training_config
+
+        try:
+            selected = load_training_config(directory, pretrained or None)
+            if selected['flow']['model'].get('backbone_args', {}).get('glu_type', 'atanglu') != 'softsign_glu':
+                raise ValueError('Fused kernels require SoftSignGLU. Existing ATanGLU experiments must keep this option disabled.')
+        except ValueError as error:
+            raise gr.Error(str(error)) from error
     vocoder = resolve_vocoder(vocoder_mode, vocoder)
     arguments = ['--model-name', str(name).strip(), '--vocoder', vocoder,
                  '--batch-size', positive_integer(batch, 'Max clips per batch'),
@@ -186,8 +195,8 @@ def start(name, vocoder, batch, max_frames, epochs, save_every, device, compile_
                  '--epochs', positive_integer(epochs, 'Total epochs'),
                  '--save-every', positive_integer(save_every, 'Save interval'),
                  '--device', str(device).strip().lower(), '--precision', precision]
-    if compile_backbone:
-        arguments.append('--compile')
+    if use_fused_kernels:
+        arguments.append('--use-fused-kernels')
     if pretrained:
         arguments.extend(['--pretrained-flow', pretrained])
     return launch(name, 'rvc.rectified.train_flow', arguments, 'Training rectified flow')
@@ -247,8 +256,8 @@ def rectified_train_tab():
                                    info='Padded frames (clips x longest clip, 1 frame = 11.6 ms). Lower it if you run out of GPU memory.')
             epochs = gr.Number(label='Total epochs', value=100, minimum=1, precision=0)
             save_every = gr.Number(label='Save every N epochs', value=10, minimum=1, precision=0)
-        compile_backbone = gr.Checkbox(label='Compile flow backbone', value=False, visible=False,
-                                       info='Requires Linux, CUDA and Triton 3.6.0. NVIDIA GPUs need compute capability 8.0 or newer. The first step takes longer to compile. Unsupported setups train uncompiled.')
+        use_fused_kernels = gr.Checkbox(label='Fused Linear + SoftSignGLU kernels', value=False,
+                                       info='Optional acceleration for new SoftSignGLU experiments. Requires Triton and CUDA FP16 or BF16. Existing ATanGLU models must leave this disabled.')
         with gr.Row():
             train_button = gr.Button('Start / resume rectified training', variant='primary')
             stop_button = gr.Button('Stop current rectified job', interactive=False)
@@ -260,7 +269,7 @@ def rectified_train_tab():
     use_pretrained.change(toggle_pretrained, [use_pretrained], [batch], queue=False)
     vocoder_mode.change(lambda mode: gr.update(visible=mode == 'Custom NSF-HiFiGAN'),
                         [vocoder_mode], [vocoder], queue=False)
-    train_button.click(start, [name, vocoder, batch, max_frames, epochs, save_every, device, compile_backbone,
+    train_button.click(start, [name, vocoder, batch, max_frames, epochs, save_every, device, use_fused_kernels,
                                use_pretrained, vocoder_mode], outputs, queue=False)
     stop_button.click(stop, [], outputs, queue=False)
     gr.Timer(2).tick(status, [], outputs, queue=False)

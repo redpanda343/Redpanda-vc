@@ -1,9 +1,7 @@
 import argparse
-import importlib
 import json
 import os
 import random
-import sys
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
@@ -11,7 +9,6 @@ os.environ.setdefault("TORCH_CUDNN_V8_API_ENABLED", "1")
 
 import numpy as np
 import torch
-from torch._functorch import config as aot_config
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
@@ -95,26 +92,55 @@ def conditioning_norms(model) -> dict:
     return norms
 
 
-def compiled_backbone(model, enabled: bool, mode: str, device):
+def configure_fused_backbone(model, enabled, device, amp_dtype, max_frames):
+    for layer in model.backbone.layers:
+        layer.use_fused_kernels = False
     if not enabled:
-        return None
-    if sys.platform != "linux" or device.type != "cuda" or not torch.cuda.is_available():
-        print("Flow backbone compilation requires Linux and CUDA; training uncompiled.", flush=True)
-        return None
-    if not torch.version.hip and torch.cuda.get_device_capability(device) < (8, 0):
-        print("Triton 3.6 requires NVIDIA compute capability 8.0 or newer; training uncompiled.", flush=True)
-        return None
-    try:
-        importlib.import_module("triton")
-    except (ImportError, OSError) as error:
-        print(f"Triton is unavailable ({error}); training uncompiled.", flush=True)
-        return None
-    print(f"Flow backbone compilation requested (Inductor, {mode}). The first training step compiles forward and backward graphs.", flush=True)
-    return torch.compile(model.backbone, backend="inductor", mode=mode, dynamic=True)
+        return 0
+    if any(layer.glu_type != 'softsign_glu' for layer in model.backbone.layers):
+        raise ValueError('Fused kernels require SoftSignGLU. Existing ATanGLU experiments must keep this option disabled.')
+    if device.type != 'cuda' or amp_dtype is None:
+        print('Fused kernels require CUDA FP16 or BF16; using eager SoftSignGLU.', flush=True)
+        return 0
+    from rvc.rectified.kernels.fused_linear_softsign_glu import fused_supported, is_triton_available
+
+    if not is_triton_available():
+        raise RuntimeError('Fused kernels require a working Triton installation. Install Triton for this platform or disable fused kernels.')
+    if not fused_supported(device, amp_dtype):
+        print('This GPU, dtype or Triton version cannot run fused kernels; using eager SoftSignGLU.', flush=True)
+        return 0
+    for layer in model.backbone.layers:
+        layer.use_fused_kernels = True
+    print(f'Enabled DiffSinger fused Linear + SoftSignGLU in {len(model.backbone.layers)} flow blocks. Warming up forward kernels.', flush=True)
+    warmup_fused_backbone(model.backbone, device, amp_dtype, max_frames)
+    return len(model.backbone.layers)
+
+
+@torch.no_grad()
+def warmup_fused_backbone(backbone, device, dtype, max_frames):
+    from rvc.rectified.kernels.fused_linear_softsign_glu import fused_linear_softsign_glu
+
+    if not backbone.layers:
+        return
+    layer = backbone.layers[0]
+    largest_bucket = 1 << (max(1, int(max_frames)) - 1).bit_length()
+    bucket = min(2048, largest_bucket)
+    with torch.random.fork_rng(devices=[device.index]), torch.cuda.device(device):
+        while bucket <= largest_bucket:
+            try:
+                x = torch.randn(bucket // 2 + 1, layer.up.in_features, device=device, dtype=dtype)
+                x = fused_linear_softsign_glu(x, layer.up.weight, layer.up.bias)
+                x = fused_linear_softsign_glu(x, layer.mid.weight, layer.mid.bias)
+                del x
+            except Exception as error:
+                print(f'Fused kernel warmup stopped ({error}); remaining kernels compile on first use.', flush=True)
+                break
+            bucket *= 2
+    torch.cuda.empty_cache()
 
 
 def train_step(model, optimizer, batch, data, settings, device, speaker_dropout, amp_dtype=None,
-               scaler=None, backbone=None, ranks=None, collect_stats=False):
+               scaler=None, ranks=None, collect_stats=False):
     (mel, content, f0, energy, breathiness, key_shift, speed, speaker, mask, harmonic_prior,
      voicing, tension) = unpack_flow(batch, device, True)
     mel = normalize_mel(mel, data)
@@ -124,12 +150,11 @@ def train_step(model, optimizer, batch, data, settings, device, speaker_dropout,
     cached_harmonics = harmonic_prior if harmonic_prior.shape[1] else None
     optimizer.zero_grad(set_to_none=True)
 
-    backward_context = aot_config.patch(backward_pass_autocast="off") if backbone is not None else nullcontext()
-    with backward_context, torch.autocast(device.type, dtype=amp_dtype or torch.float32, enabled=amp_dtype is not None):
+    with torch.autocast(device.type, dtype=amp_dtype or torch.float32, enabled=amp_dtype is not None):
         flow, auxiliary = model(
             mel, content, f0, energy, speaker, mask,
             speaker_dropout=speaker_dropout, breathiness=breathiness,
-            key_shift=key_shift, speed=speed, backbone=backbone,
+            key_shift=key_shift, speed=speed,
             voicing=voicing, tension=tension, harmonic_prior=cached_harmonics,
         )
         loss = flow if auxiliary is None else flow + settings['aux_mel_weight'] * auxiliary
@@ -281,6 +306,8 @@ def train(args):
     config = load_training_config(experiment, args.pretrained_flow)
     if config['data']['sample_rate'] != 44100:
         raise ValueError('This recipe requires 44100 Hz audio.')
+    if getattr(args, 'use_fused_kernels', False) and config['flow']['model'].get('backbone_args', {}).get('glu_type', 'atanglu') != 'softsign_glu':
+        raise ValueError('Fused kernels require SoftSignGLU. Existing ATanGLU experiments must keep this option disabled.')
     originals = read_filelist(experiment / 'filelist.txt', ROOT, originals_only=True)
     multispeaker = config['flow']['model'].get('conditioning_version', 1) in (2, 3, 4, 5)
     if multispeaker:
@@ -449,6 +476,10 @@ def train_rank(args, ranks):
         for name in ('voicing', 'tension', 'direct_speaker_conditioning'):
             if bool(pretrained_model.get(name, False)) != bool(settings['model'].get(name, False)):
                 raise ValueError(f'Pretrained flow differs in {name}. Use a matching pretrained or train a new model from scratch.')
+        source_glu = pretrained_model.get('backbone_args', {}).get('glu_type', 'atanglu')
+        target_glu = settings['model'].get('backbone_args', {}).get('glu_type', 'atanglu')
+        if source_glu != target_glu:
+            raise ValueError('Pretrained flow uses a different GLU activation. Use a matching pretrained.')
         source_scale = float(pretrained_model.get('backbone_args', {}).get('time_scale', 1000.0))
         target_scale = float(settings['model'].get('backbone_args', {}).get('time_scale', 1000.0))
         if source_scale != target_scale:
@@ -470,8 +501,7 @@ def train_rank(args, ranks):
         if main:
             output.mkdir(parents=True, exist_ok=True)
             (experiment / 'rectified_config.json').write_text(json.dumps(compact_config(config), indent=2) + '\n', encoding='utf-8')
-    backbone = compiled_backbone(model, getattr(args, 'compile', False),
-                                 getattr(args, 'torch_compile_mode', 'default'), device)
+    configure_fused_backbone(model, getattr(args, 'use_fused_kernels', False), device, amp_dtype, max_frames)
     train_model = ranks.wrap(model)
     if ranks.world > 1:
         random.seed(args.seed + ranks.rank)
@@ -514,7 +544,7 @@ def train_rank(args, ranks):
                     group['lr'] = current_lr
                 flow, auxiliary, norm, updated = train_step(
                     train_model, optimizer, batch, data, settings, device, dropout, amp_dtype, scaler,
-                    backbone, ranks, collect_stats=should_log,
+                    ranks=ranks, collect_stats=should_log,
                 )
                 if not updated:
                     if ranks.main:
@@ -599,8 +629,8 @@ def main():
     parser.add_argument('--pretrained-flow')
     parser.add_argument('--learning-rate', type=float)
     parser.add_argument('--seed', type=int, default=1234)
-    parser.add_argument('--compile', action='store_true')
-    parser.add_argument('--torch-compile-mode', choices=['default', 'reduce-overhead', 'max-autotune'], default='default')
+    parser.add_argument('--use-fused-kernels', action='store_true',
+                        help='Use DiffSinger Triton Linear + SoftSignGLU kernels during CUDA mixed-precision training.')
     parser.add_argument('--fresh', action='store_true')
     train(parser.parse_args())
 

@@ -94,8 +94,10 @@ STANDARD_PRESET['flow']['model'].update({
     'direct_speaker_conditioning': False,
 })
 STANDARD_PRESET['flow']['model']['backbone_args']['adaln'] = False
-PRESET_NAME = 'standard-v2'
-PRESETS = {'standard-v1': LEGACY_PRESET, PRESET_NAME: STANDARD_PRESET}
+ATAN_PRESET = deepcopy(STANDARD_PRESET)
+STANDARD_PRESET['flow']['model']['backbone_args']['glu_type'] = 'softsign_glu'
+PRESET_NAME = 'standard-v3'
+PRESETS = {'standard-v1': LEGACY_PRESET, 'standard-v2': ATAN_PRESET, PRESET_NAME: STANDARD_PRESET}
 EDITABLE_FLOW_KEYS = (
     'learning_rate', 'decay_step', 'gamma', 'max_batch_frames', 'max_batch_size',
     'num_workers', 'dataloader_prefetch_factor', 'log_interval',

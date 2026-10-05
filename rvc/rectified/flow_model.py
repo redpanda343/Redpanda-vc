@@ -233,10 +233,34 @@ def atan_glu(x: torch.Tensor, fused: bool = True) -> torch.Tensor:
     return out * torch.atan(gate)
 
 
+class _SoftSignGLU(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, out, gate):
+        softsign_gate = F.softsign(gate)
+        ctx.save_for_backward(softsign_gate, out * (1.0 - softsign_gate.abs()).square())
+        return out * softsign_gate
+
+    @staticmethod
+    def backward(ctx, grad):
+        softsign_gate, decay_out = ctx.saved_tensors
+        return grad * softsign_gate, grad * decay_out
+
+
+def softsign_glu(x, fused=True):
+    out, gate = x.chunk(2, dim=-1)
+    if fused and torch.is_grad_enabled():
+        return _SoftSignGLU.apply(out, gate)
+    return out * F.softsign(gate)
+
+
 class LYNXNet2Block(nn.Module):
-    def __init__(self, channels, expansion, kernel_size, adaln=False):
+    def __init__(self, channels, expansion, kernel_size, adaln=False, glu_type='atanglu'):
         super().__init__()
         inner = int(channels * expansion)
+        if glu_type not in {'atanglu', 'softsign_glu'}:
+            raise ValueError(f'Unsupported flow activation: {glu_type!r}.')
+        self.glu_type = glu_type
+        self.use_fused_kernels = False
         self.norm = MixedPrecisionLayerNorm(channels, elementwise_affine=not adaln)
         self.depthwise = nn.Conv1d(channels, channels, kernel_size, padding=kernel_size // 2, groups=channels)
         self.up = nn.Linear(channels, inner * 2)
@@ -256,7 +280,15 @@ class LYNXNet2Block(nn.Module):
             shift, scale, gate = self.modulation(F.silu(embedding)).chunk(3, dim=-1)
             y = y + y * scale + shift
         y = self.depthwise(y.transpose(1, 2)).transpose(1, 2)
-        y = self.down(atan_glu(self.mid(atan_glu(self.up(y), fused)), fused))
+        if self.training and self.use_fused_kernels:
+            from rvc.rectified.kernels.fused_linear_softsign_glu import fused_linear_softsign_glu
+
+            y = fused_linear_softsign_glu(y, self.up.weight, self.up.bias)
+            y = fused_linear_softsign_glu(y, self.mid.weight, self.mid.bias)
+        else:
+            activation = softsign_glu if self.glu_type == 'softsign_glu' else atan_glu
+            y = activation(self.mid(activation(self.up(y), fused)), fused)
+        y = self.down(y)
         if gate is not None:
             y = y + gate * y
         return x + y
@@ -264,7 +296,7 @@ class LYNXNet2Block(nn.Module):
 
 class LYNXNet2Backbone(nn.Module):
     def __init__(self, n_mels, cond_channels, channels=1024, layers=6, expansion=1, kernel_size=31,
-                 adaln=False, time_scale=1000.0, speaker_channels=None, reference=False):
+                 adaln=False, time_scale=1000.0, speaker_channels=None, reference=False, glu_type='atanglu'):
         super().__init__()
         self.channels = int(channels)
         self.time_scale = float(time_scale)
@@ -275,7 +307,7 @@ class LYNXNet2Backbone(nn.Module):
             nn.Linear(channels, channels * 4), nn.GELU(), nn.Linear(channels * 4, channels)
         )
         self.layers = nn.ModuleList(
-            [LYNXNet2Block(channels, expansion, kernel_size, adaln) for _ in range(layers)]
+            [LYNXNet2Block(channels, expansion, kernel_size, adaln, glu_type) for _ in range(layers)]
         )
         self.voice = nn.Linear(cond_channels if speaker_channels is None else speaker_channels, channels) if adaln else None
         self.norm = nn.LayerNorm(channels)
@@ -510,7 +542,7 @@ class RectifiedFlow(nn.Module):
         return t.clamp(1e-7, 1.0 - 1e-7) if self.flow_loss == "l2_lognorm" else t
 
     def forward(self, mel, content, f0, energy, speaker, mask, speaker_dropout=0.0,
-                breathiness=None, key_shift=None, speed=None, backbone=None, voicing=None, tension=None,
+                breathiness=None, key_shift=None, speed=None, voicing=None, tension=None,
                 harmonic_prior=None):
         if (self.flow_conditioning == "aux_mel" or self.direct_speaker_conditioning) and speaker_dropout != 0:
             raise ValueError("Speaker-conditioned standard flow keeps the speaker ID present during training.")
@@ -525,8 +557,7 @@ class RectifiedFlow(nn.Module):
             selection = alternate if self.reference else alternate & mask[:, 0].bool()
             t = torch.where(selection, t2[:, None], t[:, None])
 
-        backbone = self.backbone if backbone is None else backbone
-        flow, aux = self._losses(mel, cond, voice, mask, t, torch.randn_like(mel), backbone)
+        flow, aux = self._losses(mel, cond, voice, mask, t, torch.randn_like(mel), self.backbone)
         return flow, aux
 
     @torch.no_grad()
@@ -693,6 +724,9 @@ def resize_speakers(state_dict: dict, speaker_count: int, speaker_init=None, nul
 
 
 def validate_model_config(model: dict):
+    glu_type = model.get('backbone_args', {}).get('glu_type', 'atanglu')
+    if glu_type not in {'atanglu', 'softsign_glu'}:
+        raise ValueError(f'Unsupported flow activation: {glu_type!r}.')
     source = model.get('flow_conditioning', 'encoder')
     direct = bool(model.get('direct_speaker_conditioning', False))
     adaln = bool(model.get('backbone_args', {}).get('adaln', False))
