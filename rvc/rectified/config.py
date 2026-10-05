@@ -96,8 +96,13 @@ STANDARD_PRESET['flow']['model'].update({
 STANDARD_PRESET['flow']['model']['backbone_args']['adaln'] = False
 ATAN_PRESET = deepcopy(STANDARD_PRESET)
 STANDARD_PRESET['flow']['model']['backbone_args']['glu_type'] = 'softsign_glu'
-PRESET_NAME = 'standard-v3'
-PRESETS = {'standard-v1': LEGACY_PRESET, 'standard-v2': ATAN_PRESET, PRESET_NAME: STANDARD_PRESET}
+SOFTSIGN_PRESET = deepcopy(STANDARD_PRESET)
+STANDARD_PRESET['flow']['model']['use_spk_id'] = False
+PRESET_NAME = 'standard-v4'
+PRESETS = {
+    'standard-v1': LEGACY_PRESET, 'standard-v2': ATAN_PRESET,
+    'standard-v3': SOFTSIGN_PRESET, PRESET_NAME: STANDARD_PRESET,
+}
 EDITABLE_FLOW_KEYS = (
     'learning_rate', 'decay_step', 'gamma', 'max_batch_frames', 'max_batch_size',
     'num_workers', 'dataloader_prefetch_factor', 'log_interval',
@@ -156,5 +161,6 @@ def compact_config(config):
         for key in ('random_pitch_shifting', 'random_time_stretching')
     }
     visible['model'] = {key: flow['model'][key] for key in ('sampling_method', 'sampling_steps')}
+    visible['model']['use_spk_id'] = flow['model'].get('use_spk_id', True)
     compact['flow'] = _merge(visible, compact.get('flow', {}))
     return compact

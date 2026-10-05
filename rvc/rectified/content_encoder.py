@@ -82,10 +82,10 @@ class ContentEncoderLayer(nn.Module):
 
 class ContentConditionEncoder(nn.Module):
     def __init__(self, content_channels, hidden_channels, speaker_count, layers,
-                 breathiness=False, key_shift=False, speed=False, energy=False):
+                 breathiness=False, key_shift=False, speed=False, energy=False, use_spk_id=True):
         super().__init__()
         self.conditioning_version = 5
-        self.speaker_count = int(speaker_count)
+        self.speaker_count = int(speaker_count) if use_spk_id else 1
         self.has_null_speaker = False
         self.content = nn.Linear(content_channels, hidden_channels)
         nn.init.xavier_uniform_(self.content.weight)
@@ -98,11 +98,12 @@ class ContentConditionEncoder(nn.Module):
         self.breathiness = adamw_linear(1, hidden_channels) if breathiness else None
         self.key_shift = adamw_linear(1, hidden_channels) if key_shift else None
         self.speed = adamw_linear(1, hidden_channels) if speed else None
-        self.speaker = nn.Embedding(speaker_count, hidden_channels)
-        nn.init.normal_(self.speaker.weight, std=hidden_channels ** -0.5)
+        self.speaker = nn.Embedding(speaker_count, hidden_channels) if use_spk_id else None
+        if self.speaker is not None:
+            nn.init.normal_(self.speaker.weight, std=hidden_channels ** -0.5)
 
     def voice(self, speaker):
-        return self.speaker(speaker)
+        return self.speaker(speaker) if self.speaker is not None else None
 
     def forward(self, content, f0, energy, speaker, mask, breathiness=None,
                 key_shift=None, speed=None, voicing=None, tension=None, harmonic_prior=None):
@@ -112,7 +113,8 @@ class ContentConditionEncoder(nn.Module):
         for block in self.blocks:
             x = block(x, padding)
         x = self.norm(x) * mask.transpose(1, 2)
-        x = x + self.voice(speaker).unsqueeze(1)
+        if self.speaker is not None:
+            x = x + self.voice(speaker).unsqueeze(1)
         x = x + self.pitch(torch.log1p(interpolate_pitch(f0, mask) / 700.0).unsqueeze(-1))
         for layer, values, scale in ((self.energy, energy, 1.0 / 96),
                                      (self.breathiness, breathiness, 1.0 / 96)):

@@ -395,6 +395,7 @@ class RectifiedFlow(nn.Module):
         mel_std: float = 1.0,
         direct_speaker_conditioning: bool = False,
         energy: bool = True,
+        use_spk_id: bool = True,
     ):
         super().__init__()
         if backbone != "lynxnet2":
@@ -403,12 +404,14 @@ class RectifiedFlow(nn.Module):
             raise ValueError("Invalid flow conditioning or loss.")
         if not math.isfinite(mel_mean) or not math.isfinite(mel_std) or mel_std <= 0:
             raise ValueError("Mel normalization must be finite with a positive scale.")
+        if not use_spk_id and conditioning_version != 5:
+            raise ValueError('Disabling speaker IDs requires the DiffSinger-style conditioning recipe.')
         if conditioning_version == 5:
             validate_model_config(dict(
                 conditioning_version=conditioning_version, flow_conditioning=flow_conditioning,
                 direct_speaker_conditioning=direct_speaker_conditioning, backbone_args=backbone_args or {},
                 harmonic_prior=bool(harmonic_prior), pitch_fourier=pitch_fourier, flow_loss=flow_loss,
-                speaker_channels=speaker_channels, hidden_channels=hidden_channels,
+                speaker_channels=speaker_channels, hidden_channels=hidden_channels, use_spk_id=use_spk_id,
             ))
         adaln = bool((backbone_args or {}).get("adaln", False))
         if direct_speaker_conditioning and not adaln:
@@ -433,9 +436,10 @@ class RectifiedFlow(nn.Module):
         self.n_mels = int(n_mels)
         self.reference = conditioning_version == 5
         self.hidden_channels = int(hidden_channels)
+        self.use_spk_id = bool(use_spk_id)
         self.encoder = ContentConditionEncoder(
             content_channels, hidden_channels, speaker_count, encoder_layers,
-            breathiness=breathiness, key_shift=key_shift, speed=speed, energy=energy,
+            breathiness=breathiness, key_shift=key_shift, speed=speed, energy=energy, use_spk_id=self.use_spk_id,
         ) if self.reference else ConditionEncoder(
             content_channels,
             hidden_channels,
@@ -484,7 +488,7 @@ class RectifiedFlow(nn.Module):
         return self.encoder.speaker_count
 
     def _drop_speakers(self, speaker, speaker_dropout):
-        if speaker_dropout <= 0:
+        if not self.use_spk_id or speaker_dropout <= 0:
             return speaker
         if not self.encoder.has_null_speaker:
             raise ValueError('This conditioning version has no null speaker for dropout.')
@@ -642,14 +646,15 @@ class RectifiedFlow(nn.Module):
 
         prepared = self.backbone.prepare_conditioning(cond, voice)
         primary = tuple(value[:batch] if value is not None else None for value in prepared)
+        primary_voice = voice[:batch] if voice is not None else None
 
         def field(x, t):
             if count == 1:
-                return self.backbone(x, t, cond[:batch], mask, voice[:batch], prepared=primary)
+                return self.backbone(x, t, cond[:batch], mask, primary_voice, prepared=primary)
             now = float(t[0])
 
             if not (guide_from <= now and (now < guide_until or guide_until >= 1.0)):
-                return self.backbone(x, t, cond[:batch], mask, voice[:batch], prepared=primary)
+                return self.backbone(x, t, cond[:batch], mask, primary_voice, prepared=primary)
             v = self.backbone(repeat(x), repeat(t), cond, masks, voice, prepared=prepared).chunk(count)
             guided, index = v[0], 1
             if cfg_scale != 1.0:
@@ -669,7 +674,7 @@ class RectifiedFlow(nn.Module):
         t0 = 0.0
         if self.t_start > 0:
             t0 = self.t_start if start is None else min(max(self.t_start, float(start)), 0.99)
-            initial = self.aux(cond[:batch], mask, voice[:batch]) if initial_mel is None else initial_mel[:batch]
+            initial = self.aux(cond[:batch], mask, primary_voice) if initial_mel is None else initial_mel[:batch]
             if self.reference:
                 initial = initial * mask + (1.0 - mask) * (-self.mel_mean / self.mel_std)
             x = (1.0 - t0) * noise + t0 * initial
@@ -706,6 +711,8 @@ class RectifiedFlow(nn.Module):
 
 def resize_speakers(state_dict: dict, speaker_count: int, speaker_init=None, null_speaker: bool = True) -> dict:
     key = "encoder.speaker.weight"
+    if key not in state_dict:
+        return state_dict
     table = state_dict[key]
     if speaker_init is not None:
         if speaker_init.shape != (speaker_count + int(null_speaker), table.shape[1]):
@@ -724,6 +731,11 @@ def resize_speakers(state_dict: dict, speaker_count: int, speaker_init=None, nul
 
 
 def validate_model_config(model: dict):
+    use_spk_id = model.get('use_spk_id', True)
+    if not isinstance(use_spk_id, bool):
+        raise ValueError('use_spk_id must be a boolean.')
+    if not use_spk_id and model.get('conditioning_version') != 5:
+        raise ValueError('Disabling speaker IDs requires the DiffSinger-style conditioning recipe.')
     glu_type = model.get('backbone_args', {}).get('glu_type', 'atanglu')
     if glu_type not in {'atanglu', 'softsign_glu'}:
         raise ValueError(f'Unsupported flow activation: {glu_type!r}.')

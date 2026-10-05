@@ -285,7 +285,7 @@ def load_training_config(experiment, pretrained_flow=None):
     if not existing:
         filename = '44100_finetune.json' if pretrained_flow else '44100_standard.json'
         config_path = ROOT / 'rvc' / 'configs' / 'rectified' / filename
-    config = json.loads(config_path.read_text(encoding='utf-8'))
+    config = resolve_config(json.loads(config_path.read_text(encoding='utf-8')))
     if pretrained_flow and not existing:
         checkpoint = torch.load(pretrained_flow, map_location='cpu', weights_only=True)
         source = resolve_config(checkpoint.get('config', {}))
@@ -473,6 +473,8 @@ def train_rank(args, ranks):
             raise ValueError('Pretrained flow uses different conditioning. Use a pretrained with the same conditioning path or start a new model from scratch.')
         if pretrained_model.get('conditioning_version', 1) != settings['model'].get('conditioning_version', 1):
             raise ValueError('Pretrained conditioning version differs. Start a new model or use a matching pretrained.')
+        if pretrained_model.get('use_spk_id', True) != settings['model'].get('use_spk_id', True):
+            raise ValueError('Pretrained flow uses a different speaker-ID setting. Use a matching pretrained.')
         for name in ('voicing', 'tension', 'direct_speaker_conditioning'):
             if bool(pretrained_model.get(name, False)) != bool(settings['model'].get(name, False)):
                 raise ValueError(f'Pretrained flow differs in {name}. Use a matching pretrained or train a new model from scratch.')
@@ -492,7 +494,7 @@ def train_rank(args, ranks):
                     'Use a matching pretrained or start from scratch.'
                 )
         weights = state['ema']['shadow'] if state.get('ema') else state['model']
-        speaker_init = model.encoder.speaker.weight if multispeaker else None
+        speaker_init = model.encoder.speaker.weight if multispeaker and model.use_spk_id else None
         model.load_state_dict(resize_speakers(
             weights, speakers, speaker_init, null_speaker=model.encoder.has_null_speaker,
         ), strict=True)
@@ -520,10 +522,12 @@ def train_rank(args, ranks):
         print(f'Rectified flow: {sum(p.numel() for p in model.parameters()):,} parameters, {precision_label}, {device}, whole utterances, up to {max_items} clips / {max_frames} frames per batch, {len(loader)} batches per epoch and GPU, {ranks.world} device(s)', flush=True)
         if finetune:
             print(f'Fine-tuning: fresh-run LR {lr:g}, warmup {warmup} steps, {settings.get("lr_schedule", "cosine")} decay, minimum LR {settings.get("min_learning_rate", 0.0):g}.', flush=True)
-        if multispeaker:
+        if multispeaker and model.use_spk_id:
             print(f'Multispeaker conditioning v{model.encoder.conditioning_version}: {speakers} speakers, {len(held)} held-out clips. Clips per speaker: {inventory}', flush=True)
             if finetune and first_epoch == 1:
                 print('Initialized independent speaker embeddings for the new dataset.', flush=True)
+        if not model.use_spk_id:
+            print('Speaker IDs disabled: no speaker embeddings or target-speaker selection.', flush=True)
     with SummaryWriter(str(output)) if ranks.main else nullcontext(None) as writer:
         model.train()
         for epoch in range(first_epoch, args.epochs + 1):
@@ -594,7 +598,7 @@ def train_rank(args, ranks):
                         print(f'Rank 0: saving checkpoint at epoch {epoch}.', flush=True)
                         if any(not torch.isfinite(value).all() for value in model.state_dict().values()):
                             raise FloatingPointError('Non-finite trained model weights.')
-                        metadata = dict(config=config, speaker_count=speakers, embedder_model=embedder,
+                        metadata = dict(config=config, speaker_count=model.speaker_count, embedder_model=embedder,
                                         epoch=epoch, step=step)
                         if multispeaker:
                             metadata.update(speaker_ids=sorted(inventory), feature_metadata=feature_metadata)

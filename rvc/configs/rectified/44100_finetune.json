@@ -1,5 +1,5 @@
 {
-  "preset": "standard-v3",
+  "preset": "standard-v4",
   "flow": {
     "finetune_learning_rate": 0.00005,
     "min_learning_rate": 1e-05,
@@ -33,6 +33,7 @@
       }
     },
     "model": {
+      "use_spk_id": false,
       "sampling_method": "euler",
       "sampling_steps": 20
     }

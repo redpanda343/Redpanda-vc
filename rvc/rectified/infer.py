@@ -49,7 +49,7 @@ class RectifiedPipeline(Pipeline):
             vocoder, _ = load_vocoder(path, self.data)
             self.vocoder_model = vocoder.to(self.device).float()
         speaker = int(sid.item())
-        if not 0 <= speaker < net_g.speaker_count:
+        if net_g.use_spk_id and not 0 <= speaker < net_g.speaker_count:
             raise ValueError(f'Speaker ID must be between 0 and {net_g.speaker_count - 1}.')
         source = torch.from_numpy(np.asarray(audio0, dtype=np.float32)).view(1, -1).to(self.device)
         if getattr(model, 'audio_requires_normalization', False):

@@ -6,12 +6,17 @@
 
 This project is a fork of [Applio](https://github.com/IAHispano/Applio), with changes focused on dataset preprocessing, inference, training, normalization, and a cleaner WebUI experience.
 
-New Rectified Flow experiments use the `standard-v3` preset: a DiffSinger-style
+New Rectified Flow experiments use the `standard-v4` preset: a DiffSinger-style
 transformer condition encoder with ContentVec input, LYNXNet2 SoftSignGLU backbone,
 shallow flow and ConvNeXt auxiliary mel decoder. Muon/AdamW uses betas
 `(0.9, 0.98)`, Muon weight decay `0.1`, AdamW weight decay `0`.
 Random pitch and time augmentation keep their key-shift and speed embeddings.
-Existing `standard-v1` and `standard-v2` experiments retain ATanGLU.
+New experiments default to `flow.model.use_spk_id: false`, matching DiffSinger.
+These models have no speaker embedding table and ignore the target speaker ID.
+Set `flow.model.use_spk_id` to `true` before starting a new experiment to enable
+speaker conditioning. Fine-tuning and resume retain the checkpoint's setting.
+Existing `standard-v1`, `standard-v2` and `standard-v3` experiments retain their
+saved speaker conditioning; v1/v2 also retain ATanGLU.
 
 The training tab's optional **Fused Linear + SoftSignGLU kernels** switch
 replaces `torch.compile` for Rectified Flow. It uses DiffSinger's Triton forward

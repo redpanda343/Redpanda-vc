@@ -1,5 +1,5 @@
 {
-  "preset": "standard-v3",
+  "preset": "standard-v4",
   "flow": {
     "learning_rate": 0.0006,
     "decay_step": 5000,
@@ -29,6 +29,7 @@
       }
     },
     "model": {
+      "use_spk_id": false,
       "sampling_method": "euler",
       "sampling_steps": 20
     }
