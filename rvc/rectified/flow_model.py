@@ -301,7 +301,7 @@ class LYNXNet2Backbone(nn.Module):
         for layer in self.layers:
             h = layer(h, embedding)
         h = self.norm(h)
-        return self.output(h.float()).transpose(1, 2)
+        return self.output(h).float().transpose(1, 2)
 
 
 class AuxDecoder(nn.Module):
