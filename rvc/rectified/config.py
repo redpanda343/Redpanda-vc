@@ -36,7 +36,7 @@ DEFAULT_CONFIG = {
             'random_pitch_shifting': {'enabled': True, 'range': [-5.0, 5.0], 'scale': 0.75},
             'random_time_stretching': {'enabled': True, 'range': [0.5, 2.0], 'scale': 0.75},
         },
-        'augmentation_workers': 4,
+        'augmentation_workers': 0,
         'holdout_clips': 32,
         'num_workers': 4,
         'dataloader_prefetch_factor': 2,

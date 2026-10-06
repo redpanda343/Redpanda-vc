@@ -4,14 +4,16 @@ import json
 import math
 import os
 import pickle
+import platform
 import random
 import time
-from concurrent.futures import ThreadPoolExecutor
+import traceback
 from pathlib import Path
 
 import numpy as np
 import soundfile as sf
 import torch
+from torch.multiprocessing import Manager, Process, get_context
 
 from rvc.rectified.data import CONTENT_RATE, mel_frames
 from rvc.rectified.indexed_dataset import IndexedDatasetBuilder
@@ -122,12 +124,61 @@ class ItemBuilder:
             raise ValueError('Invalid binarized features.')
         return item
 
-    def items(self, entry, tasks):
-        audio, content, frames = self.source(entry)
-        sid = int(entry[4])
-        yield self.original(audio, content, frames, sid), False
-        for task in tasks:
-            yield self.augmented(audio, content, task, sid), True
+
+_BUILDERS = {}
+
+
+def item_builder(config, device):
+    key = str(device)
+    if key not in _BUILDERS:
+        _BUILDERS[key] = ItemBuilder(config, device)
+    return _BUILDERS[key]
+
+
+def process_item(config, device, entry):
+    builder = item_builder(config, device)
+    audio, content, frames = builder.source(entry)
+    return builder.original(audio, content, frames, int(entry[4]))
+
+
+def chunked_worker_run(map_func, args, results_queue=None):
+    for a in args:
+        try:
+            res = map_func(*a)
+            results_queue.put(res)
+        except KeyboardInterrupt:
+            break
+        except Exception:
+            traceback.print_exc()
+            results_queue.put(None)
+
+
+def chunked_multiprocess_run(map_func, args, num_workers, q_max_size=1000):
+    num_jobs = len(args)
+    if num_jobs < num_workers:
+        num_workers = num_jobs
+
+    manager = Manager()
+    queues = [manager.Queue(maxsize=q_max_size // num_workers) for _ in range(num_workers)]
+    if platform.system().lower() != 'windows':
+        process_creation_func = get_context('spawn').Process
+    else:
+        process_creation_func = Process
+
+    workers = []
+    for i in range(num_workers):
+        worker = process_creation_func(
+            target=chunked_worker_run, args=(map_func, args[i::num_workers], queues[i]), daemon=True
+        )
+        workers.append(worker)
+        worker.start()
+
+    for i in range(num_jobs):
+        yield queues[i % num_workers].get()
+
+    for worker in workers:
+        worker.join()
+        worker.close()
 
 
 def _recipe(config, training, held, seed):
@@ -154,34 +205,47 @@ def _read_meta(path):
         return None
 
 
-def process_dataset(binary_dir, prefix, entries, tasks, builder, workers, recipe):
+def process_dataset(binary_dir, prefix, entries, tasks, config, device, num_workers, recipe):
     grouped = {}
     for task in tasks:
         grouped.setdefault(task['index'], []).append(task)
+    builder = item_builder(config, device)
     data_path = binary_dir / f'{prefix}.data'
     temporary = data_path.with_suffix('.data.tmp')
     writer = IndexedDatasetBuilder(temporary)
     meta = dict(lengths=[], spk_ids=[], names=[], augmented=[], recipe=recipe)
     seconds = {'original': 0.0, 'total': 0.0}
     total, completed, last_report = len(entries) + len(tasks), 0, time.monotonic()
+
+    def add(item, index, augmented):
+        writer.add_item(item)
+        meta['lengths'].append(int(item['length']))
+        meta['spk_ids'].append(int(item['spk_id']))
+        meta['names'].append(entries[index][0])
+        meta['augmented'].append(augmented)
+        duration = int(item['length']) * float(item['speed']) * builder.hop / builder.sample_rate
+        seconds['total'] += duration
+        if not augmented:
+            seconds['original'] += duration
+
+    args = [(config, str(device), entry) for entry in entries]
+    if num_workers > 0:
+        results = chunked_multiprocess_run(process_item, args, num_workers=num_workers)
+    else:
+        results = (process_item(*a) for a in args)
     try:
-        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-            jobs = pool.map(lambda index: list(builder.items(entries[index], grouped.get(index, []))), range(len(entries)))
-            for index, items in enumerate(jobs):
-                for item, augmented in items:
-                    writer.add_item(item)
-                    meta['lengths'].append(int(item['length']))
-                    meta['spk_ids'].append(int(item['spk_id']))
-                    meta['names'].append(entries[index][0])
-                    meta['augmented'].append(augmented)
-                    duration = int(item['length']) * float(item['speed']) * builder.hop / builder.sample_rate
-                    seconds['total'] += duration
-                    if not augmented:
-                        seconds['original'] += duration
-                completed += len(items)
-                if completed == total or time.monotonic() - last_report >= 5:
-                    print(f'| binarize {prefix}: {completed:,}/{total:,}', flush=True)
-                    last_report = time.monotonic()
+        for index, item in enumerate(results):
+            completed += 1 + len(grouped.get(index, []))
+            if item is None:
+                continue
+            add(item, index, False)
+            if index in grouped:
+                audio, content, _ = builder.source(entries[index])
+                for task in grouped[index]:
+                    add(builder.augmented(audio, content, task, int(entries[index][4])), index, True)
+            if completed == total or time.monotonic() - last_report >= 5:
+                print(f'| binarize {prefix}: {completed:,}/{total:,}', flush=True)
+                last_report = time.monotonic()
     finally:
         writer.finalize()
     os.replace(temporary, data_path)
@@ -197,7 +261,7 @@ def process_dataset(binary_dir, prefix, entries, tasks, builder, workers, recipe
         print(f'| {prefix} total duration: {seconds["total"]:.2f}s', flush=True)
 
 
-def binarize(experiment, config, training, held, seed, device, workers):
+def binarize(experiment, config, training, held, seed, device, num_workers):
     binary_dir = Path(experiment) / 'binary'
     recipe = _recipe(config, training, held, seed)
     metas = [_read_meta(binary_dir / f'{prefix}.meta') for prefix in ('valid', 'train')]
@@ -208,11 +272,10 @@ def binarize(experiment, config, training, held, seed, device, workers):
     binary_dir.mkdir(parents=True, exist_ok=True)
     for prefix in ('valid', 'train'):
         (binary_dir / f'{prefix}.meta').unlink(missing_ok=True)
-    builder = ItemBuilder(config, device)
     settings = config['flow']
     args = settings['augmentation_args']
     augment = any(args[name]['enabled'] for name in ('random_pitch_shifting', 'random_time_stretching'))
     tasks = augmentation_plan(training, settings, seed) if augment else []
-    process_dataset(binary_dir, 'valid', held, [], builder, workers, recipe)
-    process_dataset(binary_dir, 'train', training, tasks, builder, workers, recipe)
+    process_dataset(binary_dir, 'valid', held, [], config, device, 0, recipe)
+    process_dataset(binary_dir, 'train', training, tasks, config, device, int(num_workers), recipe)
     return binary_dir

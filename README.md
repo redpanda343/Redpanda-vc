@@ -27,7 +27,10 @@ Training binarizes the dataset like DiffSinger: originals and their augmented
 copies go into `logs/<model>/binary/train.data`, held-out clips into
 `valid.data`, each with a `.meta` file of clip lengths used for batching. The
 binary data is rebuilt only when the clips or the data and augmentation
-settings change. ContentVec features stay FP32.
+settings change. ContentVec features stay FP32. As in DiffSinger, held-out
+clips are binarized in the main process, originals use
+`flow.augmentation_workers` worker processes (0 processes them in the main
+process, the default), and augmented copies are computed in the main process.
 
 The recipe defaults live in `rvc/rectified/config.py` and are written to
 `logs/<model>/rectified_config.json` when training starts. Edit the experiment
