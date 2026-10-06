@@ -17,6 +17,14 @@ def interpolate_f0(f0):
     return f0
 
 
+def resample_f0(f0, source_rate, frames, frame_rate):
+    f0 = interpolate_f0(f0)
+    if not f0.any():
+        return np.zeros(frames, dtype=np.float32)
+    positions = np.arange(frames) * (source_rate / frame_rate)
+    return np.exp2(np.interp(positions, np.arange(len(f0)), np.log2(f0))).astype(np.float32)
+
+
 def parselmouth_f0(waveform, sample_rate, hop, frames, f0_min=PARSELMOUTH_F0_MIN, f0_max=PARSELMOUTH_F0_MAX):
     import parselmouth
 
