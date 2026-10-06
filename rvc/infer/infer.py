@@ -461,7 +461,7 @@ class VoiceConverter:
             print(f"Audio split into {len(chunks)} chunks for processing.")
 
         sources = [{}] * len(chunks)
-        if rectified and f0_method in {"pm", "rmvpe"}:
+        if rectified:
             sources = [
                 {"source_audio": source}
                 for source in self.rectified_sources(

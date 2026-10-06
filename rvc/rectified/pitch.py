@@ -59,13 +59,9 @@ def parselmouth_contour(waveform, sample_rate, hop, frames, f0_min=PARSELMOUTH_F
     return np.pad(contour, (0, max(0, frames - len(contour))))[:frames]
 
 
-def parselmouth_f0(waveform, sample_rate, hop, frames, f0_min=PARSELMOUTH_F0_MIN, f0_max=PARSELMOUTH_F0_MAX):
-    return interpolate_f0(parselmouth_contour(waveform, sample_rate, hop, frames, f0_min, f0_max))
-
-
 def parselmouth_pitch(waveform, sample_rate, hop, frames):
     contour = parselmouth_contour(waveform, sample_rate, hop, frames)
-    return interpolate_f0(contour), contour > 0
+    return interpolate_f0(contour), contour == 0, contour > 0
 
 
 def rmvpe_model(device):
@@ -79,29 +75,27 @@ def rmvpe_model(device):
     return _RMVPE[key]
 
 
-def rmvpe_f0(model, waveform, sample_rate, hop, frames):
-    f0, uv = model.get_pitch(np.asarray(waveform, dtype=np.float32), sample_rate, frames,
-                             hop_size=hop, interp_uv=True)
-    return f0.astype(np.float32), not uv.all()
-
-
 def rmvpe_pitch(model, waveform, sample_rate, hop, frames):
     from rvc.lib.predictors.rmvpe import interp_f0, resample_align_curve
 
     hidden = model.infer_hidden(np.asarray(waveform, dtype=np.float32), sample_rate)
     f0 = model.decode(hidden)
-    voiced = confident_runs(f0 > 0, hidden[0].max(-1).values.float().cpu().numpy())
-    f0, _ = interp_f0(f0, f0 == 0)
+    uv = f0 == 0
+    voiced = confident_runs(~uv, hidden[0].max(-1).values.float().cpu().numpy())
+    f0, _ = interp_f0(f0, uv)
     step = hop / sample_rate
     f0 = resample_align_curve(f0, 0.01, step, frames)
+    uv = resample_align_curve(uv.astype(np.float32), 0.01, step, frames) > 0.5
     voiced = resample_align_curve(voiced.astype(np.float32), 0.01, step, frames) > 0.5
-    return f0.astype(np.float32), voiced
+    return f0.astype(np.float32), uv, voiced
 
 
-def extract_f0(extractor, waveform, sample_rate, hop, frames, device='cpu'):
+def extract_pitch(extractor, waveform, sample_rate, hop, frames, device='cpu'):
     if extractor == 'parselmouth':
-        f0 = parselmouth_f0(waveform, sample_rate, hop, frames)
-        return f0, bool(f0.any())
+        contour = parselmouth_contour(waveform, sample_rate, hop, frames)
+        return interpolate_f0(contour), contour == 0
     if extractor == 'rmvpe':
-        return rmvpe_f0(rmvpe_model(device), waveform, sample_rate, hop, frames)
+        f0, uv = rmvpe_model(device).get_pitch(np.asarray(waveform, dtype=np.float32), sample_rate, frames,
+                                               hop_size=hop, interp_uv=True)
+        return f0.astype(np.float32), uv
     raise ValueError(f'Pitch extractor must be one of {PITCH_EXTRACTORS}, not {extractor!r}.')

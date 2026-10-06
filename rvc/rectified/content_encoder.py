@@ -4,6 +4,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from rvc.rectified.variance import VARIANCE_SCALE
+
 
 def adamw_linear(inputs, outputs):
     layer = nn.Linear(inputs, outputs)
@@ -90,7 +92,7 @@ class ContentEncoderLayer(nn.Module):
 class ContentConditionEncoder(nn.Module):
     def __init__(self, content_channels, hidden_channels, speaker_count, layers, content_step,
                  key_shift=True, speed=True, use_spk_id=False, enc_ffn_kernel_size=3,
-                 use_rope=True, rope_interleaved=False, rope_theta=10000.0):
+                 use_rope=True, rope_interleaved=False, rope_theta=10000.0, variances=()):
         super().__init__()
         if not content_step > 0:
             raise ValueError('Content encoding requires the mel hop in content frames.')
@@ -108,6 +110,8 @@ class ContentConditionEncoder(nn.Module):
         self.pitch = adamw_linear(1, hidden_channels)
         self.key_shift = adamw_linear(1, hidden_channels) if key_shift else None
         self.speed = adamw_linear(1, hidden_channels) if speed else None
+        self.variance_names = list(variances)
+        self.variance_embeds = nn.ModuleDict({name: adamw_linear(1, hidden_channels) for name in self.variance_names})
         self.speaker = nn.Embedding(speaker_count, hidden_channels) if use_spk_id else None
         if self.speaker is not None:
             nn.init.normal_(self.speaker.weight, std=hidden_channels ** -0.5)
@@ -117,7 +121,7 @@ class ContentConditionEncoder(nn.Module):
         nn.init.normal_(self.content.weight, std=1.0 / (math.sqrt(fan_in * fan_out) * float(rms)))
         nn.init.zeros_(self.content.bias)
 
-    def forward(self, content, f0, speaker, mask, content_mask=None, key_shift=None, speed=None):
+    def forward(self, content, f0, speaker, mask, content_mask=None, key_shift=None, speed=None, variances=None):
         if content_mask is None:
             content_mask = mask.new_ones(content.shape[0], 1, content.shape[1])
         padding = ~content_mask[:, 0].bool()
@@ -132,6 +136,11 @@ class ContentConditionEncoder(nn.Module):
         if self.speaker is not None:
             x = x + self.speaker(speaker).unsqueeze(1)
         x = x + self.pitch(torch.log1p(f0 * mask[:, 0] / 700.0).unsqueeze(-1))
+        if self.variance_names:
+            if variances is None or variances.shape[1] != len(self.variance_names):
+                raise ValueError(f'This flow needs {", ".join(self.variance_names)} curves.')
+            x = x + torch.stack([self.variance_embeds[name](variances[:, index, :, None] * VARIANCE_SCALE)
+                                 for index, name in enumerate(self.variance_names)], dim=-1).sum(-1)
         if self.key_shift is not None:
             values = f0.new_zeros(f0.shape[0]) if key_shift is None else key_shift
             x = x + self.key_shift(values.reshape(-1, 1, 1) / 12.0)

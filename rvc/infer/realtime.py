@@ -221,6 +221,7 @@ class RealTimeRVC:
             from rvc.rectified.resources import default_vocoder
             from rvc.rectified.vocoder import load_vocoder
             from rvc.rectified.realtime import RealtimeFlowSampler
+            from rvc.rectified.variance import StreamingVariances
 
             if int(rectified_steps) != rectified_steps or not 0 <= rectified_steps <= 1000:
                 raise ValueError("Flow steps must be an integer between 0 and 1000.")
@@ -232,6 +233,11 @@ class RealTimeRVC:
             self.pipeline.vocoder_model = vocoder.to(self.device).float()
             self.flow_resampler = Resample(16000, self.sample_rate).to(self.device)
             self.source_resampler = None
+            self.variance_stream = None
+            if self.model.variance_names:
+                self.variance_stream = StreamingVariances(
+                    self.model.variance_names, self.pipeline.data, self.converter.cpt["config"]["flow"], self.device
+                )
             generator = vocoder.generator
             radius = generator.conv_pre.kernel_size[0] // 2
             scale = 1
@@ -292,6 +298,8 @@ class RealTimeRVC:
         self.rmvpe_viterbi.reset()
         self.last_f0_method = None
         self.pitch_sample_count = 0
+        if getattr(self, "variance_stream", None) is not None:
+            self.variance_stream.reset()
 
     def _extract_features(self, input_wav):
         source = input_wav.float().view(1, -1)
@@ -431,17 +439,17 @@ class RealTimeRVC:
         if f0_method in ("pm", "rmvpe"):
             audio = source.cpu().numpy()
             if f0_method == "pm":
-                f0, voiced = parselmouth_pitch(audio, rate, hop, frames)
+                f0, uv, voiced = parselmouth_pitch(audio, rate, hop, frames)
             else:
                 predictor = getattr(self.pipeline, "model_rmvpe", None)
                 model = predictor.model if predictor is not None else rmvpe_model(self.device)
-                f0, voiced = rmvpe_pitch(model, audio, rate, hop, frames)
-            return torch.from_numpy(f0).to(waveform.device)[None] * 2 ** (self.pitch / 12), voiced, source
+                f0, uv, voiced = rmvpe_pitch(model, audio, rate, hop, frames)
+            return f0, uv, voiced, source
         p_len = input_wav.shape[0] // 160
         pitchf = self.cache_pitchf[-p_len:].cpu().numpy()
-        f0 = resample_f0(pitchf, 100, frames, rate / hop)
+        f0 = resample_f0(pitchf, 100, frames, rate / hop) / 2 ** (self.pitch / 12)
         voiced = resample_voicing(pitchf > 0, 100, frames, rate / hop)
-        return torch.from_numpy(f0).to(waveform.device)[None], voiced, source
+        return f0, ~voiced, voiced, source
 
     def _infer_rectified(self, features, input_wav, speaker, skip_head, return_length,
                          f0_method, source_wav=None, source_rate=None):
@@ -456,9 +464,15 @@ class RealTimeRVC:
         if start < 0 or count < 1 or start + count > length:
             raise ValueError("The requested flow output exceeds the input context.")
         frames = math.ceil(length / hop)
-        f0, voiced, source = self._rectified_f0(waveform, input_wav, f0_method, source_wav, source_rate, frames)
+        f0, uv, voiced, source = self._rectified_f0(waveform, input_wav, f0_method, source_wav, source_rate, frames)
+        variances = None
+        if self.variance_stream is not None:
+            position = self.pitch_sample_count * rate // 16000
+            curves = self.variance_stream(source.cpu().numpy(), f0, uv, position, frames)
+            variances = torch.from_numpy(curves).to(self.device)[None]
+        f0 = torch.from_numpy(f0).to(waveform.device)[None] * 2 ** (self.pitch / 12)
         mask = torch.ones(1, 1, frames, device=self.device)
-        mel = self.flow_sampler(features.float(), f0, speaker, mask, steps=self.rectified_steps)
+        mel = self.flow_sampler(features.float(), f0, speaker, mask, steps=self.rectified_steps, variances=variances)
         mel, vocoder_f0 = guard_unvoiced(mel, f0, source, voiced, self.pipeline.data)
         first_frame = max(0, start // hop - self.vocoder_context_frames)
         audio = self.pipeline.vocoder_model(mel[..., first_frame:], vocoder_f0[..., first_frame:])[0, 0]

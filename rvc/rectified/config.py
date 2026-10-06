@@ -32,6 +32,9 @@ DEFAULT_CONFIG = {
         'max_batch_size': 64,
         'grad_clip': 1.0,
         'pitch_extractor': 'parselmouth',
+        'hnsep': 'vr',
+        'breathiness_smooth_width': 0.06,
+        'voicing_smooth_width': 0.06,
         'aux_mel_weight': 0.2,
         'augmentation_args': {
             'random_pitch_shifting': {'enabled': True, 'range': [-5.0, 5.0], 'scale': 0.75},
@@ -74,6 +77,8 @@ DEFAULT_CONFIG = {
             'use_spk_id': False,
             'key_shift': True,
             'speed': True,
+            'use_breathiness_embed': False,
+            'use_voicing_embed': False,
             'backbone_args': {
                 'channels': 1024,
                 'layers': 6,
@@ -88,11 +93,20 @@ DEFAULT_CONFIG = {
             't_start': 0.4,
             't_start_infer': 0.4,
             'dual_timestep': True,
-            'sampling_method': 'euler',
-            'sampling_steps': 20,
+            'sampling_method': 'rk2',
+            'sampling_steps': 10,
             'train_aux_decoder': True,
             'train_diffusion': True,
             'val_gt_start': False,
+        },
+    },
+}
+
+NEW_EXPERIMENT_OVERRIDES = {
+    'flow': {
+        'model': {
+            'use_breathiness_embed': True,
+            'use_voicing_embed': True,
         },
     },
 }
@@ -151,7 +165,7 @@ def resolve_config(config):
 def default_config(finetune=False, preset='standard'):
     if preset not in PRESETS:
         raise ValueError(f'Unknown rectified-flow preset {preset!r}. Choose one of {sorted(PRESETS)}.')
-    config = _merge(DEFAULT_CONFIG, PRESETS[preset])
+    config = _merge(_merge(DEFAULT_CONFIG, NEW_EXPERIMENT_OVERRIDES), PRESETS[preset])
     return _merge(config, FINETUNE_OVERRIDES) if finetune else config
 
 

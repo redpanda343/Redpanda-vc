@@ -45,6 +45,28 @@ median level gap between output and input over voiced frames. Bins the input
 does not reach (for example above 8 kHz in a 16 kHz recording) are left alone.
 Voiced frames are untouched.
 
+New experiments condition the flow on DiffSinger's breathiness and voicing
+(`use_breathiness_embed` and `use_voicing_embed`), which tell the model how
+noisy and how voiced each frame of the source is, the job DiffSinger's AP and SP
+phonemes do. Binarization splits each clip into harmonic and aperiodic parts with
+DiffSinger's harmonic-noise separator (`flow.hnsep`: `vr`, the default, or
+`world`), takes the RMS of each in dB at the mel hop and smooths it with a 60 ms
+sine window (`breathiness_smooth_width`, `voicing_smooth_width`). Each curve is
+scaled by 1/96 into its own linear embedding. Pitch-shifted copies keep the
+original curves and time-stretched copies resample them, as in DiffSinger.
+Conversion extracts the same curves from the full-rate source before pitch
+shifting. VR runs in 15 s windows with 1 s crossfades so long files fit in GPU
+memory, and realtime separates only the newest audio with 1 s (VR) or 0.3 s
+(WORLD) of context and reuses the rest. The app downloads the VR model
+(`hnsep_240512`) to `rvc/models/predictors/hnsep/vr` when first needed.
+Experiments and checkpoints made before this keep both embeddings off.
+
+The flow samples with RK2 (DiffSinger's midpoint `rk2`) for 10 steps, the same
+20 network evaluations as Euler at 20 steps but closer to the converged
+trajectory, which keeps breath noise from coming out over-smoothed. Checkpoints
+saved with the old Euler/20 default use RK2/10 when loaded. The realtime Flow
+steps setting counts RK2 steps, each costing two evaluations.
+
 Training binarizes the dataset like DiffSinger: originals and their augmented
 copies go into `logs/<model>/binary/train.data`, held-out clips into
 `valid.data`, each with a `.meta` file of clip lengths used for batching. The

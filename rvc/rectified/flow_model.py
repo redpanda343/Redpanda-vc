@@ -7,8 +7,11 @@ from torch.nn import functional as F
 
 from rvc.rectified.config import resolve_config
 from rvc.rectified.content_encoder import ContentConditionEncoder
+from rvc.rectified.variance import variance_names
 
 SAMPLERS = ("euler", "rk2", "rk4", "rk5")
+LEGACY_SAMPLER = ("euler", 20)
+DEFAULT_SAMPLER = ("rk2", 10)
 
 
 class MixedPrecisionLayerNorm(nn.LayerNorm):
@@ -190,6 +193,8 @@ class RectifiedFlow(nn.Module):
         use_spk_id: bool = False,
         key_shift: bool = True,
         speed: bool = True,
+        use_breathiness_embed: bool = False,
+        use_voicing_embed: bool = False,
         backbone_args: Optional[dict] = None,
         aux_decoder: Optional[dict] = None,
         aux_grad: float = 0.1,
@@ -219,6 +224,8 @@ class RectifiedFlow(nn.Module):
             content_channels, hidden_channels, speaker_count, encoder_layers, content_step,
             key_shift=key_shift, speed=speed, use_spk_id=self.use_spk_id, enc_ffn_kernel_size=enc_ffn_kernel_size,
             use_rope=use_rope, rope_interleaved=rope_interleaved, rope_theta=rope_theta,
+            variances=variance_names(dict(use_breathiness_embed=use_breathiness_embed,
+                                          use_voicing_embed=use_voicing_embed)),
         )
         self.backbone = LYNXNet2Backbone(n_mels, hidden_channels, **(backbone_args or {}))
         self.aux = AuxDecoder(hidden_channels, n_mels, **(aux_decoder or {}))
@@ -240,11 +247,15 @@ class RectifiedFlow(nn.Module):
     def speaker_count(self) -> int:
         return self.encoder.speaker_count
 
+    @property
+    def variance_names(self):
+        return self.encoder.variance_names
+
     def _uniform_times(self, batch, device):
         return self.t_start + (1.0 - self.t_start) * torch.rand(batch, device=device)
 
-    def forward(self, mel, content, f0, speaker, mask, content_mask=None, key_shift=None, speed=None):
-        cond = self.encoder(content, f0, speaker, mask, content_mask, key_shift, speed)
+    def forward(self, mel, content, f0, speaker, mask, content_mask=None, key_shift=None, speed=None, variances=None):
+        cond = self.encoder(content, f0, speaker, mask, content_mask, key_shift, speed, variances)
         t = self._uniform_times(mel.shape[0], mel.device)
         if self.dual_timestep:
             t2 = self._uniform_times(mel.shape[0], mel.device)
@@ -263,8 +274,8 @@ class RectifiedFlow(nn.Module):
         flow = ((prediction.float() - (mel - noise).float()).square() * mask).mean()
         return flow, aux
 
-    def predict_mel(self, content, f0, speaker, mask, content_mask=None, key_shift=None, speed=None):
-        return self.aux(self.encoder(content, f0, speaker, mask, content_mask, key_shift, speed)) * mask
+    def predict_mel(self, content, f0, speaker, mask, content_mask=None, key_shift=None, speed=None, variances=None):
+        return self.aux(self.encoder(content, f0, speaker, mask, content_mask, key_shift, speed, variances)) * mask
 
     @torch.no_grad()
     def sample(
@@ -280,12 +291,13 @@ class RectifiedFlow(nn.Module):
         method: Optional[str] = None,
         noise: Optional[torch.Tensor] = None,
         source_mel: Optional[torch.Tensor] = None,
+        variances: Optional[torch.Tensor] = None,
     ):
         method = self.sampling_method if method is None else method
         steps = max(1, int(self.sampling_steps if steps is None else steps))
         if method not in SAMPLERS:
             raise ValueError(f"method must be one of {SAMPLERS}, not {method!r}.")
-        cond = self.encoder(content, f0, speaker, mask, content_mask, key_shift, speed)
+        cond = self.encoder(content, f0, speaker, mask, content_mask, key_shift, speed, variances)
         prepared = self.backbone.prepare_conditioning(cond) if self.backbone.use_conditioner_cache else None
 
         def field(x, t):
@@ -325,7 +337,8 @@ class RectifiedFlow(nn.Module):
 
 def validate_model_config(model: dict):
     for name in ('use_rope', 'rope_interleaved', 'use_spk_id', 'key_shift', 'speed', 'dual_timestep',
-                 'train_aux_decoder', 'train_diffusion', 'val_gt_start'):
+                 'train_aux_decoder', 'train_diffusion', 'val_gt_start', 'use_breathiness_embed',
+                 'use_voicing_embed'):
         if not isinstance(model[name], bool):
             raise ValueError(f'{name} must be a boolean.')
     for section, key in ((model, 'enc_ffn_kernel_size'), (model['aux_decoder'], 'kernel_size'),
@@ -345,6 +358,8 @@ def build_flow(config: dict, speaker_count: int) -> RectifiedFlow:
     config = resolve_config(config)
     model = config["flow"]["model"]
     validate_model_config(model)
+    if (model["sampling_method"], model["sampling_steps"]) == LEGACY_SAMPLER:
+        model = dict(model, sampling_method=DEFAULT_SAMPLER[0], sampling_steps=DEFAULT_SAMPLER[1])
     data = config["data"]
     return RectifiedFlow(
         n_mels=data["n_mels"], speaker_count=speaker_count,

@@ -151,7 +151,8 @@ def unpack_flow(batch, device, non_blocking=False):
 
 
 class RectifiedDataset(Dataset):
-    def __init__(self, binary_dir, prefix):
+    def __init__(self, binary_dir, prefix, variances=()):
+        self.variances = list(variances)
         with open(Path(binary_dir) / f'{prefix}.meta', 'rb') as handle:
             self.metadata = pickle.load(handle)
         self.sizes = self.metadata['lengths']
@@ -165,7 +166,16 @@ class RectifiedDataset(Dataset):
 
     def __getitem__(self, index):
         item = self.indexed_ds[index]
-        return item['mel'], item['content'], item['f0'], item['key_shift'], item['speed'], item['spk_id']
+        return (item['mel'], item['content'], item['f0'], item['key_shift'], item['speed'], item['spk_id'],
+                self._variances(item))
+
+    def _variances(self, item, frames=None):
+        if not self.variances:
+            return torch.zeros(0, item['mel'].shape[-1] if frames is None else frames)
+        missing = [name for name in self.variances if name not in item]
+        if missing:
+            raise ValueError(f'The binary data has no {", ".join(missing)} curves; delete the binary folder to rebuild it.')
+        return torch.stack([item[name][:frames].float() for name in self.variances])
 
     def references(self, count, data, max_seconds=10.0):
         hop, sample_rate = int(data['hop_length']), int(data['sample_rate'])
@@ -182,7 +192,8 @@ class RectifiedDataset(Dataset):
             audio = torch.from_numpy(audio.mean(-1) if audio.ndim == 2 else audio)[: frames * hop]
             content_frames = min(item['content'].shape[0], int((frames - 1) * content_step) // 2 + 2)
             result.append((item['mel'][None, :, :frames], item['content'][None, :content_frames],
-                           item['f0'][None, :frames], audio[None], int(item['spk_id']), name))
+                           item['f0'][None, :frames], audio[None], int(item['spk_id']), name,
+                           self._variances(item, frames)[None]))
         return result
 
 
@@ -198,7 +209,8 @@ def collate_flow(batch):
     speed = torch.ones(size)
     speaker = torch.zeros(size, dtype=torch.long)
     mask = torch.zeros(size, 1, frames)
-    for i, (m, c, p, k, v, s) in enumerate(batch):
+    variances = torch.zeros(size, batch[0][6].shape[0], frames)
+    for i, (m, c, p, k, v, s, r) in enumerate(batch):
         n = m.shape[-1]
         mel[i, :, :n] = m
         content[i, :c.shape[0]] = c
@@ -208,7 +220,8 @@ def collate_flow(batch):
         speed[i] = v
         speaker[i] = s
         mask[i, :, :n] = 1.0
-    return mel, content, content_mask, f0, key_shift, speed, speaker, mask
+        variances[i, :, :n] = r
+    return mel, content, content_mask, f0, key_shift, speed, speaker, mask, variances
 
 
 def content_rms(entries, limit=64):

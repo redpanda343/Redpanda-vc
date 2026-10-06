@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import os
 import random
 import re
@@ -13,6 +14,7 @@ from rvc.rectified.config import PRESETS, architecture, default_config, resolve_
 from rvc.rectified.flow_model import validate_model_config
 from rvc.rectified.pitch import PITCH_EXTRACTORS
 from rvc.rectified.mel import normalize_mel
+from rvc.rectified.variance import HNSEP_METHODS, VARIANCES
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -104,15 +106,16 @@ def preview(model, vocoder, reference, data, writer, step, index=None):
     if reference is None:
         return
     device = next(model.parameters()).device
-    mel, content, f0, audio, sid, path = reference
-    content, f0 = content.to(device), f0.to(device)
+    mel, content, f0, audio, sid, path, variances = reference
+    content, f0, variances = content.to(device), f0.to(device), variances.to(device)
     mask = torch.ones(1, 1, f0.shape[1], device=device)
     speaker = torch.tensor([sid], device=device)
     suffix = '' if index is None else f'/{index}'
     with evaluation_model(model):
         generated = model.sample(content, f0, speaker, mask,
-                                 source_mel=normalize_mel(mel.to(device), data) if model.val_gt_start else None)
-        predicted = model.predict_mel(content, f0, speaker, mask)
+                                 source_mel=normalize_mel(mel.to(device), data) if model.val_gt_start else None,
+                                 variances=variances)
+        predicted = model.predict_mel(content, f0, speaker, mask, variances=variances)
     if not torch.isfinite(generated).all() or not torch.isfinite(predicted).all():
         raise FloatingPointError('Non-finite flow preview.')
     for name, value in (('flow', generated[0]), ('reference', normalize_mel(mel[0], data)), ('predictor', predicted[0])):
@@ -199,6 +202,12 @@ def configure_flow(config):
             raise ValueError(f'{name} must be a nonnegative integer.')
     if settings['pitch_extractor'] not in PITCH_EXTRACTORS:
         raise ValueError(f'pitch_extractor must be one of {PITCH_EXTRACTORS}.')
+    if settings['hnsep'] not in HNSEP_METHODS:
+        raise ValueError(f'hnsep must be one of {HNSEP_METHODS}.')
+    for name in VARIANCES:
+        value = settings[f'{name}_smooth_width']
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise ValueError(f'{name}_smooth_width must be a nonnegative number of seconds.')
     if settings['precision'] not in {'fp32', 'fp16', 'bf16'}:
         raise ValueError('precision must be fp32, fp16 or bf16.')
     for name in ('sort_by_len', 'val_with_vocoder'):

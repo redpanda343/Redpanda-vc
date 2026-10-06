@@ -27,6 +27,7 @@ from rvc.rectified.train_flow import (
     atomic_save, configure_fused_backbone, preview, prune_checkpoints,
     random_state, restore_random_state, select_fused_activation,
 )
+from rvc.rectified.variance import variance_names
 from rvc.rectified.vocoder import load_vocoder
 
 torch.multiprocessing.set_sharing_strategy(os.getenv('TORCH_SHARE_STRATEGY', 'file_system'))
@@ -87,8 +88,9 @@ class FlowDataModule(pl.LightningDataModule):
 
     def setup(self, stage):
         binary_dir = self.experiment / 'binary'
-        self.train_dataset = RectifiedDataset(binary_dir, 'train')
-        self.valid_dataset = RectifiedDataset(binary_dir, 'valid')
+        names = variance_names(self.settings['model'])
+        self.train_dataset = RectifiedDataset(binary_dir, 'train', names)
+        self.valid_dataset = RectifiedDataset(binary_dir, 'valid', names)
         self.references = []
         if self.trainer.is_global_zero and self.settings['preview_interval']:
             self.references = (self.valid_dataset if self.held else self.train_dataset).references(
@@ -150,9 +152,9 @@ class FlowTask(pl.LightningModule):
         self.trained_epoch = 1
 
     def run_model(self, batch):
-        mel, content, content_mask, f0, key_shift, speed, speaker, mask = unpack_flow(batch, self.device, True)
+        mel, content, content_mask, f0, key_shift, speed, speaker, mask, variances = unpack_flow(batch, self.device, True)
         flow, auxiliary = self.model(normalize_mel(mel, self.data), content, f0, speaker, mask,
-                                     content_mask, key_shift, speed)
+                                     content_mask, key_shift, speed, variances)
         aux = flow.new_zeros(()) if auxiliary is None else auxiliary * self.settings['aux_mel_weight']
         return dict(mel_loss=flow, aux_mel_loss=aux, total_loss=flow + aux)
 

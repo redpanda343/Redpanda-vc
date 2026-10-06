@@ -22,12 +22,18 @@ VOCODER_FILES = {
     'NOTICE.zh-CN.txt': '8983f1ac07a0b240b9d4c970c8081007b0f932e5e223d88f8f8aef0e6570ed81',
     'STATEMENTS.txt': 'fe208abd522fd9e77ee16063ca2b3d6466fe3a35db70578f615d28543dd62d85',
 }
+HNSEP_URL = 'https://github.com/yxlllc/vocal-remover/releases/download/hnsep_240512/hnsep_240512.zip'
+HNSEP_ARCHIVE_SHA256 = '3d353d6a14005690819210ad0cb8134326caa286e30f329da266049ed9cdff13'
+HNSEP_FILES = {
+    'config.yaml': '1b05438fec32da55e3d8408aa2b1108220912ea86d30c4ed152d4f56d53f4121',
+    'model.pt': 'd4dd9f8259692f9ceb5b05d86fd53553ef582a1c65184f4cfff2e00cdfe33dd2',
+}
 _download_lock = threading.Lock()
 
 
-def _valid_bundle(directory):
+def _valid_bundle(directory, files=VOCODER_FILES):
     return all((directory / name).is_file() and _sha256(directory / name) == checksum
-               for name, checksum in VOCODER_FILES.items())
+               for name, checksum in files.items())
 
 
 def default_vocoder():
@@ -52,3 +58,27 @@ def default_vocoder():
                 for name in (*[name for name in VOCODER_FILES if name != VOCODER_FILENAME], VOCODER_FILENAME):
                     os.replace(temporary / name, destination / name)
     return str(destination / VOCODER_FILENAME)
+
+
+def hnsep_model():
+    destination = ROOT / 'rvc' / 'models' / 'predictors' / 'hnsep' / 'vr'
+    with _download_lock:
+        if not _valid_bundle(destination, HNSEP_FILES):
+            print('Downloading the DiffSinger harmonic-noise separation model...', flush=True)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(dir=destination.parent, prefix='.hnsep-') as temporary:
+                temporary = Path(temporary)
+                archive_path = temporary / 'hnsep_240512.zip'
+                with tqdm(total=54974388, unit='B', unit_scale=True, desc='Harmonic-noise separator') as progress:
+                    download_file(HNSEP_URL, str(archive_path), progress, expected_sha256=HNSEP_ARCHIVE_SHA256)
+                with zipfile.ZipFile(archive_path) as archive:
+                    for name, checksum in HNSEP_FILES.items():
+                        extracted = temporary / name
+                        with archive.open('vr/' + name) as source, extracted.open('wb') as target:
+                            shutil.copyfileobj(source, target)
+                        if _sha256(extracted) != checksum:
+                            raise IOError(f'Checksum verification failed for separator file {name}.')
+                destination.mkdir(parents=True, exist_ok=True)
+                for name in ('config.yaml', 'model.pt'):
+                    os.replace(temporary / name, destination / name)
+    return str(destination / 'model.pt')

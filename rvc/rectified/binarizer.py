@@ -18,7 +18,8 @@ from torch.multiprocessing import Manager, Process, get_context
 from rvc.rectified.data import CONTENT_RATE, mel_frames
 from rvc.rectified.indexed_dataset import IndexedDatasetBuilder
 from rvc.rectified.mel import LogMel
-from rvc.rectified.pitch import extract_f0
+from rvc.rectified.pitch import extract_pitch
+from rvc.rectified.variance import extract_variances, resample_variances, variance_names
 
 BINARY_VERSION = 2
 
@@ -78,6 +79,8 @@ class ItemBuilder:
         self.sample_rate = int(self.data['sample_rate'])
         self.content_channels = int(config['flow']['model']['content_channels'])
         self.pitch_extractor = config['flow']['pitch_extractor']
+        self.settings = config['flow']
+        self.variances = variance_names(config['flow']['model'])
         self.device = torch.device(device)
         self.mel = LogMel.from_config(self.data).to(self.device)
 
@@ -103,30 +106,36 @@ class ItemBuilder:
 
     @torch.no_grad()
     def original(self, audio, content, frames, sid, name):
-        f0, voiced = self.f0(audio, self.hop, frames)
-        if not voiced:
+        f0, uv = self.f0(audio, self.hop, frames)
+        if uv.all():
             print(f"Skipped '{name}': empty gt f0", flush=True)
             return None
         clip = audio[: frames * self.hop].to(self.device)
         mel = self.mel(clip.unsqueeze(0), 0.0, self.hop)[0, :, :frames]
-        return self._item(mel, content, f0, 0.0, 1.0, sid)
+        variances = extract_variances(self.variances, audio.numpy(), f0, uv, frames, self.data, self.settings,
+                                      self.device)
+        return self._item(mel, content, f0, 0.0, 1.0, sid, variances)
 
     @torch.no_grad()
-    def augmented(self, audio, content, task, sid):
+    def augmented(self, audio, content, task, sid, original):
         hop = int(round(self.hop * task.get('speed', 1.0)))
         shift = task.get('key_shift', 0.0)
         mel = self.mel(audio.to(self.device).unsqueeze(0), shift, hop)[0]
         f0 = self.f0(audio, hop, mel.shape[-1])[0] * 2 ** (shift / 12)
-        return self._item(mel, content, f0, shift, hop / self.hop, sid)
+        curves = np.stack([original[name] for name in self.variances]) if self.variances else None
+        variances = resample_variances(curves, hop / self.hop, mel.shape[-1], self.data) if self.variances else None
+        return self._item(mel, content, f0, shift, hop / self.hop, sid, variances)
 
     def f0(self, audio, hop, frames):
-        return extract_f0(self.pitch_extractor, audio.numpy(), self.sample_rate, hop, frames, self.device)
+        return extract_pitch(self.pitch_extractor, audio.numpy(), self.sample_rate, hop, frames, self.device)
 
-    def _item(self, mel, content, f0, key_shift, speed, sid):
+    def _item(self, mel, content, f0, key_shift, speed, sid, variances=None):
         mel = mel.cpu().numpy().astype(np.float32)
         item = dict(mel=mel, content=content.numpy(), f0=np.asarray(f0, dtype=np.float32),
                     key_shift=np.float32(key_shift), speed=np.float32(speed),
                     spk_id=np.int64(sid), length=np.int64(mel.shape[-1]))
+        for name, curve in zip(self.variances, variances if variances is not None else ()):
+            item[name] = np.asarray(curve, dtype=np.float32)
         if item['length'] < 4 or not all(np.isfinite(value).all() for value in item.values()):
             raise ValueError('Invalid binarized features.')
         return item
@@ -202,6 +211,10 @@ def _recipe(config, training, held, seed):
                   pitch_extractor=config['flow']['pitch_extractor'],
                   augmentation=config['flow']['augmentation_args'], seed=seed,
                   train=sources(training), valid=sources(held))
+    names = variance_names(model)
+    if names:
+        recipe['variances'] = dict(names=names, hnsep=config['flow']['hnsep'],
+                                   widths=[config['flow'][f'{name}_smooth_width'] for name in names])
     return hashlib.sha256(json.dumps(recipe, sort_keys=True).encode()).hexdigest()
 
 
@@ -250,7 +263,7 @@ def process_dataset(binary_dir, prefix, entries, tasks, config, device, num_work
             if index in grouped:
                 audio, content, _ = builder.source(entries[index])
                 for task in grouped[index]:
-                    add(builder.augmented(audio, content, task, int(entries[index][4])), index, True)
+                    add(builder.augmented(audio, content, task, int(entries[index][4]), item), index, True)
             if completed == total or time.monotonic() - last_report >= 5:
                 print(f'| binarize {prefix}: {completed:,}/{total:,}', flush=True)
                 last_report = time.monotonic()

@@ -11,6 +11,7 @@ from rvc.lib.predictors.f0 import RMVPE
 from rvc.rectified.guard import guard_unvoiced
 from rvc.rectified.pitch import parselmouth_pitch, resample_f0, resample_voicing, rmvpe_pitch
 from rvc.rectified.resources import default_vocoder
+from rvc.rectified.variance import extract_variances
 from rvc.rectified.vocoder import load_vocoder
 
 
@@ -24,6 +25,7 @@ class RectifiedPipeline(Pipeline):
     def __init__(self, sample_rate, config, checkpoint, vocoder_path=''):
         super().__init__(sample_rate, config)
         self.data = checkpoint['config']['data']
+        self.settings = checkpoint['config']['flow']
         self.content_channels = int(checkpoint['config']['flow']['model']['content_channels'])
         self.vocoder_path = vocoder_path
         self.vocoder_model = None
@@ -88,22 +90,27 @@ class RectifiedPipeline(Pipeline):
         frames = math.ceil(length / hop)
         if self.f0_method in {'pm', 'rmvpe'}:
             if self.f0_method == 'pm':
-                f0, voiced = parselmouth_pitch(waveform, rate, hop, frames)
+                f0, uv, voiced = parselmouth_pitch(waveform, rate, hop, frames)
             else:
                 if not hasattr(self, 'model_rmvpe'):
                     self.model_rmvpe = RMVPE(device=self.device, sample_rate=self.sample_rate, hop_size=self.window)
-                f0, voiced = rmvpe_pitch(self.model_rmvpe.model, waveform, rate, hop, frames)
-            f0 = torch.from_numpy(f0).to(self.device)[None] * 2 ** (self.pitch_shift / 12)
+                f0, uv, voiced = rmvpe_pitch(self.model_rmvpe.model, waveform, rate, hop, frames)
         else:
             source_f0 = pitchf[0].float().cpu().numpy()
             voiced = resample_voicing(source_f0 > 0, self.sample_rate / self.window, frames, rate / hop)
-            f0 = resample_f0(source_f0, self.sample_rate / self.window, frames, rate / hop)
-            f0 = torch.from_numpy(f0).to(self.device)[None]
+            uv = ~voiced
+            f0 = resample_f0(source_f0, self.sample_rate / self.window, frames, rate / hop) / 2 ** (self.pitch_shift / 12)
+        variances = None
+        if net_g.variance_names:
+            variances = extract_variances(net_g.variance_names, waveform, f0, uv, frames, self.data, self.settings,
+                                          self.device)
+            variances = torch.from_numpy(variances).to(self.device)[None]
+        f0 = torch.from_numpy(f0).to(self.device)[None] * 2 ** (self.pitch_shift / 12)
         mask = torch.ones(1, 1, frames, device=self.device)
         with _INFERENCE_RNG_LOCK:
             if inference_rng is not None:
                 inference_rng.seed_next_segment()
-            mel = net_g.sample(content, f0, sid, mask)
+            mel = net_g.sample(content, f0, sid, mask, variances=variances)
             mel, vocoder_f0 = guard_unvoiced(mel, f0, torch.from_numpy(waveform), voiced, self.data)
             audio = self.vocoder_model(mel, vocoder_f0)[0, 0, :length]
         if not torch.isfinite(audio).all():
