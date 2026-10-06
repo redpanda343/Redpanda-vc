@@ -343,6 +343,16 @@ class VoiceConverter:
             chunks, intervals = [audio], None
         return audio, chunks, intervals
 
+    def rectified_sources(self, audio_input_path, chunks, intervals):
+        rate = int(self.cpt["config"]["data"]["sample_rate"])
+        source = load_audio_infer(audio_input_path, rate).astype(np.float32)
+        if intervals is None:
+            return [source]
+        return [
+            source[round(start * rate / 16000) : round(end * rate / 16000)]
+            for start, end in intervals
+        ]
+
     @deterministic_inference
     def convert_audio(
         self,
@@ -450,9 +460,18 @@ class VoiceConverter:
         if split_audio:
             print(f"Audio split into {len(chunks)} chunks for processing.")
 
+        sources = [{}] * len(chunks)
+        if rectified and f0_method in {"pm", "rmvpe"}:
+            sources = [
+                {"source_audio": source}
+                for source in self.rectified_sources(
+                    audio_input_path, chunks, intervals if split_audio else None
+                )
+            ]
+
         inference_rng = InferenceRNG(seed) if seed is not None else None
         converted_chunks = []
-        for c in chunks:
+        for c, source in zip(chunks, sources):
             audio_opt = self.vc.pipeline(
                 model=self.hubert_model,
                 net_g=self.net_g,
@@ -466,6 +485,7 @@ class VoiceConverter:
                 version=self.version,
                 protect=protect,
                 inference_rng=inference_rng,
+                **source,
             )
             converted_chunks.append(audio_opt)
             if split_audio:

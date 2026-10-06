@@ -165,6 +165,7 @@ class Pipeline:
         version,
         protect,
         inference_rng=None,
+        segment_start=0,
     ):
         """
         Performs voice conversion on a given audio segment.
@@ -365,6 +366,7 @@ class Pipeline:
                         version,
                         protect,
                         inference_rng,
+                        segment_start=s,
                     )[self.t_pad_tgt : -self.t_pad_tgt]
                 )
             else:
@@ -382,6 +384,7 @@ class Pipeline:
                         version,
                         protect,
                         inference_rng,
+                        segment_start=s,
                     )[self.t_pad_tgt : -self.t_pad_tgt]
                 )
             s = t
@@ -400,6 +403,7 @@ class Pipeline:
                     version,
                     protect,
                     inference_rng,
+                    segment_start=t or 0,
                 )[self.t_pad_tgt : -self.t_pad_tgt]
             )
         else:
@@ -417,6 +421,7 @@ class Pipeline:
                     version,
                     protect,
                     inference_rng,
+                    segment_start=t or 0,
                 )[self.t_pad_tgt : -self.t_pad_tgt]
             )
         audio_opt = np.concatenate(audio_opt)

@@ -27,8 +27,9 @@ resampled to the mel hop. Unvoiced frames are interpolated in log frequency.
 Time stretching re-extracts F0 at the stretched hop and pitch shifting scales
 it. Like DiffSinger, binarization skips clips with no voiced frames. The
 extractor is fixed when an experiment starts. File conversion with
-`parselmouth` or `rmvpe` reproduces the training extraction; other methods are
-interpolated and resampled to the mel hop. Realtime uses Parselmouth.
+`parselmouth` or `rmvpe` reproduces the training extraction on the input file at
+the model's sample rate, not on the 16 kHz copy used for content features; other
+methods are interpolated and resampled to the mel hop. Realtime uses Parselmouth.
 
 Training binarizes the dataset like DiffSinger: originals and their augmented
 copies go into `logs/<model>/binary/train.data`, held-out clips into

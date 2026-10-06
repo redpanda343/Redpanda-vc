@@ -28,11 +28,18 @@ class RectifiedPipeline(Pipeline):
         self.vocoder_model = None
         self.pitch_shift = 0.0
         self.f0_method = 'pm'
+        self.source_pad = None
 
-    def pipeline(self, *args, **kwargs):
+    def pipeline(self, *args, source_audio=None, **kwargs):
         self.pitch_shift = float(kwargs.get('pitch', args[4] if len(args) > 4 else 0))
         self.f0_method = kwargs.get('f0_method', args[5] if len(args) > 5 else 'pm')
-        return super().pipeline(*args, **kwargs)
+        if source_audio is not None:
+            pad = self.t_pad * int(self.data['sample_rate']) // self.sample_rate
+            self.source_pad = np.pad(np.asarray(source_audio, dtype=np.float32), (pad, pad), mode='reflect')
+        try:
+            return super().pipeline(*args, **kwargs)
+        finally:
+            self.source_pad = None
 
     def set_vocoder(self, path):
         path = str(path or '').strip().strip('"')
@@ -42,7 +49,7 @@ class RectifiedPipeline(Pipeline):
 
     @torch.inference_mode()
     def voice_conversion(self, model, net_g, sid, audio0, pitch, pitchf, index,
-                         big_npy, index_rate, version, protect, inference_rng=None):
+                         big_npy, index_rate, version, protect, inference_rng=None, segment_start=0):
         if self.vocoder_model is None:
             vocoder, _ = load_vocoder(self.vocoder_path or default_vocoder(), self.data)
             self.vocoder_model = vocoder.to(self.device).float()
@@ -64,10 +71,18 @@ class RectifiedPipeline(Pipeline):
                 amount = voiced + (1 - voiced) * float(protect)
                 content = content * amount + original * (1 - amount)
         rate, hop = int(self.data['sample_rate']), int(self.data['hop_length'])
-        waveform = soxr.resample(np.asarray(audio0, dtype=np.float32), self.sample_rate, rate, quality='HQ')
-        length = len(waveform)
+        if self.source_pad is not None:
+            length = round(len(audio0) * rate / self.sample_rate)
+        else:
+            waveform = soxr.resample(np.asarray(audio0, dtype=np.float32), self.sample_rate, rate, quality='HQ')
+            length = len(waveform)
         if len(audio0) == (pitchf.shape[-1] + 1) * self.window:
             length = round(pitchf.shape[-1] * self.window * rate / self.sample_rate)
+        if self.source_pad is not None:
+            start = round(segment_start * rate / self.sample_rate)
+            waveform = self.source_pad[start:start + length]
+            waveform = np.pad(waveform, (0, length - len(waveform)))
+        else:
             waveform = waveform[:length]
         frames = math.ceil(length / hop)
         if self.f0_method in {'pm', 'rmvpe'}:
