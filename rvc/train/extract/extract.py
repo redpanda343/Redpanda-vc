@@ -247,8 +247,8 @@ if __name__ == "__main__":
     include_mutes = int(sys.argv[7]) if len(sys.argv) > 7 else 2
     version = sys.argv[8] if len(sys.argv) > 8 else "v2"
     rectified = len(sys.argv) > 9 and sys.argv[9] == "--rectified"
-    if rectified and (int(sample_rate) != 44100 or version != "v2" or f0_method != "pm"):
-        raise ValueError("Rectified flow extraction requires 44100 Hz, v2 features and Parselmouth F0.")
+    if rectified and (int(sample_rate) != 44100 or version != "v2" or f0_method not in ("pm", "rmvpe")):
+        raise ValueError("Rectified flow extraction requires 44100 Hz, v2 features and Parselmouth or RMVPE F0.")
 
     wav_path = os.path.join(exp_dir, "sliced_audios")
 

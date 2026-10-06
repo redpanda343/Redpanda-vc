@@ -104,13 +104,14 @@ def preprocess(name, dataset, workers, slicing=True):
                    'Automatic' if slicing else 'Skip', 'False', 'False', '0.0', '10.0', '0.3', 'none', 'WAV'], 'Preprocessing')
 
 
-def extract(name, workers, device, embedder):
+def extract(name, workers, device, embedder, pitch_extractor='parselmouth'):
     directory = experiment_path(name)
     if not (directory / 'sliced_audios').is_dir():
         raise gr.Error('Preprocess this experiment first.')
     gpu = device_id(device)
+    method = 'pm' if pitch_extractor == 'parselmouth' else pitch_extractor
     return launch(name, 'rvc.train.extract.extract',
-                  [str(directory), 'pm', positive_integer(workers, 'CPU workers'), gpu,
+                  [str(directory), method, positive_integer(workers, 'CPU workers'), gpu,
                    '44100', embedder, '0', 'v2', '--rectified'], 'Extracting content and F0')
 
 
@@ -141,14 +142,16 @@ def resolve_pretrained(directory, enabled, preferred=''):
 
 
 def start(name, batch, max_frames, max_updates, checkpoint_interval, device, use_fused_kernels=False,
-          use_pretrained=False, pretrained_path='', realtime=False, pitch_extractor='parselmouth'):
+          use_pretrained=False, pretrained_path='', realtime=False):
     directory = experiment_path(name)
     device_id(device)
     if not (directory / 'filelist.txt').is_file():
         raise gr.Error('Extract features for this experiment first.')
     pretrained = resolve_pretrained(directory, use_pretrained, pretrained_path)
     preset = 'realtime' if realtime else 'standard'
-    from rvc.rectified.train_flow import load_training_config
+    from rvc.rectified.train_flow import experiment_pitch_extractor, load_training_config
+
+    pitch_extractor = experiment_pitch_extractor(directory)
 
     try:
         selected = load_training_config(directory, pretrained or None, use_fused_kernels, preset, pitch_extractor)
@@ -212,8 +215,13 @@ def rectified_train_tab():
         slicing = gr.Checkbox(label='Slice dataset', value=True,
                               info='Disable to keep full clips. Audio is always resampled to 44.1 kHz.')
         preprocess_button = gr.Button('Preprocess dataset')
-        embedder = gr.Dropdown(label='Content embedder', choices=['contentvec', 'spin-v2'], value='contentvec',
-                               info='F0 is extracted when training binarizes the dataset, with the pitch extractor chosen below.')
+        with gr.Row():
+            embedder = gr.Dropdown(label='Content embedder', choices=['contentvec', 'spin-v2'], value='contentvec')
+            pitch_extractor = gr.Dropdown(label='Pitch extractor', choices=['parselmouth', 'rmvpe'], value='parselmouth',
+                                          info='As in DiffSinger. Parselmouth: 65-1100 Hz autocorrelation. RMVPE: neural '
+                                               'tracker (230917 model), more robust on breathy or fry voices. Training '
+                                               'extracts F0 with it, interpolates unvoiced frames and skips clips without '
+                                               'voiced frames. Fixed once training starts.')
         extract_button = gr.Button('Extract content and F0')
     with gr.Accordion('2. Train rectified flow', open=True):
         use_pretrained = gr.Checkbox(label='Pretrained', value=False)
@@ -229,11 +237,6 @@ def rectified_train_tab():
                                info='Blank uses config, default 100000 Lightning training steps.')
             checkpoint_interval = gr.Number(label='Checkpoint interval (updates)', value=None, minimum=1, precision=0,
                                    info='Blank uses config, default 4000 updates.')
-        pitch_extractor = gr.Dropdown(label='Pitch extractor', choices=['parselmouth', 'rmvpe'], value='parselmouth',
-                                      info='F0 for new experiments, as in DiffSinger. Parselmouth: 65-1100 Hz autocorrelation. '
-                                           'RMVPE: neural tracker (230917 model), more robust on breathy or fry voices. '
-                                           'Unvoiced frames are interpolated and clips without voiced frames are skipped. '
-                                           'Keep it set the same when resuming.')
         realtime = gr.Checkbox(label='Realtime', value=False,
                                info='Smaller, deeper model for new experiments: 256 hidden / 6 encoder layers, '
                                     '512-channel backbone with 12 layers, 384-channel aux decoder with 8 layers. '
@@ -247,8 +250,8 @@ def rectified_train_tab():
     log = gr.Textbox(label='Rectified job log', lines=12, max_lines=20, interactive=False)
     outputs = [state, log, preprocess_button, extract_button, train_button, stop_button]
     preprocess_button.click(preprocess, [name, dataset, workers, slicing], outputs, queue=False)
-    extract_button.click(extract, [name, workers, device, embedder], outputs, queue=False)
+    extract_button.click(extract, [name, workers, device, embedder, pitch_extractor], outputs, queue=False)
     train_button.click(start, [name, batch, max_frames, max_updates, checkpoint_interval, device, use_fused_kernels,
-                               use_pretrained, pretrained_path, realtime, pitch_extractor], outputs, queue=False)
+                               use_pretrained, pretrained_path, realtime], outputs, queue=False)
     stop_button.click(stop, [], outputs, queue=False)
     gr.Timer(2).tick(status, [], outputs, queue=False)

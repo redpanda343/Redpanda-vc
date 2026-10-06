@@ -17,8 +17,9 @@ matching DiffSinger; set it to `true` before starting an experiment to enable
 speaker conditioning.
 
 F0 is extracted when training binarizes the dataset, exactly like DiffSinger's
-acoustic binarizer, with the training tab's **Pitch extractor**
-(`flow.pitch_extractor`, `--pitch-extractor`). `parselmouth` uses
+acoustic binarizer, with the **Pitch extractor** chosen next to the content
+embedder at extraction (`flow.pitch_extractor`; `--pitch-extractor` overrides it
+on the command line). `parselmouth` uses
 autocorrelation on the 44.1 kHz audio at the mel hop, 65-1100 Hz, voicing
 threshold 0.6. `rmvpe` uses DiffSinger's RMVPE code (from
 [yxlllc/RMVPE](https://github.com/yxlllc/RMVPE)) with the 230917 model, which
