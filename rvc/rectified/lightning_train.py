@@ -29,6 +29,8 @@ from rvc.rectified.train_flow import (
 )
 from rvc.rectified.vocoder import load_vocoder
 
+torch.multiprocessing.set_sharing_strategy(os.getenv('TORCH_SHARE_STRATEGY', 'file_system'))
+
 
 def validation_collate(batch):
     return collate_flow(batch) if batch else None

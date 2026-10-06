@@ -6,8 +6,6 @@ import re
 from contextlib import contextmanager
 from pathlib import Path
 
-os.environ.setdefault("TORCH_CUDNN_V8_API_ENABLED", "1")
-
 import numpy as np
 import torch
 
