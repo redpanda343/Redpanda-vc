@@ -412,6 +412,7 @@ class RealTimeRVC:
             f0_to_mel_rate, smooth_curve, to_mel_rate, upsample_content, variance_curves,
         )
         from rvc.rectified.energy import frame_energy
+        from rvc.rectified.pitch import parselmouth_f0, uses_parselmouth
 
         rate = self.sample_rate
         hop = int(self.pipeline.data["hop_length"])
@@ -429,7 +430,11 @@ class RealTimeRVC:
         source_f0 = pitchf / (2 ** (self.pitch / 12))
         content = upsample_content(features.float(), self.pipeline.data["content_interpolation"])
         content = to_mel_rate(content, frames, rate, hop)
-        f0 = f0_to_mel_rate(pitchf, frames, rate, hop, self.model.use_continuous_f0)
+        if uses_parselmouth(self.pipeline.data):
+            f0 = parselmouth_f0(waveform[0].cpu().numpy(), rate, hop, frames)
+            f0 = torch.from_numpy(f0).to(waveform.device)[None] * 2 ** (self.pitch / 12)
+        else:
+            f0 = f0_to_mel_rate(pitchf, frames, rate, hop, self.model.use_continuous_f0)
         energy = smooth_curve(frame_energy(waveform, rate, feature_frames))
         energy = to_mel_rate(energy.unsqueeze(-1), frames, rate, hop)[..., 0]
         breathiness = smooth_curve(aperiodicity(waveform, rate, source_f0, feature_frames))

@@ -15,6 +15,7 @@ import torch
 
 from rvc.rectified.data import RectifiedDataset, read_filelist, upsample_content, to_mel_rate
 from rvc.rectified.config import STANDARD_PRESET, resolve_config
+from rvc.rectified.pitch import interpolate_f0, parselmouth_f0, uses_parselmouth
 
 
 DEFAULT_AUGMENTATION = copy.deepcopy(STANDARD_PRESET['flow']['augmentation_args'])
@@ -93,17 +94,6 @@ def augmentation_plan(entries, settings, seed):
     return tasks
 
 
-def interpolate_f0(f0):
-    f0 = np.asarray(f0, dtype=np.float32).copy()
-    if f0.ndim != 1 or not len(f0) or not np.isfinite(f0).all() or (f0 < 0).any():
-        raise ValueError('Pitch extraction returned invalid frequencies.')
-    voiced = f0 > 0
-    if voiced.any():
-        positions = np.arange(len(f0))
-        f0 = np.exp2(np.interp(positions, positions[voiced], np.log2(f0[voiced]))).astype(np.float32)
-    return f0
-
-
 class AugmentationPitch:
     def __init__(self, method, device, root, f0_min=50.0, f0_max=1100.0):
         self.method, self.device = method, device
@@ -123,17 +113,7 @@ class AugmentationPitch:
     def __call__(self, audio, sample_rate, hop, frames):
         waveform = audio.cpu().numpy()
         if self.method == 'pm':
-            import parselmouth
-
-            left = int(np.ceil(1.5 / self.f0_min * sample_rate))
-            right = hop * ((len(waveform) - 1) // hop + 1) - len(waveform) + left + 1
-            waveform = np.pad(waveform, (left, right))
-            contour = parselmouth.Sound(waveform, sampling_frequency=sample_rate).to_pitch_ac(
-                time_step=hop / sample_rate, voicing_threshold=0.6,
-                pitch_floor=self.f0_min, pitch_ceiling=self.f0_max,
-            ).selected_array['frequency'].astype(np.float32)
-            contour = np.pad(contour, (0, max(0, frames - len(contour))))[:frames]
-            return interpolate_f0(contour)
+            return parselmouth_f0(waveform, sample_rate, hop, frames)
         if audio is not self.last_audio:
             waveform = librosa.resample(waveform, orig_sr=sample_rate, target_sr=16000)
             if self.method == 'rmvpe':
@@ -207,7 +187,7 @@ def generate_features(dataset, entry, tasks, paths, pitch, device, speed_embed=T
         with torch.no_grad():
             mel = mel_extractor(audio.to(device).unsqueeze(0), shift, hop)[0].cpu()
         length = mel.shape[-1]
-        if hop != dataset.hop or speed_embed:
+        if hop != dataset.hop or speed_embed or dataset.parselmouth:
             f0 = pitch(audio, dataset.sample_rate, hop, length)
         else:
             contour = interpolate_f0(source_f0.numpy())
@@ -279,7 +259,7 @@ def prepare_augmentation(experiment, root, originals, train_entries, config, see
     tasks = augmentation_plan(train_entries, config['flow'], seed)
     info_path = experiment / 'model_info.json'
     info = json.loads(info_path.read_text(encoding='utf-8')) if info_path.exists() else {}
-    method = info.get('f0_method', 'rmvpe')
+    method = 'pm' if uses_parselmouth(config['data']) else info.get('f0_method', 'rmvpe')
     sources = [[list(entry), [(Path(path).stat().st_size, Path(path).stat().st_mtime_ns)
                               for path in entry[:4]]] for entry in train_entries]
     recipe = dict(version=2, sources=sources, tasks=tasks, data=config['data'],

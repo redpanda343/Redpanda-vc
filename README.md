@@ -71,6 +71,14 @@ New v5 experiments interpolate unvoiced F0 in log frequency before aligning it
 to mel frames, and use this continuous pitch for conditioning and the vocoder.
 Set `flow.model.use_continuous_f0` to `false` to retain raw unvoiced zeros.
 
+Choose **Parselmouth (DiffSinger)** as the pitch extractor in the Rectified Flow
+tab to extract F0 exactly like DiffSinger's acoustic binarizer: Parselmouth
+autocorrelation on the 44.1 kHz audio at the mel hop, 65-1100 Hz, voicing
+threshold 0.6, with unvoiced frames interpolated in log frequency. Time
+stretching re-extracts F0 at the stretched hop and pitch shifting scales it.
+The same F0 feeds the flow and the vocoder during training, file conversion and
+realtime. Start a new experiment after switching extractors.
+
  ## Credits
 
 - [Applio](https://github.com/IAHispano/Applio)

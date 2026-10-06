@@ -19,6 +19,7 @@ from rvc.rectified.mel import LogMel
 from rvc.rectified.config import resolve_config
 from rvc.rectified.flow_model import HarmonicPrior
 from rvc.rectified.indexed_dataset import IndexedDataset, IndexedDatasetBuilder
+from rvc.rectified.pitch import parselmouth_f0, uses_parselmouth
 
 FEATURE_RATE = 100
 SMOOTH_SECONDS = 0.06
@@ -245,6 +246,7 @@ class RectifiedDataset(Dataset):
         self.use_variances = any(config["flow"]["model"].get(name, False) for name in ("voicing", "tension"))
         self.continuous_f0 = config['flow']['model'].get('use_continuous_f0',
                                                        config['flow']['model'].get('conditioning_version') == 5)
+        self.parselmouth = uses_parselmouth(self.data)
         self.use_harmonics = bool(config["flow"]["model"].get("harmonic_prior", False))
         self.harmonic_prior = (
             HarmonicPrior(
@@ -292,6 +294,11 @@ class RectifiedDataset(Dataset):
         feature_frames = audio.shape[-1] // (self.sample_rate // FEATURE_RATE)
         share = smooth_curve(aperiodicity(audio, self.sample_rate, f0, feature_frames))
         return to_mel_rate(share.unsqueeze(-1), frames, self.sample_rate, hop)[..., 0]
+
+    def _mel_f0(self, audio, source_f0, frames, hop):
+        if self.parselmouth:
+            return torch.from_numpy(parselmouth_f0(audio.numpy(), self.sample_rate, hop, frames))
+        return f0_to_mel_rate(source_f0, frames, self.sample_rate, hop, self.continuous_f0)
 
     @torch.no_grad()
     def _harmonics(self, f0):
@@ -345,9 +352,9 @@ class RectifiedDataset(Dataset):
         )
         if frames < 4:
             raise ValueError("Training clips must contain at least four mel frames.")
+        f0 = self._mel_f0(audio, source_f0, frames, self.hop)
         audio = audio[: frames * self.hop]
         content = to_mel_rate(content, frames, self.sample_rate, self.hop)
-        f0 = f0_to_mel_rate(source_f0, frames, self.sample_rate, self.hop, self.continuous_f0)
         with torch.no_grad():
             mel = self.mel(audio.unsqueeze(0), 0.0, self.hop)[0, :, :frames]
         energy = self._energy(audio.unsqueeze(0), frames, self.hop)[0]
@@ -401,9 +408,9 @@ class RectifiedDataset(Dataset):
         )
         if frames < 4:
             raise ValueError("Training clips must contain at least four mel frames.")
+        f0 = self._mel_f0(audio, source_f0, frames, hop) * 2.0 ** (key_shift / 12.0)
         audio = audio[: frames * hop]
         content = to_mel_rate(content, frames, self.sample_rate, hop)
-        f0 = f0_to_mel_rate(source_f0, frames, self.sample_rate, hop, self.continuous_f0) * 2.0 ** (key_shift / 12.0)
         with torch.no_grad():
             mel = self.mel(audio.unsqueeze(0), key_shift, hop)[0, :, :frames]
         energy = self._energy(audio.unsqueeze(0), frames, hop)[0]
@@ -460,11 +467,11 @@ class RectifiedDataset(Dataset):
         )
         if max_frames is not None:
             frames = min(frames, max_frames)
+        source_f0 = f0
+        f0 = self._mel_f0(audio, source_f0, frames, self.hop)
         audio = audio[: frames * self.hop]
         content = to_mel_rate(content, frames, self.sample_rate, self.hop)
-        breathiness = self._breathiness(audio.unsqueeze(0), f0.unsqueeze(0), frames, self.hop)
-        source_f0 = f0
-        f0 = f0_to_mel_rate(f0, frames, self.sample_rate, self.hop, self.continuous_f0)
+        breathiness = self._breathiness(audio.unsqueeze(0), source_f0.unsqueeze(0), frames, self.hop)
         with torch.no_grad():
             mel = self.mel(audio.unsqueeze(0))[:, :, :frames]
         energy = self._energy(audio.unsqueeze(0), frames, self.hop)

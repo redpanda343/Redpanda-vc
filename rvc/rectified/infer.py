@@ -10,6 +10,7 @@ from rvc.lib.utils import extract_embedding_features
 from rvc.rectified.aperiodicity import aperiodicity
 from rvc.rectified.data import f0_to_mel_rate, smooth_curve, to_mel_rate, upsample_content, variance_curves
 from rvc.rectified.energy import frame_energy
+from rvc.rectified.pitch import parselmouth_f0, uses_parselmouth
 from rvc.rectified.resources import default_vocoder
 from rvc.rectified.vocoder import load_vocoder
 
@@ -81,7 +82,11 @@ class RectifiedPipeline(Pipeline):
         energy = smooth_curve(frame_energy(waveform, rate, feature_frames))
         breathiness = smooth_curve(aperiodicity(waveform, rate, source_f0, feature_frames))
         content = to_mel_rate(content, frames, rate, hop)
-        f0 = f0_to_mel_rate(pitchf.float(), frames, rate, hop, net_g.use_continuous_f0)
+        if uses_parselmouth(self.data):
+            f0 = parselmouth_f0(waveform[0].cpu().numpy(), rate, hop, frames)
+            f0 = torch.from_numpy(f0).to(self.device)[None] * 2 ** (self.pitch_shift / 12)
+        else:
+            f0 = f0_to_mel_rate(pitchf.float(), frames, rate, hop, net_g.use_continuous_f0)
         energy = to_mel_rate(energy.unsqueeze(-1), frames, rate, hop)[..., 0]
         breathiness = to_mel_rate(breathiness.unsqueeze(-1), frames, rate, hop)[..., 0]
         mask = torch.ones(1, 1, frames, device=self.device)

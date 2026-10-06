@@ -170,6 +170,12 @@ def load_training_config(experiment, pretrained_flow=None, use_fused_kernels=Fal
             raise ValueError('Choose a Rectified Flow voice checkpoint for fine-tuning.')
         config['data'] = source['data']
         config['flow']['model'] = source['flow']['model']
+    info_path = experiment / 'model_info.json'
+    info = json.loads(info_path.read_text(encoding='utf-8')) if info_path.exists() else {}
+    if info.get('f0_method') == 'pm':
+        config['data']['pitch_extractor'] = 'parselmouth'
+    else:
+        config['data'].pop('pitch_extractor', None)
     select_fused_activation(config, use_fused_kernels)
     configure_flow(config, existing)
     return config

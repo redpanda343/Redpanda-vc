@@ -308,7 +308,9 @@ class FlowTask(pl.LightningModule):
         source_model, target_model = deepcopy(source['flow']['model']), deepcopy(self.settings['model'])
         for candidate in (source_model, target_model):
             candidate.pop('use_continuous_f0', None)
-        if source['data'] != self.data or source_model != target_model:
+        source_data, target_data = ({key: value for key, value in data.items() if key != 'pitch_extractor'}
+                                    for data in (source['data'], self.data))
+        if source_data != target_data or source_model != target_model:
             raise ValueError('Pretrained architecture or audio configuration differs from the experiment.')
         if state.get('embedder_model', self.data_module.embedder) != self.data_module.embedder:
             raise ValueError('Pretrained flow uses a different content embedder.')
