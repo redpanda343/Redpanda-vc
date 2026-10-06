@@ -224,7 +224,7 @@ def rectified_train_tab():
         with gr.Row():
             method = gr.Dropdown(label='Pitch extractor',
                                  choices=[('RMVPE', 'rmvpe'), ('SwiftF0', 'swift'), ('Parselmouth (DiffSinger)', 'pm')],
-                                 value='rmvpe',
+                                 value='pm',
                                  info='Parselmouth follows DiffSinger: 65-1100 Hz at the mel hop with interpolated unvoiced frames, for training, conversion and realtime.')
             embedder = gr.Dropdown(label='Content embedder', choices=['contentvec', 'spin-v2'], value='contentvec')
         extract_button = gr.Button('Extract content and F0')

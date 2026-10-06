@@ -356,6 +356,8 @@ class AuxDecoder(nn.Module):
         )
         self.output = nn.Conv1d(channels, n_mels, 7, padding=3)
         self.output.use_adamw = True
+        if self.reference:
+            nn.init.kaiming_normal_(self.output.weight)
 
     def forward(self, cond, mask, voice=None):
         x = self.input(cond)
