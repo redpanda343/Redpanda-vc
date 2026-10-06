@@ -5,6 +5,7 @@ import numpy as np
 PARSELMOUTH_F0_MIN = 65.0
 PARSELMOUTH_F0_MAX = 1100.0
 PITCH_EXTRACTORS = ('parselmouth', 'rmvpe')
+RMVPE_VOICED_PEAK = 0.5
 RMVPE_PATH = Path(__file__).resolve().parents[1] / 'models' / 'predictors' / 'rmvpe.pt'
 _RMVPE = {}
 
@@ -28,7 +29,23 @@ def resample_f0(f0, source_rate, frames, frame_rate):
     return np.exp2(np.interp(positions, np.arange(len(f0)), np.log2(f0))).astype(np.float32)
 
 
-def parselmouth_f0(waveform, sample_rate, hop, frames, f0_min=PARSELMOUTH_F0_MIN, f0_max=PARSELMOUTH_F0_MAX):
+def resample_voicing(voiced, source_rate, frames, frame_rate):
+    voiced = np.asarray(voiced, dtype=np.float32)
+    if not len(voiced):
+        return np.zeros(frames, dtype=bool)
+    positions = np.arange(frames) * (source_rate / frame_rate)
+    return np.interp(positions, np.arange(len(voiced)), voiced) > 0.5
+
+
+def confident_runs(voiced, salience, peak=RMVPE_VOICED_PEAK):
+    edges = np.flatnonzero(np.diff(np.r_[0, voiced.astype(np.int8), 0]))
+    keep = np.zeros(len(voiced), dtype=bool)
+    for start, end in zip(edges[::2], edges[1::2]):
+        keep[start:end] = salience[start:end].max() >= peak
+    return keep
+
+
+def parselmouth_contour(waveform, sample_rate, hop, frames, f0_min=PARSELMOUTH_F0_MIN, f0_max=PARSELMOUTH_F0_MAX):
     import parselmouth
 
     waveform = np.asarray(waveform)
@@ -39,8 +56,16 @@ def parselmouth_f0(waveform, sample_rate, hop, frames, f0_min=PARSELMOUTH_F0_MIN
         time_step=hop / sample_rate, voicing_threshold=0.6,
         pitch_floor=f0_min, pitch_ceiling=f0_max,
     ).selected_array['frequency'].astype(np.float32)
-    contour = np.pad(contour, (0, max(0, frames - len(contour))))[:frames]
-    return interpolate_f0(contour)
+    return np.pad(contour, (0, max(0, frames - len(contour))))[:frames]
+
+
+def parselmouth_f0(waveform, sample_rate, hop, frames, f0_min=PARSELMOUTH_F0_MIN, f0_max=PARSELMOUTH_F0_MAX):
+    return interpolate_f0(parselmouth_contour(waveform, sample_rate, hop, frames, f0_min, f0_max))
+
+
+def parselmouth_pitch(waveform, sample_rate, hop, frames):
+    contour = parselmouth_contour(waveform, sample_rate, hop, frames)
+    return interpolate_f0(contour), contour > 0
 
 
 def rmvpe_model(device):
@@ -58,6 +83,19 @@ def rmvpe_f0(model, waveform, sample_rate, hop, frames):
     f0, uv = model.get_pitch(np.asarray(waveform, dtype=np.float32), sample_rate, frames,
                              hop_size=hop, interp_uv=True)
     return f0.astype(np.float32), not uv.all()
+
+
+def rmvpe_pitch(model, waveform, sample_rate, hop, frames):
+    from rvc.lib.predictors.rmvpe import interp_f0, resample_align_curve
+
+    hidden = model.infer_hidden(np.asarray(waveform, dtype=np.float32), sample_rate)
+    f0 = model.decode(hidden)
+    voiced = confident_runs(f0 > 0, hidden[0].max(-1).values.float().cpu().numpy())
+    f0, _ = interp_f0(f0, f0 == 0)
+    step = hop / sample_rate
+    f0 = resample_align_curve(f0, 0.01, step, frames)
+    voiced = resample_align_curve(voiced.astype(np.float32), 0.01, step, frames) > 0.5
+    return f0.astype(np.float32), voiced
 
 
 def extract_f0(extractor, waveform, sample_rate, hop, frames, device='cpu'):

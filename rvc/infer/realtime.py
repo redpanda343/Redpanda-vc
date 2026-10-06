@@ -421,28 +421,32 @@ class RealTimeRVC:
         return source[-length:]
 
     def _rectified_f0(self, waveform, input_wav, f0_method, source_wav, source_rate, frames):
-        from rvc.rectified.pitch import parselmouth_f0, resample_f0, rmvpe_f0, rmvpe_model
+        from rvc.rectified.pitch import parselmouth_pitch, resample_f0, resample_voicing, rmvpe_model, rmvpe_pitch
 
         rate = self.sample_rate
         hop = int(self.pipeline.data["hop_length"])
+        source = waveform[0]
+        if source_wav is not None:
+            source = self._full_rate_source(source_wav, source_rate, waveform.shape[-1])
         if f0_method in ("pm", "rmvpe"):
-            source = waveform[0]
-            if source_wav is not None:
-                source = self._full_rate_source(source_wav, source_rate, waveform.shape[-1])
-            source = source.cpu().numpy()
+            audio = source.cpu().numpy()
             if f0_method == "pm":
-                f0 = parselmouth_f0(source, rate, hop, frames)
+                f0, voiced = parselmouth_pitch(audio, rate, hop, frames)
             else:
                 predictor = getattr(self.pipeline, "model_rmvpe", None)
                 model = predictor.model if predictor is not None else rmvpe_model(self.device)
-                f0 = rmvpe_f0(model, source, rate, hop, frames)[0]
-            return torch.from_numpy(f0).to(waveform.device)[None] * 2 ** (self.pitch / 12)
+                f0, voiced = rmvpe_pitch(model, audio, rate, hop, frames)
+            return torch.from_numpy(f0).to(waveform.device)[None] * 2 ** (self.pitch / 12), voiced, source
         p_len = input_wav.shape[0] // 160
-        f0 = resample_f0(self.cache_pitchf[-p_len:].cpu().numpy(), 100, frames, rate / hop)
-        return torch.from_numpy(f0).to(waveform.device)[None]
+        pitchf = self.cache_pitchf[-p_len:].cpu().numpy()
+        f0 = resample_f0(pitchf, 100, frames, rate / hop)
+        voiced = resample_voicing(pitchf > 0, 100, frames, rate / hop)
+        return torch.from_numpy(f0).to(waveform.device)[None], voiced, source
 
     def _infer_rectified(self, features, input_wav, speaker, skip_head, return_length,
                          f0_method, source_wav=None, source_rate=None):
+        from rvc.rectified.guard import guard_unvoiced
+
         rate = self.sample_rate
         hop = int(self.pipeline.data["hop_length"])
         waveform = self.flow_resampler(input_wav.float()).view(1, -1)
@@ -452,11 +456,12 @@ class RealTimeRVC:
         if start < 0 or count < 1 or start + count > length:
             raise ValueError("The requested flow output exceeds the input context.")
         frames = math.ceil(length / hop)
-        f0 = self._rectified_f0(waveform, input_wav, f0_method, source_wav, source_rate, frames)
+        f0, voiced, source = self._rectified_f0(waveform, input_wav, f0_method, source_wav, source_rate, frames)
         mask = torch.ones(1, 1, frames, device=self.device)
         mel = self.flow_sampler(features.float(), f0, speaker, mask, steps=self.rectified_steps)
+        mel, vocoder_f0 = guard_unvoiced(mel, f0, source, voiced, self.pipeline.data)
         first_frame = max(0, start // hop - self.vocoder_context_frames)
-        audio = self.pipeline.vocoder_model(mel[..., first_frame:], f0[..., first_frame:])[0, 0]
+        audio = self.pipeline.vocoder_model(mel[..., first_frame:], vocoder_f0[..., first_frame:])[0, 0]
         start -= first_frame * hop
         audio = audio[start:start + count]
         if audio.numel() != count:

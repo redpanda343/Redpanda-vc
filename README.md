@@ -34,6 +34,17 @@ methods are interpolated and resampled to the mel hop. Realtime follows the
 selected pitch method the same way, extracting Parselmouth and RMVPE F0 from the
 full-rate input stream.
 
+Conversion adds an unvoiced guard that DiffSinger does not need. The flow
+always receives interpolated F0, so breaths, noise and whispers in the input
+can come out as sung vowels. Frames the pitch method marks unvoiced are guarded:
+RMVPE counts a voiced run only when its peak salience reaches 0.5, Parselmouth
+uses its own voicing, and other methods use their nonzero F0. In guarded frames
+the vocoder gets zero F0, so it renders noise instead of harmonics, and each mel
+bin is capped at the input's level plus 6 dB, after shifting the input by the
+median level gap between output and input over voiced frames. Bins the input
+does not reach (for example above 8 kHz in a 16 kHz recording) are left alone.
+Voiced frames are untouched.
+
 Training binarizes the dataset like DiffSinger: originals and their augmented
 copies go into `logs/<model>/binary/train.data`, held-out clips into
 `valid.data`, each with a `.meta` file of clip lengths used for batching. The
