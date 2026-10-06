@@ -13,7 +13,6 @@ from rvc.rectified.resources import default_vocoder
 
 ROOT = Path(__file__).resolve().parents[2]
 _lock = threading.Lock()
-VOCODER_CHOICES = ['Default NSF-HiFiGAN', 'Custom NSF-HiFiGAN', 'Mel previews only']
 _process = None
 _log_handle = None
 _log_path = None
@@ -28,7 +27,7 @@ def experiment_path(name):
 
 
 def positive_integer(value, label):
-    if float(value) != int(value) or int(value) < 1:
+    if value is None or float(value) != int(value) or int(value) < 1:
         raise gr.Error(f'{label} must be a positive whole number.')
     return str(int(value))
 
@@ -123,16 +122,7 @@ def device_id(device):
     return '-' if devices == ['cpu'] else '-'.join(item[5:] for item in devices)
 
 
-def resolve_vocoder(mode, path):
-    if mode == 'Mel previews only':
-        return ''
-    if mode == 'Custom NSF-HiFiGAN':
-        path = str(path or '').strip().strip('"')
-        if not path or not Path(path).is_file():
-            raise gr.Error('Choose an existing OpenVPI NSF-HiFiGAN checkpoint or converted vocoder export.')
-        return path
-    if mode != 'Default NSF-HiFiGAN':
-        raise gr.Error('Choose a supported vocoder option.')
+def resolve_vocoder():
     try:
         return default_vocoder()
     except Exception as error:
@@ -150,8 +140,8 @@ def resolve_pretrained(directory, enabled, preferred=''):
     return str(path)
 
 
-def start(name, vocoder, batch, max_frames, max_updates, checkpoint_interval, device, use_fused_kernels=False,
-          use_pretrained=False, vocoder_mode='Default NSF-HiFiGAN', pretrained_path=''):
+def start(name, batch, max_frames, max_updates, checkpoint_interval, device, use_fused_kernels=False,
+          use_pretrained=False, pretrained_path=''):
     directory = experiment_path(name)
     device_id(device)
     if not (directory / 'filelist.txt').is_file():
@@ -166,7 +156,7 @@ def start(name, vocoder, batch, max_frames, max_updates, checkpoint_interval, de
     precision = get_precision() or selected['flow'].get('precision', 'fp32')
     if precision not in {'fp32', 'fp16', 'bf16'}:
         raise gr.Error(f'Unsupported training precision: {precision}')
-    vocoder = resolve_vocoder(vocoder_mode, vocoder) if selected['flow'].get('val_with_vocoder', True) else ''
+    vocoder = resolve_vocoder() if selected['flow'].get('val_with_vocoder', True) else ''
     arguments = ['--model-name', str(name).strip(), '--vocoder', vocoder,
                  '--precision', precision]
     for flag, value, label in (('--batch-size', batch, 'Max clips per batch'),
@@ -229,10 +219,6 @@ def rectified_train_tab():
             embedder = gr.Dropdown(label='Content embedder', choices=['contentvec', 'spin-v2'], value='contentvec')
         extract_button = gr.Button('Extract content and F0')
     with gr.Accordion('2. Train rectified flow', open=True):
-        vocoder_mode = gr.Dropdown(label='Audio preview vocoder', choices=VOCODER_CHOICES, value='Default NSF-HiFiGAN', visible=False,
-                                   info='The default NSF-HiFiGAN downloads automatically on start. Choose mel previews only to skip audio rendering.')
-        vocoder = gr.Textbox(label='Custom OpenVPI NSF-HiFiGAN checkpoint path', visible=False,
-                            info='Use a compatible .ckpt or converted .pth export: 44.1 kHz, 128 mel bins, hop 512. Keep config.json beside raw checkpoints when provided.')
         use_pretrained = gr.Checkbox(label='Pretrained', value=False)
         pretrained_path = gr.Textbox(label='Voice checkpoint to fine-tune', value='',
                                     info='Optional exported flow .pth path, used when Pretrained is checked.')
@@ -256,9 +242,7 @@ def rectified_train_tab():
     outputs = [state, log, preprocess_button, extract_button, train_button, stop_button]
     preprocess_button.click(preprocess, [name, dataset, workers, slicing], outputs, queue=False)
     extract_button.click(extract, [name, method, workers, device, embedder], outputs, queue=False)
-    vocoder_mode.change(lambda mode: gr.update(visible=mode == 'Custom NSF-HiFiGAN'),
-                        [vocoder_mode], [vocoder], queue=False)
-    train_button.click(start, [name, vocoder, batch, max_frames, max_updates, checkpoint_interval, device, use_fused_kernels,
-                               use_pretrained, vocoder_mode, pretrained_path], outputs, queue=False)
+    train_button.click(start, [name, batch, max_frames, max_updates, checkpoint_interval, device, use_fused_kernels,
+                               use_pretrained, pretrained_path], outputs, queue=False)
     stop_button.click(stop, [], outputs, queue=False)
     gr.Timer(2).tick(status, [], outputs, queue=False)

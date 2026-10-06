@@ -58,7 +58,7 @@ def split_holdout(entries, count: int, seed: int = 1234, stratified: bool = Fals
             rng.shuffle(group)
             if len(group) > 1:
                 pools.append(group[1:])
-        target = min(sum(map(len, pools)), max(count, len(pools))) if count > 0 else 0
+        target = min(sum(map(len, pools)), max(count, len(pools)), len(candidates) // 10) if count > 0 else 0
         held = set()
         while len(held) < target:
             rng.shuffle(pools)
