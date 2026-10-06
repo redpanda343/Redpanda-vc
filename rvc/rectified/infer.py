@@ -64,9 +64,12 @@ class RectifiedPipeline(Pipeline):
         if index is not None:
             content = self._retrieve_speaker_embeddings(content, index, big_npy, index_rate)
         mode = self.data['content_interpolation']
-        content = upsample_content(content, mode)
+        native = net_g.native_content_rate
+        if not native:
+            content = upsample_content(content, mode)
         if index is not None and protect < .5:
-            original = upsample_content(original, mode)
+            if not native:
+                original = upsample_content(original, mode)
             voiced = (pitchf > 0).float()
             voiced = F.interpolate(voiced.unsqueeze(1), size=content.shape[1], mode='nearest').transpose(1, 2)
             amount = voiced + (1 - voiced) * float(protect)
@@ -83,7 +86,8 @@ class RectifiedPipeline(Pipeline):
         source_f0 = pitchf.float() / (2 ** (self.pitch_shift / 12))
         energy = smooth_curve(frame_energy(waveform, rate, feature_frames))
         breathiness = smooth_curve(aperiodicity(waveform, rate, source_f0, feature_frames))
-        content = to_mel_rate(content, frames, rate, hop)
+        if not native:
+            content = to_mel_rate(content, frames, rate, hop)
         if uses_parselmouth(self.data):
             f0 = parselmouth_f0(waveform[0].cpu().numpy(), rate, hop, frames)
             f0 = torch.from_numpy(f0).to(self.device)[None] * 2 ** (self.pitch_shift / 12)

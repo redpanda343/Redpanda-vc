@@ -27,6 +27,20 @@ def interpolate_pitch(f0, mask):
     return pitch * voiced.any(dim=-1, keepdim=True) * mask[:, 0]
 
 
+def expand_content(x, frames, step, lengths):
+    positions = torch.arange(frames, device=x.device, dtype=torch.float64)[None] * step.double()[:, None]
+    limit = (2 * lengths - 1)[:, None]
+    positions = torch.minimum(positions, limit.double())
+    left = positions.floor().long()
+    right = torch.minimum(left + 1, limit)
+    weight = (positions - left).to(x.dtype).unsqueeze(-1)
+
+    def gather(index):
+        return x.gather(1, (index // 2).unsqueeze(-1).expand(-1, -1, x.shape[-1]))
+
+    return gather(left) * (1 - weight) + gather(right) * weight
+
+
 class ContentAttention(nn.Module):
     def __init__(self, channels, heads=2, use_rope=True, rope_interleaved=False, rope_theta=10000.0):
         super().__init__()
@@ -59,11 +73,8 @@ class ContentAttention(nn.Module):
                    for value in self.in_proj(x).split(channels, dim=-1)]
         if self.use_rope:
             q, k = self.rotate(q), self.rotate(k)
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        scores = scores.masked_fill(padding[:, None, None], -torch.inf)
-        weights = F.softmax(scores, dim=-1)
-        output = torch.matmul(weights, v).transpose(1, 2).contiguous().view(batch, frames, channels)
-        return self.out_proj(output)
+        output = F.scaled_dot_product_attention(q, k, v, attn_mask=~padding[:, None, None])
+        return self.out_proj(output.transpose(1, 2).contiguous().view(batch, frames, channels))
 
 
 class ContentEncoderLayer(nn.Module):
@@ -94,9 +105,13 @@ class ContentConditionEncoder(nn.Module):
     def __init__(self, content_channels, hidden_channels, speaker_count, layers,
                  breathiness=False, key_shift=False, speed=False, energy=False, use_spk_id=True,
                  enc_ffn_kernel_size=3, use_rope=True, rope_interleaved=False, rope_theta=10000.0,
-                 use_variance_scaling=True):
+                 use_variance_scaling=True, native_content_rate=False, content_step=0.0):
         super().__init__()
         self.conditioning_version = 5
+        self.native_content_rate = bool(native_content_rate)
+        self.content_step = float(content_step)
+        if self.native_content_rate and not self.content_step > 0:
+            raise ValueError('Native-rate content encoding requires the mel hop in content frames.')
         self.speaker_count = int(speaker_count) if use_spk_id else 1
         self.has_null_speaker = False
         self.content = nn.Linear(content_channels, hidden_channels)
@@ -127,13 +142,21 @@ class ContentConditionEncoder(nn.Module):
         return self.speaker(speaker) if self.speaker is not None else None
 
     def forward(self, content, f0, energy, speaker, mask, breathiness=None,
-                key_shift=None, speed=None, voicing=None, tension=None, harmonic_prior=None):
-        padding = ~mask[:, 0].bool()
+                key_shift=None, speed=None, voicing=None, tension=None, harmonic_prior=None, content_mask=None):
+        if not self.native_content_rate:
+            content_mask = mask
+        elif content_mask is None:
+            content_mask = mask.new_ones(content.shape[0], 1, content.shape[1])
+        padding = ~content_mask[:, 0].bool()
         x = F.dropout(self.content(content) * self.embed_scale, 0.1, training=self.training)
-        x = x * mask.transpose(1, 2)
+        x = x * content_mask.transpose(1, 2)
         for block in self.blocks:
             x = block(x, padding)
-        x = self.norm(x) * mask.transpose(1, 2)
+        x = self.norm(x) * content_mask.transpose(1, 2)
+        if self.native_content_rate:
+            speeds = (f0.new_ones(f0.shape[0]) if speed is None else speed.reshape(-1)).double()
+            lengths = content_mask[:, 0].sum(-1).long()
+            x = expand_content(x, mask.shape[-1], speeds * self.content_step, lengths) * mask.transpose(1, 2)
         if self.speaker is not None:
             x = x + self.voice(speaker).unsqueeze(1)
         x = x + self.pitch(torch.log1p(interpolate_pitch(f0, mask) / 700.0).unsqueeze(-1))

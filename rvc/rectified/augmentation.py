@@ -13,7 +13,7 @@ import librosa
 import numpy as np
 import torch
 
-from rvc.rectified.data import RectifiedDataset, read_filelist, upsample_content, to_mel_rate
+from rvc.rectified.data import RectifiedDataset, read_filelist, upsample_content
 from rvc.rectified.config import STANDARD_PRESET, resolve_config
 from rvc.rectified.pitch import interpolate_f0, parselmouth_f0, uses_parselmouth
 
@@ -194,7 +194,7 @@ def generate_features(dataset, entry, tasks, paths, pitch, device, speed_embed=T
             f0 = np.interp(np.arange(length) * hop / dataset.sample_rate,
                            np.arange(len(contour)) * 0.01, contour).astype(np.float32)
         f0 = torch.from_numpy(f0) * 2 ** (shift / 12)
-        values = dict(mel=mel, content=to_mel_rate(content, length, dataset.sample_rate, hop),
+        values = dict(mel=mel, content=dataset._model_content(content, length, hop),
                       f0=f0, energy=resample_curve(energy, length, speed),
                       breathiness=resample_curve(breathiness, length, speed),
                       harmonic_prior=dataset._harmonics(f0),
@@ -268,7 +268,8 @@ def prepare_augmentation(experiment, root, originals, train_entries, config, see
                                            for name in ('voicing', 'tension')],
                   harmonic_prior=bool(config['flow']['model'].get('harmonic_prior', False)))
     recipe.update(continuous_f0=config['flow']['model'].get('use_continuous_f0',
-                                                           config['flow']['model'].get('conditioning_version') == 5))
+                                                           config['flow']['model'].get('conditioning_version') == 5),
+                  native_content=bool(config['flow']['model'].get('native_content_rate', False)))
     checkpoint = root / 'rvc/models/predictors/rmvpe.pt'
     if method == 'rmvpe' and checkpoint.exists():
         recipe['pitch_checkpoint'] = [checkpoint.stat().st_size, checkpoint.stat().st_mtime_ns]

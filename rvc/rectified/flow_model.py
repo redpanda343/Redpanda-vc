@@ -414,6 +414,8 @@ class RectifiedFlow(nn.Module):
         train_diffusion: bool = True,
         val_gt_start: bool = False,
         aux_decoder_arch: str = 'convnext',
+        native_content_rate: bool = False,
+        content_step: float = 0.0,
     ):
         super().__init__()
         if diffusion_type != 'reflow' or aux_decoder_arch != 'convnext':
@@ -461,6 +463,9 @@ class RectifiedFlow(nn.Module):
         self.mel_std = float(mel_std)
         self.n_mels = int(n_mels)
         self.reference = conditioning_version == 5
+        self.native_content_rate = bool(native_content_rate)
+        if self.native_content_rate and not self.reference:
+            raise ValueError('Native-rate content encoding requires conditioning version 5.')
         self.use_continuous_f0 = self.reference if use_continuous_f0 is None else bool(use_continuous_f0)
         self.hidden_channels = int(hidden_channels)
         self.use_spk_id = bool(use_spk_id)
@@ -469,6 +474,7 @@ class RectifiedFlow(nn.Module):
             breathiness=breathiness, key_shift=key_shift, speed=speed, energy=energy, use_spk_id=self.use_spk_id,
             enc_ffn_kernel_size=enc_ffn_kernel_size, use_rope=use_rope,
             rope_interleaved=rope_interleaved, rope_theta=rope_theta, use_variance_scaling=use_variance_scaling,
+            native_content_rate=self.native_content_rate, content_step=content_step,
         ) if self.reference else ConditionEncoder(
             content_channels,
             hidden_channels,
@@ -574,11 +580,15 @@ class RectifiedFlow(nn.Module):
         denominator = (mask.sum() * self.n_mels).clamp_min(1.0) if denominator is None else denominator
         return (error * mask).sum() / denominator
 
+    def _content_mask(self, content_mask):
+        return {'content_mask': content_mask} if self.native_content_rate else {}
+
     def predict_mel(self, content, f0, energy, speaker, mask, breathiness=None, key_shift=None,
-                    speed=None, voicing=None, tension=None):
+                    speed=None, voicing=None, tension=None, content_mask=None):
         if self.aux is None:
             raise ValueError("This model has no direct mel predictor.")
-        cond = self.encoder(content, f0, energy, speaker, mask, breathiness, key_shift, speed, voicing, tension)
+        cond = self.encoder(content, f0, energy, speaker, mask, breathiness, key_shift, speed, voicing, tension,
+                            **self._content_mask(content_mask))
         return self.aux(cond, mask, self.encoder.voice(speaker)) * mask
 
     def _uniform_times(self, batch, device):
@@ -588,12 +598,12 @@ class RectifiedFlow(nn.Module):
 
     def forward(self, mel, content, f0, energy, speaker, mask, speaker_dropout=0.0,
                 breathiness=None, key_shift=None, speed=None, voicing=None, tension=None,
-                harmonic_prior=None):
+                harmonic_prior=None, content_mask=None):
         if (self.flow_conditioning == "aux_mel" or self.direct_speaker_conditioning) and speaker_dropout != 0:
             raise ValueError("Speaker-conditioned standard flow keeps the speaker ID present during training.")
         speaker = self._drop_speakers(speaker, speaker_dropout)
         cond = self.encoder(content, f0, energy, speaker, mask, breathiness, key_shift, speed, voicing, tension,
-                            harmonic_prior=harmonic_prior)
+                            harmonic_prior=harmonic_prior, **self._content_mask(content_mask))
         voice = self.encoder.voice(speaker)
         t = self._uniform_times(mel.shape[0], mel.device)
         if self.dual_timestep:
@@ -607,9 +617,10 @@ class RectifiedFlow(nn.Module):
 
     @torch.no_grad()
     def validation_losses(self, mel, content, f0, energy, speaker, mask, breathiness, key_shift,
-                          speed, noise, fractions, voicing=None, tension=None, harmonic_prior=None):
+                          speed, noise, fractions, voicing=None, tension=None, harmonic_prior=None,
+                          content_mask=None):
         cond = self.encoder(content, f0, energy, speaker, mask, breathiness, key_shift, speed, voicing, tension,
-                            harmonic_prior=harmonic_prior)
+                            harmonic_prior=harmonic_prior, **self._content_mask(content_mask))
         voice = self.encoder.voice(speaker)
         losses, aux = [], None
         for fraction in fractions:
@@ -643,6 +654,7 @@ class RectifiedFlow(nn.Module):
         schedule: str = "uniform",
         voicing: Optional[torch.Tensor] = None,
         tension: Optional[torch.Tensor] = None,
+        content_mask: Optional[torch.Tensor] = None,
     ):
         method = self.sampling_method if method is None else method
         steps = self.sampling_steps if steps is None else steps
@@ -671,7 +683,7 @@ class RectifiedFlow(nn.Module):
         cond = self.encoder(
             torch.cat([c for c, _ in variants]), repeat(f0), repeat(energy),
             torch.cat([s for _, s in variants]), repeat(mask), repeat(breathiness), repeat(key_shift),
-            voicing=repeat(voicing), tension=repeat(tension),
+            voicing=repeat(voicing), tension=repeat(tension), **self._content_mask(repeat(content_mask)),
         )
         voice = self.encoder.voice(torch.cat([s for _, s in variants]))
         masks = repeat(mask)
@@ -709,7 +721,7 @@ class RectifiedFlow(nn.Module):
                 guided = guidance_rescale * rescaled + (1.0 - guidance_rescale) * guided
             return guided
 
-        shape = (batch, self.n_mels, content.shape[1])
+        shape = (batch, self.n_mels, mask.shape[-1])
         if noise is None:
             noise = torch.randn(shape, device=content.device)
         noise = noise * float(temperature)
@@ -775,7 +787,7 @@ def resize_speakers(state_dict: dict, speaker_count: int, speaker_init=None, nul
 
 
 def validate_model_config(model: dict):
-    for name in ('use_continuous_f0', 'dual_timestep', 'use_rope', 'rope_interleaved', 'use_variance_scaling',
+    for name in ('use_continuous_f0', 'native_content_rate', 'dual_timestep', 'use_rope', 'rope_interleaved', 'use_variance_scaling',
                  'use_shallow_diffusion', 'train_aux_decoder', 'train_diffusion', 'val_gt_start'):
         if name in model and not isinstance(model[name], bool):
             raise ValueError(f'{name} must be a boolean.')
@@ -787,6 +799,8 @@ def validate_model_config(model: dict):
             raise ValueError(f'{key} must be a positive odd integer.')
     if not math.isfinite(model.get('rope_theta', 10000.0)) or model.get('rope_theta', 10000.0) <= 0:
         raise ValueError('rope_theta must be finite and positive.')
+    if model.get('native_content_rate', False) and model.get('conditioning_version') != 5:
+        raise ValueError('Native-rate content encoding requires conditioning version 5.')
     if model.get('use_stretch_embed', False):
         raise ValueError('Phoneme stretch embeddings require phoneme alignment and do not apply to frame-level ContentVec.')
     use_spk_id = model.get('use_spk_id', True)
@@ -843,6 +857,10 @@ def build_flow(config: dict, speaker_count: int) -> RectifiedFlow:
     if model.get('flow_conditioning', 'encoder') == 'aux_mel' or model.get('conditioning_version') == 5:
         model['mel_mean'] = float(data['mel_mean'])
         model['mel_std'] = float(data['mel_std'])
+    if model.get('native_content_rate', False):
+        if data.get('content_interpolation', 'nearest') != 'nearest':
+            raise ValueError('Native-rate content encoding requires nearest content interpolation.')
+        model['content_step'] = data['hop_length'] * 100 / data['sample_rate']
     if model.pop("harmonic_prior", False):
         model["harmonic_prior"] = dict(
             sample_rate=data["sample_rate"], n_fft=data["n_fft"],

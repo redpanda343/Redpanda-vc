@@ -3,6 +3,7 @@ import os
 import re
 import time
 from copy import deepcopy
+from functools import partial
 from pathlib import Path
 
 import lightning.pytorch as pl
@@ -31,8 +32,8 @@ from rvc.rectified.train_flow import (
 from rvc.rectified.vocoder import load_vocoder
 
 
-def validation_collate(batch):
-    return collate_flow(batch) if batch else None
+def validation_collate(batch, native_content=False):
+    return collate_flow(batch, native_content=native_content) if batch else None
 
 
 def latest_checkpoint(output):
@@ -105,8 +106,10 @@ class FlowDataModule(pl.LightningDataModule):
 
     def loader(self, dataset, sampler, validation=False):
         workers = int(self.settings.get('num_workers', 4))
+        collate = partial(validation_collate if validation else collate_flow,
+                          native_content=bool(self.settings['model'].get('native_content_rate', False)))
         kwargs = dict(num_workers=workers, pin_memory=not validation,
-                      persistent_workers=workers > 0, collate_fn=validation_collate if validation else collate_flow)
+                      persistent_workers=workers > 0, collate_fn=collate)
         if workers:
             kwargs.update(prefetch_factor=self.settings['dataloader_prefetch_factor'], multiprocessing_context='spawn')
         return DataLoader(dataset, batch_sampler=sampler, **kwargs)
@@ -160,7 +163,7 @@ class FlowTask(pl.LightningModule):
 
     def run_model(self, batch):
         (mel, content, f0, energy, breathiness, key_shift, speed, speaker, mask,
-         harmonic_prior, voicing, tension) = unpack_flow(batch, self.device, True)
+         harmonic_prior, voicing, tension, content_mask) = unpack_flow(batch, self.device, True)
         mel = normalize_mel(mel, self.data)
         if not self.model.reference:
             mel = mel * mask
@@ -168,7 +171,7 @@ class FlowTask(pl.LightningModule):
             mel, content, f0, energy, speaker, mask,
             speaker_dropout=self.settings['speaker_dropout'] if self.training else 0.0,
             breathiness=breathiness, key_shift=key_shift, speed=speed, voicing=voicing, tension=tension,
-            harmonic_prior=harmonic_prior if harmonic_prior.shape[1] else None,
+            harmonic_prior=harmonic_prior if harmonic_prior.shape[1] else None, content_mask=content_mask,
         )
         aux = flow.new_zeros(()) if auxiliary is None else auxiliary * self.settings['aux_mel_weight']
         return dict(mel_loss=flow, aux_mel_loss=aux, total_loss=flow + aux)

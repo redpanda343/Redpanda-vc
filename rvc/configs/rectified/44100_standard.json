@@ -97,6 +97,7 @@
       "t_start": 0.4,
       "conditioning_version": 5,
       "use_continuous_f0": true,
+      "native_content_rate": true,
       "direct_speaker_conditioning": false,
       "aux_grad": 0.1,
       "aux_decoder": {

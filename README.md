@@ -71,6 +71,11 @@ New v5 experiments interpolate unvoiced F0 in log frequency before aligning it
 to mel frames, and use this continuous pitch for conditioning and the vocoder.
 Set `flow.model.use_continuous_f0` to `false` to retain raw unvoiced zeros.
 
+New experiments set `flow.model.native_content_rate`: the content encoder runs
+over ContentVec frames at their native 50 Hz, like DiffSinger's phoneme encoder,
+and its output is then expanded to mel frames before pitch, speaker, key-shift
+and speed conditioning. Earlier models keep encoding at the mel frame rate.
+
 Choose **Parselmouth (DiffSinger)** as the pitch extractor in the Rectified Flow
 tab to extract F0 exactly like DiffSinger's acoustic binarizer: Parselmouth
 autocorrelation on the 44.1 kHz audio at the mel hop, 65-1100 Hz, voicing

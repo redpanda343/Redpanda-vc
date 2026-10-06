@@ -225,11 +225,11 @@ def variance_curves(audio, f0, frames, sample_rate, hop):
 
 def unpack_flow(batch, device, non_blocking=False):
     values = tuple(item.to(device, non_blocking=non_blocking) for item in batch)
-    if len(values) == 10:
-        return (*values, None, None)
-    if len(values) != 12:
+    if len(values) not in (10, 11, 12, 13):
         raise ValueError("Invalid rectified-flow batch.")
-    return values
+    content_mask = values[-1] if len(values) % 2 else None
+    core = values[:12] if len(values) >= 12 else (*values[:10], None, None)
+    return (*core, content_mask)
 
 class RectifiedDataset(Dataset):
     def __init__(self, entries, config: dict, max_frames: int, augment: bool = True, cache_path=None):
@@ -247,6 +247,7 @@ class RectifiedDataset(Dataset):
         self.continuous_f0 = config['flow']['model'].get('use_continuous_f0',
                                                        config['flow']['model'].get('conditioning_version') == 5)
         self.parselmouth = uses_parselmouth(self.data)
+        self.native_content = bool(config['flow']['model'].get('native_content_rate', False))
         self.use_harmonics = bool(config["flow"]["model"].get("harmonic_prior", False))
         self.harmonic_prior = (
             HarmonicPrior(
@@ -264,6 +265,7 @@ class RectifiedDataset(Dataset):
                 use_variances=self.use_variances,
                 use_harmonics=self.use_harmonics,
                 continuous_f0=self.continuous_f0,
+                native_content=self.native_content,
             ),
             sort_keys=True,
             separators=(",", ":"),
@@ -294,6 +296,11 @@ class RectifiedDataset(Dataset):
         feature_frames = audio.shape[-1] // (self.sample_rate // FEATURE_RATE)
         share = smooth_curve(aperiodicity(audio, self.sample_rate, f0, feature_frames))
         return to_mel_rate(share.unsqueeze(-1), frames, self.sample_rate, hop)[..., 0]
+
+    def _model_content(self, content, frames, hop):
+        if self.native_content:
+            return content[::2].contiguous()
+        return to_mel_rate(content, frames, self.sample_rate, hop)
 
     def _mel_f0(self, audio, source_f0, frames, hop):
         if self.parselmouth:
@@ -354,7 +361,7 @@ class RectifiedDataset(Dataset):
             raise ValueError("Training clips must contain at least four mel frames.")
         f0 = self._mel_f0(audio, source_f0, frames, self.hop)
         audio = audio[: frames * self.hop]
-        content = to_mel_rate(content, frames, self.sample_rate, self.hop)
+        content = self._model_content(content, frames, self.hop)
         with torch.no_grad():
             mel = self.mel(audio.unsqueeze(0), 0.0, self.hop)[0, :, :frames]
         energy = self._energy(audio.unsqueeze(0), frames, self.hop)[0]
@@ -410,17 +417,17 @@ class RectifiedDataset(Dataset):
             raise ValueError("Training clips must contain at least four mel frames.")
         f0 = self._mel_f0(audio, source_f0, frames, hop) * 2.0 ** (key_shift / 12.0)
         audio = audio[: frames * hop]
-        content = to_mel_rate(content, frames, self.sample_rate, hop)
+        content = self._model_content(content, frames, hop)
         with torch.no_grad():
             mel = self.mel(audio.unsqueeze(0), key_shift, hop)[0, :, :frames]
         energy = self._energy(audio.unsqueeze(0), frames, hop)[0]
         breathiness = self._breathiness(audio.unsqueeze(0), source_f0.unsqueeze(0), frames, hop)[0]
 
         length = min(frames, self.max_frames)
-        start = random.randint(0, frames - length) if self.augment else 0
+        start = random.randint(0, frames - length) if self.augment and not self.native_content else 0
         stop = start + length
         item = (
-            mel[:, start:stop], content[start:stop], f0[start:stop], energy[start:stop],
+            mel[:, start:stop], content if self.native_content else content[start:stop], f0[start:stop], energy[start:stop],
             breathiness[start:stop], key_shift, speed, sid, self._harmonics(f0)[..., start:stop],
         )
         if self.use_variances:
@@ -436,12 +443,15 @@ class RectifiedDataset(Dataset):
     def _cached_values(self, values, sid, source):
         frames = int(values['frames'])
         length = min(frames, self.max_frames)
-        start = random.randint(0, frames - length) if self.augment else 0
+        start = random.randint(0, frames - length) if self.augment and not self.native_content else 0
         stop = start + length
         mel = torch.from_numpy(np.asarray(values['mel'])[:, start:stop].copy())
-        curves = tuple(torch.from_numpy(np.asarray(values[name])[start:stop].copy())
-                       for name in ('content', 'f0', 'energy', 'breathiness'))
-        if mel.shape != (self.data['n_mels'], length) or curves[0].shape != (length, self.content_channels):
+        content = np.asarray(values['content'])
+        content = torch.from_numpy((content if self.native_content else content[start:stop]).copy())
+        curves = (content, *(torch.from_numpy(np.asarray(values[name])[start:stop].copy())
+                             for name in ('f0', 'energy', 'breathiness')))
+        content_shape = (content.shape[0] if self.native_content else length, self.content_channels)
+        if mel.shape != (self.data['n_mels'], length) or content.shape != content_shape or not content.shape[0]:
             raise ValueError(f'Invalid augmented feature dimensions: {source}')
         if any(value.shape[0] != length for value in curves[1:]):
             raise ValueError(f'Invalid augmented curve lengths: {source}')
@@ -470,7 +480,7 @@ class RectifiedDataset(Dataset):
         source_f0 = f0
         f0 = self._mel_f0(audio, source_f0, frames, self.hop)
         audio = audio[: frames * self.hop]
-        content = to_mel_rate(content, frames, self.sample_rate, self.hop)
+        content = self._model_content(content, frames, self.hop)
         breathiness = self._breathiness(audio.unsqueeze(0), source_f0.unsqueeze(0), frames, self.hop)
         with torch.no_grad():
             mel = self.mel(audio.unsqueeze(0))[:, :, :frames]
@@ -558,11 +568,13 @@ def prepare_training_cache(entries, config, cache_path, workers=4):
     finally:
         torch.set_num_threads(previous_threads)
 
-def collate_flow(batch, frames=None):
+def collate_flow(batch, frames=None, native_content=False):
     frames = frames or max(item[0].shape[-1] for item in batch)
     size = len(batch)
     mel = torch.full((size, batch[0][0].shape[0], frames), math.log(1e-5))
-    content = torch.zeros(size, frames, batch[0][1].shape[-1])
+    content_frames = max(item[1].shape[0] for item in batch) if native_content else frames
+    content = torch.zeros(size, content_frames, batch[0][1].shape[-1])
+    content_mask = torch.zeros(size, 1, content_frames)
     f0 = torch.zeros(size, frames)
     energy = torch.full((size, frames), -1.0)
     breathiness = torch.ones(size, frames)
@@ -582,7 +594,11 @@ def collate_flow(batch, frames=None):
         if h.shape != (harmonic_channels, n):
             raise ValueError("Mixed harmonic-prior formats in rectified-flow batch.")
         mel[i, :, :n] = m
-        content[i, :n] = c
+        if native_content:
+            content[i, :c.shape[0]] = c
+            content_mask[i, :, :c.shape[0]] = 1.0
+        else:
+            content[i, :n] = c
         f0[i, :n] = p
         energy[i, :n] = e
         breathiness[i, :n] = b
@@ -595,7 +611,8 @@ def collate_flow(batch, frames=None):
         if extended:
             voicing[i, :n], tension[i, :n] = item[9:]
     result = (mel, content, f0, energy, breathiness, key_shift, speed, speaker, mask, harmonic_prior)
-    return (*result, voicing, tension) if extended else result
+    result = (*result, voicing, tension) if extended else result
+    return (*result, content_mask) if native_content else result
 
 def content_rms(entries, limit=64):
     total, count = 0.0, 0

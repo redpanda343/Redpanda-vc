@@ -428,8 +428,10 @@ class RealTimeRVC:
             raise ValueError("Flow input context exceeds the pitch cache capacity.")
         pitchf = self.cache_pitchf[None, -feature_frames:]
         source_f0 = pitchf / (2 ** (self.pitch / 12))
-        content = upsample_content(features.float(), self.pipeline.data["content_interpolation"])
-        content = to_mel_rate(content, frames, rate, hop)
+        content = features.float()
+        if not self.model.native_content_rate:
+            content = upsample_content(content, self.pipeline.data["content_interpolation"])
+            content = to_mel_rate(content, frames, rate, hop)
         if uses_parselmouth(self.pipeline.data):
             f0 = parselmouth_f0(waveform[0].cpu().numpy(), rate, hop, frames)
             f0 = torch.from_numpy(f0).to(waveform.device)[None] * 2 ** (self.pitch / 12)
