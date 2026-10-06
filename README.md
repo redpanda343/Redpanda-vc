@@ -16,12 +16,19 @@ key-shift and speed embeddings. `flow.model.use_spk_id` defaults to `false`,
 matching DiffSinger; set it to `true` before starting an experiment to enable
 speaker conditioning.
 
-F0 is extracted with Parselmouth exactly like DiffSinger's acoustic binarizer:
+F0 is extracted when training binarizes the dataset, exactly like DiffSinger's
+acoustic binarizer, with the training tab's **Pitch extractor**
+(`flow.pitch_extractor`, `--pitch-extractor`). `parselmouth` uses
 autocorrelation on the 44.1 kHz audio at the mel hop, 65-1100 Hz, voicing
-threshold 0.6, with unvoiced frames interpolated in log frequency. Time
-stretching re-extracts F0 at the stretched hop and pitch shifting scales it.
-The same F0 feeds the flow and the vocoder during training, file conversion and
-realtime. Like DiffSinger, extraction skips clips with no voiced frames.
+threshold 0.6. `rmvpe` uses DiffSinger's RMVPE code (from
+[yxlllc/RMVPE](https://github.com/yxlllc/RMVPE)) with the 230917 model, which
+the app downloads to `rvc/models/predictors/rmvpe.pt`. It runs at 16 kHz and is
+resampled to the mel hop. Unvoiced frames are interpolated in log frequency.
+Time stretching re-extracts F0 at the stretched hop and pitch shifting scales
+it. Like DiffSinger, binarization skips clips with no voiced frames. The
+extractor is fixed when an experiment starts. File conversion with
+`parselmouth` or `rmvpe` reproduces the training extraction; other methods are
+interpolated and resampled to the mel hop. Realtime uses Parselmouth.
 
 Training binarizes the dataset like DiffSinger: originals and their augmented
 copies go into `logs/<model>/binary/train.data`, held-out clips into

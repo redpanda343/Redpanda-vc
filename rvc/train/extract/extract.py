@@ -373,14 +373,6 @@ if __name__ == "__main__":
 
     if rectified:
         generate_filelist(exp_dir, sample_rate, 0)
-        from rvc.rectified.config import DEFAULT_CONFIG
-        from rvc.rectified.pitch import drop_unvoiced_clips
-
-        drop_unvoiced_clips(
-            os.path.join(exp_dir, "filelist.txt"),
-            DEFAULT_CONFIG["data"]["hop_length"],
-            num_processes,
-        )
     else:
         generate_config(sample_rate, exp_dir, version)
         generate_filelist(exp_dir, sample_rate, include_mutes)

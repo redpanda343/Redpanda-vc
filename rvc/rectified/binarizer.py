@@ -18,9 +18,9 @@ from torch.multiprocessing import Manager, Process, get_context
 from rvc.rectified.data import CONTENT_RATE, mel_frames
 from rvc.rectified.indexed_dataset import IndexedDatasetBuilder
 from rvc.rectified.mel import LogMel
-from rvc.rectified.pitch import parselmouth_f0
+from rvc.rectified.pitch import extract_f0
 
-BINARY_VERSION = 1
+BINARY_VERSION = 2
 
 
 def augmentation_plan(entries, settings, seed):
@@ -77,6 +77,7 @@ class ItemBuilder:
         self.hop = int(self.data['hop_length'])
         self.sample_rate = int(self.data['sample_rate'])
         self.content_channels = int(config['flow']['model']['content_channels'])
+        self.pitch_extractor = config['flow']['pitch_extractor']
         self.device = torch.device(device)
         self.mel = LogMel.from_config(self.data).to(self.device)
 
@@ -101,8 +102,11 @@ class ItemBuilder:
         return audio, content, frames
 
     @torch.no_grad()
-    def original(self, audio, content, frames, sid):
-        f0 = parselmouth_f0(audio.numpy(), self.sample_rate, self.hop, frames)
+    def original(self, audio, content, frames, sid, name):
+        f0, voiced = self.f0(audio, self.hop, frames)
+        if not voiced:
+            print(f"Skipped '{name}': empty gt f0", flush=True)
+            return None
         clip = audio[: frames * self.hop].to(self.device)
         mel = self.mel(clip.unsqueeze(0), 0.0, self.hop)[0, :, :frames]
         return self._item(mel, content, f0, 0.0, 1.0, sid)
@@ -112,8 +116,11 @@ class ItemBuilder:
         hop = int(round(self.hop * task.get('speed', 1.0)))
         shift = task.get('key_shift', 0.0)
         mel = self.mel(audio.to(self.device).unsqueeze(0), shift, hop)[0]
-        f0 = parselmouth_f0(audio.numpy(), self.sample_rate, hop, mel.shape[-1]) * 2 ** (shift / 12)
+        f0 = self.f0(audio, hop, mel.shape[-1])[0] * 2 ** (shift / 12)
         return self._item(mel, content, f0, shift, hop / self.hop, sid)
+
+    def f0(self, audio, hop, frames):
+        return extract_f0(self.pitch_extractor, audio.numpy(), self.sample_rate, hop, frames, self.device)
 
     def _item(self, mel, content, f0, key_shift, speed, sid):
         mel = mel.cpu().numpy().astype(np.float32)
@@ -138,7 +145,7 @@ def item_builder(config, device):
 def process_item(config, device, entry):
     builder = item_builder(config, device)
     audio, content, frames = builder.source(entry)
-    return builder.original(audio, content, frames, int(entry[4]))
+    return builder.original(audio, content, frames, int(entry[4]), entry[0])
 
 
 def chunked_worker_run(map_func, args, results_queue=None):
@@ -192,6 +199,7 @@ def _recipe(config, training, held, seed):
     model = config['flow']['model']
     recipe = dict(version=BINARY_VERSION, data=config['data'], content_channels=model['content_channels'],
                   key_shift=model['key_shift'], speed=model['speed'],
+                  pitch_extractor=config['flow']['pitch_extractor'],
                   augmentation=config['flow']['augmentation_args'], seed=seed,
                   train=sources(training), valid=sources(held))
     return hashlib.sha256(json.dumps(recipe, sort_keys=True).encode()).hexdigest()

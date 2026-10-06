@@ -7,7 +7,8 @@ from torch.nn import functional as F
 
 from rvc.infer.pipeline import Pipeline, _INFERENCE_RNG_LOCK
 from rvc.lib.utils import extract_embedding_features
-from rvc.rectified.pitch import parselmouth_f0, resample_f0
+from rvc.lib.predictors.f0 import RMVPE
+from rvc.rectified.pitch import parselmouth_f0, resample_f0, rmvpe_f0
 from rvc.rectified.resources import default_vocoder
 from rvc.rectified.vocoder import load_vocoder
 
@@ -69,9 +70,14 @@ class RectifiedPipeline(Pipeline):
             length = round(pitchf.shape[-1] * self.window * rate / self.sample_rate)
             waveform = waveform[:length]
         frames = math.ceil(length / hop)
-        if self.f0_method == 'pm':
-            f0 = torch.from_numpy(parselmouth_f0(waveform, rate, hop, frames)).to(self.device)[None]
-            f0 = f0 * 2 ** (self.pitch_shift / 12)
+        if self.f0_method in {'pm', 'rmvpe'}:
+            if self.f0_method == 'pm':
+                f0 = parselmouth_f0(waveform, rate, hop, frames)
+            else:
+                if not hasattr(self, 'model_rmvpe'):
+                    self.model_rmvpe = RMVPE(device=self.device, sample_rate=self.sample_rate, hop_size=self.window)
+                f0 = rmvpe_f0(self.model_rmvpe.model, waveform, rate, hop, frames)[0]
+            f0 = torch.from_numpy(f0).to(self.device)[None] * 2 ** (self.pitch_shift / 12)
         else:
             f0 = resample_f0(pitchf[0].float().cpu().numpy(), self.sample_rate / self.window, frames, rate / hop)
             f0 = torch.from_numpy(f0).to(self.device)[None]

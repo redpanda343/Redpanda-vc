@@ -31,6 +31,7 @@ DEFAULT_CONFIG = {
         'max_batch_frames': 50000,
         'max_batch_size': 64,
         'grad_clip': 1.0,
+        'pitch_extractor': 'parselmouth',
         'aux_mel_weight': 0.2,
         'augmentation_args': {
             'random_pitch_shifting': {'enabled': True, 'range': [-5.0, 5.0], 'scale': 0.75},

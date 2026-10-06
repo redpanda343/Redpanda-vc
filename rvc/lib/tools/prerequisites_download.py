@@ -1,6 +1,8 @@
 import hashlib
 import os
+import shutil
 import tempfile
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
@@ -85,6 +87,13 @@ remote_base_mapping = {
     "utmosv2/": "https://huggingface.co/sarulab-speech/UTMOSv2/resolve/main/",
 }
 
+archive_mapping = {
+    ("predictors/", "rmvpe.pt"): (
+        "https://github.com/yxlllc/RMVPE/releases/download/230917/rmvpe.zip",
+        "model.pt",
+    ),
+}
+
 CONTENTVEC_SHA256 = "d8dd400e054ddf4e6be75dab5a2549db748cc99e756a097c496c099f65a4854e"
 CONTENTVEC_CONFIG_SHA256 = "2ddde063b795d38d9051a7215a092fecf4cfe148b54251e38de51d88d356898b"
 CONTENTVEC_PREPROCESSOR_PATH = (
@@ -93,6 +102,9 @@ CONTENTVEC_PREPROCESSOR_PATH = (
 
 
 expected_sha256_mapping = {
+    ("predictors/", "rmvpe.pt"): (
+        "19dc1809cf4cdb0a18db93441816bc327e14e5644b72eeaae5220560c6736fe2"
+    ),
     ("embedders/contentvec/", "pytorch_model.bin"): CONTENTVEC_SHA256,
     ("embedders/contentvec/", "config.json"): CONTENTVEC_CONFIG_SHA256,
     ("FireRedVAD/AED/", "cmvn.ark"): (
@@ -123,6 +135,9 @@ expected_sha256_mapping = {
 
 
 def get_download_url(remote_folder, file):
+    archive = archive_mapping.get((remote_folder, file))
+    if archive is not None:
+        return archive[0]
     remote_base = remote_base_mapping.get(remote_folder)
     if remote_base is not None:
         return f"{remote_base}{file}"
@@ -176,7 +191,7 @@ def get_file_size_if_missing(file_list):
     return total_size
 
 
-def download_file(url, destination_path, global_bar, expected_sha256=None):
+def download_file(url, destination_path, global_bar, expected_sha256=None, archive_member=None):
     """
     Download a file from the given URL to the specified destination path,
     updating the global progress bar as data is downloaded.
@@ -219,6 +234,14 @@ def download_file(url, destination_path, global_bar, expected_sha256=None):
                 f"Incomplete download for {destination_path}: "
                 f"expected {expected_size} bytes, received {bytes_written}"
             )
+        if archive_member is not None:
+            extracted_path = f"{temporary_path}.member"
+            with zipfile.ZipFile(temporary_path) as archive, archive.open(
+                archive_member
+            ) as source, open(extracted_path, "wb") as target:
+                shutil.copyfileobj(source, target, 1024 * 1024)
+            os.remove(temporary_path)
+            temporary_path = extracted_path
         if expected_sha256 is not None and _sha256(temporary_path) != expected_sha256:
             raise IOError(f"Checksum verification failed for {destination_path}")
 
@@ -266,6 +289,7 @@ def download_mapping_files(file_mapping_list, global_bar):
                             destination_path,
                             global_bar,
                             expected_sha256_mapping.get((remote_folder, file)),
+                            archive_mapping.get((remote_folder, file), (None, None))[1],
                         )
                     )
         for future in futures:

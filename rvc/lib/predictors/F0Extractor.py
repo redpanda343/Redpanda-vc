@@ -7,7 +7,7 @@ import numpy as np
 import parselmouth
 
 from rvc.configs.config import Config
-from rvc.lib.predictors.RMVPE import RMVPE0Predictor
+from rvc.lib.predictors.rmvpe import RMVPE as RMVPEModel
 from rvc.lib.utils import load_audio
 
 config = Config()
@@ -47,7 +47,7 @@ class F0Extractor:
                     f0, [[pad_size, p_len - len(f0) - pad_size]], mode="constant"
                 )
         elif self.method == "rmvpe":
-            model_rmvpe = RMVPE0Predictor(
+            model_rmvpe = RMVPEModel(
                 os.path.join("rvc", "models", "predictors", "rmvpe.pt"),
                 device=config.device,
             )

@@ -141,7 +141,7 @@ def resolve_pretrained(directory, enabled, preferred=''):
 
 
 def start(name, batch, max_frames, max_updates, checkpoint_interval, device, use_fused_kernels=False,
-          use_pretrained=False, pretrained_path='', realtime=False):
+          use_pretrained=False, pretrained_path='', realtime=False, pitch_extractor='parselmouth'):
     directory = experiment_path(name)
     device_id(device)
     if not (directory / 'filelist.txt').is_file():
@@ -151,7 +151,7 @@ def start(name, batch, max_frames, max_updates, checkpoint_interval, device, use
     from rvc.rectified.train_flow import load_training_config
 
     try:
-        selected = load_training_config(directory, pretrained or None, use_fused_kernels, preset)
+        selected = load_training_config(directory, pretrained or None, use_fused_kernels, preset, pitch_extractor)
     except ValueError as error:
         raise gr.Error(str(error)) from error
     precision = get_precision() or selected['flow'].get('precision', 'fp32')
@@ -159,7 +159,7 @@ def start(name, batch, max_frames, max_updates, checkpoint_interval, device, use
         raise gr.Error(f'Unsupported training precision: {precision}')
     vocoder = resolve_vocoder() if selected['flow'].get('val_with_vocoder', True) else ''
     arguments = ['--model-name', str(name).strip(), '--vocoder', vocoder,
-                 '--precision', precision, '--preset', preset]
+                 '--precision', precision, '--preset', preset, '--pitch-extractor', pitch_extractor]
     for flag, value, label in (('--batch-size', batch, 'Max clips per batch'),
                                ('--max-batch-frames', max_frames, 'Max frames per batch'),
                                ('--max-updates', max_updates, 'Max training updates'),
@@ -213,7 +213,7 @@ def rectified_train_tab():
                               info='Disable to keep full clips. Audio is always resampled to 44.1 kHz.')
         preprocess_button = gr.Button('Preprocess dataset')
         embedder = gr.Dropdown(label='Content embedder', choices=['contentvec', 'spin-v2'], value='contentvec',
-                               info='F0 is extracted with Parselmouth like DiffSinger: 65-1100 Hz at the mel hop with interpolated unvoiced frames.')
+                               info='F0 is extracted when training binarizes the dataset, with the pitch extractor chosen below.')
         extract_button = gr.Button('Extract content and F0')
     with gr.Accordion('2. Train rectified flow', open=True):
         use_pretrained = gr.Checkbox(label='Pretrained', value=False)
@@ -229,6 +229,11 @@ def rectified_train_tab():
                                info='Blank uses config, default 100000 Lightning training steps.')
             checkpoint_interval = gr.Number(label='Checkpoint interval (updates)', value=None, minimum=1, precision=0,
                                    info='Blank uses config, default 4000 updates.')
+        pitch_extractor = gr.Dropdown(label='Pitch extractor', choices=['parselmouth', 'rmvpe'], value='parselmouth',
+                                      info='F0 for new experiments, as in DiffSinger. Parselmouth: 65-1100 Hz autocorrelation. '
+                                           'RMVPE: neural tracker (230917 model), more robust on breathy or fry voices. '
+                                           'Unvoiced frames are interpolated and clips without voiced frames are skipped. '
+                                           'Keep it set the same when resuming.')
         realtime = gr.Checkbox(label='Realtime', value=False,
                                info='Smaller, deeper model for new experiments: 256 hidden / 6 encoder layers, '
                                     '512-channel backbone with 12 layers, 384-channel aux decoder with 8 layers. '
@@ -244,6 +249,6 @@ def rectified_train_tab():
     preprocess_button.click(preprocess, [name, dataset, workers, slicing], outputs, queue=False)
     extract_button.click(extract, [name, workers, device, embedder], outputs, queue=False)
     train_button.click(start, [name, batch, max_frames, max_updates, checkpoint_interval, device, use_fused_kernels,
-                               use_pretrained, pretrained_path, realtime], outputs, queue=False)
+                               use_pretrained, pretrained_path, realtime, pitch_extractor], outputs, queue=False)
     stop_button.click(stop, [], outputs, queue=False)
     gr.Timer(2).tick(status, [], outputs, queue=False)

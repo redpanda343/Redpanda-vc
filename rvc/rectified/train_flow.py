@@ -11,6 +11,7 @@ import torch
 
 from rvc.rectified.config import PRESETS, architecture, default_config, resolve_config
 from rvc.rectified.flow_model import validate_model_config
+from rvc.rectified.pitch import PITCH_EXTRACTORS
 from rvc.rectified.mel import normalize_mel
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -132,13 +133,15 @@ def select_fused_activation(config, enabled):
         config['flow']['model']['backbone_args']['glu_type'] = 'softsign_glu'
 
 
-def load_training_config(experiment, pretrained_flow=None, use_fused_kernels=False, preset='standard'):
+def load_training_config(experiment, pretrained_flow=None, use_fused_kernels=False, preset='standard',
+                         pitch_extractor='parselmouth'):
     config_path = experiment / 'rectified_config.json'
     if config_path.exists():
         config = resolve_config(json.loads(config_path.read_text(encoding='utf-8')))
         source = 'This experiment'
     else:
         config = default_config(finetune=bool(pretrained_flow), preset=preset)
+        config['flow']['pitch_extractor'] = pitch_extractor
         source = 'The pretrained checkpoint'
         if pretrained_flow:
             checkpoint = torch.load(pretrained_flow, map_location='cpu', weights_only=True)
@@ -150,6 +153,9 @@ def load_training_config(experiment, pretrained_flow=None, use_fused_kernels=Fal
     if architecture(config['flow']['model']) != architecture(default_config(preset=preset)['flow']['model']):
         raise ValueError(f'{source} does not use the {preset} model size. Set the Realtime option to match it, '
                          'or start a new experiment.')
+    if config['flow']['pitch_extractor'] != pitch_extractor:
+        raise ValueError(f"This experiment trains on {config['flow']['pitch_extractor']} F0. Set the pitch extractor "
+                         'to match it, or start a new experiment.')
     select_fused_activation(config, use_fused_kernels)
     configure_flow(config)
     return config
@@ -162,7 +168,7 @@ def train(args):
         raise ValueError('Use a model name, not a path.')
     experiment = ROOT / 'logs' / args.model_name
     config = load_training_config(experiment, args.pretrained_flow, getattr(args, 'use_fused_kernels', False),
-                                  getattr(args, 'preset', 'standard'))
+                                  getattr(args, 'preset', 'standard'), getattr(args, 'pitch_extractor', 'parselmouth'))
     configure_arguments(args, config['flow'])
     if config['data']['sample_rate'] != 44100:
         raise ValueError('This recipe requires 44100 Hz audio.')
@@ -183,6 +189,8 @@ def configure_flow(config):
         value = settings[name]
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError(f'{name} must be a nonnegative integer.')
+    if settings['pitch_extractor'] not in PITCH_EXTRACTORS:
+        raise ValueError(f'pitch_extractor must be one of {PITCH_EXTRACTORS}.')
     if settings['precision'] not in {'fp32', 'fp16', 'bf16'}:
         raise ValueError('precision must be fp32, fp16 or bf16.')
     for name in ('sort_by_len', 'val_with_vocoder'):
@@ -243,6 +251,8 @@ def main():
                         help='Override the activation with SoftSignGLU and use DiffSinger Triton kernels during CUDA mixed-precision training.')
     parser.add_argument('--preset', choices=sorted(PRESETS), default='standard',
                         help='Model size for new experiments. realtime uses narrower, deeper networks.')
+    parser.add_argument('--pitch-extractor', choices=PITCH_EXTRACTORS, default='parselmouth',
+                        help='F0 extractor for new experiments, following DiffSinger: parselmouth or rmvpe.')
     parser.add_argument('--fresh', action='store_true')
     train(parser.parse_args())
 
