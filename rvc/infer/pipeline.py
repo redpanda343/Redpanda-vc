@@ -49,6 +49,8 @@ class Pipeline:
     voice conversion using a model, and post-processing.
     """
 
+    high_pass = True
+
     def __init__(self, tgt_sr, config):
         """
         Initializes the Pipeline class with target sampling rate and configuration parameters.
@@ -310,7 +312,8 @@ class Pipeline:
             big_npy = index.reconstruct_n(0, index.ntotal)
         else:
             index = big_npy = None
-        audio = signal.filtfilt(bh, ah, audio)
+        if self.high_pass:
+            audio = signal.filtfilt(bh, ah, audio)
         audio_pad = np.pad(audio, (self.window // 2, self.window // 2), mode="reflect")
         opt_ts = []
         if audio_pad.shape[0] > self.t_max:
