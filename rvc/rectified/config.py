@@ -116,7 +116,7 @@ STANDARD_PRESET['flow']['model']['backbone_args'].update({
     'glu_type': 'atanglu', 'dropout_rate': 0.0, 'use_conditioner_cache': True,
 })
 STANDARD_PRESET['flow']['model']['aux_decoder']['kernel_size'] = 7
-STANDARD_PRESET['flow']['model'].update({'use_phonation': False, 'use_continuous_f0': True})
+STANDARD_PRESET['flow']['model'].update({'use_continuous_f0': True})
 STANDARD_PRESET['flow'].update({
     'accelerator': 'auto', 'num_nodes': 1,
     'strategy': {'name': 'auto', 'find_unused_parameters': False},
@@ -141,17 +141,26 @@ def _merge(base, overrides):
     return result
 
 
+def _drop_phonation(config):
+    flow = config.get('flow')
+    model = flow.get('model') if isinstance(flow, dict) else None
+    if isinstance(model, dict) and model.pop('use_phonation', False):
+        raise ValueError('Phonation conditioning is no longer supported. Train a new experiment without it.')
+    return config
+
+
 def resolve_config(config):
     if not isinstance(config, dict):
         raise ValueError('Rectified-flow config must be a JSON object.')
     if 'preset' not in config:
-        return deepcopy(config)
+        return _drop_phonation(deepcopy(config))
     if config['preset'] not in PRESETS:
         raise ValueError(f'Unknown rectified-flow preset: {config["preset"]!r}.')
     for key in ('data', 'flow'):
         if key in config and not isinstance(config[key], dict):
             raise ValueError(f'Rectified-flow {key} settings must be a JSON object.')
-    return _merge(PRESETS[config['preset']], {key: value for key, value in config.items() if key != 'preset'})
+    return _drop_phonation(_merge(PRESETS[config['preset']],
+                                  {key: value for key, value in config.items() if key != 'preset'}))
 
 
 def _differences(config, defaults):

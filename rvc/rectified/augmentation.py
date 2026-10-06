@@ -15,7 +15,6 @@ import torch
 
 from rvc.rectified.data import RectifiedDataset, read_filelist, upsample_content, to_mel_rate
 from rvc.rectified.config import STANDARD_PRESET, resolve_config
-from rvc.rectified.phonation import PHONATION_VERSION
 
 
 DEFAULT_AUGMENTATION = copy.deepcopy(STANDARD_PRESET['flow']['augmentation_args'])
@@ -176,8 +175,7 @@ def prepare_source(dataset, entry):
 
         variances = variance_curves(audio.unsqueeze(0), source_f0.unsqueeze(0), frames,
                                    dataset.sample_rate, dataset.hop)
-    phonation = dataset._phonation(audio.unsqueeze(0), source_f0.unsqueeze(0), frames, dataset.hop)[0] if dataset.use_phonation else None
-    return audio, source_f0, content, energy, breathiness, variances, phonation
+    return audio, source_f0, content, energy, breathiness, variances
 
 
 def save_features(path, values):
@@ -198,7 +196,7 @@ def save_features(path, values):
 
 def generate_features(dataset, entry, tasks, paths, pitch, device, speed_embed=True,
                       source=None, writer=None):
-    audio, source_f0, content, energy, breathiness, variances, phonation = (
+    audio, source_f0, content, energy, breathiness, variances = (
         prepare_source(dataset, entry) if source is None else source
     )
     mel_extractor = dataset.mel.to(device)
@@ -224,12 +222,6 @@ def generate_features(dataset, entry, tasks, paths, pitch, device, speed_embed=T
                       speed=np.float32(speed), frames=np.int64(length), hop=np.int64(dataset.hop))
         for name, curve in zip(('voicing', 'tension'), variances):
             values[name] = resample_curve(curve[0], length, speed)
-        if phonation is not None:
-            positions = np.arange(length) * speed
-            values['phonation'] = torch.from_numpy(np.stack([
-                np.interp(positions, np.arange(phonation.shape[0]), curve)
-                for curve in phonation.numpy().T
-            ], axis=-1).astype(np.float32))
         values = {name: value.numpy() if torch.is_tensor(value) else value for name, value in values.items()}
         if not all(np.isfinite(value).all() for value in values.values()) or length < 4:
             raise ValueError(f'Invalid augmented features: {entry[0]}')
@@ -295,9 +287,7 @@ def prepare_augmentation(experiment, root, originals, train_entries, config, see
                   variances=[config['flow']['model'].get(name, False)
                                            for name in ('voicing', 'tension')],
                   harmonic_prior=bool(config['flow']['model'].get('harmonic_prior', False)))
-    recipe.update(phonation=config['flow']['model'].get('use_phonation', False),
-                  phonation_version=PHONATION_VERSION if config['flow']['model'].get('use_phonation', False) else None,
-                  continuous_f0=config['flow']['model'].get('use_continuous_f0',
+    recipe.update(continuous_f0=config['flow']['model'].get('use_continuous_f0',
                                                            config['flow']['model'].get('conditioning_version') == 5))
     checkpoint = root / 'rvc/models/predictors/rmvpe.pt'
     if method == 'rmvpe' and checkpoint.exists():

@@ -19,7 +19,6 @@ from rvc.rectified.mel import LogMel
 from rvc.rectified.config import resolve_config
 from rvc.rectified.flow_model import HarmonicPrior
 from rvc.rectified.indexed_dataset import IndexedDataset, IndexedDatasetBuilder
-from rvc.rectified.phonation import PHONATION_CHANNELS, PHONATION_VERSION
 
 FEATURE_RATE = 100
 SMOOTH_SECONDS = 0.06
@@ -226,14 +225,10 @@ def variance_curves(audio, f0, frames, sample_rate, hop):
 def unpack_flow(batch, device, non_blocking=False):
     values = tuple(item.to(device, non_blocking=non_blocking) for item in batch)
     if len(values) == 10:
-        return (*values, None, None, None)
-    if len(values) == 11:
-        return (*values[:10], None, None, values[-1])
-    if len(values) == 12:
-        return (*values, None)
-    if len(values) == 13:
-        return values
-    raise ValueError("Invalid rectified-flow batch.")
+        return (*values, None, None)
+    if len(values) != 12:
+        raise ValueError("Invalid rectified-flow batch.")
+    return values
 
 class RectifiedDataset(Dataset):
     def __init__(self, entries, config: dict, max_frames: int, augment: bool = True, cache_path=None):
@@ -248,7 +243,6 @@ class RectifiedDataset(Dataset):
         self.strict_features = config['flow']['model'].get('conditioning_version', 1) in (2, 3, 4, 5)
         self.augment = augment
         self.use_variances = any(config["flow"]["model"].get(name, False) for name in ("voicing", "tension"))
-        self.use_phonation = config['flow']['model'].get('use_phonation', False)
         self.continuous_f0 = config['flow']['model'].get('use_continuous_f0',
                                                        config['flow']['model'].get('conditioning_version') == 5)
         self.use_harmonics = bool(config["flow"]["model"].get("harmonic_prior", False))
@@ -267,8 +261,6 @@ class RectifiedDataset(Dataset):
                 content_channels=self.content_channels,
                 use_variances=self.use_variances,
                 use_harmonics=self.use_harmonics,
-                use_phonation=self.use_phonation,
-                phonation_version=PHONATION_VERSION if self.use_phonation else None,
                 continuous_f0=self.continuous_f0,
             ),
             sort_keys=True,
@@ -300,12 +292,6 @@ class RectifiedDataset(Dataset):
         feature_frames = audio.shape[-1] // (self.sample_rate // FEATURE_RATE)
         share = smooth_curve(aperiodicity(audio, self.sample_rate, f0, feature_frames))
         return to_mel_rate(share.unsqueeze(-1), frames, self.sample_rate, hop)[..., 0]
-
-    def _phonation(self, audio, f0, frames, hop):
-        from rvc.rectified.phonation import phonation_features
-
-        pitch = f0_to_mel_rate(f0, frames, self.sample_rate, hop)
-        return phonation_features(audio, self.sample_rate, pitch, frames, hop)
 
     @torch.no_grad()
     def _harmonics(self, f0):
@@ -382,8 +368,6 @@ class RectifiedDataset(Dataset):
         if self.use_variances:
             curves = variance_curves(audio.unsqueeze(0), source_f0.unsqueeze(0), frames, self.sample_rate, self.hop)
             values.update(voicing=curves[0][0].numpy(), tension=curves[1][0].numpy())
-        if self.use_phonation:
-            values['phonation'] = self._phonation(audio.unsqueeze(0), source_f0.unsqueeze(0), frames, self.hop)[0].numpy()
         if not all(np.isfinite(value).all() for value in values.values()):
             raise ValueError(f'Invalid cached training features: {wav_path}')
         return values
@@ -435,8 +419,6 @@ class RectifiedDataset(Dataset):
         if self.use_variances:
             curves = variance_curves(audio.unsqueeze(0), source_f0.unsqueeze(0), frames, self.sample_rate, hop)
             item += tuple(curve[0, start:stop] for curve in curves)
-        if self.use_phonation:
-            item += (self._phonation(audio.unsqueeze(0), source_f0.unsqueeze(0), frames, hop)[0, start:stop],)
         return item
 
     def _npz_item(self, path, sid):
@@ -469,13 +451,6 @@ class RectifiedDataset(Dataset):
         item = (mel, *curves, float(values['key_shift']), float(values['speed']), sid, harmonic)
         if self.use_variances:
             item += tuple(torch.from_numpy(np.asarray(values[name])[start:stop].copy()) for name in ('voicing', 'tension'))
-        if self.use_phonation:
-            if 'phonation' not in values:
-                raise ValueError(f'Missing phonation cues; rebuild training features: {source}')
-            phonation = torch.from_numpy(np.asarray(values['phonation'])[start:stop].copy())
-            if phonation.shape != (length, PHONATION_CHANNELS) or not torch.isfinite(phonation).all():
-                raise ValueError(f'Invalid phonation cues: {source}')
-            item += (phonation,)
         return item
 
     def _reference_item(self, audio, content, f0, sid, path, max_frames=None):
@@ -499,8 +474,6 @@ class RectifiedDataset(Dataset):
         )
         if self.use_variances:
             item += variance_curves(audio.unsqueeze(0), source_f0.unsqueeze(0), frames, self.sample_rate, self.hop)
-        if self.use_phonation:
-            item += (self._phonation(audio.unsqueeze(0), source_f0.unsqueeze(0), frames, self.hop),)
         return item
 
     def reference(self, max_seconds: float = 10.0):
@@ -592,12 +565,10 @@ def collate_flow(batch, frames=None):
     speaker = torch.zeros(size, dtype=torch.long)
     harmonic_channels = batch[0][8].shape[0]
     harmonic_prior = torch.zeros(size, harmonic_channels, frames)
-    extended = len(batch[0]) in (11, 12)
-    has_phonation = len(batch[0]) in (10, 12)
-    phonation = torch.zeros(size, frames, PHONATION_CHANNELS) if has_phonation else None
+    extended = len(batch[0]) == 11
     voicing, tension = torch.zeros(size, frames), torch.zeros(size, frames)
     for i, item in enumerate(batch):
-        if len(item) != (11 if extended else 9) + int(has_phonation):
+        if len(item) != (11 if extended else 9):
             raise ValueError("Mixed conditioning formats in rectified-flow batch.")
         m, c, p, e, b, k, v, s, h = item[:9]
         n = m.shape[-1]
@@ -615,12 +586,9 @@ def collate_flow(batch, frames=None):
         if harmonic_channels:
             harmonic_prior[i, :, :n] = h
         if extended:
-            voicing[i, :n], tension[i, :n] = item[9:11]
-        if has_phonation:
-            phonation[i, :n] = item[-1]
+            voicing[i, :n], tension[i, :n] = item[9:]
     result = (mel, content, f0, energy, breathiness, key_shift, speed, speaker, mask, harmonic_prior)
-    result = (*result, voicing, tension) if extended else result
-    return (*result, phonation) if has_phonation else result
+    return (*result, voicing, tension) if extended else result
 
 def read_filelist(path, root, originals_only=False):
     rows = []

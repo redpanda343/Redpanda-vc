@@ -104,7 +104,6 @@ def run_infer_script(
     sid: int = 0,
     seed: int = 0,
     rectified_vocoder_path: str = "",
-    rectified_phonation_scale: float = 1.0,
 ):
     seed = resolve_inference_seed(seed)
     kwargs = {
@@ -161,7 +160,6 @@ def run_infer_script(
         "sid": sid,
         "seed": seed,
         "rectified_vocoder_path": rectified_vocoder_path,
-        "rectified_phonation_scale": rectified_phonation_scale,
     }
     infer_pipeline = import_voice_converter()
     infer_pipeline.convert_audio(**kwargs)
@@ -225,7 +223,6 @@ def run_batch_infer_script(
     sid: int = 0,
     seed: int = 0,
     rectified_vocoder_path: str = "",
-    rectified_phonation_scale: float = 1.0,
 ):
     seed = resolve_inference_seed(seed)
     kwargs = {
@@ -282,7 +279,6 @@ def run_batch_infer_script(
         "sid": sid,
         "seed": seed,
         "rectified_vocoder_path": rectified_vocoder_path,
-        "rectified_phonation_scale": rectified_phonation_scale,
     }
     infer_pipeline = import_voice_converter()
     infer_pipeline.convert_audio_batch(**kwargs)

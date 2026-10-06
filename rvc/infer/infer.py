@@ -400,10 +400,6 @@ class VoiceConverter:
         rectified = isinstance(self.cpt.get('config'), dict)
         if rectified:
             self.vc.set_vocoder(kwargs.pop('rectified_vocoder_path', ''))
-            scale = float(kwargs.pop('rectified_phonation_scale', 1.0))
-            if not np.isfinite(scale) or not 0 <= scale <= 2:
-                raise ValueError('Phonation strength must be between 0 and 2.')
-            self.vc.phonation_scale = scale
             self.tgt_sr = int(self.cpt['config']['data']['sample_rate'])
 
         start_time = time.time()

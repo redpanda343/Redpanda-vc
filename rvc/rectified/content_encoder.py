@@ -4,8 +4,6 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from rvc.rectified.phonation import PHONATION_CHANNELS
-
 
 def adamw_linear(inputs, outputs):
     layer = nn.Linear(inputs, outputs)
@@ -96,7 +94,7 @@ class ContentConditionEncoder(nn.Module):
     def __init__(self, content_channels, hidden_channels, speaker_count, layers,
                  breathiness=False, key_shift=False, speed=False, energy=False, use_spk_id=True,
                  enc_ffn_kernel_size=3, use_rope=True, rope_interleaved=False, rope_theta=10000.0,
-                 use_variance_scaling=True, use_phonation=False):
+                 use_variance_scaling=True):
         super().__init__()
         self.conditioning_version = 5
         self.speaker_count = int(speaker_count) if use_spk_id else 1
@@ -112,10 +110,6 @@ class ContentConditionEncoder(nn.Module):
         self.norm = nn.LayerNorm(hidden_channels)
         self.embed_scale = math.sqrt(hidden_channels)
         self.pitch = adamw_linear(1, hidden_channels)
-        self.phonation = adamw_linear(PHONATION_CHANNELS, hidden_channels) if use_phonation else None
-        if self.phonation is not None:
-            nn.init.zeros_(self.phonation.weight)
-            nn.init.zeros_(self.phonation.bias)
         self.energy = adamw_linear(1, hidden_channels) if energy else None
         self.breathiness = adamw_linear(1, hidden_channels) if breathiness else None
         self.key_shift = adamw_linear(1, hidden_channels) if key_shift else None
@@ -128,7 +122,7 @@ class ContentConditionEncoder(nn.Module):
         return self.speaker(speaker) if self.speaker is not None else None
 
     def forward(self, content, f0, energy, speaker, mask, breathiness=None,
-                key_shift=None, speed=None, voicing=None, tension=None, harmonic_prior=None, phonation=None):
+                key_shift=None, speed=None, voicing=None, tension=None, harmonic_prior=None):
         padding = ~mask[:, 0].bool()
         x = F.dropout(self.content(content) * self.embed_scale, 0.1, training=self.training)
         x = x * mask.transpose(1, 2)
@@ -138,10 +132,6 @@ class ContentConditionEncoder(nn.Module):
         if self.speaker is not None:
             x = x + self.voice(speaker).unsqueeze(1)
         x = x + self.pitch(torch.log1p(interpolate_pitch(f0, mask) / 700.0).unsqueeze(-1))
-        if self.phonation is not None:
-            if phonation is None or phonation.shape != (*f0.shape, PHONATION_CHANNELS):
-                raise ValueError('This model requires four frame-aligned phonation cues.')
-            x = x + self.phonation(phonation.float() * mask.transpose(1, 2))
         for layer, values, scale in ((self.energy, energy, 1.0 / 96),
                                      (self.breathiness, breathiness, 1.0 / 96)):
             if layer is not None:

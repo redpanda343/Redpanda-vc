@@ -71,21 +71,6 @@ New v5 experiments interpolate unvoiced F0 in log frequency before aligning it
 to mel frames, and use this continuous pitch for conditioning and the vocoder.
 Set `flow.model.use_continuous_f0` to `false` to retain raw unvoiced zeros.
 
-Optional `flow.model.use_phonation` adds four frame-level waveform cues:
-normalized periodicity and evidence of repeating patterns across two, three and
-four pitch cycles. This is an experimental phonation input, not a labeled fry
-classifier. It defaults to `false`. Enable **Phonation conditioning** in the
-training tab for a new experiment, enable **Pretrained**, and enter an existing
-voice export in **Voice checkpoint to fine-tune**. The new projection starts at
-zero so the pretrained conditioning is preserved initially. Native checkpoint
-resume requires the same architecture.
-Training caches these cues for originals and augmented examples. File conversion
-and realtime extract the same cues automatically, using an 80 ms history window
-without adding another audio buffer. **Phonation strength** scales the input from
-0 to 2, with 1 as the default. Realtime still depends on the model's inference
-speed. Learning useful fry control requires training examples containing fry;
-startup checks do not establish audible improvement.
-
  ## Credits
 
 - [Applio](https://github.com/IAHispano/Applio)

@@ -30,7 +30,6 @@ class RectifiedPipeline(Pipeline):
         self.checkpoint_vocoder = checkpoint.get('vocoder', '')
         self.vocoder_model = None
         self.pitch_shift = 0.0
-        self.phonation_scale = 1.0
 
     def pipeline(self, *args, **kwargs):
         self.pitch_shift = float(kwargs.get('pitch', args[4] if len(args) > 4 else 0))
@@ -83,12 +82,6 @@ class RectifiedPipeline(Pipeline):
         breathiness = smooth_curve(aperiodicity(waveform, rate, source_f0, feature_frames))
         content = to_mel_rate(content, frames, rate, hop)
         f0 = f0_to_mel_rate(pitchf.float(), frames, rate, hop, net_g.use_continuous_f0)
-        phonation = None
-        if net_g.use_phonation:
-            from rvc.rectified.phonation import phonation_features
-
-            raw_f0 = f0_to_mel_rate(source_f0, frames, rate, hop)
-            phonation = phonation_features(waveform, rate, raw_f0, frames, hop) * self.phonation_scale
         energy = to_mel_rate(energy.unsqueeze(-1), frames, rate, hop)[..., 0]
         breathiness = to_mel_rate(breathiness.unsqueeze(-1), frames, rate, hop)[..., 0]
         mask = torch.ones(1, 1, frames, device=self.device)
@@ -98,7 +91,7 @@ class RectifiedPipeline(Pipeline):
         with _INFERENCE_RNG_LOCK:
             if inference_rng is not None:
                 inference_rng.seed_next_segment()
-            mel = net_g.sample(content, f0, energy, sid, mask, breathiness=breathiness, phonation=phonation, **variances)
+            mel = net_g.sample(content, f0, energy, sid, mask, breathiness=breathiness, **variances)
             audio = self.vocoder_model(mel, f0)[0, 0, :length]
         if not torch.isfinite(audio).all():
             raise FloatingPointError('Non-finite Rectified Flow audio output.')
