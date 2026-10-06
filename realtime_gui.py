@@ -228,6 +228,8 @@ class AudioEngine:
             self.skip_head,
             self.return_length,
             settings["f0_method"],
+            self.input_wav,
+            self.sample_rate,
         )
         self.rvc.reset_caches()
         self._process_block(
@@ -440,6 +442,8 @@ class AudioEngine:
                 self.skip_head,
                 self.return_length,
                 self.settings["f0_method"],
+                self.input_wav,
+                self.sample_rate,
             )
             if self.output_resampler is not None:
                 converted = self.output_resampler(converted)
@@ -563,10 +567,7 @@ class RealtimeGUI:
         self.index_rate = tk.DoubleVar(value=value.get("index_rate", 0.0))
         self.rms_mix_rate = tk.DoubleVar(value=value.get("rms_mix_rate", 0.0))
         self.threshold = tk.IntVar(value=value.get("threshold", -60))
-        f0_method = value.get("f0_method", "rmvpe")
-        self.f0_method = tk.StringVar(
-            value="swift" if f0_method == "pm" else f0_method
-        )
+        self.f0_method = tk.StringVar(value=value.get("f0_method", "rmvpe"))
         self.block_time = tk.DoubleVar(value=value.get("block_time", 0.25))
         self.crossfade_time = tk.DoubleVar(
             value=value.get("crossfade_time", 0.05)
@@ -666,10 +667,15 @@ class RealtimeGUI:
         ttk.Label(settings, text="Pitch extraction").grid(row=5, column=0, sticky="w")
         pitch_methods = ttk.Frame(settings)
         pitch_methods.grid(row=5, column=1, sticky="w", pady=4)
-        for method in ("rmvpe", "fcpe", "swift"):
+        for label, method in (
+            ("rmvpe", "rmvpe"),
+            ("fcpe", "fcpe"),
+            ("swift", "swift"),
+            ("parselmouth", "pm"),
+        ):
             ttk.Radiobutton(
                 pitch_methods,
-                text=method,
+                text=label,
                 variable=self.f0_method,
                 value=method,
             ).pack(side="left", padx=(0, 10))

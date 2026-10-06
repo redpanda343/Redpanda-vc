@@ -231,6 +231,7 @@ class RealTimeRVC:
             vocoder, _ = load_vocoder(path, self.pipeline.data)
             self.pipeline.vocoder_model = vocoder.to(self.device).float()
             self.flow_resampler = Resample(16000, self.sample_rate).to(self.device)
+            self.source_resampler = None
             generator = vocoder.generator
             radius = generator.conv_pre.kernel_size[0] // 2
             scale = 1
@@ -406,9 +407,42 @@ class RealTimeRVC:
             self.cache_pitch[-count:] = usable_pitch[-count:]
             self.cache_pitchf[-count:] = usable_pitchf[-count:]
 
-    def _infer_rectified(self, features, input_wav, speaker, skip_head, return_length):
-        from rvc.rectified.pitch import parselmouth_f0
+    def _full_rate_source(self, source_wav, source_rate, length):
+        source = source_wav.float().view(-1)
+        if int(source_rate) != self.sample_rate:
+            if self.source_resampler is None or self.source_resampler[0] != int(source_rate):
+                from torchaudio.transforms import Resample
 
+                resampler = Resample(int(source_rate), self.sample_rate).to(self.device)
+                self.source_resampler = (int(source_rate), resampler)
+            source = self.source_resampler[1](source)
+        if source.numel() < length:
+            source = F.pad(source, (length - source.numel(), 0))
+        return source[-length:]
+
+    def _rectified_f0(self, waveform, input_wav, f0_method, source_wav, source_rate, frames):
+        from rvc.rectified.pitch import parselmouth_f0, resample_f0, rmvpe_f0, rmvpe_model
+
+        rate = self.sample_rate
+        hop = int(self.pipeline.data["hop_length"])
+        if f0_method in ("pm", "rmvpe"):
+            source = waveform[0]
+            if source_wav is not None:
+                source = self._full_rate_source(source_wav, source_rate, waveform.shape[-1])
+            source = source.cpu().numpy()
+            if f0_method == "pm":
+                f0 = parselmouth_f0(source, rate, hop, frames)
+            else:
+                predictor = getattr(self.pipeline, "model_rmvpe", None)
+                model = predictor.model if predictor is not None else rmvpe_model(self.device)
+                f0 = rmvpe_f0(model, source, rate, hop, frames)[0]
+            return torch.from_numpy(f0).to(waveform.device)[None] * 2 ** (self.pitch / 12)
+        p_len = input_wav.shape[0] // 160
+        f0 = resample_f0(self.cache_pitchf[-p_len:].cpu().numpy(), 100, frames, rate / hop)
+        return torch.from_numpy(f0).to(waveform.device)[None]
+
+    def _infer_rectified(self, features, input_wav, speaker, skip_head, return_length,
+                         f0_method, source_wav=None, source_rate=None):
         rate = self.sample_rate
         hop = int(self.pipeline.data["hop_length"])
         waveform = self.flow_resampler(input_wav.float()).view(1, -1)
@@ -418,8 +452,7 @@ class RealTimeRVC:
         if start < 0 or count < 1 or start + count > length:
             raise ValueError("The requested flow output exceeds the input context.")
         frames = math.ceil(length / hop)
-        f0 = parselmouth_f0(waveform[0].cpu().numpy(), rate, hop, frames)
-        f0 = torch.from_numpy(f0).to(waveform.device)[None] * 2 ** (self.pitch / 12)
+        f0 = self._rectified_f0(waveform, input_wav, f0_method, source_wav, source_rate, frames)
         mask = torch.ones(1, 1, frames, device=self.device)
         mel = self.flow_sampler(features.float(), f0, speaker, mask, steps=self.rectified_steps)
         first_frame = max(0, start // hop - self.vocoder_context_frames)
@@ -440,6 +473,8 @@ class RealTimeRVC:
         skip_head,
         return_length,
         f0_method,
+        source_wav=None,
+        source_rate=None,
     ):
         lookahead = self.pitch_lookahead_frames(f0_method)
         if skip_head < lookahead:
@@ -457,7 +492,8 @@ class RealTimeRVC:
                 )
                 if self.is_rectified:
                     audio = self._infer_rectified(
-                        features, input_wav, speaker, skip_head, int(return_length)
+                        features, input_wav, speaker, skip_head, int(return_length),
+                        f0_method, source_wav, source_rate,
                     )
                     if torch.device(self.device).type == "cuda":
                         torch.cuda.synchronize(self.device)
