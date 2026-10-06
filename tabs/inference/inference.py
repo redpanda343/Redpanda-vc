@@ -360,13 +360,7 @@ def match_index(model_file_value, available_indexes=None):
 @lru_cache(maxsize=32)
 def read_model_info(path, modified, size):
     model_data = torch.load(path, map_location="cpu", weights_only=True)
-    config = model_data.get("config")
-    rectified = model_data.get("kind") == "rectified_flow" or (
-        isinstance(config, dict)
-        and "flow" in config
-        and "data" in config
-        and "model" in model_data
-    )
+    rectified = model_data.get("kind") == "rectified_flow"
     speakers = model_data.get("speaker_count", model_data.get("speakers_id")) or 1
     return rectified, speakers
 

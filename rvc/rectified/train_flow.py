@@ -3,7 +3,6 @@ import json
 import os
 import random
 import re
-from copy import deepcopy
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -12,17 +11,11 @@ os.environ.setdefault("TORCH_CUDNN_V8_API_ENABLED", "1")
 import numpy as np
 import torch
 
-from rvc.rectified.augmentation import configure_augmentation
-from rvc.rectified.config import compact_config, resolve_config
+from rvc.rectified.config import default_config, resolve_config
 from rvc.rectified.flow_model import validate_model_config
 from rvc.rectified.mel import normalize_mel
 
 ROOT = Path(__file__).resolve().parents[2]
-LIGHTNING_DEFAULTS = dict(accelerator='auto', num_nodes=1,
-                          strategy={'name': 'auto', 'find_unused_parameters': False},
-                          accumulate_grad_batches=1, num_sanity_val_steps=1,
-                          max_val_batch_frames=60000, max_val_batch_size=1,
-                          sort_by_len=True, sampler_frame_count_grid=6)
 
 
 def atomic_save(state, path):
@@ -112,39 +105,24 @@ def preview(model, vocoder, reference, data, writer, step, index=None):
     if reference is None:
         return
     device = next(model.parameters()).device
-    mel, content, f0, energy, breathiness, audio, sid, path = reference[:8]
-    variances = dict(zip(("voicing", "tension"), (value.to(device) for value in reference[8:])))
-    content, f0, energy = content.to(device), f0.to(device), energy.to(device)
+    mel, content, f0, audio, sid, path = reference
+    content, f0 = content.to(device), f0.to(device)
     mask = torch.ones(1, 1, f0.shape[1], device=device)
     speaker = torch.tensor([sid], device=device)
-    training = model.training
     suffix = '' if index is None else f'/{index}'
-    try:
-        with evaluation_model(model):
-            model.eval()
-            generated = model.sample(content, f0, energy, speaker, mask,
-                                     breathiness=breathiness.to(device),
-                                     source_mel=normalize_mel(mel.to(device), data) if model.val_gt_start else None,
-                                     **variances)
-            predicted = model.predict_mel(content, f0, energy, speaker, mask,
-                                          breathiness=breathiness.to(device), **variances) if model.aux is not None else None
-    finally:
-        model.train(training)
-    if not torch.isfinite(generated).all():
+    with evaluation_model(model):
+        generated = model.sample(content, f0, speaker, mask,
+                                 source_mel=normalize_mel(mel.to(device), data) if model.val_gt_start else None)
+        predicted = model.predict_mel(content, f0, speaker, mask)
+    if not torch.isfinite(generated).all() or not torch.isfinite(predicted).all():
         raise FloatingPointError('Non-finite flow preview.')
-    writer.add_image(f'mel/flow{suffix}', (generated[0] / 6.0 + 0.5).clamp(0, 1).cpu(), step, dataformats='HW')
-    writer.add_image(f'mel/reference{suffix}', (normalize_mel(mel[0], data) / 6.0 + 0.5).clamp(0, 1).cpu(), step, dataformats='HW')
-    if predicted is not None:
-        if not torch.isfinite(predicted).all():
-            raise FloatingPointError('Non-finite direct mel preview.')
-        writer.add_image(f'mel/predictor{suffix}', (predicted[0] / 6.0 + 0.5).clamp(0, 1).cpu(), step, dataformats='HW')
+    for name, value in (('flow', generated[0]), ('reference', normalize_mel(mel[0], data)), ('predictor', predicted[0])):
+        writer.add_image(f'mel/{name}{suffix}', (value / 6.0 + 0.5).clamp(0, 1).cpu(), step, dataformats='HW')
     if vocoder is None:
         return
-    generated_audio = vocoder(generated, f0)[0]
-    rendered_reference = vocoder(normalize_mel(mel.to(device), data), f0)[0]
-    previews = [('flow', generated_audio), ('reference', audio[0]), ('vocoder_on_real_mel', rendered_reference)]
-    if predicted is not None:
-        previews.append(('predictor', vocoder(predicted, f0)[0]))
+    previews = [('flow', vocoder(generated, f0)[0]), ('reference', audio[0]),
+                ('vocoder_on_real_mel', vocoder(normalize_mel(mel.to(device), data), f0)[0]),
+                ('predictor', vocoder(predicted, f0)[0])]
     for name, value in previews:
         if not torch.isfinite(value).all():
             raise FloatingPointError(f'Non-finite {name} preview.')
@@ -153,31 +131,24 @@ def preview(model, vocoder, reference, data, writer, step, index=None):
 
 def select_fused_activation(config, enabled):
     if enabled:
-        config['flow']['model'].setdefault('backbone_args', {})['glu_type'] = 'softsign_glu'
+        config['flow']['model']['backbone_args']['glu_type'] = 'softsign_glu'
 
 
 def load_training_config(experiment, pretrained_flow=None, use_fused_kernels=False):
     config_path = experiment / 'rectified_config.json'
-    existing = config_path.exists()
-    if not existing:
-        filename = '44100_finetune.json' if pretrained_flow else '44100_standard.json'
-        config_path = ROOT / 'rvc' / 'configs' / 'rectified' / filename
-    config = resolve_config(json.loads(config_path.read_text(encoding='utf-8')))
-    if pretrained_flow and not existing:
-        checkpoint = torch.load(pretrained_flow, map_location='cpu', weights_only=True)
-        source = resolve_config(checkpoint.get('config', {}))
-        if 'data' not in source or 'flow' not in source or 'model' not in checkpoint:
-            raise ValueError('Choose a Rectified Flow voice checkpoint for fine-tuning.')
-        config['data'] = source['data']
-        config['flow']['model'] = source['flow']['model']
-    info_path = experiment / 'model_info.json'
-    info = json.loads(info_path.read_text(encoding='utf-8')) if info_path.exists() else {}
-    if info.get('f0_method') == 'pm':
-        config['data']['pitch_extractor'] = 'parselmouth'
+    if config_path.exists():
+        config = resolve_config(json.loads(config_path.read_text(encoding='utf-8')))
     else:
-        config['data'].pop('pitch_extractor', None)
+        config = default_config(finetune=bool(pretrained_flow))
+        if pretrained_flow:
+            checkpoint = torch.load(pretrained_flow, map_location='cpu', weights_only=True)
+            if checkpoint.get('kind') != 'rectified_flow':
+                raise ValueError('Choose a Rectified Flow voice checkpoint for fine-tuning.')
+            source = resolve_config(checkpoint['config'])
+            config['data'] = source['data']
+            config['flow']['model'] = source['flow']['model']
     select_fused_activation(config, use_fused_kernels)
-    configure_flow(config, existing)
+    configure_flow(config)
     return config
 
 
@@ -194,51 +165,29 @@ def train(args):
     fit(args, config, ROOT)
 
 
-def configure_flow(config, existing_config):
-    resolved = resolve_config(config)
-    config.clear()
-    config.update(resolved)
+def configure_flow(config):
     settings = config['flow']
-    settings['model'].setdefault('use_continuous_f0', settings['model'].get('conditioning_version') == 5)
     validate_model_config(settings['model'])
-    settings.setdefault('min_learning_rate', 0.0)
-    settings.setdefault('max_batch_frames', 50000)
-    settings.setdefault('max_batch_size', 64)
-    settings.setdefault('dataloader_prefetch_factor', 2)
-    settings.setdefault('log_interval', 100)
-    for name, value in LIGHTNING_DEFAULTS.items():
-        settings.setdefault(name, deepcopy(value))
-    reference = settings['model'].get('conditioning_version') == 5
-    settings.setdefault('muon_min_fan_in', 0 if reference else 16)
-    settings.setdefault('adamw_weight_decay', 0.0)
-    for name in ('use_ema', 'ema_decay', 'finetune_ema_decay', 'ema_update_interval'):
-        settings.pop(name, None)
-    settings.pop('speaker_balanced_sampling', None)
     for name in ('dataloader_prefetch_factor', 'log_interval', 'accumulate_grad_batches', 'num_nodes',
-                 'max_val_batch_frames', 'max_val_batch_size', 'sampler_frame_count_grid'):
+                 'max_val_batch_frames', 'max_val_batch_size', 'sampler_frame_count_grid',
+                 'max_updates', 'checkpoint_interval', 'num_ckpt_keep', 'permanent_ckpt_interval'):
         value = settings[name]
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError(f'{name} must be a positive integer.')
-    warmup = settings.get('finetune_warmup_steps', 0)
-    if isinstance(warmup, bool) or not isinstance(warmup, int) or warmup < 0:
-        raise ValueError('finetune_warmup_steps must be a nonnegative integer.')
-    configure_augmentation(settings)
-    for name in ('max_updates', 'checkpoint_interval', 'num_ckpt_keep', 'permanent_ckpt_interval'):
-        if name in settings and (isinstance(settings[name], bool) or not isinstance(settings[name], int) or settings[name] < 1):
-            raise ValueError(f'{name} must be a positive integer.')
-    for name in ('preview_interval', 'eval_interval', 'num_valid_plots', 'permanent_ckpt_start', 'num_sanity_val_steps'):
-        if name in settings and (isinstance(settings[name], bool) or not isinstance(settings[name], int) or settings[name] < 0):
+    for name in ('preview_interval', 'finetune_preview_interval', 'eval_interval', 'num_valid_plots',
+                 'permanent_ckpt_start', 'num_sanity_val_steps', 'finetune_warmup_steps', 'warmup_steps'):
+        value = settings[name]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError(f'{name} must be a nonnegative integer.')
-    if settings.get('precision', 'fp32') not in {'fp32', 'fp16', 'bf16'}:
+    if settings['precision'] not in {'fp32', 'fp16', 'bf16'}:
         raise ValueError('precision must be fp32, fp16 or bf16.')
-    if not isinstance(settings['sort_by_len'], bool):
-        raise ValueError('sort_by_len must be a boolean.')
+    for name in ('sort_by_len', 'val_with_vocoder'):
+        if not isinstance(settings[name], bool):
+            raise ValueError(f'{name} must be a boolean.')
     if settings['accelerator'] not in {'auto', 'cpu', 'gpu', 'cuda'}:
         raise ValueError('accelerator must be auto, cpu, gpu or cuda.')
     if not isinstance(settings['strategy'], (str, dict)):
         raise ValueError('strategy must be a name or a configuration object.')
-    if not isinstance(settings.get('val_with_vocoder', True), bool):
-        raise ValueError('val_with_vocoder must be a boolean.')
 
 
 def configure_arguments(args, settings):
@@ -251,28 +200,23 @@ def configure_arguments(args, settings):
         if args.max_updates is None:
             args.epochs = 100
     args.save_every = getattr(args, 'save_every', None) or 10
-    args.precision = getattr(args, 'precision', None) or settings.get('precision', 'fp32')
+    args.precision = getattr(args, 'precision', None) or settings['precision']
     args.device = getattr(args, 'device', None) or 'auto'
 
 
 def prune_checkpoints(output, model_name, settings):
-    keep = settings.get('num_ckpt_keep')
-    if keep is None:
-        return
-    start = settings.get('permanent_ckpt_start', 0)
-    interval = settings.get('permanent_ckpt_interval', 10000)
-    for suffix in (r'_flow_\d+e_(\d+)s\.pth', r'_trainer_(\d+)s\.pth'):
-        pattern = re.compile(re.escape(model_name) + suffix)
-        checkpoints = []
-        for path in output.iterdir():
-            match = pattern.fullmatch(path.name)
-            if path.is_file() and match:
-                checkpoints.append((int(match[1]), path))
-        checkpoints.sort(key=lambda item: item[0], reverse=True)
-        for step, path in checkpoints[keep:]:
-            permanent = start > 0 and step >= start and (step - start) % interval == 0
-            if not permanent:
-                path.unlink()
+    keep, start, interval = settings['num_ckpt_keep'], settings['permanent_ckpt_start'], settings['permanent_ckpt_interval']
+    pattern = re.compile(re.escape(model_name) + r'_flow_\d+e_(\d+)s\.pth')
+    checkpoints = []
+    for path in output.iterdir():
+        match = pattern.fullmatch(path.name)
+        if path.is_file() and match:
+            checkpoints.append((int(match[1]), path))
+    checkpoints.sort(key=lambda item: item[0], reverse=True)
+    for step, path in checkpoints[keep:]:
+        permanent = start > 0 and step >= start and (step - start) % interval == 0
+        if not permanent:
+            path.unlink()
 
 
 def main():

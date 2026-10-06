@@ -104,13 +104,13 @@ def preprocess(name, dataset, workers, slicing=True):
                    'Automatic' if slicing else 'Skip', 'False', 'False', '0.0', '10.0', '0.3', 'none', 'WAV'], 'Preprocessing')
 
 
-def extract(name, method, workers, device, embedder):
+def extract(name, workers, device, embedder):
     directory = experiment_path(name)
     if not (directory / 'sliced_audios').is_dir():
         raise gr.Error('Preprocess this experiment first.')
     gpu = device_id(device)
     return launch(name, 'rvc.train.extract.extract',
-                  [str(directory), method, positive_integer(workers, 'CPU workers'), gpu,
+                  [str(directory), 'pm', positive_integer(workers, 'CPU workers'), gpu,
                    '44100', embedder, '0', 'v2', '--rectified'], 'Extracting content and F0')
 
 
@@ -211,12 +211,8 @@ def rectified_train_tab():
         slicing = gr.Checkbox(label='Slice dataset', value=True,
                               info='Disable to keep full clips. Audio is always resampled to 44.1 kHz.')
         preprocess_button = gr.Button('Preprocess dataset')
-        with gr.Row():
-            method = gr.Dropdown(label='Pitch extractor',
-                                 choices=[('RMVPE', 'rmvpe'), ('SwiftF0', 'swift'), ('Parselmouth (DiffSinger)', 'pm')],
-                                 value='pm',
-                                 info='Parselmouth follows DiffSinger: 65-1100 Hz at the mel hop with interpolated unvoiced frames, for training, conversion and realtime.')
-            embedder = gr.Dropdown(label='Content embedder', choices=['contentvec', 'spin-v2'], value='contentvec')
+        embedder = gr.Dropdown(label='Content embedder', choices=['contentvec', 'spin-v2'], value='contentvec',
+                               info='F0 is extracted with Parselmouth like DiffSinger: 65-1100 Hz at the mel hop with interpolated unvoiced frames.')
         extract_button = gr.Button('Extract content and F0')
     with gr.Accordion('2. Train rectified flow', open=True):
         use_pretrained = gr.Checkbox(label='Pretrained', value=False)
@@ -241,7 +237,7 @@ def rectified_train_tab():
     log = gr.Textbox(label='Rectified job log', lines=12, max_lines=20, interactive=False)
     outputs = [state, log, preprocess_button, extract_button, train_button, stop_button]
     preprocess_button.click(preprocess, [name, dataset, workers, slicing], outputs, queue=False)
-    extract_button.click(extract, [name, method, workers, device, embedder], outputs, queue=False)
+    extract_button.click(extract, [name, workers, device, embedder], outputs, queue=False)
     train_button.click(start, [name, batch, max_frames, max_updates, checkpoint_interval, device, use_fused_kernels,
                                use_pretrained, pretrained_path], outputs, queue=False)
     stop_button.click(stop, [], outputs, queue=False)

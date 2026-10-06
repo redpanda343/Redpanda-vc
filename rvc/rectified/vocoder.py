@@ -23,22 +23,15 @@ def mel_mismatch(data: dict, vocoder_data: dict):
 
 
 def load_vocoder(path: str, data: dict):
-    from rvc.rectified.openvpi import ARCHITECTURE, NSFHiFiGAN, generator_state, openvpi_spec
+    from rvc.rectified.openvpi import NSFHiFiGAN, generator_state, openvpi_spec
 
-    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-    if checkpoint.get("kind") == "rectified_vocoder" and checkpoint.get("architecture") == ARCHITECTURE:
-        generator = NSFHiFiGAN(**checkpoint["config"]["vocoder"]["model"])
-        generator.load_state_dict(checkpoint["model"])
-        model = RawMelVocoder(generator, data)
-        vocoder_data = checkpoint["config"]["data"]
-    else:
-        state = generator_state(checkpoint)
-        if state is None:
-            raise ValueError(f"{path} is not an OpenVPI NSF-HiFiGAN checkpoint.")
-        hparams, vocoder_data, weights = openvpi_spec(path, state)
-        generator = NSFHiFiGAN(**hparams)
-        generator.load_state_dict(weights)
-        model = RawMelVocoder(generator, data)
+    state = generator_state(torch.load(path, map_location="cpu", weights_only=True))
+    if state is None:
+        raise ValueError(f"{path} is not an OpenVPI NSF-HiFiGAN checkpoint.")
+    hparams, vocoder_data, weights = openvpi_spec(path, state)
+    generator = NSFHiFiGAN(**hparams)
+    generator.load_state_dict(weights)
+    model = RawMelVocoder(generator, data)
     mismatch = mel_mismatch(data, vocoder_data)
     if mismatch:
         raise ValueError(f"{path} renders another mel than the flow's: {mismatch}.")

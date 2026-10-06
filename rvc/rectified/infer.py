@@ -7,19 +7,13 @@ from torch.nn import functional as F
 
 from rvc.infer.pipeline import Pipeline, _INFERENCE_RNG_LOCK
 from rvc.lib.utils import extract_embedding_features
-from rvc.rectified.aperiodicity import aperiodicity
-from rvc.rectified.data import f0_to_mel_rate, smooth_curve, to_mel_rate, upsample_content, variance_curves
-from rvc.rectified.energy import frame_energy
-from rvc.rectified.pitch import parselmouth_f0, uses_parselmouth
+from rvc.rectified.pitch import parselmouth_f0
 from rvc.rectified.resources import default_vocoder
 from rvc.rectified.vocoder import load_vocoder
 
 
 def is_rectified(checkpoint):
-    config = checkpoint.get('config')
-    return checkpoint.get('kind') == 'rectified_flow' or (
-        isinstance(config, dict) and 'flow' in config and 'data' in config and 'model' in checkpoint
-    )
+    return checkpoint.get('kind') == 'rectified_flow'
 
 
 class RectifiedPipeline(Pipeline):
@@ -30,7 +24,6 @@ class RectifiedPipeline(Pipeline):
         self.data = checkpoint['config']['data']
         self.content_channels = int(checkpoint['config']['flow']['model']['content_channels'])
         self.vocoder_path = vocoder_path
-        self.checkpoint_vocoder = checkpoint.get('vocoder', '')
         self.vocoder_model = None
         self.pitch_shift = 0.0
 
@@ -48,8 +41,7 @@ class RectifiedPipeline(Pipeline):
     def voice_conversion(self, model, net_g, sid, audio0, pitch, pitchf, index,
                          big_npy, index_rate, version, protect, inference_rng=None):
         if self.vocoder_model is None:
-            path = self.vocoder_path or default_vocoder(self.checkpoint_vocoder)
-            vocoder, _ = load_vocoder(path, self.data)
+            vocoder, _ = load_vocoder(self.vocoder_path or default_vocoder(), self.data)
             self.vocoder_model = vocoder.to(self.device).float()
         speaker = int(sid.item())
         if net_g.use_spk_id and not 0 <= speaker < net_g.speaker_count:
@@ -63,46 +55,25 @@ class RectifiedPipeline(Pipeline):
         original = content
         if index is not None:
             content = self._retrieve_speaker_embeddings(content, index, big_npy, index_rate)
-        mode = self.data['content_interpolation']
-        native = net_g.native_content_rate
-        if not native:
-            content = upsample_content(content, mode)
-        if index is not None and protect < .5:
-            if not native:
-                original = upsample_content(original, mode)
-            voiced = (pitchf > 0).float()
-            voiced = F.interpolate(voiced.unsqueeze(1), size=content.shape[1], mode='nearest').transpose(1, 2)
-            amount = voiced + (1 - voiced) * float(protect)
-            content = content * amount + original * (1 - amount)
+            if protect < .5:
+                voiced = (pitchf > 0).float()
+                voiced = F.interpolate(voiced.unsqueeze(1), size=content.shape[1], mode='nearest').transpose(1, 2)
+                amount = voiced + (1 - voiced) * float(protect)
+                content = content * amount + original * (1 - amount)
         rate, hop = int(self.data['sample_rate']), int(self.data['hop_length'])
         waveform = soxr.resample(np.asarray(audio0, dtype=np.float32), self.sample_rate, rate, quality='HQ')
-        waveform = torch.from_numpy(waveform).view(1, -1).to(self.device)
-        length = waveform.shape[-1]
+        length = len(waveform)
         if len(audio0) == (pitchf.shape[-1] + 1) * self.window:
             length = round(pitchf.shape[-1] * self.window * rate / self.sample_rate)
-            waveform = waveform[..., :length]
+            waveform = waveform[:length]
         frames = math.ceil(length / hop)
-        feature_frames = max(1, length // (rate // 100))
-        source_f0 = pitchf.float() / (2 ** (self.pitch_shift / 12))
-        energy = smooth_curve(frame_energy(waveform, rate, feature_frames))
-        breathiness = smooth_curve(aperiodicity(waveform, rate, source_f0, feature_frames))
-        if not native:
-            content = to_mel_rate(content, frames, rate, hop)
-        if uses_parselmouth(self.data):
-            f0 = parselmouth_f0(waveform[0].cpu().numpy(), rate, hop, frames)
-            f0 = torch.from_numpy(f0).to(self.device)[None] * 2 ** (self.pitch_shift / 12)
-        else:
-            f0 = f0_to_mel_rate(pitchf.float(), frames, rate, hop, net_g.use_continuous_f0)
-        energy = to_mel_rate(energy.unsqueeze(-1), frames, rate, hop)[..., 0]
-        breathiness = to_mel_rate(breathiness.unsqueeze(-1), frames, rate, hop)[..., 0]
+        f0 = torch.from_numpy(parselmouth_f0(waveform, rate, hop, frames)).to(self.device)[None]
+        f0 = f0 * 2 ** (self.pitch_shift / 12)
         mask = torch.ones(1, 1, frames, device=self.device)
-        variances = {}
-        if any(getattr(net_g.encoder, name, None) is not None for name in ('voicing', 'tension')):
-            variances = dict(zip(('voicing', 'tension'), variance_curves(waveform, source_f0, frames, rate, hop)))
         with _INFERENCE_RNG_LOCK:
             if inference_rng is not None:
                 inference_rng.seed_next_segment()
-            mel = net_g.sample(content, f0, energy, sid, mask, breathiness=breathiness, **variances)
+            mel = net_g.sample(content, f0, sid, mask)
             audio = self.vocoder_model(mel, f0)[0, 0, :length]
         if not torch.isfinite(audio).all():
             raise FloatingPointError('Non-finite Rectified Flow audio output.')

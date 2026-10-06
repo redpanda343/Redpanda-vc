@@ -247,8 +247,8 @@ if __name__ == "__main__":
     include_mutes = int(sys.argv[7]) if len(sys.argv) > 7 else 2
     version = sys.argv[8] if len(sys.argv) > 8 else "v2"
     rectified = len(sys.argv) > 9 and sys.argv[9] == "--rectified"
-    if rectified and (int(sample_rate) != 44100 or version != "v2"):
-        raise ValueError("Rectified flow extraction requires 44100 Hz and v2 features.")
+    if rectified and (int(sample_rate) != 44100 or version != "v2" or f0_method != "pm"):
+        raise ValueError("Rectified flow extraction requires 44100 Hz, v2 features and Parselmouth F0.")
 
     wav_path = os.path.join(exp_dir, "sliced_audios")
 
@@ -373,15 +373,14 @@ if __name__ == "__main__":
 
     if rectified:
         generate_filelist(exp_dir, sample_rate, 0)
-        if f0_method == "pm":
-            from rvc.rectified.config import STANDARD_PRESET
-            from rvc.rectified.pitch import drop_unvoiced_clips
+        from rvc.rectified.config import DEFAULT_CONFIG
+        from rvc.rectified.pitch import drop_unvoiced_clips
 
-            drop_unvoiced_clips(
-                os.path.join(exp_dir, "filelist.txt"),
-                STANDARD_PRESET["data"]["hop_length"],
-                num_processes,
-            )
+        drop_unvoiced_clips(
+            os.path.join(exp_dir, "filelist.txt"),
+            DEFAULT_CONFIG["data"]["hop_length"],
+            num_processes,
+        )
     else:
         generate_config(sample_rate, exp_dir, version)
         generate_filelist(exp_dir, sample_rate, include_mutes)

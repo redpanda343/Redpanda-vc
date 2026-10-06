@@ -227,7 +227,7 @@ class RealTimeRVC:
             self.rectified_steps = int(rectified_steps) or None
             self.flow_sampler = RealtimeFlowSampler(self.model, enabled=rectified_cuda_graph)
             self.pipeline.set_vocoder(rectified_vocoder_path)
-            path = self.pipeline.vocoder_path or default_vocoder(self.pipeline.checkpoint_vocoder)
+            path = self.pipeline.vocoder_path or default_vocoder()
             vocoder, _ = load_vocoder(path, self.pipeline.data)
             self.pipeline.vocoder_model = vocoder.to(self.device).float()
             self.flow_resampler = Resample(16000, self.sample_rate).to(self.device)
@@ -407,12 +407,7 @@ class RealTimeRVC:
             self.cache_pitchf[-count:] = usable_pitchf[-count:]
 
     def _infer_rectified(self, features, input_wav, speaker, skip_head, return_length):
-        from rvc.rectified.aperiodicity import aperiodicity
-        from rvc.rectified.data import (
-            f0_to_mel_rate, smooth_curve, to_mel_rate, upsample_content, variance_curves,
-        )
-        from rvc.rectified.energy import frame_energy
-        from rvc.rectified.pitch import parselmouth_f0, uses_parselmouth
+        from rvc.rectified.pitch import parselmouth_f0
 
         rate = self.sample_rate
         hop = int(self.pipeline.data["hop_length"])
@@ -423,34 +418,10 @@ class RealTimeRVC:
         if start < 0 or count < 1 or start + count > length:
             raise ValueError("The requested flow output exceeds the input context.")
         frames = math.ceil(length / hop)
-        feature_frames = max(1, input_wav.shape[0] // 160)
-        if feature_frames > self.cache_pitchf.numel():
-            raise ValueError("Flow input context exceeds the pitch cache capacity.")
-        pitchf = self.cache_pitchf[None, -feature_frames:]
-        source_f0 = pitchf / (2 ** (self.pitch / 12))
-        content = features.float()
-        if not self.model.native_content_rate:
-            content = upsample_content(content, self.pipeline.data["content_interpolation"])
-            content = to_mel_rate(content, frames, rate, hop)
-        if uses_parselmouth(self.pipeline.data):
-            f0 = parselmouth_f0(waveform[0].cpu().numpy(), rate, hop, frames)
-            f0 = torch.from_numpy(f0).to(waveform.device)[None] * 2 ** (self.pitch / 12)
-        else:
-            f0 = f0_to_mel_rate(pitchf, frames, rate, hop, self.model.use_continuous_f0)
-        energy = smooth_curve(frame_energy(waveform, rate, feature_frames))
-        energy = to_mel_rate(energy.unsqueeze(-1), frames, rate, hop)[..., 0]
-        breathiness = smooth_curve(aperiodicity(waveform, rate, source_f0, feature_frames))
-        breathiness = to_mel_rate(breathiness.unsqueeze(-1), frames, rate, hop)[..., 0]
-        variances = {}
-        if any(getattr(self.model.encoder, name, None) is not None for name in ('voicing', 'tension')):
-            variances = dict(zip(
-                ("voicing", "tension"), variance_curves(waveform, source_f0, frames, rate, hop)
-            ))
+        f0 = parselmouth_f0(waveform[0].cpu().numpy(), rate, hop, frames)
+        f0 = torch.from_numpy(f0).to(waveform.device)[None] * 2 ** (self.pitch / 12)
         mask = torch.ones(1, 1, frames, device=self.device)
-        mel = self.flow_sampler(
-            content, f0, energy, speaker, mask, steps=self.rectified_steps,
-            breathiness=breathiness, **variances,
-        )
+        mel = self.flow_sampler(features.float(), f0, speaker, mask, steps=self.rectified_steps)
         first_frame = max(0, start // hop - self.vocoder_context_frames)
         audio = self.pipeline.vocoder_model(mel[..., first_frame:], f0[..., first_frame:])[0, 0]
         start -= first_frame * hop

@@ -19,9 +19,9 @@ class _FlowSampleGraph:
             key: value.clone() if torch.is_tensor(value) else value
             for key, value in kwargs.items()
         }
-        content = args[0]
+        content, mask = args[0], args[-1]
         self.noise = torch.zeros(
-            content.shape[0], model.n_mels, content.shape[1], device=content.device
+            content.shape[0], model.n_mels, mask.shape[-1], device=content.device
         )
         self.kwargs["noise"] = self.noise
         with torch.cuda.device(content.device):
@@ -57,22 +57,17 @@ class RealtimeFlowSampler:
         self.signature = None
 
     @torch.inference_mode()
-    def __call__(self, content, f0, energy, speaker, mask, steps=None,
-                 breathiness=None, voicing=None, tension=None):
-        args = (content, f0, energy, speaker, mask)
+    def __call__(self, content, f0, speaker, mask, steps=None):
+        args = (content, f0, speaker, mask)
         kwargs = {
             "steps": self.model.sampling_steps if steps is None else int(steps),
             "method": self.model.sampling_method,
-            "breathiness": breathiness,
-            "voicing": voicing,
-            "tension": tension,
         }
         if not self.enabled or self.failed or content.device.type != "cuda":
             return self.model.sample(*args, **kwargs)
         signature = (
             tuple(_tensor_signature(value) for value in args),
-            tuple(_tensor_signature(kwargs[key]) for key in ("breathiness", "voicing", "tension")),
-            kwargs["steps"], kwargs["method"], self.model.t_start,
+            kwargs["steps"], kwargs["method"], self.model.t_start_infer,
         )
         if signature != self.signature:
             self.entry = None
@@ -92,7 +87,7 @@ class RealtimeFlowSampler:
                 logger.warning("Realtime flow CUDA Graph unavailable; using eager inference: %s", error)
                 return self.model.sample(*args, **kwargs)
         noise = torch.randn(
-            content.shape[0], self.model.n_mels, content.shape[1], device=content.device
+            content.shape[0], self.model.n_mels, mask.shape[-1], device=content.device
         )
         try:
             return self.entry.replay(args, kwargs, noise)

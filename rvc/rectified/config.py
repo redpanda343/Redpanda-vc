@@ -1,7 +1,7 @@
 from copy import deepcopy
 
 
-STANDARD_PRESET = {
+DEFAULT_CONFIG = {
     'data': {
         'sample_rate': 44100,
         'hop_length': 512,
@@ -12,13 +12,13 @@ STANDARD_PRESET = {
         'mel_fmax': 16000.0,
         'mel_mean': -6.0,
         'mel_std': 6.0,
-        'content_interpolation': 'nearest',
     },
     'flow': {
         'optimizer': 'muon',
         'learning_rate': 0.0006,
         'min_learning_rate': 0.0,
         'finetune_learning_rate': 0.0001,
+        'finetune_warmup_steps': 0,
         'lr_final_ratio': 0.1,
         'lr_schedule': 'step',
         'decay_step': 5000,
@@ -26,162 +26,113 @@ STANDARD_PRESET = {
         'step_lr_offset': 0,
         'betas': [0.9, 0.999],
         'weight_decay': 0.1,
+        'adamw_weight_decay': 0.0,
         'warmup_steps': 0,
         'max_batch_frames': 50000,
         'max_batch_size': 64,
         'grad_clip': 1.0,
-        'speaker_dropout': 0.0,
+        'aux_mel_weight': 0.2,
         'augmentation_args': {
             'random_pitch_shifting': {'enabled': True, 'range': [-5.0, 5.0], 'scale': 0.75},
-            'fixed_pitch_shifting': {'enabled': False, 'targets': [-5.0, 5.0], 'scale': 0.5},
             'random_time_stretching': {'enabled': True, 'range': [0.5, 2.0], 'scale': 0.75},
         },
-        'preview_interval': 1000,
-        'eval_interval': 1000,
+        'augmentation_workers': 4,
         'holdout_clips': 32,
         'num_workers': 4,
         'dataloader_prefetch_factor': 2,
         'log_interval': 100,
-        'augmentation_workers': 4,
+        'max_updates': 100000,
+        'precision': 'fp16',
+        'devices': 'auto',
+        'accelerator': 'auto',
+        'num_nodes': 1,
+        'strategy': {'name': 'auto', 'find_unused_parameters': False},
+        'accumulate_grad_batches': 1,
+        'num_sanity_val_steps': 1,
+        'eval_interval': 4000,
+        'preview_interval': 4000,
+        'finetune_preview_interval': 500,
+        'checkpoint_interval': 4000,
+        'num_valid_plots': 10,
+        'val_with_vocoder': True,
+        'num_ckpt_keep': 8,
+        'permanent_ckpt_start': 60000,
+        'permanent_ckpt_interval': 10000,
+        'max_val_batch_frames': 60000,
+        'max_val_batch_size': 1,
+        'sort_by_len': True,
+        'sampler_frame_count_grid': 6,
         'model': {
-            'dual_timestep': True,
-            'voicing': False,
-            'tension': False,
-            'sampling_method': 'euler',
-            'sampling_steps': 20,
-            'flow_conditioning': 'encoder',
-            'flow_loss': 'l2',
             'content_channels': 768,
             'hidden_channels': 384,
             'encoder_layers': 4,
-            'speaker_channels': 256,
-            'pitch_fourier': 6,
-            'harmonic_prior': True,
-            'breathiness': True,
+            'enc_ffn_kernel_size': 3,
+            'use_rope': True,
+            'rope_interleaved': False,
+            'rope_theta': 10000.0,
+            'use_spk_id': False,
             'key_shift': True,
             'speed': True,
-            'backbone': 'lynxnet2',
             'backbone_args': {
-                'channels': 1024, 'layers': 6, 'expansion': 1,
-                'kernel_size': 31, 'adaln': True, 'time_scale': 1000.0,
+                'channels': 1024,
+                'layers': 6,
+                'expansion': 1,
+                'kernel_size': 31,
+                'glu_type': 'atanglu',
+                'dropout_rate': 0.0,
+                'use_conditioner_cache': True,
             },
-            't_start': 0.4,
-            'conditioning_version': 4,
-            'direct_speaker_conditioning': True,
+            'aux_decoder': {'channels': 512, 'layers': 6, 'dropout': 0.1, 'kernel_size': 7},
             'aux_grad': 0.1,
-            'aux_decoder': {'channels': 512, 'layers': 6, 'dropout': 0.1},
+            't_start': 0.4,
+            't_start_infer': 0.4,
+            'dual_timestep': True,
+            'sampling_method': 'euler',
+            'sampling_steps': 20,
+            'train_aux_decoder': True,
+            'train_diffusion': True,
+            'val_gt_start': False,
         },
-        'finetune_preview_interval': 500,
-        'aux_mel_weight': 0.2,
     },
 }
 
-LEGACY_PRESET = deepcopy(STANDARD_PRESET)
-STANDARD_PRESET['flow'].update({
-    'betas': [0.9, 0.999],
-    'adamw_weight_decay': 0.0,
-    'muon_min_fan_in': 0,
-})
-STANDARD_PRESET['flow']['model'].update({
-    'conditioning_version': 5,
-    'speaker_channels': 384,
-    'pitch_fourier': 0,
-    'harmonic_prior': False,
-    'energy': False,
-    'breathiness': False,
-    'key_shift': True,
-    'speed': True,
-    'direct_speaker_conditioning': False,
-})
-STANDARD_PRESET['flow']['model']['backbone_args']['adaln'] = False
-ATAN_PRESET = deepcopy(STANDARD_PRESET)
-STANDARD_PRESET['flow']['model']['backbone_args']['glu_type'] = 'softsign_glu'
-SOFTSIGN_PRESET = deepcopy(STANDARD_PRESET)
-STANDARD_PRESET['flow']['model']['use_spk_id'] = False
-NO_SPEAKER_PRESET = deepcopy(STANDARD_PRESET)
-STANDARD_PRESET['flow'].update({
-    'max_updates': 100000, 'precision': 'fp16', 'devices': 'auto',
-    'preview_interval': 4000, 'eval_interval': 4000, 'checkpoint_interval': 4000,
-    'num_valid_plots': 10, 'val_with_vocoder': True, 'num_ckpt_keep': 8,
-    'permanent_ckpt_start': 60000, 'permanent_ckpt_interval': 10000,
-})
-STANDARD_PRESET['flow']['model'].update({
-    'diffusion_type': 'reflow', 'enc_ffn_kernel_size': 3, 'use_rope': True,
-    'rope_interleaved': False, 'rope_theta': 10000.0, 'use_variance_scaling': True,
-    'use_shallow_diffusion': True, 't_start_infer': 0.4,
-    'train_aux_decoder': True, 'train_diffusion': True, 'val_gt_start': False,
-    'aux_decoder_arch': 'convnext',
-})
-STANDARD_PRESET['flow']['model']['backbone_args'].update({
-    'glu_type': 'atanglu', 'dropout_rate': 0.0, 'use_conditioner_cache': True,
-})
-STANDARD_PRESET['flow']['model']['aux_decoder']['kernel_size'] = 7
-STANDARD_PRESET['flow']['model'].update({'use_continuous_f0': True})
-STANDARD_PRESET['flow'].update({
-    'accelerator': 'auto', 'num_nodes': 1,
-    'strategy': {'name': 'auto', 'find_unused_parameters': False},
-    'accumulate_grad_batches': 1, 'num_sanity_val_steps': 1,
-    'max_val_batch_frames': 60000, 'max_val_batch_size': 1,
-    'sort_by_len': True, 'sampler_frame_count_grid': 6,
-})
-PRESET_NAME = 'standard-v5'
-PRESETS = {
-    'standard-v1': LEGACY_PRESET, 'standard-v2': ATAN_PRESET,
-    'standard-v3': SOFTSIGN_PRESET, 'standard-v4': NO_SPEAKER_PRESET, PRESET_NAME: STANDARD_PRESET,
+FINETUNE_OVERRIDES = {
+    'flow': {
+        'finetune_learning_rate': 5e-05,
+        'finetune_warmup_steps': 500,
+        'min_learning_rate': 1e-05,
+        'decay_step': 2000,
+        'eval_interval': 500,
+        'max_batch_size': 32,
+        'augmentation_args': {
+            'random_pitch_shifting': {'enabled': False},
+            'random_time_stretching': {'enabled': False},
+        },
+    },
 }
 
+FREE_FORM_KEYS = {('flow', 'strategy')}
 
-def _merge(base, overrides):
+
+def _merge(base, overrides, path=()):
     result = deepcopy(base)
     for key, value in overrides.items():
-        if isinstance(value, dict) and isinstance(result.get(key), dict):
-            result[key] = _merge(result[key], value)
+        if key not in result:
+            name = '.'.join((*path, key))
+            raise ValueError(f'Unknown rectified-flow setting {name!r}. This experiment or checkpoint was made by '
+                             'an older version; start a new experiment.')
+        if isinstance(value, dict) and isinstance(result[key], dict) and (*path, key) not in FREE_FORM_KEYS:
+            result[key] = _merge(result[key], value, (*path, key))
         else:
             result[key] = deepcopy(value)
     return result
 
 
-def _drop_phonation(config):
-    flow = config.get('flow')
-    model = flow.get('model') if isinstance(flow, dict) else None
-    if isinstance(model, dict) and model.pop('use_phonation', False):
-        raise ValueError('Phonation conditioning is no longer supported. Train a new experiment without it.')
-    return config
-
-
 def resolve_config(config):
     if not isinstance(config, dict):
         raise ValueError('Rectified-flow config must be a JSON object.')
-    if 'preset' not in config:
-        return _drop_phonation(deepcopy(config))
-    if config['preset'] not in PRESETS:
-        raise ValueError(f'Unknown rectified-flow preset: {config["preset"]!r}.')
-    for key in ('data', 'flow'):
-        if key in config and not isinstance(config[key], dict):
-            raise ValueError(f'Rectified-flow {key} settings must be a JSON object.')
-    return _drop_phonation(_merge(PRESETS[config['preset']],
-                                  {key: value for key, value in config.items() if key != 'preset'}))
+    return _merge(DEFAULT_CONFIG, config)
 
 
-def _differences(config, defaults):
-    result = {}
-    for key, value in config.items():
-        if key not in defaults or value != defaults[key]:
-            if isinstance(value, dict) and isinstance(defaults.get(key), dict):
-                result[key] = _differences(value, defaults[key])
-            else:
-                result[key] = deepcopy(value)
-    return result
-
-
-def compact_config(config):
-    resolved = resolve_config(config)
-    compact = {'preset': PRESET_NAME, **_differences(resolved, STANDARD_PRESET)}
-    if resolve_config(compact) != resolved:
-        return resolved
-    flow = resolved['flow']
-    visible = {key: deepcopy(value) for key, value in flow.items() if key != 'model'}
-    visible['model'] = deepcopy(flow['model'])
-    compact['data'] = deepcopy(resolved['data'])
-    compact['flow'] = _merge(visible, compact.get('flow', {}))
-    return compact
+def default_config(finetune=False):
+    return resolve_config(FINETUNE_OVERRIDES) if finetune else deepcopy(DEFAULT_CONFIG)

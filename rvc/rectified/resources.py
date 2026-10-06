@@ -22,8 +22,6 @@ VOCODER_FILES = {
     'NOTICE.zh-CN.txt': '8983f1ac07a0b240b9d4c970c8081007b0f932e5e223d88f8f8aef0e6570ed81',
     'STATEMENTS.txt': 'fe208abd522fd9e77ee16063ca2b3d6466fe3a35db70578f615d28543dd62d85',
 }
-LEGACY_VOCODER_FILENAME = 'pc_nsf_hifigan_44.1k_hop512_128bin_vocoder.pth'
-LEGACY_VOCODER_SHA256 = '4d7c843cb663137a28b94e8707503d540e5eec4b16e40867ae0d17f07440cc8d'
 _download_lock = threading.Lock()
 
 
@@ -32,22 +30,7 @@ def _valid_bundle(directory):
                for name, checksum in VOCODER_FILES.items())
 
 
-def default_vocoder(recorded=''):
-    if recorded:
-        path = Path(recorded)
-        parts = str(recorded).replace('\\', '/').split('/')
-        is_legacy = parts[-1] == LEGACY_VOCODER_FILENAME
-        is_default = parts[-2:] == [VOCODER_DIRECTORY, VOCODER_FILENAME]
-        for candidate in (path, ROOT / path):
-            if not candidate.is_file():
-                continue
-            if is_legacy and _sha256(candidate) != LEGACY_VOCODER_SHA256:
-                continue
-            if is_default and not _valid_bundle(candidate.parent):
-                continue
-            return str(candidate)
-        if not is_legacy and not is_default:
-            raise ValueError(f'The flow requires its custom NSF-HiFiGAN vocoder: {recorded}. Restore that file or supply rectified_vocoder_path.')
+def default_vocoder():
     destination = ROOT / 'rvc' / 'models' / 'pretraineds' / 'rectified' / VOCODER_DIRECTORY
     with _download_lock:
         if not _valid_bundle(destination):

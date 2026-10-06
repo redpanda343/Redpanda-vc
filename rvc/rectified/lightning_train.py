@@ -2,8 +2,6 @@ import json
 import os
 import re
 import time
-from copy import deepcopy
-from functools import partial
 from pathlib import Path
 
 import lightning.pytorch as pl
@@ -14,14 +12,14 @@ from lightning.pytorch.strategies import DDPStrategy, StrategyRegistry
 from torch.utils.data import DataLoader
 from torchmetrics import MeanMetric
 
-from rvc.rectified.augmentation import is_augmented, prepare_augmentation
-from rvc.rectified.config import compact_config, resolve_config
+from rvc.rectified.augmentation import prepare_augmentation
+from rvc.rectified.config import resolve_config
 from rvc.rectified.data import (
-    FlowBatchSampler, RectifiedDataset, collate_flow, content_rms, prepare_training_cache,
+    FlowBatchSampler, RectifiedDataset, collate_flow, content_rms, is_augmented, prepare_training_cache,
     read_filelist, speaker_inventory, split_holdout, unpack_flow,
 )
 from rvc.rectified.distributed import parse_devices
-from rvc.rectified.flow_model import build_flow, resize_speakers
+from rvc.rectified.flow_model import build_flow
 from rvc.rectified.mel import normalize_mel
 from rvc.rectified.muon import MuonAdamW
 from rvc.rectified.schedule import learning_rate
@@ -32,8 +30,8 @@ from rvc.rectified.train_flow import (
 from rvc.rectified.vocoder import load_vocoder
 
 
-def validation_collate(batch, native_content=False):
-    return collate_flow(batch, native_content=native_content) if batch else None
+def validation_collate(batch):
+    return collate_flow(batch) if batch else None
 
 
 def latest_checkpoint(output):
@@ -64,12 +62,9 @@ class FlowDataModule(pl.LightningDataModule):
         self.experiment, self.root, self.config, self.args = experiment, root, config, args
         self.settings = config['flow']
         self.originals = read_filelist(experiment / 'filelist.txt', root, originals_only=True)
-        self.multispeaker = self.settings['model'].get('conditioning_version', 1) in (2, 3, 4, 5)
-        self.inventory = speaker_inventory(self.originals) if self.multispeaker else None
+        self.inventory = speaker_inventory(self.originals)
         self.speaker_count = max(int(entry[4]) for entry in self.originals) + 1
-        self.training_entries, self.held = split_holdout(
-            self.originals, int(self.settings.get('holdout_clips', 0)), stratified=self.multispeaker,
-        )
+        self.training_entries, self.held = split_holdout(self.originals, int(self.settings['holdout_clips']))
         self.max_items = int(args.batch_size or self.settings['max_batch_size'])
         self.max_frames = int(args.max_batch_frames or self.settings['max_batch_frames'])
         info_path = experiment / 'model_info.json'
@@ -78,15 +73,15 @@ class FlowDataModule(pl.LightningDataModule):
         self.feature_metadata = {key: info[key] for key in (
             'embedder_model', 'version', 'feature_dim', 'feature_output', 'feature_fingerprint',
         ) if key in info}
-        if self.multispeaker and (info.get('version', 'v2') != 'v2' or
-                                 int(info.get('feature_dim', self.settings['model']['content_channels'])) != self.settings['model']['content_channels']):
+        if (info.get('version', 'v2') != 'v2' or
+                int(info.get('feature_dim', self.settings['model']['content_channels'])) != self.settings['model']['content_channels']):
             raise ValueError('Extraction metadata does not match the content encoder. Re-extract v2 features.')
         self.training_sampler = None
         self.resume_sampler_cap = None
 
     def prepare_data(self):
         prepare_training_cache(self.originals, self.config, self.experiment / 'rectified-flow.data',
-                               self.settings.get('num_workers', 4))
+                               self.settings['num_workers'])
         prepare_augmentation(self.experiment, self.root, self.originals, self.training_entries,
                              self.config, self.args.seed, self.trainer.strategy.root_device)
 
@@ -96,20 +91,18 @@ class FlowDataModule(pl.LightningDataModule):
         cache_path = self.experiment / 'rectified-flow.data'
         self.train_dataset = RectifiedDataset(entries, self.config, self.max_frames, cache_path=cache_path)
         self.valid_dataset = RectifiedDataset(
-            self.held, self.config, self.settings['max_val_batch_frames'], augment=False, cache_path=cache_path,
+            self.held, self.config, self.settings['max_val_batch_frames'], cache_path=cache_path,
         )
         self.references = []
-        if self.trainer.is_global_zero and self.settings.get('preview_interval', 0):
+        if self.trainer.is_global_zero and self.settings['preview_interval']:
             self.references = (self.valid_dataset if self.held else self.train_dataset).references(
-                self.settings.get('num_valid_plots', 10),
+                self.settings['num_valid_plots'],
             )
 
     def loader(self, dataset, sampler, validation=False):
-        workers = int(self.settings.get('num_workers', 4))
-        collate = partial(validation_collate if validation else collate_flow,
-                          native_content=bool(self.settings['model'].get('native_content_rate', False)))
-        kwargs = dict(num_workers=workers, pin_memory=not validation,
-                      persistent_workers=workers > 0, collate_fn=collate)
+        workers = int(self.settings['num_workers'])
+        kwargs = dict(num_workers=workers, pin_memory=not validation, persistent_workers=workers > 0,
+                      collate_fn=validation_collate if validation else collate_flow)
         if workers:
             kwargs.update(prefetch_factor=self.settings['dataloader_prefetch_factor'], multiprocessing_context='spawn')
         return DataLoader(dataset, batch_sampler=sampler, **kwargs)
@@ -152,8 +145,7 @@ class FlowTask(pl.LightningModule):
         self.settings, self.data = config['flow'], config['data']
         self.finetune = finetune
         self.model = build_flow(config, datamodule.speaker_count).float()
-        if self.model.reference:
-            self.model.encoder.init_content_scale(content_rms(datamodule.originals))
+        self.model.encoder.init_content_scale(content_rms(datamodule.originals))
         self.base_lr = args.learning_rate or self.settings['finetune_learning_rate' if finetune else 'learning_rate']
         self.valid_losses = torch.nn.ModuleDict({name: MeanMetric() for name in ('total_loss', 'mel_loss', 'aux_mel_loss')})
         self.skip_immediate_validation = False
@@ -162,17 +154,9 @@ class FlowTask(pl.LightningModule):
         self.trained_epoch = 1
 
     def run_model(self, batch):
-        (mel, content, f0, energy, breathiness, key_shift, speed, speaker, mask,
-         harmonic_prior, voicing, tension, content_mask) = unpack_flow(batch, self.device, True)
-        mel = normalize_mel(mel, self.data)
-        if not self.model.reference:
-            mel = mel * mask
-        flow, auxiliary = self.model(
-            mel, content, f0, energy, speaker, mask,
-            speaker_dropout=self.settings['speaker_dropout'] if self.training else 0.0,
-            breathiness=breathiness, key_shift=key_shift, speed=speed, voicing=voicing, tension=tension,
-            harmonic_prior=harmonic_prior if harmonic_prior.shape[1] else None, content_mask=content_mask,
-        )
+        mel, content, content_mask, f0, key_shift, speed, speaker, mask = unpack_flow(batch, self.device, True)
+        flow, auxiliary = self.model(normalize_mel(mel, self.data), content, f0, speaker, mask,
+                                     content_mask, key_shift, speed)
         aux = flow.new_zeros(()) if auxiliary is None else auxiliary * self.settings['aux_mel_weight']
         return dict(mel_loss=flow, aux_mel_loss=aux, total_loss=flow + aux)
 
@@ -220,7 +204,7 @@ class FlowTask(pl.LightningModule):
         settings = self.settings
         if settings['optimizer'] == 'muon':
             return MuonAdamW(self.model, self.base_lr, muon_weight_decay=settings['weight_decay'],
-                             adamw_weight_decay=settings['adamw_weight_decay'], min_fan_in=settings['muon_min_fan_in'],
+                             adamw_weight_decay=settings['adamw_weight_decay'],
                              betas=tuple(settings['betas']), iteration_dtype=torch.float16 if self.device.type == 'cuda' else torch.float32)
         if settings['optimizer'] == 'adamw':
             return torch.optim.AdamW(self.model.parameters(), lr=self.base_lr, betas=tuple(settings['betas']),
@@ -229,7 +213,7 @@ class FlowTask(pl.LightningModule):
 
     def build_scheduler(self, optimizer):
         settings = self.settings
-        warmup = settings.get('finetune_warmup_steps', 0) if self.finetune else settings['warmup_steps']
+        warmup = settings['finetune_warmup_steps'] if self.finetune else settings['warmup_steps']
         if settings['lr_schedule'] == 'step' and not (warmup or settings['min_learning_rate'] or settings['step_lr_offset']):
             return torch.optim.lr_scheduler.StepLR(optimizer, step_size=settings['decay_step'], gamma=settings['gamma'])
         total = self.args.max_updates or self.trainer.estimated_stepping_batches
@@ -256,12 +240,10 @@ class FlowTask(pl.LightningModule):
 
     def metadata(self):
         data = self.data_module
-        result = dict(config=self.config, speaker_count=self.model.speaker_count,
-                      embedder_model=data.embedder, step=self.global_step,
-                      finetune=self.finetune, precision=self.args.precision, trained_epoch=self.trained_epoch)
-        if data.multispeaker:
-            result.update(speaker_ids=sorted(data.inventory), feature_metadata=data.feature_metadata)
-        return result
+        return dict(config=self.config, speaker_count=self.model.speaker_count,
+                    embedder_model=data.embedder, step=self.global_step,
+                    finetune=self.finetune, precision=self.args.precision, trained_epoch=self.trained_epoch,
+                    speaker_ids=sorted(data.inventory), feature_metadata=data.feature_metadata)
 
     def on_save_checkpoint(self, checkpoint):
         checkpoint.update(self.metadata())
@@ -274,7 +256,6 @@ class FlowTask(pl.LightningModule):
 
     def on_load_checkpoint(self, checkpoint):
         saved = resolve_config(checkpoint['config'])
-        saved['flow']['model'].setdefault('use_continuous_f0', saved['flow']['model'].get('conditioning_version') == 5)
         select_fused_activation(saved, getattr(self.args, 'use_fused_kernels', False))
         if saved['data'] != self.data or saved['flow']['model'] != self.settings['model']:
             raise ValueError('Resume architecture or audio configuration differs from the checkpoint.')
@@ -283,12 +264,12 @@ class FlowTask(pl.LightningModule):
         data = self.data_module
         if checkpoint.get('embedder_model') != data.embedder:
             raise ValueError('Resume content embedder differs from the checkpoint.')
-        if data.multispeaker and (checkpoint.get('speaker_ids') != sorted(data.inventory) or
-                                 checkpoint.get('feature_metadata') != data.feature_metadata):
+        if (checkpoint.get('speaker_ids') != sorted(data.inventory) or
+                checkpoint.get('feature_metadata') != data.feature_metadata):
             raise ValueError('Speaker IDs or extraction metadata changed. Use a new experiment.')
         self.skip_immediate_validation = checkpoint.get('trainer_stage') == 'validate'
         self.resume_random = checkpoint.get('random_states')
-        self.trained_epoch = checkpoint.get('trained_epoch', checkpoint['epoch'] + 1)
+        self.trained_epoch = checkpoint['trained_epoch']
         if checkpoint.get('optimizer_states'):
             optimizer = self.build_optimizer()
             scheduler = self.build_scheduler(optimizer)
@@ -308,20 +289,18 @@ class FlowTask(pl.LightningModule):
 
     def load_pretrained(self, path):
         state = torch.load(path, map_location='cpu', weights_only=True)
-        source = resolve_config(state.get('config', {}))
+        if state.get('kind') != 'rectified_flow':
+            raise ValueError('Choose a Rectified Flow voice checkpoint for fine-tuning.')
+        source = resolve_config(state['config'])
         select_fused_activation(source, getattr(self.args, 'use_fused_kernels', False))
-        source_model, target_model = deepcopy(source['flow']['model']), deepcopy(self.settings['model'])
-        for candidate in (source_model, target_model):
-            candidate.pop('use_continuous_f0', None)
-        source_data, target_data = ({key: value for key, value in data.items() if key != 'pitch_extractor'}
-                                    for data in (source['data'], self.data))
-        if source_data != target_data or source_model != target_model:
+        if source['data'] != self.data or source['flow']['model'] != self.settings['model']:
             raise ValueError('Pretrained architecture or audio configuration differs from the experiment.')
-        if state.get('embedder_model', self.data_module.embedder) != self.data_module.embedder:
+        if state['embedder_model'] != self.data_module.embedder:
             raise ValueError('Pretrained flow uses a different content embedder.')
-        speaker_init = self.model.encoder.speaker.weight if self.model.use_spk_id else None
-        self.model.load_state_dict(resize_speakers(state['model'], self.model.speaker_count, speaker_init,
-                                                  null_speaker=self.model.encoder.has_null_speaker), strict=True)
+        weights = dict(state['model'])
+        if self.model.use_spk_id:
+            weights['encoder.speaker.weight'] = self.model.encoder.speaker.weight.detach().clone()
+        self.model.load_state_dict(weights, strict=True)
 
 
 class FlowCheckpoint(ModelCheckpoint):
@@ -381,7 +360,7 @@ class FlowPreview(pl.Callback):
         self.last_step = -1
 
     def on_fit_start(self, trainer, task):
-        if trainer.is_global_zero and self.args.vocoder and task.settings.get('val_with_vocoder', True):
+        if trainer.is_global_zero and self.args.vocoder and task.settings['val_with_vocoder']:
             self.vocoder, _ = load_vocoder(self.args.vocoder, task.data)
             self.vocoder = self.vocoder.to(task.device)
 
@@ -398,7 +377,7 @@ class FlowPreview(pl.Callback):
             self.render(trainer, task)
 
     def on_train_batch_end(self, trainer, task, outputs, batch, batch_idx):
-        interval = task.settings.get('finetune_preview_interval', 500) if task.finetune else task.settings.get('preview_interval', 0)
+        interval = task.settings['finetune_preview_interval'] if task.finetune else task.settings['preview_interval']
         if interval and trainer.global_step and trainer.global_step % interval == 0:
             self.render(trainer, task)
 
@@ -420,37 +399,6 @@ def trainer_device_options(args, settings):
     return dict(accelerator='gpu', devices=[int(value[5:]) for value in devices])
 
 
-def migrate_legacy_checkpoint(path, trainer):
-    legacy = torch.load(path, map_location='cpu', weights_only=True)
-    loops = trainer.fit_loop.state_dict()
-    step = legacy['step']
-    epoch = legacy['epoch'] - 1
-    completed = bool(legacy.get('epoch_complete', True))
-    for values in loops['epoch_loop.automatic_optimization.optim_progress']['optimizer']['step'].values():
-        values.update(ready=step, completed=step)
-    loops['epoch_loop.state_dict']['_batches_that_stepped'] = step
-    for values in loops['epoch_progress'].values():
-        values.update(ready=epoch + 1, started=epoch + 1, processed=epoch + int(completed), completed=epoch + int(completed))
-    if not completed:
-        for values in loops['epoch_loop.batch_progress'].values():
-            if isinstance(values, dict):
-                values.update({key: legacy.get('batch_in_epoch', 0) for key in values})
-    checkpoint = dict(state_dict={f'model.{key}': value for key, value in legacy['model'].items()},
-                      optimizer_states=[legacy['optimizer']], lr_schedulers=[], epoch=epoch,
-                      global_step=step, loops={'fit_loop': loops}, **{'pytorch-lightning_version': pl.__version__})
-    for key in ('config', 'embedder_model', 'speaker_count', 'speaker_ids', 'feature_metadata', 'random_states', 'finetune'):
-        if key in legacy:
-            checkpoint[key] = legacy[key]
-    if legacy.get('scaler'):
-        checkpoint['MixedPrecision'] = legacy['scaler']
-    converted = path.with_name('legacy_lightning.ckpt')
-    if trainer.is_global_zero:
-        atomic_save(checkpoint, converted)
-        print('Migrated legacy trainer checkpoint to Lightning. Mid-epoch replay follows Lightning resume behavior.', flush=True)
-    trainer.strategy.barrier()
-    return str(converted)
-
-
 def fit(args, config, root):
     pl.seed_everything(args.seed, workers=True)
     experiment = root / 'logs' / args.model_name
@@ -458,14 +406,12 @@ def fit(args, config, root):
     settings = config['flow']
     data = FlowDataModule(experiment, root, config, args)
     checkpoint_path = None if args.fresh else latest_checkpoint(output)
-    legacy_path = output / 'checkpoint.pth'
-    resume_state = torch.load(checkpoint_path or legacy_path, map_location='cpu', weights_only=True) if (
-        not args.fresh and (checkpoint_path or legacy_path.exists())
-    ) else None
-    finetune = bool(resume_state.get('finetune', False)) if resume_state else bool(args.pretrained_flow)
-    del resume_state
+    if checkpoint_path:
+        finetune = bool(torch.load(checkpoint_path, map_location='cpu', weights_only=True)['finetune'])
+    else:
+        finetune = bool(args.pretrained_flow)
     task = FlowTask(config, args, data, finetune)
-    if not checkpoint_path and (args.fresh or not legacy_path.exists()) and args.pretrained_flow:
+    if not checkpoint_path and args.pretrained_flow:
         task.load_pretrained(args.pretrained_flow)
     options = trainer_device_options(args, settings)
     strategy = settings['strategy']
@@ -486,13 +432,13 @@ def fit(args, config, root):
             parameters.setdefault('process_group_backend', 'gloo' if os.name == 'nt' or options['accelerator'] == 'cpu' else 'nccl')
         strategy = registration['strategy'](**parameters)
     precision = {'fp32': '32-true', 'fp16': '16-mixed', 'bf16': 'bf16-mixed'}[args.precision]
-    has_validation = bool(data.held and settings.get('eval_interval', 0))
+    has_validation = bool(data.held and settings['eval_interval'])
     trainer = pl.Trainer(
         **options, num_nodes=settings['num_nodes'], strategy=strategy, precision=precision,
         callbacks=[FlowCheckpoint(output, args, settings, has_validation), FlowPreview(args)],
         logger=TensorBoardLogger(save_dir=str(output), name='lightning_logs', version='latest'),
         gradient_clip_val=settings['grad_clip'],
-        val_check_interval=max(1, settings.get('eval_interval', 4000)) * settings['accumulate_grad_batches'],
+        val_check_interval=max(1, settings['eval_interval']) * settings['accumulate_grad_batches'],
         check_val_every_n_epoch=None, log_every_n_steps=1,
         max_steps=args.max_updates if args.epochs is None else -1,
         max_epochs=-1 if args.epochs is None else args.epochs,
@@ -504,17 +450,12 @@ def fit(args, config, root):
         output.mkdir(parents=True, exist_ok=True)
         if args.fresh:
             old = list(output.glob('*.ckpt')) + list(output.glob(f'{args.model_name}_flow_*.pth'))
-            old += list(output.glob(f'{args.model_name}_trainer_*.pth'))
-            if legacy_path.exists():
-                old.append(legacy_path)
             if old:
                 archive = output / f'previous-run-{time.time_ns()}'
                 archive.mkdir()
                 for path in old:
                     path.rename(archive / path.name)
-        (experiment / 'rectified_config.json').write_text(json.dumps(compact_config(config), indent=2) + '\n', encoding='utf-8')
-    if not checkpoint_path and legacy_path.exists() and not args.fresh:
-        checkpoint_path = migrate_legacy_checkpoint(legacy_path, trainer)
+        (experiment / 'rectified_config.json').write_text(json.dumps(config, indent=2) + '\n', encoding='utf-8')
     trainer.fit(task, datamodule=data, ckpt_path=checkpoint_path)
     if trainer.is_global_zero:
         print(f'Finished at Lightning step {trainer.global_step}. Checkpoints and TensorBoard previews: {output}', flush=True)

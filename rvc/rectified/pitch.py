@@ -6,10 +6,6 @@ PARSELMOUTH_F0_MIN = 65.0
 PARSELMOUTH_F0_MAX = 1100.0
 
 
-def uses_parselmouth(data):
-    return data.get('pitch_extractor') == 'parselmouth'
-
-
 def interpolate_f0(f0):
     f0 = np.asarray(f0, dtype=np.float32).copy()
     if f0.ndim != 1 or not len(f0) or not np.isfinite(f0).all() or (f0 < 0).any():

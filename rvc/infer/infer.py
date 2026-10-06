@@ -671,14 +671,8 @@ class VoiceConverter:
                 if not is_rectified(self.cpt):
                     raise ValueError('Select an RVC model or Rectified Flow voice checkpoint, not a vocoder checkpoint.')
                 self.cpt['config'] = resolve_config(self.cpt['config'])
-                weights = self.cpt['ema']['shadow'] if self.cpt.get('ema') else self.cpt['model']
-                model_config = self.cpt['config']['flow']['model']
-                if model_config.get('use_spk_id', True):
-                    rows = weights['encoder.speaker.weight'].shape[0]
-                    fallback = rows - int(model_config.get('conditioning_version', 2) == 2)
-                    self.n_spk = int(self.cpt.get('speaker_count', fallback))
-                else:
-                    self.n_spk = 1
+                weights = self.cpt['model']
+                self.n_spk = int(self.cpt['speaker_count'])
                 self.tgt_sr = int(self.cpt['config']['data']['sample_rate'])
                 self.version, self.use_f0 = 'v2', 1
                 self.text_enc_hidden_dim = int(self.cpt['config']['flow']['model']['content_channels'])
