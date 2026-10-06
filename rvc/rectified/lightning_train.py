@@ -16,7 +16,7 @@ from torchmetrics import MeanMetric
 from rvc.rectified.augmentation import is_augmented, prepare_augmentation
 from rvc.rectified.config import compact_config, resolve_config
 from rvc.rectified.data import (
-    FlowBatchSampler, RectifiedDataset, collate_flow, prepare_training_cache,
+    FlowBatchSampler, RectifiedDataset, collate_flow, content_rms, prepare_training_cache,
     read_filelist, speaker_inventory, split_holdout, unpack_flow,
 )
 from rvc.rectified.distributed import parse_devices
@@ -149,6 +149,8 @@ class FlowTask(pl.LightningModule):
         self.settings, self.data = config['flow'], config['data']
         self.finetune = finetune
         self.model = build_flow(config, datamodule.speaker_count).float()
+        if self.model.reference:
+            self.model.encoder.init_content_scale(content_rms(datamodule.originals))
         self.base_lr = args.learning_rate or self.settings['finetune_learning_rate' if finetune else 'learning_rate']
         self.valid_losses = torch.nn.ModuleDict({name: MeanMetric() for name in ('total_loss', 'mel_loss', 'aux_mel_loss')})
         self.skip_immediate_validation = False

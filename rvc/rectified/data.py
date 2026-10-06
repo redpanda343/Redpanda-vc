@@ -597,6 +597,16 @@ def collate_flow(batch, frames=None):
     result = (mel, content, f0, energy, breathiness, key_shift, speed, speaker, mask, harmonic_prior)
     return (*result, voicing, tension) if extended else result
 
+def content_rms(entries, limit=64):
+    total, count = 0.0, 0
+    for entry in [entry for entry in entries if not str(entry[1]).endswith('.flow.npz')][:limit]:
+        values = np.load(entry[1], allow_pickle=False).astype(np.float64)
+        total += float(np.square(values).sum())
+        count += values.size
+    if not count or not total > 0:
+        raise ValueError('Training content features are empty; re-extract features.')
+    return math.sqrt(total / count)
+
 def read_filelist(path, root, originals_only=False):
     rows = []
     for number, line in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), 1):

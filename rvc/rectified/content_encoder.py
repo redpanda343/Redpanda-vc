@@ -118,6 +118,11 @@ class ContentConditionEncoder(nn.Module):
         if self.speaker is not None:
             nn.init.normal_(self.speaker.weight, std=hidden_channels ** -0.5)
 
+    def init_content_scale(self, rms):
+        fan_in, fan_out = self.content.in_features, self.content.out_features
+        nn.init.normal_(self.content.weight, std=1.0 / (math.sqrt(fan_in * fan_out) * float(rms)))
+        nn.init.zeros_(self.content.bias)
+
     def voice(self, speaker):
         return self.speaker(speaker) if self.speaker is not None else None
 
