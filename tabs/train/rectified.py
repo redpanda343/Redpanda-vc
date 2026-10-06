@@ -142,7 +142,7 @@ def resolve_pretrained(directory, enabled, preferred=''):
 
 
 def start(name, batch, max_frames, max_updates, checkpoint_interval, device, use_fused_kernels=False,
-          use_pretrained=False, pretrained_path='', realtime=False):
+          use_pretrained=False, pretrained_path='', realtime=False, shortcut=False):
     directory = experiment_path(name)
     device_id(device)
     if not (directory / 'filelist.txt').is_file():
@@ -154,7 +154,8 @@ def start(name, batch, max_frames, max_updates, checkpoint_interval, device, use
     pitch_extractor = experiment_pitch_extractor(directory)
 
     try:
-        selected = load_training_config(directory, pretrained or None, use_fused_kernels, preset, pitch_extractor)
+        selected = load_training_config(directory, pretrained or None, use_fused_kernels, preset, pitch_extractor,
+                                        bool(shortcut))
     except ValueError as error:
         raise gr.Error(str(error)) from error
     precision = get_precision() or selected['flow'].get('precision', 'fp32')
@@ -173,6 +174,8 @@ def start(name, batch, max_frames, max_updates, checkpoint_interval, device, use
         arguments.extend(['--device', str(device).strip().lower()])
     if use_fused_kernels:
         arguments.append('--use-fused-kernels')
+    if shortcut:
+        arguments.append('--shortcut')
     if pretrained:
         arguments.extend(['--pretrained-flow', pretrained])
     return launch(name, 'rvc.rectified.train_flow', arguments, 'Training rectified flow')
@@ -241,6 +244,10 @@ def rectified_train_tab():
                                info='Smaller, deeper model for new experiments: 256 hidden / 6 encoder layers, '
                                     '512-channel backbone with 12 layers, 384-channel aux decoder with 8 layers. '
                                     'Keep it set the same when resuming.')
+        shortcut = gr.Checkbox(label='Shortcut (few-step) flow', value=False,
+                               info='Optional. Trains the flow to also take larger steps (Frans et al., 2024), so it can '
+                                    'sample in 1, 2, 4, 8... steps. Costs about 15% more per update. Off keeps the '
+                                    'DiffSinger flow unchanged. Set it when the experiment starts and keep it when resuming.')
         use_fused_kernels = gr.Checkbox(label='Fused Linear + SoftSignGLU kernels', value=False,
                                        info='Overrides the configured activation with SoftSignGLU, including on resume. Requires Triton and CUDA FP16 or BF16 for acceleration.')
         with gr.Row():
@@ -252,6 +259,6 @@ def rectified_train_tab():
     preprocess_button.click(preprocess, [name, dataset, workers, slicing], outputs, queue=False)
     extract_button.click(extract, [name, workers, device, embedder, pitch_extractor], outputs, queue=False)
     train_button.click(start, [name, batch, max_frames, max_updates, checkpoint_interval, device, use_fused_kernels,
-                               use_pretrained, pretrained_path, realtime], outputs, queue=False)
+                               use_pretrained, pretrained_path, realtime, shortcut], outputs, queue=False)
     stop_button.click(stop, [], outputs, queue=False)
     gr.Timer(2).tick(status, [], outputs, queue=False)

@@ -14,6 +14,7 @@ from rvc.lib.utils import extract_embedding_features
 
 SUPPORTED_VOCODERS = {"HiFi-GAN", "RefineGAN"}
 SUPPORTED_EMBEDDERS = {"contentvec", "spin-v2"}
+FLOW_WINDOW_CONTEXT = 0.5
 
 
 class RMVPEViterbi:
@@ -154,6 +155,7 @@ class RealTimeRVC:
         rectified_vocoder_path="",
         rectified_steps=0,
         rectified_cuda_graph=True,
+        rectified_flow_window=True,
     ):
         self.converter = VoiceConverter()
         self.converter.get_vc(model_path, speaker_id)
@@ -226,6 +228,14 @@ class RealTimeRVC:
             if int(rectified_steps) != rectified_steps or not 0 <= rectified_steps <= 1000:
                 raise ValueError("Flow steps must be an integer between 0 and 1000.")
             self.rectified_steps = int(rectified_steps) or None
+            steps = self.rectified_steps or self.model.sampling_steps
+            if self.model.shortcut and (steps & (steps - 1) or steps > self.model.shortcut_steps):
+                raise ValueError(f"This shortcut flow needs a power of two up to {self.model.shortcut_steps} flow steps.")
+            self.flow_context_frames = None
+            if rectified_flow_window:
+                self.flow_context_frames = math.ceil(
+                    FLOW_WINDOW_CONTEXT * self.sample_rate / int(self.pipeline.data["hop_length"])
+                )
             self.flow_sampler = RealtimeFlowSampler(self.model, enabled=rectified_cuda_graph)
             self.pipeline.set_vocoder(rectified_vocoder_path)
             path = self.pipeline.vocoder_path or default_vocoder()
@@ -472,10 +482,14 @@ class RealTimeRVC:
             variances = torch.from_numpy(curves).to(self.device)[None]
         f0 = torch.from_numpy(f0).to(waveform.device)[None] * 2 ** (self.pitch / 12)
         mask = torch.ones(1, 1, frames, device=self.device)
-        mel = self.flow_sampler(features.float(), f0, speaker, mask, steps=self.rectified_steps, variances=variances)
-        mel, vocoder_f0 = guard_unvoiced(mel, f0, source, voiced, self.pipeline.data)
         first_frame = max(0, start // hop - self.vocoder_context_frames)
-        audio = self.pipeline.vocoder_model(mel[..., first_frame:], vocoder_f0[..., first_frame:])[0, 0]
+        window = 0 if self.flow_context_frames is None else max(0, first_frame - self.flow_context_frames)
+        mel = self.flow_sampler(features.float(), f0, speaker, mask, steps=self.rectified_steps, variances=variances,
+                                start=window)
+        mel, vocoder_f0 = guard_unvoiced(mel, f0[..., window:], source[window * hop:], voiced[window:],
+                                         self.pipeline.data)
+        offset = first_frame - window
+        audio = self.pipeline.vocoder_model(mel[..., offset:], vocoder_f0[..., offset:])[0, 0]
         start -= first_frame * hop
         audio = audio[start:start + count]
         if audio.numel() != count:

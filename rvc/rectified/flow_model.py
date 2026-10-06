@@ -124,7 +124,7 @@ class LYNXNet2Block(nn.Module):
 
 class LYNXNet2Backbone(nn.Module):
     def __init__(self, n_mels, cond_channels, channels=1024, layers=6, expansion=1, kernel_size=31,
-                 glu_type='atanglu', dropout_rate=0.0, use_conditioner_cache=True):
+                 glu_type='atanglu', dropout_rate=0.0, use_conditioner_cache=True, shortcut_steps=0):
         super().__init__()
         self.channels = int(channels)
         self.use_conditioner_cache = bool(use_conditioner_cache)
@@ -133,6 +133,14 @@ class LYNXNet2Backbone(nn.Module):
         self.time_mlp = nn.Sequential(
             nn.Linear(channels, channels * 4), nn.GELU(), nn.Linear(channels * 4, channels)
         )
+        self.step_mlp = None
+        if shortcut_steps:
+            self.flow_step = math.log2(shortcut_steps)
+            self.step_mlp = nn.Sequential(
+                nn.Linear(channels, channels * 4), nn.GELU(), nn.Linear(channels * 4, channels)
+            )
+            nn.init.zeros_(self.step_mlp[-1].weight)
+            nn.init.zeros_(self.step_mlp[-1].bias)
         self.layers = nn.ModuleList(
             [LYNXNet2Block(channels, expansion, kernel_size, glu_type, dropout_rate) for _ in range(layers)]
         )
@@ -147,9 +155,14 @@ class LYNXNet2Backbone(nn.Module):
     def prepare_conditioning(self, cond):
         return self.input_cond(cond).transpose(1, 2)
 
-    def forward(self, x, t, cond, prepared=None):
+    def forward(self, x, t, cond, prepared=None, step=None):
         time = self.time_mlp(timestep_embedding(t.reshape(-1), self.channels))
         time = time.view(t.shape[0], -1, self.channels)
+        if self.step_mlp is not None:
+            if step is None:
+                step = torch.full((x.shape[0],), self.flow_step, device=x.device)
+            step = self.step_mlp(timestep_embedding(step.reshape(-1), self.channels, scale=1.0))
+            time = time + step.view(x.shape[0], 1, self.channels)
         h = self.input(x.transpose(1, 2))
         h = h + (self.prepare_conditioning(cond) if prepared is None else prepared) + time
         for layer in self.layers:
@@ -203,6 +216,10 @@ class RectifiedFlow(nn.Module):
         dual_timestep: bool = True,
         sampling_method: str = "euler",
         sampling_steps: int = 20,
+        shortcut: bool = False,
+        shortcut_steps: int = 128,
+        shortcut_bootstrap_every: int = 8,
+        shortcut_ema: float = 0.999,
         train_aux_decoder: bool = True,
         train_diffusion: bool = True,
         val_gt_start: bool = False,
@@ -227,7 +244,12 @@ class RectifiedFlow(nn.Module):
             variances=variance_names(dict(use_breathiness_embed=use_breathiness_embed,
                                           use_voicing_embed=use_voicing_embed)),
         )
-        self.backbone = LYNXNet2Backbone(n_mels, hidden_channels, **(backbone_args or {}))
+        self.shortcut = bool(shortcut)
+        self.shortcut_steps = int(shortcut_steps)
+        self.shortcut_bootstrap_every = int(shortcut_bootstrap_every)
+        self.shortcut_ema = float(shortcut_ema)
+        self.backbone = LYNXNet2Backbone(n_mels, hidden_channels, **(backbone_args or {}),
+                                         shortcut_steps=self.shortcut_steps if self.shortcut else 0)
         self.aux = AuxDecoder(hidden_channels, n_mels, **(aux_decoder or {}))
         self.t_start = float(t_start)
         self.t_start_infer = float(t_start_infer)
@@ -254,7 +276,26 @@ class RectifiedFlow(nn.Module):
     def _uniform_times(self, batch, device):
         return self.t_start + (1.0 - self.t_start) * torch.rand(batch, device=device)
 
-    def forward(self, mel, content, f0, speaker, mask, content_mask=None, key_shift=None, speed=None, variances=None):
+    def _shortcut_targets(self, teacher, count, mel, noise, inputs):
+        levels = int(math.log2(self.shortcut_steps))
+        level = torch.randint(0, levels, (count,), device=mel.device)
+        sections = (2 ** level).float()
+        span = 1.0 - self.t_start
+        t = self.t_start + span * torch.floor(torch.rand(count, device=mel.device) * sections) / sections
+        half = span / sections / 2
+        mixing = t[:, None, None]
+        x_t = (1.0 - mixing) * noise[:count] + mixing * mel[:count]
+        with torch.no_grad():
+            cond = teacher.encoder(*(None if value is None else value[:count] for value in inputs))
+            step = (level + 1).float()
+            first = teacher.backbone(x_t, t, cond, step=step)
+            middle = (x_t + half[:, None, None] * first).clamp(-4.0, 4.0)
+            second = teacher.backbone(middle, t + half, cond, step=step)
+            target = ((first + second) / 2).clamp(-4.0, 4.0)
+        return x_t, t, target.to(mel.dtype), level.float()
+
+    def forward(self, mel, content, f0, speaker, mask, content_mask=None, key_shift=None, speed=None, variances=None,
+                teacher=None):
         cond = self.encoder(content, f0, speaker, mask, content_mask, key_shift, speed, variances)
         t = self._uniform_times(mel.shape[0], mel.device)
         if self.dual_timestep:
@@ -270,8 +311,24 @@ class RectifiedFlow(nn.Module):
             return cond.sum() * 0.0, aux
         mixing = t[:, None, None] if t.ndim == 1 else t[:, None, :]
         x_t = (1.0 - mixing) * noise + mixing * mel
-        prediction = self.backbone(x_t, t, cond)
-        flow = ((prediction.float() - (mel - noise).float()).square() * mask).mean()
+        target = mel - noise
+        step = None
+        if self.shortcut:
+            batch = mel.shape[0]
+            step = torch.full((batch,), self.backbone.flow_step, device=mel.device)
+            count = batch // self.shortcut_bootstrap_every
+            if not count and torch.rand(()).item() < batch / self.shortcut_bootstrap_every:
+                count = 1
+            if count:
+                if teacher is None:
+                    raise ValueError('Shortcut training needs the EMA teacher for its self-consistency targets.')
+                inputs = (content, f0, speaker, mask, content_mask, key_shift, speed, variances)
+                boot_x, boot_t, boot_target, boot_step = self._shortcut_targets(teacher, count, mel, noise, inputs)
+                x_t, target, t, step = x_t.clone(), target.clone(), t.clone(), step.clone()
+                x_t[:count], target[:count], step[:count] = boot_x, boot_target, boot_step
+                t[:count] = boot_t if t.ndim == 1 else boot_t[:, None]
+        prediction = self.backbone(x_t, t, cond, step=step)
+        flow = ((prediction.float() - target.float()).square() * mask).mean()
         return flow, aux
 
     def predict_mel(self, content, f0, speaker, mask, content_mask=None, key_shift=None, speed=None, variances=None):
@@ -292,18 +349,28 @@ class RectifiedFlow(nn.Module):
         noise: Optional[torch.Tensor] = None,
         source_mel: Optional[torch.Tensor] = None,
         variances: Optional[torch.Tensor] = None,
+        start: int = 0,
     ):
         method = self.sampling_method if method is None else method
         steps = max(1, int(self.sampling_steps if steps is None else steps))
         if method not in SAMPLERS:
             raise ValueError(f"method must be one of {SAMPLERS}, not {method!r}.")
+        batch = content.shape[0]
+        step = None
+        if self.shortcut:
+            if steps & (steps - 1) or steps > self.shortcut_steps:
+                raise ValueError(f"Shortcut flows sample with a power of two up to {self.shortcut_steps} steps, not {steps}.")
+            method = "euler"
+            step = torch.full((batch,), math.log2(steps), device=content.device)
         cond = self.encoder(content, f0, speaker, mask, content_mask, key_shift, speed, variances)
+        if start:
+            cond, mask = cond[..., start:], mask[..., start:]
+            source_mel = None if source_mel is None else source_mel[..., start:]
         prepared = self.backbone.prepare_conditioning(cond) if self.backbone.use_conditioner_cache else None
 
         def field(x, t):
-            return self.backbone(x, t, cond, prepared=prepared)
+            return self.backbone(x, t, cond, prepared=prepared, step=step)
 
-        batch = content.shape[0]
         if noise is None:
             noise = torch.randn((batch, self.n_mels, mask.shape[-1]), device=content.device)
         t0 = self.t_start_infer
@@ -338,7 +405,7 @@ class RectifiedFlow(nn.Module):
 def validate_model_config(model: dict):
     for name in ('use_rope', 'rope_interleaved', 'use_spk_id', 'key_shift', 'speed', 'dual_timestep',
                  'train_aux_decoder', 'train_diffusion', 'val_gt_start', 'use_breathiness_embed',
-                 'use_voicing_embed'):
+                 'use_voicing_embed', 'shortcut'):
         if not isinstance(model[name], bool):
             raise ValueError(f'{name} must be a boolean.')
     for section, key in ((model, 'enc_ffn_kernel_size'), (model['aux_decoder'], 'kernel_size'),
@@ -352,13 +419,27 @@ def validate_model_config(model: dict):
         raise ValueError(f"Unsupported flow activation: {model['backbone_args']['glu_type']!r}.")
     if model['sampling_method'] not in SAMPLERS:
         raise ValueError(f'Flow sampler must be one of {SAMPLERS}.')
+    if model['shortcut']:
+        total = model['shortcut_steps']
+        if isinstance(total, bool) or not isinstance(total, int) or total < 2 or total & (total - 1):
+            raise ValueError('shortcut_steps must be a power of two of at least 2.')
+        steps = model['sampling_steps']
+        if steps & (steps - 1) or steps > total:
+            raise ValueError(f'Shortcut flows sample with a power of two up to {total} steps.')
+        every = model['shortcut_bootstrap_every']
+        if isinstance(every, bool) or not isinstance(every, int) or every < 1:
+            raise ValueError('shortcut_bootstrap_every must be a positive integer.')
+        if not 0.0 < model['shortcut_ema'] < 1.0:
+            raise ValueError('shortcut_ema must be between 0 and 1.')
+        if model['t_start_infer'] != model['t_start']:
+            raise ValueError('Shortcut flows must sample from the training start time (t_start_infer = t_start).')
 
 
 def build_flow(config: dict, speaker_count: int) -> RectifiedFlow:
     config = resolve_config(config)
     model = config["flow"]["model"]
     validate_model_config(model)
-    if (model["sampling_method"], model["sampling_steps"]) == LEGACY_SAMPLER:
+    if not model["shortcut"] and (model["sampling_method"], model["sampling_steps"]) == LEGACY_SAMPLER:
         model = dict(model, sampling_method=DEFAULT_SAMPLER[0], sampling_steps=DEFAULT_SAMPLER[1])
     data = config["data"]
     return RectifiedFlow(

@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 import re
@@ -31,6 +32,13 @@ from rvc.rectified.variance import variance_names
 from rvc.rectified.vocoder import load_vocoder
 
 torch.multiprocessing.set_sharing_strategy(os.getenv('TORCH_SHARE_STRATEGY', 'file_system'))
+
+
+SAMPLER_KEYS = ('sampling_method', 'sampling_steps', 'shortcut', 'shortcut_steps', 'shortcut_bootstrap_every', 'shortcut_ema')
+
+
+def sampler_free(model):
+    return {key: value for key, value in model.items() if key not in SAMPLER_KEYS}
 
 
 def validation_collate(batch):
@@ -144,6 +152,7 @@ class FlowTask(pl.LightningModule):
         self.finetune = finetune
         self.model = build_flow(config, datamodule.speaker_count).float()
         self.model.encoder.init_content_scale(content_rms(datamodule.originals))
+        self.ema_model = copy.deepcopy(self.model).requires_grad_(False).eval() if self.model.shortcut else None
         self.base_lr = args.learning_rate or self.settings['finetune_learning_rate' if finetune else 'learning_rate']
         self.valid_losses = torch.nn.ModuleDict({name: MeanMetric() for name in ('total_loss', 'mel_loss', 'aux_mel_loss')})
         self.skip_immediate_validation = False
@@ -154,9 +163,25 @@ class FlowTask(pl.LightningModule):
     def run_model(self, batch):
         mel, content, content_mask, f0, key_shift, speed, speaker, mask, variances = unpack_flow(batch, self.device, True)
         flow, auxiliary = self.model(normalize_mel(mel, self.data), content, f0, speaker, mask,
-                                     content_mask, key_shift, speed, variances)
+                                     content_mask, key_shift, speed, variances, teacher=self.ema_model)
         aux = flow.new_zeros(()) if auxiliary is None else auxiliary * self.settings['aux_mel_weight']
         return dict(mel_loss=flow, aux_mel_loss=aux, total_loss=flow + aux)
+
+    def train(self, mode=True):
+        super().train(mode)
+        if self.ema_model is not None:
+            self.ema_model.eval()
+        return self
+
+    @torch.no_grad()
+    def on_before_zero_grad(self, optimizer):
+        if self.ema_model is None:
+            return
+        decay = self.model.shortcut_ema
+        online = list(self.model.parameters()) + list(self.model.buffers())
+        averaged = list(self.ema_model.parameters()) + list(self.ema_model.buffers())
+        floats = [(a, o) for a, o in zip(averaged, online) if a.is_floating_point()]
+        torch._foreach_lerp_([a for a, _ in floats], [o.detach() for _, o in floats], 1.0 - decay)
 
     def training_step(self, batch, batch_idx):
         self.trained_epoch = self.current_epoch + 1
@@ -289,14 +314,19 @@ class FlowTask(pl.LightningModule):
             raise ValueError('Choose a Rectified Flow voice checkpoint for fine-tuning.')
         source = resolve_config(state['config'])
         select_fused_activation(source, getattr(self.args, 'use_fused_kernels', False))
-        if source['data'] != self.data or source['flow']['model'] != self.settings['model']:
+        if source['data'] != self.data or sampler_free(source['flow']['model']) != sampler_free(self.settings['model']):
             raise ValueError('Pretrained architecture or audio configuration differs from the experiment.')
         if state['embedder_model'] != self.data_module.embedder:
             raise ValueError('Pretrained flow uses a different content embedder.')
         weights = dict(state['model'])
         if self.model.use_spk_id:
             weights['encoder.speaker.weight'] = self.model.encoder.speaker.weight.detach().clone()
-        self.model.load_state_dict(weights, strict=True)
+        missing, unexpected = self.model.load_state_dict(weights, strict=False)
+        mismatched = [key for key in missing + unexpected if not key.startswith('backbone.step_mlp.')]
+        if mismatched:
+            raise ValueError(f'Pretrained weights do not match the experiment: {", ".join(mismatched[:5])}')
+        if self.ema_model is not None:
+            self.ema_model.load_state_dict(self.model.state_dict())
 
 
 class FlowCheckpoint(ModelCheckpoint):

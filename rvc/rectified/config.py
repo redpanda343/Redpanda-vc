@@ -95,6 +95,10 @@ DEFAULT_CONFIG = {
             'dual_timestep': True,
             'sampling_method': 'rk2',
             'sampling_steps': 10,
+            'shortcut': False,
+            'shortcut_steps': 128,
+            'shortcut_bootstrap_every': 8,
+            'shortcut_ema': 0.999,
             'train_aux_decoder': True,
             'train_diffusion': True,
             'val_gt_start': False,
@@ -107,6 +111,16 @@ NEW_EXPERIMENT_OVERRIDES = {
         'model': {
             'use_breathiness_embed': True,
             'use_voicing_embed': True,
+        },
+    },
+}
+
+SHORTCUT_OVERRIDES = {
+    'flow': {
+        'model': {
+            'shortcut': True,
+            'sampling_method': 'euler',
+            'sampling_steps': 8,
         },
     },
 }

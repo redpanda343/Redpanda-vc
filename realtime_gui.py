@@ -106,6 +106,7 @@ class AudioEngine:
             embedder_model=settings["embedder_model"],
             rectified_vocoder_path=settings.get("rectified_vocoder_path", ""),
             rectified_steps=settings.get("rectified_steps", 0),
+            rectified_flow_window=settings.get("rectified_flow_window", True),
         )
         input_info = sd.query_devices(settings["input_device"])
         output_info = sd.query_devices(settings["output_device"])
@@ -550,6 +551,7 @@ class RealtimeGUI:
         self.index_path = tk.StringVar(value=value.get("index_path", ""))
         self.rectified_vocoder_path = tk.StringVar(value=value.get("rectified_vocoder_path", ""))
         self.rectified_steps = tk.IntVar(value=value.get("rectified_steps", 0))
+        self.rectified_flow_window = tk.BooleanVar(value=value.get("rectified_flow_window", True))
         self.embedder_model = tk.StringVar(
             value=value.get("embedder_model", "contentvec")
         )
@@ -617,6 +619,11 @@ class RealtimeGUI:
         flow_settings.grid(row=4, column=1, columnspan=2, sticky="w", padx=8, pady=(8, 0))
         ttk.Spinbox(flow_settings, from_=0, to=1000, textvariable=self.rectified_steps, width=6).pack(side="left")
         ttk.Label(flow_settings, text="0 uses model settings; fewer steps process faster").pack(side="left", padx=8)
+        ttk.Checkbutton(
+            model,
+            text="Flow window: generate only the newest audio plus 0.5 s of context (faster, same output)",
+            variable=self.rectified_flow_window,
+        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 0))
         model.columnconfigure(1, weight=1)
         devices = ttk.LabelFrame(root, text="Audio devices", padding=10)
         devices.pack(fill="x", pady=(0, 8))
@@ -816,6 +823,7 @@ class RealtimeGUI:
             "index_path": index_path,
             "rectified_vocoder_path": self.rectified_vocoder_path.get().strip(),
             "rectified_steps": self.rectified_steps.get(),
+            "rectified_flow_window": self.rectified_flow_window.get(),
             "embedder_model": self.embedder_model.get(),
             "host_api": self.host_api.get(),
             "input_device": self.input_devices[self.input_device.get()],

@@ -67,6 +67,30 @@ trajectory, which keeps breath noise from coming out over-smoothed. Checkpoints
 saved with the old Euler/20 default use RK2/10 when loaded. The realtime Flow
 steps setting counts RK2 steps, each costing two evaluations.
 
+Realtime can run the flow on the newest audio only (Flow window, on by default
+in the realtime GUI). The content encoder still sees the whole context, as
+seed-vc does, but the aux decoder, the flow steps and the guard run on the frames
+the vocoder needs plus 0.5 s. The backbone is convolutional, so frames further back
+do not change the output; on a GTX 1660 Ti this took a realtime-preset flow from
+203 ms to 141 ms per 250 ms block. Turning it off runs the flow over the full
+context as before.
+
+Shortcut training is optional (**Shortcut (few-step) flow** in the training tab,
+`--shortcut` on the command line; off by default, which keeps the DiffSinger flow
+unchanged). It follows Frans et al., "One Step Diffusion via Shortcut Models"
+(2024) and their reference code: the backbone also takes the step size as log2 of
+the step count through its own embedding, initialised to zero so a converted
+checkpoint starts out identical. One in eight clips per batch (`shortcut_bootstrap_every`)
+is trained to make one jump of 2d equal to two jumps of d, with both jumps taken
+by an EMA copy of the model (`shortcut_ema` 0.999) and the remaining clips use the
+usual flow loss at the finest of 128 steps (`shortcut_steps`). Step levels are drawn
+uniformly per clip rather than spread over the batch as in the reference code,
+which with small batches trained only the one-step jump (kvfrans/shortcut-models#11).
+The step grid covers the shallow-flow range from `t_start` to 1. Shortcut flows
+sample with Euler in a power of two of steps, 8 by default, and down to 1 in the
+realtime Flow steps setting; each update costs about 15% more. An existing flow can
+be fine-tuned into a shortcut flow by enabling Shortcut with a pretrained checkpoint.
+
 Training binarizes the dataset like DiffSinger: originals and their augmented
 copies go into `logs/<model>/binary/train.data`, held-out clips into
 `valid.data`, each with a `.meta` file of clip lengths used for batching. The
