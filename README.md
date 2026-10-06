@@ -77,7 +77,8 @@ autocorrelation on the 44.1 kHz audio at the mel hop, 65-1100 Hz, voicing
 threshold 0.6, with unvoiced frames interpolated in log frequency. Time
 stretching re-extracts F0 at the stretched hop and pitch shifting scales it.
 The same F0 feeds the flow and the vocoder during training, file conversion and
-realtime. Start a new experiment after switching extractors.
+realtime. Like DiffSinger, extraction skips clips with no voiced frames. Start a
+new experiment after switching extractors.
 
  ## Credits
 

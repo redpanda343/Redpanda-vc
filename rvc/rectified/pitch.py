@@ -1,3 +1,5 @@
+from concurrent.futures import ProcessPoolExecutor
+
 import numpy as np
 
 PARSELMOUTH_F0_MIN = 65.0
@@ -32,3 +34,29 @@ def parselmouth_f0(waveform, sample_rate, hop, frames, f0_min=PARSELMOUTH_F0_MIN
     ).selected_array['frequency'].astype(np.float32)
     contour = np.pad(contour, (0, max(0, frames - len(contour))))[:frames]
     return interpolate_f0(contour)
+
+
+def has_voiced_frames(path, hop):
+    import soundfile as sf
+
+    audio, sample_rate = sf.read(path, dtype='float32')
+    if audio.ndim == 2:
+        audio = audio.mean(-1)
+    return bool(parselmouth_f0(audio, sample_rate, hop, max(1, len(audio) // hop)).any())
+
+
+def drop_unvoiced_clips(filelist, hop, workers=1):
+    with open(filelist, encoding='utf-8') as handle:
+        rows = [row for row in handle.read().splitlines() if row.strip()]
+    paths = [row.split('|')[0] for row in rows]
+    with ProcessPoolExecutor(max_workers=max(1, int(workers))) as executor:
+        voiced = list(executor.map(has_voiced_frames, paths, [hop] * len(paths), chunksize=16))
+    for path, keep in zip(paths, voiced):
+        if not keep:
+            print(f"Skipped '{path}': empty gt f0")
+    kept = [row for row, keep in zip(rows, voiced) if keep]
+    if rows and not kept:
+        raise RuntimeError('Parselmouth found no voiced frames in any training clip.')
+    print(f'Parselmouth F0: kept {len(kept):,} of {len(rows):,} clip(s).')
+    with open(filelist, 'w', encoding='utf-8') as handle:
+        handle.write('\n'.join(kept))
