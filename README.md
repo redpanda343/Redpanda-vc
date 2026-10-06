@@ -63,6 +63,13 @@ and `flow/last.ckpt`; voice exports are `_flow_<epoch>e_<step>s.pth` files.
 As in DiffSinger, Lightning counts optimizer attempts when FP16 overflow skips
 an update. Reflow inference uses `flow.model.sampling_steps`.
 
+The training tab's optional **Realtime** switch (`--preset realtime`) starts a
+new experiment with a narrower, deeper model: 256 hidden channels and 6 content
+encoder layers, a 512-channel LYNXNet2 backbone with 12 layers and a 384-channel
+aux decoder with 8 layers. It has about 37M parameters instead of 67M. The
+switch must match the experiment or pretrained checkpoint when resuming or
+fine-tuning.
+
 The training tab's optional **Fused Linear + SoftSignGLU kernels** switch
 uses DiffSinger's Triton forward and elementwise backward kernels with cuBLAS
 gradient matrix multiplications, and is off by default. Enabling it overrides

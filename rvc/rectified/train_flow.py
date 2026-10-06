@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from rvc.rectified.config import default_config, resolve_config
+from rvc.rectified.config import PRESETS, architecture, default_config, resolve_config
 from rvc.rectified.flow_model import validate_model_config
 from rvc.rectified.mel import normalize_mel
 
@@ -132,19 +132,24 @@ def select_fused_activation(config, enabled):
         config['flow']['model']['backbone_args']['glu_type'] = 'softsign_glu'
 
 
-def load_training_config(experiment, pretrained_flow=None, use_fused_kernels=False):
+def load_training_config(experiment, pretrained_flow=None, use_fused_kernels=False, preset='standard'):
     config_path = experiment / 'rectified_config.json'
     if config_path.exists():
         config = resolve_config(json.loads(config_path.read_text(encoding='utf-8')))
+        source = 'This experiment'
     else:
-        config = default_config(finetune=bool(pretrained_flow))
+        config = default_config(finetune=bool(pretrained_flow), preset=preset)
+        source = 'The pretrained checkpoint'
         if pretrained_flow:
             checkpoint = torch.load(pretrained_flow, map_location='cpu', weights_only=True)
             if checkpoint.get('kind') != 'rectified_flow':
                 raise ValueError('Choose a Rectified Flow voice checkpoint for fine-tuning.')
-            source = resolve_config(checkpoint['config'])
-            config['data'] = source['data']
-            config['flow']['model'] = source['flow']['model']
+            pretrained = resolve_config(checkpoint['config'])
+            config['data'] = pretrained['data']
+            config['flow']['model'] = pretrained['flow']['model']
+    if architecture(config['flow']['model']) != architecture(default_config(preset=preset)['flow']['model']):
+        raise ValueError(f'{source} does not use the {preset} model size. Set the Realtime option to match it, '
+                         'or start a new experiment.')
     select_fused_activation(config, use_fused_kernels)
     configure_flow(config)
     return config
@@ -156,7 +161,8 @@ def train(args):
     if Path(args.model_name).name != args.model_name or args.model_name in {'.', '..'}:
         raise ValueError('Use a model name, not a path.')
     experiment = ROOT / 'logs' / args.model_name
-    config = load_training_config(experiment, args.pretrained_flow, getattr(args, 'use_fused_kernels', False))
+    config = load_training_config(experiment, args.pretrained_flow, getattr(args, 'use_fused_kernels', False),
+                                  getattr(args, 'preset', 'standard'))
     configure_arguments(args, config['flow'])
     if config['data']['sample_rate'] != 44100:
         raise ValueError('This recipe requires 44100 Hz audio.')
@@ -235,6 +241,8 @@ def main():
     parser.add_argument('--seed', type=int, default=1234)
     parser.add_argument('--use-fused-kernels', action='store_true',
                         help='Override the activation with SoftSignGLU and use DiffSinger Triton kernels during CUDA mixed-precision training.')
+    parser.add_argument('--preset', choices=sorted(PRESETS), default='standard',
+                        help='Model size for new experiments. realtime uses narrower, deeper networks.')
     parser.add_argument('--fresh', action='store_true')
     train(parser.parse_args())
 

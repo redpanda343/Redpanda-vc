@@ -111,6 +111,19 @@ FINETUNE_OVERRIDES = {
     },
 }
 
+REALTIME_OVERRIDES = {
+    'flow': {
+        'model': {
+            'hidden_channels': 256,
+            'encoder_layers': 6,
+            'backbone_args': {'channels': 512, 'layers': 12},
+            'aux_decoder': {'channels': 384, 'layers': 8},
+        },
+    },
+}
+
+PRESETS = {'standard': {}, 'realtime': REALTIME_OVERRIDES}
+
 FREE_FORM_KEYS = {('flow', 'strategy')}
 
 
@@ -134,5 +147,14 @@ def resolve_config(config):
     return _merge(DEFAULT_CONFIG, config)
 
 
-def default_config(finetune=False):
-    return resolve_config(FINETUNE_OVERRIDES) if finetune else deepcopy(DEFAULT_CONFIG)
+def default_config(finetune=False, preset='standard'):
+    if preset not in PRESETS:
+        raise ValueError(f'Unknown rectified-flow preset {preset!r}. Choose one of {sorted(PRESETS)}.')
+    config = _merge(DEFAULT_CONFIG, PRESETS[preset])
+    return _merge(config, FINETUNE_OVERRIDES) if finetune else config
+
+
+def architecture(model):
+    return (model['hidden_channels'], model['encoder_layers'],
+            model['backbone_args']['channels'], model['backbone_args']['layers'],
+            model['aux_decoder']['channels'], model['aux_decoder']['layers'])
