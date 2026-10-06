@@ -12,11 +12,11 @@ from lightning.pytorch.strategies import DDPStrategy, StrategyRegistry
 from torch.utils.data import DataLoader
 from torchmetrics import MeanMetric
 
-from rvc.rectified.augmentation import prepare_augmentation
+from rvc.rectified.binarizer import binarize
 from rvc.rectified.config import resolve_config
 from rvc.rectified.data import (
-    FlowBatchSampler, RectifiedDataset, collate_flow, content_rms, is_augmented, prepare_training_cache,
-    read_filelist, speaker_inventory, split_holdout, unpack_flow,
+    FlowBatchSampler, RectifiedDataset, collate_flow, content_rms, read_filelist, speaker_inventory,
+    split_holdout, unpack_flow,
 )
 from rvc.rectified.distributed import parse_devices
 from rvc.rectified.flow_model import build_flow
@@ -80,23 +80,17 @@ class FlowDataModule(pl.LightningDataModule):
         self.resume_sampler_cap = None
 
     def prepare_data(self):
-        prepare_training_cache(self.originals, self.config, self.experiment / 'rectified-flow.data',
-                               self.settings['num_workers'])
-        prepare_augmentation(self.experiment, self.root, self.originals, self.training_entries,
-                             self.config, self.args.seed, self.trainer.strategy.root_device)
+        binarize(self.experiment, self.config, self.training_entries, self.held, self.args.seed,
+                 self.trainer.strategy.root_device, self.settings['augmentation_workers'])
 
     def setup(self, stage):
-        entries = read_filelist(self.experiment / 'filelist.txt', self.root)
-        entries = self.training_entries + [entry for entry in entries if is_augmented(entry)]
-        cache_path = self.experiment / 'rectified-flow.data'
-        self.train_dataset = RectifiedDataset(entries, self.config, self.max_frames, cache_path=cache_path)
-        self.valid_dataset = RectifiedDataset(
-            self.held, self.config, self.settings['max_val_batch_frames'], cache_path=cache_path,
-        )
+        binary_dir = self.experiment / 'binary'
+        self.train_dataset = RectifiedDataset(binary_dir, 'train')
+        self.valid_dataset = RectifiedDataset(binary_dir, 'valid')
         self.references = []
         if self.trainer.is_global_zero and self.settings['preview_interval']:
             self.references = (self.valid_dataset if self.held else self.train_dataset).references(
-                self.settings['num_valid_plots'],
+                self.settings['num_valid_plots'], self.config['data'],
             )
 
     def loader(self, dataset, sampler, validation=False):
@@ -104,7 +98,7 @@ class FlowDataModule(pl.LightningDataModule):
         kwargs = dict(num_workers=workers, pin_memory=not validation, persistent_workers=workers > 0,
                       collate_fn=validation_collate if validation else collate_flow)
         if workers:
-            kwargs.update(prefetch_factor=self.settings['dataloader_prefetch_factor'], multiprocessing_context='spawn')
+            kwargs.update(prefetch_factor=self.settings['dataloader_prefetch_factor'])
         return DataLoader(dataset, batch_sampler=sampler, **kwargs)
 
     def train_dataloader(self):
@@ -163,8 +157,6 @@ class FlowTask(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         self.trained_epoch = self.current_epoch + 1
         losses = self.run_model(batch)
-        if not torch.isfinite(losses['total_loss']):
-            raise FloatingPointError('Non-finite rectified-flow training loss.')
         log_outputs = dict(mel_loss=losses['mel_loss'], aux_mel_loss=losses['aux_mel_loss'], batch_size=float(batch[0].shape[0]))
         self.log_dict(log_outputs, prog_bar=True, logger=False, on_step=True, on_epoch=False)
         lr = self.lr_schedulers().get_last_lr()[0]

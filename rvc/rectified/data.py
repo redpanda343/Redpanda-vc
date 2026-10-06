@@ -1,10 +1,7 @@
-import hashlib
-import json
 import math
 import os
+import pickle
 import random
-import time
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -12,13 +9,9 @@ import soundfile as sf
 import torch
 from torch.utils.data import Dataset, Sampler
 
-from rvc.rectified.config import resolve_config
-from rvc.rectified.indexed_dataset import IndexedDataset, IndexedDatasetBuilder
-from rvc.rectified.mel import LogMel
-from rvc.rectified.pitch import parselmouth_f0
+from rvc.rectified.indexed_dataset import IndexedDataset
 
 CONTENT_RATE = 50
-CACHE_VERSION = 5
 
 
 def split_holdout(entries, count: int, seed: int = 1234):
@@ -44,21 +37,6 @@ def split_holdout(entries, count: int, seed: int = 1234):
             [entries[i] for i in sorted(held)])
 
 
-def clip_samples(entries, workers: int = 8):
-    """Sample count of every training clip, read from the audio headers only."""
-    def count(entry):
-        if is_augmented(entry):
-            with np.load(entry[1], allow_pickle=False) as features:
-                return int(features['frames']) * int(features['hop'])
-        return sf.info(entry[0]).frames
-    with ThreadPoolExecutor(workers) as pool:
-        return np.fromiter(pool.map(count, entries), dtype=np.int64, count=len(entries))
-
-
-def is_augmented(entry):
-    return str(entry[1]).endswith('.flow.npz')
-
-
 class FlowBatchSampler(Sampler):
     def __init__(self, dataset, max_frames, max_items, seed=1234, rank=0, world=1,
                  shuffle=True, required_batch_count_multiple=1, disallow_empty_batch=True,
@@ -78,8 +56,10 @@ class FlowBatchSampler(Sampler):
         self.frame_count_grid = int(frame_count_grid)
         if self.required_batch_count_multiple < 1 or self.frame_count_grid < 1:
             raise ValueError('Sampler batch multiple and frame grid must be positive.')
-        self.samples = clip_samples(dataset.entries)
-        self.frames = np.minimum(np.maximum(1, self.samples // dataset.hop), self.max_frames)
+        self.frames = np.asarray(dataset.sizes, dtype=np.int64)
+        if len(self.frames) and int(self.frames.max()) > self.max_frames:
+            raise ValueError(f'A clip has {int(self.frames.max())} frames, more than the {self.max_frames} max frames '
+                             'per batch. Raise the frame limit or slice the dataset into shorter clips.')
         self.measured_max_frames = None
         self.epoch = 0
         self._formed = None
@@ -171,184 +151,39 @@ def unpack_flow(batch, device, non_blocking=False):
 
 
 class RectifiedDataset(Dataset):
-    def __init__(self, entries, config: dict, max_frames: int, cache_path=None):
-        config = resolve_config(config)
-        self.entries = entries
-        self.data = config["data"]
-        self.max_frames = int(max_frames)
-        self.hop = int(self.data["hop_length"])
-        self.sample_rate = int(self.data["sample_rate"])
-        self.mel = LogMel.from_config(self.data)
-        self.content_channels = int(config["flow"]["model"]["content_channels"])
-        self._cache_recipe = json.dumps(
-            dict(version=CACHE_VERSION, data=self.data, content_channels=self.content_channels),
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        self._cache_recipe_hash = hashlib.sha256(self._cache_recipe.encode()).hexdigest()
-        self._original_keys = [self._cache_key(entry) for entry in self.entries]
-        self._indexed_cache = IndexedDataset(cache_path, self._cache_recipe_hash) if cache_path is not None else None
+    def __init__(self, binary_dir, prefix):
+        with open(Path(binary_dir) / f'{prefix}.meta', 'rb') as handle:
+            self.metadata = pickle.load(handle)
+        self.sizes = self.metadata['lengths']
+        self.indexed_ds = IndexedDataset(Path(binary_dir) / f'{prefix}.data')
 
     def __len__(self):
-        return len(self.entries)
+        return len(self.sizes)
 
-    def _audio(self, path):
-        data, sample_rate = sf.read(path, dtype="float32")
-        audio = torch.from_numpy(data)
-        if sample_rate != self.sample_rate:
-            raise ValueError(
-                f"{path} is {sample_rate} Hz; the rectified models train at "
-                f"{self.sample_rate} Hz. Preprocess the dataset at that rate."
-            )
-        return audio.mean(-1) if audio.dim() == 2 else audio
-
-    def _content(self, path):
-        content = torch.from_numpy(np.load(path, allow_pickle=False).astype(np.float32))
-        if content.ndim != 2 or content.shape[1] != self.content_channels or not content.shape[0]:
-            raise ValueError(f"Expected {self.content_channels}-wide content features: {path}")
-        return content
-
-    def _cache_key(self, entry):
-        if is_augmented(entry):
-            return None
-        sources = []
-        for path in (entry[0], entry[1]):
-            value = Path(path)
-            stat = value.stat()
-            sources.append((str(value.resolve()), stat.st_size, stat.st_mtime_ns))
-        return hashlib.sha256(
-            (self._cache_recipe + json.dumps(sources, separators=(",", ":"))).encode()
-        ).hexdigest()
-
-    def _frames(self, audio, content, path):
-        if not all(torch.isfinite(value).all() for value in (audio, content)):
-            raise ValueError(f'Invalid audio or content values: {path}')
-        if abs(content.shape[0] / CONTENT_RATE - audio.numel() / self.sample_rate) > 0.25:
-            raise ValueError(f'Content duration does not match audio; re-extract features: {path}')
-        frames = min(audio.shape[0] // self.hop, mel_frames(content.shape[0], self.sample_rate, self.hop))
-        if frames < 4:
-            raise ValueError("Training clips must contain at least four mel frames.")
-        return frames
-
-    def _build_original_values(self, index):
-        if self._original_keys[index] is None:
-            return None
-        wav_path, content_path = self.entries[index][:2]
-        audio, content = self._audio(wav_path), self._content(content_path)
-        frames = self._frames(audio, content, wav_path)
-        f0 = torch.from_numpy(parselmouth_f0(audio.numpy(), self.sample_rate, self.hop, frames))
-        audio = audio[: frames * self.hop]
-        with torch.no_grad():
-            mel = self.mel(audio.unsqueeze(0), 0.0, self.hop)[0, :, :frames]
-        values = dict(
-            mel=mel.numpy(),
-            content=content.numpy(),
-            f0=f0.numpy(),
-            key_shift=np.float32(0.0),
-            speed=np.float32(1.0),
-            frames=np.int64(frames),
-            hop=np.int64(self.hop),
-        )
-        if not all(np.isfinite(value).all() for value in values.values()):
-            raise ValueError(f'Invalid cached training features: {wav_path}')
-        return values
+    def num_frames(self, index):
+        return self.sizes[index]
 
     def __getitem__(self, index):
-        _, content_path, _, _, sid = self.entries[index]
-        if is_augmented(self.entries[index]):
-            with np.load(content_path, allow_pickle=False) as values:
-                return self._item({name: values[name] for name in values.files}, int(sid), content_path)
-        if self._indexed_cache is None:
-            values = self._build_original_values(index)
-        else:
-            try:
-                values = self._indexed_cache[self._original_keys[index]]
-            except (FileNotFoundError, KeyError, OSError, ValueError) as error:
-                raise RuntimeError(
-                    f'Indexed training feature cache is missing or stale for {self.entries[index][0]}; rebuild it before training.'
-                ) from error
-        source = str(self._indexed_cache.path) if self._indexed_cache is not None else self.entries[index][0]
-        return self._item(values, int(sid), source)
+        item = self.indexed_ds[index]
+        return item['mel'], item['content'], item['f0'], item['key_shift'], item['speed'], item['spk_id']
 
-    def _item(self, values, sid, source):
-        length = min(int(values['frames']), self.max_frames)
-        mel = torch.from_numpy(np.asarray(values['mel'])[:, :length].copy())
-        content = torch.from_numpy(np.asarray(values['content']).copy())
-        f0 = torch.from_numpy(np.asarray(values['f0'])[:length].copy())
-        if mel.shape != (self.data['n_mels'], length) or content.ndim != 2 or not content.shape[0] \
-                or content.shape[1] != self.content_channels or f0.shape != (length,):
-            raise ValueError(f'Invalid training feature dimensions: {source}')
-        if not all(torch.isfinite(value).all() for value in (mel, content, f0)) or (f0 < 0).any():
-            raise ValueError(f'Invalid training feature values: {source}')
-        return mel, content, f0, float(values['key_shift']), float(values['speed']), sid
-
-    def references(self, count: int, max_seconds: float = 10.0):
+    def references(self, count, data, max_seconds=10.0):
+        hop, sample_rate = int(data['hop_length']), int(data['sample_rate'])
+        content_step = hop * 100 / sample_rate
         result = []
-        for index in sorted(range(len(self.entries)), key=lambda i: self.entries[i][0]):
+        for index, (name, augmented) in enumerate(zip(self.metadata['names'], self.metadata['augmented'])):
             if len(result) >= count:
                 break
-            wav_path, content_path, _, _, sid = self.entries[index]
-            if "mute" in os.path.basename(wav_path) or is_augmented(self.entries[index]):
+            if augmented:
                 continue
-            audio, content = self._audio(wav_path), self._content(content_path)
-            if audio.shape[0] < self.hop * 4:
-                continue
-            frames = min(self._frames(audio, content, wav_path), int(max_seconds * self.sample_rate) // self.hop)
-            f0 = torch.from_numpy(parselmouth_f0(audio.numpy(), self.sample_rate, self.hop, frames))
-            audio = audio[: frames * self.hop]
-            with torch.no_grad():
-                mel = self.mel(audio.unsqueeze(0))[:, :, :frames]
-            result.append((mel, content.unsqueeze(0), f0.unsqueeze(0), audio.unsqueeze(0), int(sid), wav_path))
+            item = self.indexed_ds[index]
+            frames = min(self.sizes[index], int(max_seconds * sample_rate) // hop)
+            audio, _ = sf.read(name, dtype='float32')
+            audio = torch.from_numpy(audio.mean(-1) if audio.ndim == 2 else audio)[: frames * hop]
+            content_frames = min(item['content'].shape[0], int((frames - 1) * content_step) // 2 + 2)
+            result.append((item['mel'][None, :, :frames], item['content'][None, :content_frames],
+                           item['f0'][None, :frames], audio[None], int(item['spk_id']), name))
         return result
-
-
-def prepare_training_cache(entries, config, cache_path, workers=4):
-    if not entries:
-        return
-    dataset = RectifiedDataset(entries, config, 2 ** 31)
-    keys = dataset._original_keys
-    cache_path = Path(cache_path)
-    if IndexedDataset.matches(cache_path, dataset._cache_recipe_hash, keys):
-        print(f'Training feature index: {len(entries):,}/{len(entries):,} ready.', flush=True)
-        return
-    workers = max(1, min(int(workers), os.cpu_count() or 1, len(entries)))
-    print(
-        f'Training feature index: building {len(entries):,} clip(s) with {workers} worker(s)...',
-        flush=True,
-    )
-    temporary = Path(str(cache_path) + f'.{os.getpid()}.tmp')
-    if temporary.exists():
-        temporary.unlink()
-    builder = IndexedDatasetBuilder(temporary, dataset._cache_recipe_hash, len(entries))
-    previous_threads = torch.get_num_threads()
-    torch.set_num_threads(max(1, previous_threads // workers))
-    completed = 0
-    last_report = time.monotonic()
-    try:
-        if workers == 1:
-            iterator = map(dataset._build_original_values, range(len(entries)))
-            pool = None
-        else:
-            pool = ThreadPoolExecutor(max_workers=workers)
-            iterator = pool.map(dataset._build_original_values, range(len(entries)))
-        try:
-            for index, values in enumerate(iterator):
-                builder.add_item(index, keys[index], values)
-                completed += 1
-                now = time.monotonic()
-                if completed == len(entries) or now - last_report >= 5:
-                    print(f'Training feature index: {completed:,}/{len(entries):,}', flush=True)
-                    last_report = now
-        finally:
-            if pool is not None:
-                pool.shutdown(wait=True)
-        builder.finalize()
-        os.replace(temporary, cache_path)
-    except Exception:
-        builder.abort()
-        raise
-    finally:
-        torch.set_num_threads(previous_threads)
 
 
 def collate_flow(batch):
@@ -378,7 +213,7 @@ def collate_flow(batch):
 
 def content_rms(entries, limit=64):
     total, count = 0.0, 0
-    for entry in [entry for entry in entries if not is_augmented(entry)][:limit]:
+    for entry in entries[:limit]:
         values = np.load(entry[1], allow_pickle=False).astype(np.float64)
         total += float(np.square(values).sum())
         count += values.size

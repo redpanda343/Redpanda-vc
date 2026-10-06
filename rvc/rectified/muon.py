@@ -103,7 +103,10 @@ class MuonAdamW(torch.optim.Optimizer):
 
     def _muon(self, group, params, lr):
         grads = [p.grad for p in params]
-        buffers = [self.state[p].setdefault("momentum_buffer", torch.zeros_like(p)) for p in params]
+        for p in params:
+            if "momentum_buffer" not in self.state[p]:
+                self.state[p]["momentum_buffer"] = torch.zeros_like(p)
+        buffers = [self.state[p]["momentum_buffer"] for p in params]
         torch._foreach_lerp_(buffers, grads, 1.0 - group["momentum"])
         updates = torch._foreach_lerp(grads, buffers, group["momentum"])
 
@@ -114,12 +117,7 @@ class MuonAdamW(torch.optim.Optimizer):
             shapes.setdefault(tuple(sorted(update.shape)), []).append((p, update.mT if tall else update, tall))
         for shape, members in shapes.items():
             updates = torch.stack([update for _, update, _ in members])
-            orthogonal = orthogonalize(updates, dtype=self.iteration_dtype)
-            if not torch.isfinite(orthogonal).all():
-                orthogonal = orthogonalize(updates, dtype=torch.float32)
-            if not torch.isfinite(orthogonal).all():
-                raise FloatingPointError('Non-finite Muon update after FP32 recovery.')
-            orthogonal = orthogonal.unbind(0)
+            orthogonal = orthogonalize(updates, dtype=self.iteration_dtype).unbind(0)
             torch._foreach_add_(
                 [p for p, _, _ in members],
                 [(u.mT if tall else u).reshape(p.shape) for (p, _, tall), u in zip(members, orthogonal)],

@@ -23,6 +23,12 @@ stretching re-extracts F0 at the stretched hop and pitch shifting scales it.
 The same F0 feeds the flow and the vocoder during training, file conversion and
 realtime. Like DiffSinger, extraction skips clips with no voiced frames.
 
+Training binarizes the dataset like DiffSinger: originals and their augmented
+copies go into `logs/<model>/binary/train.data`, held-out clips into
+`valid.data`, each with a `.meta` file of clip lengths used for batching. The
+binary data is rebuilt only when the clips or the data and augmentation
+settings change. ContentVec features stay FP32.
+
 The recipe defaults live in `rvc/rectified/config.py` and are written to
 `logs/<model>/rectified_config.json` when training starts. Edit the experiment
 config to change the model, optimizer, scheduler, batching, validation or
