@@ -35,7 +35,7 @@ torch.multiprocessing.set_sharing_strategy(os.getenv('TORCH_SHARE_STRATEGY', 'fi
 
 
 FINETUNE_OPTIONAL_KEYS = ('sampling_method', 'sampling_steps', 'shortcut', 'shortcut_steps', 'shortcut_bootstrap_every',
-                          'shortcut_ema', 'use_breathiness_embed', 'use_voicing_embed')
+                          'shortcut_ema', 'shortcut_ema_export', 'use_breathiness_embed', 'use_voicing_embed')
 FINETUNE_OPTIONAL_WEIGHTS = ('backbone.step_mlp.', 'encoder.variance_embeds.')
 
 
@@ -168,6 +168,10 @@ class FlowTask(pl.LightningModule):
                                      content_mask, key_shift, speed, variances, teacher=self.ema_model)
         aux = flow.new_zeros(()) if auxiliary is None else auxiliary * self.settings['aux_mel_weight']
         return dict(mel_loss=flow, aux_mel_loss=aux, total_loss=flow + aux)
+
+    @property
+    def evaluation_model(self):
+        return self.ema_model if self.ema_model is not None and self.model.shortcut_ema_export else self.model
 
     def train(self, mode=True):
         super().train(mode)
@@ -362,7 +366,8 @@ class FlowCheckpoint(ModelCheckpoint):
 
     def _save_checkpoint(self, trainer, filepath):
         task = trainer.lightning_module
-        if any(not torch.isfinite(value).all() for value in task.model.state_dict().values()):
+        exported = task.evaluation_model.state_dict()
+        if any(not torch.isfinite(value).all() for value in [*task.model.state_dict().values(), *exported.values()]):
             raise FloatingPointError('Non-finite trained model weights.')
         super()._save_checkpoint(trainer, filepath)
         if not trainer.is_global_zero or Path(filepath).name == 'last.ckpt':
@@ -370,7 +375,7 @@ class FlowCheckpoint(ModelCheckpoint):
         metadata = task.metadata()
         epoch = task.trained_epoch
         path = Path(self.dirpath) / f'{self.args.model_name}_flow_{epoch}e_{trainer.global_step}s.pth'
-        atomic_save(dict(kind='rectified_flow', model={key: value.detach().cpu() for key, value in task.model.state_dict().items()},
+        atomic_save(dict(kind='rectified_flow', model={key: value.detach().cpu() for key, value in exported.items()},
                          epoch=epoch, **metadata), path)
         prune_checkpoints(Path(self.dirpath), self.args.model_name, self.settings)
         prune_lightning_checkpoints(self.dirpath, self.settings)
@@ -401,7 +406,8 @@ class FlowPreview(pl.Callback):
             return
         with torch.autocast(task.device.type, enabled=False):
             for index, reference in enumerate(task.data_module.references):
-                preview(task.model, self.vocoder, reference, task.data, trainer.logger.experiment, trainer.global_step, index)
+                preview(task.evaluation_model, self.vocoder, reference, task.data, trainer.logger.experiment,
+                        trainer.global_step, index)
         self.last_step = trainer.global_step
 
     def on_validation_epoch_end(self, trainer, task):
