@@ -94,14 +94,29 @@ def launch(name, module, arguments, description):
         return _status()
 
 
-def preprocess(name, dataset, workers, slicing=True):
+def preprocess(name, dataset, workers, cutting='Automatic', chunk_len=3.0, overlap_len=0.3, truncate_silence=False,
+               silence_action='truncate', silence_threshold=-45.0, silence_minimum=0.3, silence_to=0.3,
+               silence_compress=50.0):
     directory = experiment_path(name)
     dataset = str(dataset).strip().strip('"')
     if not Path(dataset).is_dir():
         raise gr.Error('The dataset folder does not exist.')
+    if cutting not in ('Skip', 'Simple', 'Automatic'):
+        raise gr.Error('Choose Skip, Simple or Automatic audio cutting.')
     return launch(name, 'rvc.train.preprocess.preprocess',
-                  [str(directory), dataset, '44100', positive_integer(workers, 'CPU workers'),
-                   'Automatic' if slicing else 'Skip', 'False', 'False', '0.0', '10.0', '0.3', 'none', 'WAV'], 'Preprocessing')
+                  [str(directory), dataset, '44100', positive_integer(workers, 'CPU workers'), cutting, 'False', 'False',
+                   '0.0', str(float(chunk_len)), str(float(overlap_len)), 'none', 'WAV', str(bool(truncate_silence)),
+                   str(float(silence_threshold)), str(float(silence_to)), str(float(silence_minimum)), silence_action,
+                   str(float(silence_compress))], 'Preprocessing')
+
+
+def cutting_visibility(cutting, truncate_silence, silence_action):
+    simple = cutting == 'Simple'
+    silence = simple and truncate_silence
+    return (gr.update(visible=simple), gr.update(visible=simple), gr.update(visible=simple),
+            gr.update(visible=silence), gr.update(visible=silence), gr.update(visible=silence),
+            gr.update(visible=silence and silence_action == 'truncate'),
+            gr.update(visible=silence and silence_action == 'compress'))
 
 
 def extract(name, workers, device, embedder, pitch_extractor='parselmouth'):
@@ -216,8 +231,32 @@ def rectified_train_tab():
     with gr.Accordion('1. Prepare dataset', open=True):
         dataset = gr.Textbox(label='Dataset folder')
         workers = gr.Number(label='CPU workers', value=4, minimum=1, precision=0)
-        slicing = gr.Checkbox(label='Slice dataset', value=True,
-                              info='Disable to keep full clips. Audio is always resampled to 44.1 kHz.')
+        cutting = gr.Radio(label='Audio cutting', choices=['Skip', 'Simple', 'Automatic'], value='Automatic',
+                           info="'Skip' keeps full clips, 'Simple' cuts fixed-length slices, 'Automatic' slices at "
+                                'silences. Audio is always resampled to 44.1 kHz.')
+        with gr.Row():
+            chunk_len = gr.Slider(0.5, 10.0, 3.0, step=0.1, label='Chunk length (sec)',
+                                  info="Length of the audio slice for 'Simple' method.", visible=False)
+            overlap_len = gr.Slider(0.0, 0.4, 0.3, step=0.1, label='Overlap length (sec)',
+                                    info="Length of the overlap between slices for 'Simple' method.", visible=False)
+        truncate_silence = gr.Checkbox(label='Truncate silence', value=False, visible=False,
+                                       info='For Simple slicing only. Shortens qualifying silent regions using the '
+                                            'settings below.')
+        silence_action = gr.Radio(label='Silence action', value='truncate', visible=False,
+                                  choices=[('Truncate Detected Silence', 'truncate'),
+                                           ('Compress Excess Silence', 'compress')])
+        silence_threshold = gr.Slider(-80, -20, -45, step=1, label='Silence threshold (dB)', visible=False,
+                                      info='For Simple slicing only. Audio below this level is treated as silence '
+                                           'when truncation is enabled.')
+        silence_minimum = gr.Slider(0.001, 5.0, 0.3, step=0.001, label='Minimum silence (sec)', visible=False,
+                                    info='For Simple slicing only. A silent region must be at least this long '
+                                         'before it can be truncated.')
+        silence_to = gr.Slider(0.0, 0.5, 0.3, step=0.001, label='Truncate to (sec)', visible=False,
+                               info='For Simple slicing only. Sets how much of each qualifying silent region remains '
+                                    'after truncation.')
+        silence_compress = gr.Slider(0.0, 99.9, 50.0, step=0.1, label='Compress excess silence to (%)', visible=False,
+                                     info='Keeps the minimum silence plus this percentage of the silence beyond '
+                                          'that minimum.')
         preprocess_button = gr.Button('Preprocess dataset')
         with gr.Row():
             embedder = gr.Dropdown(label='Content embedder', choices=['contentvec', 'spin-v2'], value='contentvec')
@@ -263,7 +302,14 @@ def rectified_train_tab():
     state = gr.Textbox(label='Rectified job status', interactive=False)
     log = gr.Textbox(label='Rectified job log', lines=12, max_lines=20, interactive=False)
     outputs = [state, log, preprocess_button, extract_button, train_button, stop_button]
-    preprocess_button.click(preprocess, [name, dataset, workers, slicing], outputs, queue=False)
+    cutting_inputs = [cutting, truncate_silence, silence_action]
+    cutting_outputs = [chunk_len, overlap_len, truncate_silence, silence_action, silence_threshold, silence_minimum,
+                       silence_to, silence_compress]
+    for control in cutting_inputs:
+        control.change(cutting_visibility, cutting_inputs, cutting_outputs, queue=False)
+    preprocess_button.click(preprocess, [name, dataset, workers, cutting, chunk_len, overlap_len, truncate_silence,
+                                         silence_action, silence_threshold, silence_minimum, silence_to,
+                                         silence_compress], outputs, queue=False)
     extract_button.click(extract, [name, workers, device, embedder, pitch_extractor], outputs, queue=False)
     train_button.click(start, [name, batch, max_frames, max_updates, checkpoint_interval, device, use_fused_kernels,
                                use_pretrained, pretrained_path, realtime, shortcut, variance_embeds], outputs, queue=False)
