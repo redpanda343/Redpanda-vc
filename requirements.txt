@@ -18,14 +18,14 @@ stftpitchshift==2.0
 soxr==1.1.0
 fireredvad==0.0.2
 
-torch==2.11.0
+torch==2.14.1
 lightning~=2.3.0
-triton==3.6.0; sys_platform == "linux"
+triton==3.8.0; sys_platform == "linux"
 torchaudio==2.11.0
-torchvision==0.26.0
+torchvision==0.29.1
 praat-parselmouth
 pyworld==0.3.5
-onnxruntime-gpu==1.26.0
+onnxruntime-gpu==1.30.0
 transformers==5.13.1
 
 matplotlib==3.11.0

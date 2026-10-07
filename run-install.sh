@@ -82,7 +82,7 @@ install_dependencies() {
     source "$MINICONDA_DIR/etc/profile.d/conda.sh"
     conda activate "$ENV_DIR"
     uv pip install -r "$INSTALL_DIR/requirements.txt" \
-        --extra-index-url https://download.pytorch.org/whl/cu128 \
+        --extra-index-url https://download.pytorch.org/whl/cu130 \
         --index-strategy unsafe-best-match
     uv pip install --no-deps swift-f0==0.3.0
     conda deactivate

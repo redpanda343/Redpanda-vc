@@ -1,4 +1,4 @@
-FROM docker.io/nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
+FROM docker.io/nvidia/cuda:13.0.3-cudnn-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -18,7 +18,7 @@ COPY . .
 RUN python3 -m venv .venv
 
 RUN .venv/bin/pip install --no-cache-dir --upgrade pip
-RUN .venv/bin/pip install --no-cache-dir torch==2.11.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu128
+RUN .venv/bin/pip install --no-cache-dir torch==2.14.1 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu130
 
 RUN .venv/bin/pip install --no-cache-dir -r requirements.txt
 RUN .venv/bin/pip install --no-cache-dir --no-deps swift-f0==0.3.0
