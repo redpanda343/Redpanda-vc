@@ -395,7 +395,7 @@ def get_vocoders():
 
 def update_vocoder_visibility(model):
     rectified, _, creak = get_model_info(model)
-    return gr.update(visible=rectified), gr.update(visible=creak)
+    return gr.update(visible=rectified), gr.update(visible=creak), gr.update(visible=creak)
 
 
 def filter_dropdowns(filter_text):
@@ -466,10 +466,22 @@ def inference_tab():
             interactive=True,
             visible=get_model_info(default_weight)[2],
         )
+        rectified_fry_strength = gr.Slider(
+            minimum=0,
+            maximum=2,
+            value=1,
+            step=0.05,
+            label=i18n("Rectified Flow Vocal Fry Strength"),
+            info=i18n(
+                "Scales the vocal fry curve from the source above. 0 turns vocal fry conditioning off, 1 is as trained, higher values exaggerate it."
+            ),
+            interactive=True,
+            visible=get_model_info(default_weight)[2],
+        )
         model_file.change(
             fn=update_vocoder_visibility,
             inputs=[model_file],
-            outputs=[rectified_vocoder_path, rectified_fry_source],
+            outputs=[rectified_vocoder_path, rectified_fry_source, rectified_fry_strength],
             show_progress=False,
         )
         filter_box_inf.blur(
@@ -2263,6 +2275,7 @@ def inference_tab():
             seed,
             rectified_vocoder_path,
             rectified_fry_source,
+            rectified_fry_strength,
         ],
         outputs=[vc_output1, vc_output2],
     )
@@ -2327,6 +2340,7 @@ def inference_tab():
             seed_batch,
             rectified_vocoder_path,
             rectified_fry_source,
+            rectified_fry_strength,
         ],
         outputs=[vc_output3],
     ).then(

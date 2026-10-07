@@ -16,6 +16,7 @@ from rvc.rectified.vocoder import load_vocoder
 
 
 FRY_SOURCES = ('predictor', 'creapy')
+FRY_STRENGTH_MAX = 2.0
 
 
 def is_rectified(checkpoint):
@@ -36,6 +37,7 @@ class RectifiedPipeline(Pipeline):
         self.f0_method = 'pm'
         self.source_pad = None
         self.fry_source = 'predictor'
+        self.fry_strength = 1.0
 
     def pipeline(self, *args, source_audio=None, **kwargs):
         self.pitch_shift = float(kwargs.get('pitch', args[4] if len(args) > 4 else 0))
@@ -53,6 +55,12 @@ class RectifiedPipeline(Pipeline):
         if source not in FRY_SOURCES:
             raise ValueError(f'Vocal fry source must be one of {FRY_SOURCES}, not {source!r}.')
         self.fry_source = source
+
+    def set_fry_strength(self, strength):
+        strength = float(1.0 if strength is None else strength)
+        if not 0.0 <= strength <= FRY_STRENGTH_MAX:
+            raise ValueError(f'Vocal fry strength must be between 0 and {FRY_STRENGTH_MAX}, not {strength}.')
+        self.fry_strength = strength
 
     def set_vocoder(self, path):
         path = str(path or '').strip().strip('"')
@@ -123,7 +131,8 @@ class RectifiedPipeline(Pipeline):
         with _INFERENCE_RNG_LOCK:
             if inference_rng is not None:
                 inference_rng.seed_next_segment()
-            mel = net_g.sample(content, f0, sid, mask, variances=variances, uv=uv, fry=fry)
+            mel = net_g.sample(content, f0, sid, mask, variances=variances, uv=uv, fry=fry,
+                               fry_strength=self.fry_strength)
             audio = self.vocoder_model(mel, f0)[0, 0, :length]
         if not torch.isfinite(audio).all():
             raise FloatingPointError('Non-finite Rectified Flow audio output.')

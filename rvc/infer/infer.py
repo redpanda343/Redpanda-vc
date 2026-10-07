@@ -411,6 +411,7 @@ class VoiceConverter:
         if rectified:
             self.vc.set_vocoder(kwargs.pop('rectified_vocoder_path', ''))
             self.vc.set_fry_source(kwargs.pop('rectified_fry_source', 'predictor'))
+            self.vc.set_fry_strength(kwargs.pop('rectified_fry_strength', 1.0))
             self.tgt_sr = int(self.cpt['config']['data']['sample_rate'])
 
         start_time = time.time()

@@ -84,7 +84,10 @@ already have, so it adds no latency. File conversion can use creapy instead
 (**Rectified Flow Vocal Fry** in the inference tab, `--rectified-fry-source
 creapy` on the command line): it labels the input the same way as binarization
 and feeds those labels to the flow in place of the predictor, at the cost of
-creapy's CPU time. Realtime always uses the predictor. The unvoiced flags come from the pitch
+creapy's CPU time. **Rectified Flow Vocal Fry Strength** (`--rectified-fry-strength`,
+0 to 2) scales the fry curve from either source before it enters the flow, as
+CreakVC's creak value does: 0 turns the conditioning off, 1 is as trained and
+higher values exaggerate it. Realtime always uses the predictor at strength 1. The unvoiced flags come from the pitch
 method, so convert with the method the model was trained on. Experiments and
 checkpoints made before this keep it off; turn the option off to resume them.
 Enabling it while fine-tuning a checkpoint without it starts the embedding at
