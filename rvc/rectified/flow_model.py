@@ -364,6 +364,7 @@ class RectifiedFlow(nn.Module):
         variances: Optional[torch.Tensor] = None,
         start: int = 0,
         uv: Optional[torch.Tensor] = None,
+        fry: Optional[torch.Tensor] = None,
     ):
         method = self.sampling_method if method is None else method
         steps = max(1, int(self.sampling_steps if steps is None else steps))
@@ -376,7 +377,7 @@ class RectifiedFlow(nn.Module):
                 raise ValueError(f"Shortcut flows sample with a power of two up to {self.shortcut_steps} steps, not {steps}.")
             method = "euler"
             step = torch.full((batch,), math.log2(steps), device=content.device)
-        cond = self.encoder(content, f0, speaker, mask, content_mask, key_shift, speed, variances, uv)
+        cond = self.encoder(content, f0, speaker, mask, content_mask, key_shift, speed, variances, uv, fry)
         if start:
             cond, mask = cond[..., start:], mask[..., start:]
             source_mel = None if source_mel is None else source_mel[..., start:]

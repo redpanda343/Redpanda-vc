@@ -152,7 +152,7 @@ class ContentConditionEncoder(nn.Module):
         return self.creak_head(features.to(mask.dtype), mask)
 
     def forward(self, content, f0, speaker, mask, content_mask=None, key_shift=None, speed=None, variances=None,
-                uv=None):
+                uv=None, fry=None):
         if content_mask is None:
             content_mask = mask.new_ones(content.shape[0], 1, content.shape[1])
         padding = ~content_mask[:, 0].bool()
@@ -173,9 +173,12 @@ class ContentConditionEncoder(nn.Module):
             x = x + torch.stack([self.variance_embeds[name](variances[:, index, :, None] * VARIANCE_SCALE)
                                  for index, name in enumerate(self.variance_names)], dim=-1).sum(-1)
         if self.creak_head is not None:
-            if uv is None:
+            if fry is not None:
+                creak = fry.to(x.dtype)
+            elif uv is None:
                 raise ValueError('This flow needs unvoiced flags for its vocal fry predictor.')
-            creak = torch.sigmoid(self.creak_logits(f0, uv, mask)).detach().to(x.dtype)
+            else:
+                creak = torch.sigmoid(self.creak_logits(f0, uv, mask)).detach().to(x.dtype)
             x = x + self.creak_embed(creak.unsqueeze(-1)) * mask.transpose(1, 2)
         if self.key_shift is not None:
             values = f0.new_zeros(f0.shape[0]) if key_shift is None else key_shift

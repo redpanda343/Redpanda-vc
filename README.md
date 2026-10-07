@@ -80,7 +80,11 @@ like the rest of the dataset and lists it in `vocal_fry.json` in the
 experiment, and every non-silent frame of those slices is labeled fry instead of
 using creapy. Slices under 1 s are skipped, so keep fry clips at least that long.
 Conversion and realtime only run the predictor on the F0 and unvoiced flags they
-already have, so it adds no latency. The unvoiced flags come from the pitch
+already have, so it adds no latency. File conversion can use creapy instead
+(**Rectified Flow Vocal Fry** in the inference tab, `--rectified-fry-source
+creapy` on the command line): it labels the input the same way as binarization
+and feeds those labels to the flow in place of the predictor, at the cost of
+creapy's CPU time. Realtime always uses the predictor. The unvoiced flags come from the pitch
 method, so convert with the method the model was trained on. Experiments and
 checkpoints made before this keep it off; turn the option off to resume them.
 Enabling it while fine-tuning a checkpoint without it starts the embedding at
