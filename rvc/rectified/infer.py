@@ -18,6 +18,13 @@ def is_rectified(checkpoint):
     return checkpoint.get('kind') == 'rectified_flow'
 
 
+def shift_audio(audio, sample_rate, semitones):
+    from pedalboard import Pedalboard, PitchShift
+
+    audio = np.asarray(audio, dtype=np.float32)
+    return Pedalboard([PitchShift(semitones=float(semitones))])(audio[None], sample_rate)[0]
+
+
 class RectifiedPipeline(Pipeline):
     high_pass = False
 
@@ -33,8 +40,27 @@ class RectifiedPipeline(Pipeline):
         self.source_pad = None
 
     def pipeline(self, *args, source_audio=None, **kwargs):
-        self.pitch_shift = float(kwargs.get('pitch', args[4] if len(args) > 4 else 0))
+        args = list(args)
+        pitch = float(kwargs.get('pitch', args[4] if len(args) > 4 else 0))
         self.f0_method = kwargs.get('f0_method', args[5] if len(args) > 5 else 'pm')
+        self.pitch_shift = 0.0
+        if pitch:
+            audio = np.asarray(kwargs['audio'] if 'audio' in kwargs else args[3])
+            rate = int(self.data['sample_rate'])
+            if source_audio is not None:
+                source_audio = shift_audio(source_audio, rate, pitch)
+                shifted = soxr.resample(source_audio, rate, self.sample_rate, quality='HQ')
+            else:
+                shifted = shift_audio(audio, self.sample_rate, pitch)
+            shifted = np.pad(shifted, (0, max(0, len(audio) - len(shifted))))[:len(audio)].astype(audio.dtype)
+            if 'audio' in kwargs:
+                kwargs['audio'] = shifted
+            else:
+                args[3] = shifted
+            if 'pitch' in kwargs:
+                kwargs['pitch'] = 0
+            else:
+                args[4] = 0
         if source_audio is not None:
             pad = self.t_pad * int(self.data['sample_rate']) // self.sample_rate
             self.source_pad = np.pad(np.asarray(source_audio, dtype=np.float32), (pad, pad), mode='reflect')

@@ -34,6 +34,14 @@ methods are interpolated and resampled to the mel hop. Realtime follows the
 selected pitch method the same way, extracting Parselmouth and RMVPE F0 from the
 full-rate input stream.
 
+File conversion applies the pitch shift to the input audio before extracting
+anything: the full-rate input is shifted with Rubber Band (Pedalboard's
+`PitchShift`, which also moves the formants), its 16 kHz copy for the content
+encoder is resampled from the shifted audio, and content, F0 and the
+breathiness/voicing curves all come from the shifted audio, so the F0 is not
+scaled afterwards. Training (whose pitch-shift augmentation keeps the original
+content and only shifts the mel and F0) and realtime still shift only the F0.
+
 As in DiffSinger, the vocoder gets the same interpolated F0 as the flow, and
 conversion does not post-process unvoiced frames. The interpolated F0 does not
 tell the flow which frames are breaths, noise or whispers; models trained with
@@ -52,8 +60,9 @@ DiffSinger's harmonic-noise separator (`flow.hnsep`: `vr`, the default, or
 sine window (`breathiness_smooth_width`, `voicing_smooth_width`). Each curve is
 scaled by 1/96 into its own linear embedding. Pitch-shifted copies keep the
 original curves and time-stretched copies resample them, as in DiffSinger.
-Conversion extracts the same curves from the full-rate source before pitch
-shifting. VR runs in 15 s windows with 1 s crossfades so long files fit in GPU
+Conversion extracts the same curves from the full-rate source after the input is
+pitch-shifted (see above); realtime extracts them before pitch shifting. VR runs
+in 15 s windows with 1 s crossfades so long files fit in GPU
 memory, and realtime separates only the newest audio with 1 s (VR) or 0.3 s
 (WORLD) of context and reuses the rest. The app downloads the VR model
 (`hnsep_240512`) to `rvc/models/predictors/hnsep/vr` when first needed.
