@@ -145,10 +145,11 @@ fine-tuning.
 
 The training tab's optional **Fused Linear + SoftSignGLU kernels** switch
 uses DiffSinger's Triton forward and elementwise backward kernels with cuBLAS
-gradient matrix multiplications, and is off by default. Enabling it overrides
-`flow.model.backbone_args.glu_type` with `softsign_glu`, including for resume and
-fine-tuning. The effective activation is saved with the experiment and
-checkpoints. Disabling the switch later turns off fused kernels and keeps the
+gradient matrix multiplications, and is off by default. Enabling it when an
+experiment starts sets `flow.model.backbone_args.glu_type` to `softsign_glu`, which
+is saved with the experiment and checkpoints. Experiments and pretrained
+checkpoints that use another activation refuse the switch instead of changing
+their activation. Disabling the switch later turns off fused kernels and keeps the
 saved activation. Evaluation and inference use eager kernels.
 Fused CUDA FP16/BF16 training requires a working Triton installation; CPU/FP32 and
 unsupported GPUs use the eager path. The port in `rvc/rectified/kernels` is

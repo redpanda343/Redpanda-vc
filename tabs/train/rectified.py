@@ -295,7 +295,9 @@ def rectified_train_tab():
                                     'sample in 1, 2, 4, 8... steps. Costs about 15% more per update. Off keeps the '
                                     'DiffSinger flow unchanged. Set it when the experiment starts and keep it when resuming.')
         use_fused_kernels = gr.Checkbox(label='Fused Linear + SoftSignGLU kernels', value=False,
-                                       info='Overrides the configured activation with SoftSignGLU, including on resume. Requires Triton and CUDA FP16 or BF16 for acceleration.')
+                                       info='Set it when starting a new experiment: the experiment then trains with SoftSignGLU so the '
+                                            'kernels can run. Experiments and pretrained checkpoints that use ATanGLU cannot enable it. '
+                                            'Requires Triton and CUDA FP16 or BF16 for acceleration.')
         with gr.Row():
             train_button = gr.Button('Start / resume rectified training', variant='primary')
             stop_button = gr.Button('Stop current rectified job', interactive=False)

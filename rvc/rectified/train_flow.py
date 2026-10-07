@@ -131,9 +131,11 @@ def preview(model, vocoder, reference, data, writer, step, index=None):
         writer.add_audio(f'audio/{name}{suffix}', value.clamp(-1, 1).cpu(), step, data['sample_rate'])
 
 
-def select_fused_activation(config, enabled):
-    if enabled:
-        config['flow']['model']['backbone_args']['glu_type'] = 'softsign_glu'
+def require_fused_activation(config, enabled):
+    activation = config['flow']['model']['backbone_args']['glu_type']
+    if enabled and activation != 'softsign_glu':
+        raise ValueError(f'Fused kernels need SoftSignGLU, but this experiment or pretrained checkpoint uses {activation}. '
+                         'Enable them only when starting a new experiment, or turn them off.')
 
 
 def experiment_pitch_extractor(experiment):
@@ -164,6 +166,8 @@ def load_training_config(experiment, pretrained_flow=None, use_fused_kernels=Fal
         if variance_embeds is not None:
             config['flow']['model'].update(use_breathiness_embed=bool(variance_embeds),
                                            use_voicing_embed=bool(variance_embeds))
+        if use_fused_kernels and not pretrained_flow:
+            config['flow']['model']['backbone_args']['glu_type'] = 'softsign_glu'
     if architecture(config['flow']['model']) != architecture(default_config(preset=preset)['flow']['model']):
         raise ValueError(f'{source} does not use the {preset} model size. Set the Realtime option to match it, '
                          'or start a new experiment.')
@@ -179,7 +183,7 @@ def load_training_config(experiment, pretrained_flow=None, use_fused_kernels=Fal
         raise ValueError(f"This experiment trains on {config['flow']['pitch_extractor']} F0, but its features were "
                          f"extracted for {pitch_extractor}. Re-extract with {config['flow']['pitch_extractor']} "
                          'or start a new experiment.')
-    select_fused_activation(config, use_fused_kernels)
+    require_fused_activation(config, use_fused_kernels)
     configure_flow(config)
     return config
 

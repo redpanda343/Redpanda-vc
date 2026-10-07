@@ -26,7 +26,7 @@ from rvc.rectified.muon import MuonAdamW
 from rvc.rectified.schedule import learning_rate
 from rvc.rectified.train_flow import (
     atomic_save, configure_fused_backbone, preview, prune_checkpoints,
-    random_state, restore_random_state, select_fused_activation,
+    random_state, restore_random_state,
 )
 from rvc.rectified.variance import variance_names
 from rvc.rectified.vocoder import load_vocoder
@@ -279,7 +279,6 @@ class FlowTask(pl.LightningModule):
 
     def on_load_checkpoint(self, checkpoint):
         saved = resolve_config(checkpoint['config'])
-        select_fused_activation(saved, getattr(self.args, 'use_fused_kernels', False))
         if saved['data'] != self.data or saved['flow']['model'] != self.settings['model']:
             raise ValueError('Resume architecture or audio configuration differs from the checkpoint.')
         if saved['flow']['optimizer'] != self.settings['optimizer']:
@@ -315,7 +314,6 @@ class FlowTask(pl.LightningModule):
         if state.get('kind') != 'rectified_flow':
             raise ValueError('Choose a Rectified Flow voice checkpoint for fine-tuning.')
         source = resolve_config(state['config'])
-        select_fused_activation(source, getattr(self.args, 'use_fused_kernels', False))
         if source['data'] != self.data or required_model(source['flow']['model']) != required_model(self.settings['model']):
             raise ValueError('Pretrained architecture or audio configuration differs from the experiment.')
         if state['embedder_model'] != self.data_module.embedder:
