@@ -125,6 +125,13 @@ SHORTCUT_OVERRIDES = {
     },
 }
 
+SHORTCUT_SCHEDULE_OVERRIDES = {
+    'flow': {
+        'decay_step': 10000,
+        'max_updates': 200000,
+    },
+}
+
 FINETUNE_OVERRIDES = {
     'flow': {
         'finetune_learning_rate': 5e-05,

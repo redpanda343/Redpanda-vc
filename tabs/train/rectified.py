@@ -277,7 +277,8 @@ def rectified_train_tab():
             max_frames = gr.Number(label='Max frames per batch (per GPU)', value=None, minimum=1, precision=0,
                                    info='Blank uses config, default 50000 padded frames. Lower to reduce GPU memory use.')
             max_updates = gr.Number(label='Max training updates', value=None, minimum=1, precision=0,
-                               info='Blank uses config, default 100000 Lightning training steps.')
+                               info='Blank uses config, default 100000 Lightning training steps '
+                                    '(200000 for new shortcut flows).')
             checkpoint_interval = gr.Number(label='Checkpoint interval (updates)', value=None, minimum=1, precision=0,
                                    info='Blank uses config, default 4000 updates.')
         realtime = gr.Checkbox(label='Realtime', value=False,

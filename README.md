@@ -89,8 +89,12 @@ uniformly per clip rather than spread over the batch as in the reference code,
 which with small batches trained only the one-step jump (kvfrans/shortcut-models#11).
 The step grid covers the shallow-flow range from `t_start` to 1. Shortcut flows
 sample with Euler in a power of two of steps, 8 by default, and down to 1 in the
-realtime Flow steps setting; each update costs about 15% more. An existing flow can
-be fine-tuned into a shortcut flow by enabling Shortcut with a pretrained checkpoint.
+realtime Flow steps setting; each update costs about 15% more. New shortcut flows
+trained from scratch decay the learning rate twice as slowly (`decay_step` 10000
+instead of 5000) over twice as many updates (`max_updates` 200000), so they reach
+at 200000 updates the learning rate a standard flow reaches at 100000, about
+6.9e-6. An existing flow can be fine-tuned into a shortcut flow by enabling
+Shortcut with a pretrained checkpoint; fine-tunes keep the fine-tuning schedule.
 
 Training binarizes the dataset like DiffSinger: originals and their augmented
 copies go into `logs/<model>/binary/train.data`, held-out clips into
@@ -122,7 +126,8 @@ sanity validation. Training logs use `training/*` and `validation/*` in
 The config exposes accelerator, devices, nodes, strategy, accumulation, sanity
 validation, separate validation batch limits and length sorting. Multi-GPU
 training uses Lightning DDP with NCCL on Linux and Gloo on Windows/CPU.
-Experiments default to 100000 Lightning training steps, FP16 mixed precision,
+Experiments default to 100000 Lightning training steps (200000 for new shortcut
+flows), FP16 mixed precision,
 validation/preview/checkpoints every 4000 updates, up to 10 validation plots,
 vocoder previews and 8 recent resumable checkpoints plus voice exports.
 Checkpoints saved from step 60000 at 10000-step multiples are retained

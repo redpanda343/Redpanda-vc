@@ -10,7 +10,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from rvc.rectified.config import PRESETS, SHORTCUT_OVERRIDES, _merge, architecture, default_config, resolve_config
+from rvc.rectified.config import (
+    PRESETS, SHORTCUT_OVERRIDES, SHORTCUT_SCHEDULE_OVERRIDES, _merge, architecture, default_config, resolve_config,
+)
 from rvc.rectified.flow_model import validate_model_config
 from rvc.rectified.pitch import PITCH_EXTRACTORS
 from rvc.rectified.mel import normalize_mel
@@ -163,6 +165,8 @@ def load_training_config(experiment, pretrained_flow=None, use_fused_kernels=Fal
             config['flow']['model'] = pretrained['flow']['model']
         if shortcut:
             config = _merge(config, SHORTCUT_OVERRIDES)
+            if not pretrained_flow:
+                config = _merge(config, SHORTCUT_SCHEDULE_OVERRIDES)
         if variance_embeds is not None:
             config['flow']['model'].update(use_breathiness_embed=bool(variance_embeds),
                                            use_voicing_embed=bool(variance_embeds))
