@@ -104,11 +104,12 @@ class RectifiedPipeline(Pipeline):
                                           self.device)
             variances = torch.from_numpy(variances).to(self.device)[None]
         f0 = torch.from_numpy(f0).to(self.device)[None] * 2 ** (self.pitch_shift / 12)
+        uv = torch.from_numpy(np.asarray(uv, dtype=np.float32)).to(self.device)[None]
         mask = torch.ones(1, 1, frames, device=self.device)
         with _INFERENCE_RNG_LOCK:
             if inference_rng is not None:
                 inference_rng.seed_next_segment()
-            mel = net_g.sample(content, f0, sid, mask, variances=variances)
+            mel = net_g.sample(content, f0, sid, mask, variances=variances, uv=uv)
             audio = self.vocoder_model(mel, f0)[0, 0, :length]
         if not torch.isfinite(audio).all():
             raise FloatingPointError('Non-finite Rectified Flow audio output.')

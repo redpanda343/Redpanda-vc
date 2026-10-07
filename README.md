@@ -62,6 +62,30 @@ option off to resume them. Turning it off matches DiffSinger's default. Enabling
 it while fine-tuning a checkpoint without it starts both embeddings at zero, so
 the fine-tune begins from the checkpoint's exact output.
 
+**Vocal fry conditioning** (training tab, on by default; `--creak-embed` /
+`--no-creak-embed` on the command line; `use_creak_embed`) helps the flow with
+vocal fry and voice cracks, which pitch extractors track badly: on test clips
+RMVPE left most crack frames voiced but several semitones too low and marked the
+rest unvoiced. A small dilated convolution stack in the content encoder (about
+0.7 s of context each side) predicts a fry probability per frame from the F0,
+the pitch method's unvoiced flags and the frame-to-frame pitch jumps, and its
+detached prediction goes through a zero-initialized embedding, CreakVC's
+mechanism, into the flow. The predictor trains with binary cross-entropy
+(`creak_weight`) against labels made at binarization by a port of
+[creapy](https://gitlab.tugraz.at/speech/creapy) (TU Graz) with its default
+settings and bundled `all` model, run at 44.1 kHz, averaged over 50 ms each side
+and thresholded at 0.3. Optionally, put hand-picked fry in a `vocal_fry` folder
+inside the dataset folder (`vocal_fry/1` for speaker 1): preprocessing slices it
+like the rest of the dataset and lists it in `vocal_fry.json` in the
+experiment, and every non-silent frame of those slices is labeled fry instead of
+using creapy. Slices under 1 s are skipped, so keep fry clips at least that long.
+Conversion and realtime only run the predictor on the F0 and unvoiced flags they
+already have, so it adds no latency. The unvoiced flags come from the pitch
+method, so convert with the method the model was trained on. Experiments and
+checkpoints made before this keep it off; turn the option off to resume them.
+Enabling it while fine-tuning a checkpoint without it starts the embedding at
+zero. See `rvc/rectified/creapy/NOTICE.md` for creapy's licence status.
+
 The flow samples with RK2 (DiffSinger's midpoint `rk2`) for 10 steps, the same
 20 network evaluations as Euler at 20 steps but closer to the converged
 trajectory, which keeps breath noise from coming out over-smoothed. Checkpoints

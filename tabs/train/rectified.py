@@ -157,7 +157,8 @@ def resolve_pretrained(directory, enabled, preferred=''):
 
 
 def start(name, batch, max_frames, max_updates, checkpoint_interval, device, use_fused_kernels=False,
-          use_pretrained=False, pretrained_path='', realtime=False, shortcut=False, variance_embeds=True):
+          use_pretrained=False, pretrained_path='', realtime=False, shortcut=False, variance_embeds=True,
+          creak_embed=True):
     directory = experiment_path(name)
     device_id(device)
     if not (directory / 'filelist.txt').is_file():
@@ -170,7 +171,7 @@ def start(name, batch, max_frames, max_updates, checkpoint_interval, device, use
 
     try:
         selected = load_training_config(directory, pretrained or None, use_fused_kernels, preset, pitch_extractor,
-                                        bool(shortcut), bool(variance_embeds))
+                                        bool(shortcut), bool(variance_embeds), bool(creak_embed))
     except ValueError as error:
         raise gr.Error(str(error)) from error
     precision = get_precision() or selected['flow'].get('precision', 'fp32')
@@ -192,6 +193,7 @@ def start(name, batch, max_frames, max_updates, checkpoint_interval, device, use
     if shortcut:
         arguments.append('--shortcut')
     arguments.append('--variance-embeds' if variance_embeds else '--no-variance-embeds')
+    arguments.append('--creak-embed' if creak_embed else '--no-creak-embed')
     if pretrained:
         arguments.extend(['--pretrained-flow', pretrained])
     return launch(name, 'rvc.rectified.train_flow', arguments, 'Training rectified flow')
@@ -290,6 +292,13 @@ def rectified_train_tab():
                                            'natural breaths and noise. Adds the separator to binarization, conversion '
                                            'and realtime (about 60 ms per realtime block on a GTX 1660 Ti). Off matches '
                                            "DiffSinger's default. Set it when the experiment starts and keep it when resuming.")
+        creak_embed = gr.Checkbox(label='Vocal fry conditioning', value=True,
+                                  info='Optional. A small predictor in the flow learns where vocal fry and voice cracks '
+                                       'are from F0, unvoiced flags and pitch jumps, and conditions the flow on it, so '
+                                       'realtime adds no delay. Binarization labels the dataset with creapy (TU Graz). '
+                                       "Put hand-picked fry clips in a 'vocal_fry' folder inside the dataset folder "
+                                       "('vocal_fry/1' for speaker 1) to label them as fry. Set it when the experiment "
+                                       'starts and keep it when resuming.')
         shortcut = gr.Checkbox(label='Shortcut (few-step) flow', value=False,
                                info='Optional. Trains the flow to also take larger steps (Frans et al., 2024), so it can '
                                     'sample in 1, 2, 4, 8... steps. Costs about 15% more per update. Off keeps the '
@@ -314,6 +323,7 @@ def rectified_train_tab():
                                          silence_compress], outputs, queue=False)
     extract_button.click(extract, [name, workers, device, embedder, pitch_extractor], outputs, queue=False)
     train_button.click(start, [name, batch, max_frames, max_updates, checkpoint_interval, device, use_fused_kernels,
-                               use_pretrained, pretrained_path, realtime, shortcut, variance_embeds], outputs, queue=False)
+                               use_pretrained, pretrained_path, realtime, shortcut, variance_embeds, creak_embed],
+                       outputs, queue=False)
     stop_button.click(stop, [], outputs, queue=False)
     gr.Timer(2).tick(status, [], outputs, queue=False)

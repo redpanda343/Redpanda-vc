@@ -15,6 +15,7 @@ import soundfile as sf
 import torch
 from torch.multiprocessing import Manager, Process, get_context
 
+from rvc.rectified.creak import creak_labels, fry_labels, fry_sources, is_fry_slice
 from rvc.rectified.data import CONTENT_RATE, mel_frames
 from rvc.rectified.indexed_dataset import IndexedDatasetBuilder
 from rvc.rectified.mel import LogMel
@@ -81,6 +82,8 @@ class ItemBuilder:
         self.pitch_extractor = config['flow']['pitch_extractor']
         self.settings = config['flow']
         self.variances = variance_names(config['flow']['model'])
+        self.creak = bool(config['flow']['model']['use_creak_embed'])
+        self.fry = {}
         self.device = torch.device(device)
         self.mel = LogMel.from_config(self.data).to(self.device)
 
@@ -114,28 +117,44 @@ class ItemBuilder:
         mel = self.mel(clip.unsqueeze(0), 0.0, self.hop)[0, :, :frames]
         variances = extract_variances(self.variances, audio.numpy(), f0, uv, frames, self.data, self.settings,
                                       self.device)
-        return self._item(mel, content, f0, 0.0, 1.0, sid, variances)
+        creak = self.creak_labels(audio.numpy(), frames, name) if self.creak else None
+        return self._item(mel, content, f0, 0.0, 1.0, sid, variances, uv, creak)
+
+    def creak_labels(self, audio, frames, name):
+        experiment = Path(name).resolve().parent.parent
+        if experiment not in self.fry:
+            self.fry[experiment] = set(fry_sources(experiment))
+        if is_fry_slice(name, self.fry[experiment]):
+            return fry_labels(audio, self.hop, frames)
+        return creak_labels(audio, self.sample_rate, self.hop, frames)
 
     @torch.no_grad()
     def augmented(self, audio, content, task, sid, original):
         hop = int(round(self.hop * task.get('speed', 1.0)))
         shift = task.get('key_shift', 0.0)
         mel = self.mel(audio.to(self.device).unsqueeze(0), shift, hop)[0]
-        f0 = self.f0(audio, hop, mel.shape[-1])[0] * 2 ** (shift / 12)
+        f0, uv = self.f0(audio, hop, mel.shape[-1])
+        f0 = f0 * 2 ** (shift / 12)
         curves = np.stack([original[name] for name in self.variances]) if self.variances else None
         variances = resample_variances(curves, hop / self.hop, mel.shape[-1], self.data) if self.variances else None
-        return self._item(mel, content, f0, shift, hop / self.hop, sid, variances)
+        creak = None
+        if self.creak:
+            creak = resample_variances(original['creak'][None], hop / self.hop, mel.shape[-1], self.data)[0]
+        return self._item(mel, content, f0, shift, hop / self.hop, sid, variances, uv, creak)
 
     def f0(self, audio, hop, frames):
         return extract_pitch(self.pitch_extractor, audio.numpy(), self.sample_rate, hop, frames, self.device)
 
-    def _item(self, mel, content, f0, key_shift, speed, sid, variances=None):
+    def _item(self, mel, content, f0, key_shift, speed, sid, variances=None, uv=None, creak=None):
         mel = mel.cpu().numpy().astype(np.float32)
         item = dict(mel=mel, content=content.numpy(), f0=np.asarray(f0, dtype=np.float32),
                     key_shift=np.float32(key_shift), speed=np.float32(speed),
                     spk_id=np.int64(sid), length=np.int64(mel.shape[-1]))
         for name, curve in zip(self.variances, variances if variances is not None else ()):
             item[name] = np.asarray(curve, dtype=np.float32)
+        if creak is not None:
+            item['uv'] = np.asarray(uv, dtype=np.float32)
+            item['creak'] = np.asarray(creak, dtype=np.float32)
         if item['length'] < 4 or not all(np.isfinite(value).all() for value in item.values()):
             raise ValueError('Invalid binarized features.')
         return item
@@ -197,7 +216,7 @@ def chunked_multiprocess_run(map_func, args, num_workers, q_max_size=1000):
         worker.close()
 
 
-def _recipe(config, training, held, seed):
+def _recipe(config, training, held, seed, fry=()):
     def sources(entries):
         result = []
         for entry in entries:
@@ -215,6 +234,8 @@ def _recipe(config, training, held, seed):
     if names:
         recipe['variances'] = dict(names=names, hnsep=config['flow']['hnsep'],
                                    widths=[config['flow'][f'{name}_smooth_width'] for name in names])
+    if model['use_creak_embed']:
+        recipe['creak'] = dict(fry=list(fry))
     return hashlib.sha256(json.dumps(recipe, sort_keys=True).encode()).hexdigest()
 
 
@@ -284,7 +305,8 @@ def process_dataset(binary_dir, prefix, entries, tasks, config, device, num_work
 
 def binarize(experiment, config, training, held, seed, device, num_workers):
     binary_dir = Path(experiment) / 'binary'
-    recipe = _recipe(config, training, held, seed)
+    fry = fry_sources(experiment) if config['flow']['model']['use_creak_embed'] else []
+    recipe = _recipe(config, training, held, seed, fry)
     metas = [_read_meta(binary_dir / f'{prefix}.meta') for prefix in ('valid', 'train')]
     if all(meta is not None and meta.get('recipe') == recipe and (binary_dir / f'{prefix}.data').is_file()
            for meta, prefix in zip(metas, ('valid', 'train'))):

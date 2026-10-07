@@ -35,8 +35,8 @@ torch.multiprocessing.set_sharing_strategy(os.getenv('TORCH_SHARE_STRATEGY', 'fi
 
 
 FINETUNE_OPTIONAL_KEYS = ('sampling_method', 'sampling_steps', 'shortcut', 'shortcut_steps', 'shortcut_bootstrap_every',
-                          'shortcut_ema', 'use_breathiness_embed', 'use_voicing_embed')
-FINETUNE_OPTIONAL_WEIGHTS = ('backbone.step_mlp.', 'encoder.variance_embeds.')
+                          'shortcut_ema', 'use_breathiness_embed', 'use_voicing_embed', 'use_creak_embed')
+FINETUNE_OPTIONAL_WEIGHTS = ('backbone.step_mlp.', 'encoder.variance_embeds.', 'encoder.creak_')
 
 
 def required_model(model):
@@ -99,8 +99,9 @@ class FlowDataModule(pl.LightningDataModule):
     def setup(self, stage):
         binary_dir = self.experiment / 'binary'
         names = variance_names(self.settings['model'])
-        self.train_dataset = RectifiedDataset(binary_dir, 'train', names)
-        self.valid_dataset = RectifiedDataset(binary_dir, 'valid', names)
+        creak = self.settings['model']['use_creak_embed']
+        self.train_dataset = RectifiedDataset(binary_dir, 'train', names, creak)
+        self.valid_dataset = RectifiedDataset(binary_dir, 'valid', names, creak)
         self.references = []
         if self.trainer.is_global_zero and self.settings['preview_interval']:
             self.references = (self.valid_dataset if self.held else self.train_dataset).references(
@@ -156,18 +157,26 @@ class FlowTask(pl.LightningModule):
         self.model.encoder.init_content_scale(content_rms(datamodule.originals))
         self.ema_model = copy.deepcopy(self.model).requires_grad_(False).eval() if self.model.shortcut else None
         self.base_lr = args.learning_rate or self.settings['finetune_learning_rate' if finetune else 'learning_rate']
-        self.valid_losses = torch.nn.ModuleDict({name: MeanMetric() for name in ('total_loss', 'mel_loss', 'aux_mel_loss')})
+        names = ('total_loss', 'mel_loss', 'aux_mel_loss') + (('creak_loss',) if self.model.uses_creak else ())
+        self.valid_losses = torch.nn.ModuleDict({name: MeanMetric() for name in names})
         self.skip_immediate_validation = False
         self.skip_immediate_ckpt_save = False
         self.resume_random = None
         self.trained_epoch = 1
 
     def run_model(self, batch):
-        mel, content, content_mask, f0, key_shift, speed, speaker, mask, variances = unpack_flow(batch, self.device, True)
-        flow, auxiliary = self.model(normalize_mel(mel, self.data), content, f0, speaker, mask,
-                                     content_mask, key_shift, speed, variances, teacher=self.ema_model)
+        mel, content, content_mask, f0, key_shift, speed, speaker, mask, variances, creak = unpack_flow(
+            batch, self.device, True)
+        uv, labels = (creak[:, 0], creak[:, 1]) if creak.shape[1] else (None, None)
+        flow, auxiliary, creak_loss = self.model(normalize_mel(mel, self.data), content, f0, speaker, mask,
+                                                 content_mask, key_shift, speed, variances, teacher=self.ema_model,
+                                                 uv=uv, creak=labels)
         aux = flow.new_zeros(()) if auxiliary is None else auxiliary * self.settings['aux_mel_weight']
-        return dict(mel_loss=flow, aux_mel_loss=aux, total_loss=flow + aux)
+        losses = dict(mel_loss=flow, aux_mel_loss=aux, total_loss=flow + aux)
+        if creak_loss is not None:
+            losses['creak_loss'] = creak_loss
+            losses['total_loss'] = losses['total_loss'] + creak_loss * self.settings['creak_weight']
+        return losses
 
     def train(self, mode=True):
         super().train(mode)
@@ -189,6 +198,8 @@ class FlowTask(pl.LightningModule):
         self.trained_epoch = self.current_epoch + 1
         losses = self.run_model(batch)
         log_outputs = dict(mel_loss=losses['mel_loss'], aux_mel_loss=losses['aux_mel_loss'], batch_size=float(batch[0].shape[0]))
+        if 'creak_loss' in losses:
+            log_outputs['creak_loss'] = losses['creak_loss']
         self.log_dict(log_outputs, prog_bar=True, logger=False, on_step=True, on_epoch=False)
         lr = self.lr_schedulers().get_last_lr()[0]
         self.log('lr', lr, prog_bar=True, logger=False, on_step=True, on_epoch=False)
