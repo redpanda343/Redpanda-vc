@@ -85,13 +85,10 @@ Shortcut training is optional (**Shortcut (few-step) flow** in the training tab,
 unchanged). It follows Frans et al., "One Step Diffusion via Shortcut Models"
 (2024) and their reference code: the backbone also takes the step size as log2 of
 the step count through its own embedding, initialised to zero so a converted
-checkpoint starts out identical. One in four clips per batch (`shortcut_bootstrap_every`,
-the paper's 0.75/0.25 split; the reference code defaults to one in eight)
+checkpoint starts out identical. One in eight clips per batch (`shortcut_bootstrap_every`)
 is trained to make one jump of 2d equal to two jumps of d, with both jumps taken
 by an EMA copy of the model (`shortcut_ema` 0.999) and the remaining clips use the
-usual flow loss at the finest of 128 steps (`shortcut_steps`). As in the paper,
-exports and previews use the EMA weights (`shortcut_ema_export`; set it to false for
-the live weights, as the reference code evaluates by default). Step levels are drawn
+usual flow loss at the finest of 128 steps (`shortcut_steps`). Step levels are drawn
 uniformly per clip rather than spread over the batch as in the reference code,
 which with small batches trained only the one-step jump (kvfrans/shortcut-models#11).
 The step grid covers the shallow-flow range from `t_start` to 1. Shortcut flows

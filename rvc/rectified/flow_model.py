@@ -220,7 +220,6 @@ class RectifiedFlow(nn.Module):
         shortcut_steps: int = 128,
         shortcut_bootstrap_every: int = 8,
         shortcut_ema: float = 0.999,
-        shortcut_ema_export: bool = True,
         train_aux_decoder: bool = True,
         train_diffusion: bool = True,
         val_gt_start: bool = False,
@@ -249,7 +248,6 @@ class RectifiedFlow(nn.Module):
         self.shortcut_steps = int(shortcut_steps)
         self.shortcut_bootstrap_every = int(shortcut_bootstrap_every)
         self.shortcut_ema = float(shortcut_ema)
-        self.shortcut_ema_export = bool(shortcut_ema_export)
         self.backbone = LYNXNet2Backbone(n_mels, hidden_channels, **(backbone_args or {}),
                                          shortcut_steps=self.shortcut_steps if self.shortcut else 0)
         self.aux = AuxDecoder(hidden_channels, n_mels, **(aux_decoder or {}))
@@ -407,7 +405,7 @@ class RectifiedFlow(nn.Module):
 def validate_model_config(model: dict):
     for name in ('use_rope', 'rope_interleaved', 'use_spk_id', 'key_shift', 'speed', 'dual_timestep',
                  'train_aux_decoder', 'train_diffusion', 'val_gt_start', 'use_breathiness_embed',
-                 'use_voicing_embed', 'shortcut', 'shortcut_ema_export'):
+                 'use_voicing_embed', 'shortcut'):
         if not isinstance(model[name], bool):
             raise ValueError(f'{name} must be a boolean.')
     for section, key in ((model, 'enc_ffn_kernel_size'), (model['aux_decoder'], 'kernel_size'),
