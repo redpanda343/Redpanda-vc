@@ -21,6 +21,7 @@ fireredvad==0.0.2
 
 torch==2.14.1
 lightning~=2.3.0
+setuptools<82
 triton==3.8.0; sys_platform == "linux"
 torchaudio==2.11.0
 torchvision==0.29.1
