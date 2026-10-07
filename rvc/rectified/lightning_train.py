@@ -34,11 +34,13 @@ from rvc.rectified.vocoder import load_vocoder
 torch.multiprocessing.set_sharing_strategy(os.getenv('TORCH_SHARE_STRATEGY', 'file_system'))
 
 
-SAMPLER_KEYS = ('sampling_method', 'sampling_steps', 'shortcut', 'shortcut_steps', 'shortcut_bootstrap_every', 'shortcut_ema')
+FINETUNE_OPTIONAL_KEYS = ('sampling_method', 'sampling_steps', 'shortcut', 'shortcut_steps', 'shortcut_bootstrap_every',
+                          'shortcut_ema', 'use_breathiness_embed', 'use_voicing_embed')
+FINETUNE_OPTIONAL_WEIGHTS = ('backbone.step_mlp.', 'encoder.variance_embeds.')
 
 
-def sampler_free(model):
-    return {key: value for key, value in model.items() if key not in SAMPLER_KEYS}
+def required_model(model):
+    return {key: value for key, value in model.items() if key not in FINETUNE_OPTIONAL_KEYS}
 
 
 def validation_collate(batch):
@@ -314,7 +316,7 @@ class FlowTask(pl.LightningModule):
             raise ValueError('Choose a Rectified Flow voice checkpoint for fine-tuning.')
         source = resolve_config(state['config'])
         select_fused_activation(source, getattr(self.args, 'use_fused_kernels', False))
-        if source['data'] != self.data or sampler_free(source['flow']['model']) != sampler_free(self.settings['model']):
+        if source['data'] != self.data or required_model(source['flow']['model']) != required_model(self.settings['model']):
             raise ValueError('Pretrained architecture or audio configuration differs from the experiment.')
         if state['embedder_model'] != self.data_module.embedder:
             raise ValueError('Pretrained flow uses a different content embedder.')
@@ -322,9 +324,13 @@ class FlowTask(pl.LightningModule):
         if self.model.use_spk_id:
             weights['encoder.speaker.weight'] = self.model.encoder.speaker.weight.detach().clone()
         missing, unexpected = self.model.load_state_dict(weights, strict=False)
-        mismatched = [key for key in missing + unexpected if not key.startswith('backbone.step_mlp.')]
+        mismatched = [key for key in missing + unexpected if not key.startswith(FINETUNE_OPTIONAL_WEIGHTS)]
         if mismatched:
             raise ValueError(f'Pretrained weights do not match the experiment: {", ".join(mismatched[:5])}')
+        for name, layer in self.model.encoder.variance_embeds.items():
+            if f'encoder.variance_embeds.{name}.weight' in missing:
+                torch.nn.init.zeros_(layer.weight)
+                torch.nn.init.zeros_(layer.bias)
         if self.ema_model is not None:
             self.ema_model.load_state_dict(self.model.state_dict())
 

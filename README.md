@@ -45,7 +45,9 @@ median level gap between output and input over voiced frames. Bins the input
 does not reach (for example above 8 kHz in a 16 kHz recording) are left alone.
 Voiced frames are untouched.
 
-New experiments condition the flow on DiffSinger's breathiness and voicing
+**Breathiness / voicing conditioning** (training tab, on by default;
+`--variance-embeds` / `--no-variance-embeds` on the command line) conditions the
+flow on DiffSinger's breathiness and voicing
 (`use_breathiness_embed` and `use_voicing_embed`), which tell the model how
 noisy and how voiced each frame of the source is, the job DiffSinger's AP and SP
 phonemes do. Binarization splits each clip into harmonic and aperiodic parts with
@@ -59,7 +61,10 @@ shifting. VR runs in 15 s windows with 1 s crossfades so long files fit in GPU
 memory, and realtime separates only the newest audio with 1 s (VR) or 0.3 s
 (WORLD) of context and reuses the rest. The app downloads the VR model
 (`hnsep_240512`) to `rvc/models/predictors/hnsep/vr` when first needed.
-Experiments and checkpoints made before this keep both embeddings off.
+Experiments and checkpoints made before this keep both embeddings off; turn the
+option off to resume them. Turning it off matches DiffSinger's default. Enabling
+it while fine-tuning a checkpoint without it starts both embeddings at zero, so
+the fine-tune begins from the checkpoint's exact output.
 
 The flow samples with RK2 (DiffSinger's midpoint `rk2`) for 10 steps, the same
 20 network evaluations as Euler at 20 steps but closer to the converged

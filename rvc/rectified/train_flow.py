@@ -143,7 +143,7 @@ def experiment_pitch_extractor(experiment):
 
 
 def load_training_config(experiment, pretrained_flow=None, use_fused_kernels=False, preset='standard',
-                         pitch_extractor='parselmouth', shortcut=None):
+                         pitch_extractor='parselmouth', shortcut=None, variance_embeds=None):
     config_path = experiment / 'rectified_config.json'
     if config_path.exists():
         config = resolve_config(json.loads(config_path.read_text(encoding='utf-8')))
@@ -161,12 +161,20 @@ def load_training_config(experiment, pretrained_flow=None, use_fused_kernels=Fal
             config['flow']['model'] = pretrained['flow']['model']
         if shortcut:
             config = _merge(config, SHORTCUT_OVERRIDES)
+        if variance_embeds is not None:
+            config['flow']['model'].update(use_breathiness_embed=bool(variance_embeds),
+                                           use_voicing_embed=bool(variance_embeds))
     if architecture(config['flow']['model']) != architecture(default_config(preset=preset)['flow']['model']):
         raise ValueError(f'{source} does not use the {preset} model size. Set the Realtime option to match it, '
                          'or start a new experiment.')
     if shortcut is not None and config['flow']['model']['shortcut'] != bool(shortcut):
         kind = 'a shortcut' if config['flow']['model']['shortcut'] else 'a standard'
         raise ValueError(f'This experiment trains {kind} flow. Set Shortcut to match it, or start a new experiment.')
+    model = config['flow']['model']
+    if variance_embeds is not None and (model['use_breathiness_embed'] or model['use_voicing_embed']) != bool(variance_embeds):
+        state = 'with' if variance_embeds is False else 'without'
+        raise ValueError(f'This experiment was started {state} breathiness/voicing conditioning. Set it to match, '
+                         'or start a new experiment.')
     if config['flow']['pitch_extractor'] != pitch_extractor:
         raise ValueError(f"This experiment trains on {config['flow']['pitch_extractor']} F0, but its features were "
                          f"extracted for {pitch_extractor}. Re-extract with {config['flow']['pitch_extractor']} "
@@ -185,7 +193,7 @@ def train(args):
     config = load_training_config(experiment, args.pretrained_flow, getattr(args, 'use_fused_kernels', False),
                                   getattr(args, 'preset', 'standard'),
                                   getattr(args, 'pitch_extractor', None) or experiment_pitch_extractor(experiment),
-                                  getattr(args, 'shortcut', None))
+                                  getattr(args, 'shortcut', None), getattr(args, 'variance_embeds', None))
     configure_arguments(args, config['flow'])
     if config['data']['sample_rate'] != 44100:
         raise ValueError('This recipe requires 44100 Hz audio.')
@@ -279,6 +287,9 @@ def main():
     parser.add_argument('--shortcut', action='store_true', default=None,
                         help='Train a shortcut flow (Frans et al., 2024) that samples in a power-of-two number of steps, '
                              'down to one. New experiments and fine-tunes only.')
+    parser.add_argument('--variance-embeds', action=argparse.BooleanOptionalAction, default=None,
+                        help="Condition the flow on DiffSinger's breathiness and voicing curves. New experiments "
+                             'default to on; fine-tunes default to the pretrained setting.')
     parser.add_argument('--fresh', action='store_true')
     train(parser.parse_args())
 

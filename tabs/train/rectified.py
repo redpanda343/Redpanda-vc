@@ -142,7 +142,7 @@ def resolve_pretrained(directory, enabled, preferred=''):
 
 
 def start(name, batch, max_frames, max_updates, checkpoint_interval, device, use_fused_kernels=False,
-          use_pretrained=False, pretrained_path='', realtime=False, shortcut=False):
+          use_pretrained=False, pretrained_path='', realtime=False, shortcut=False, variance_embeds=True):
     directory = experiment_path(name)
     device_id(device)
     if not (directory / 'filelist.txt').is_file():
@@ -155,7 +155,7 @@ def start(name, batch, max_frames, max_updates, checkpoint_interval, device, use
 
     try:
         selected = load_training_config(directory, pretrained or None, use_fused_kernels, preset, pitch_extractor,
-                                        bool(shortcut))
+                                        bool(shortcut), bool(variance_embeds))
     except ValueError as error:
         raise gr.Error(str(error)) from error
     precision = get_precision() or selected['flow'].get('precision', 'fp32')
@@ -176,6 +176,7 @@ def start(name, batch, max_frames, max_updates, checkpoint_interval, device, use
         arguments.append('--use-fused-kernels')
     if shortcut:
         arguments.append('--shortcut')
+    arguments.append('--variance-embeds' if variance_embeds else '--no-variance-embeds')
     if pretrained:
         arguments.extend(['--pretrained-flow', pretrained])
     return launch(name, 'rvc.rectified.train_flow', arguments, 'Training rectified flow')
@@ -244,6 +245,12 @@ def rectified_train_tab():
                                info='Smaller, deeper model for new experiments: 256 hidden / 6 encoder layers, '
                                     '512-channel backbone with 12 layers, 384-channel aux decoder with 8 layers. '
                                     'Keep it set the same when resuming.')
+        variance_embeds = gr.Checkbox(label='Breathiness / voicing conditioning', value=True,
+                                      info="Optional. Conditions the flow on DiffSinger's breathiness and voicing curves, "
+                                           'extracted from the source with the VR harmonic-noise separator, for more '
+                                           'natural breaths and noise. Adds the separator to binarization, conversion '
+                                           'and realtime (about 60 ms per realtime block on a GTX 1660 Ti). Off matches '
+                                           "DiffSinger's default. Set it when the experiment starts and keep it when resuming.")
         shortcut = gr.Checkbox(label='Shortcut (few-step) flow', value=False,
                                info='Optional. Trains the flow to also take larger steps (Frans et al., 2024), so it can '
                                     'sample in 1, 2, 4, 8... steps. Costs about 15% more per update. Off keeps the '
@@ -259,6 +266,6 @@ def rectified_train_tab():
     preprocess_button.click(preprocess, [name, dataset, workers, slicing], outputs, queue=False)
     extract_button.click(extract, [name, workers, device, embedder, pitch_extractor], outputs, queue=False)
     train_button.click(start, [name, batch, max_frames, max_updates, checkpoint_interval, device, use_fused_kernels,
-                               use_pretrained, pretrained_path, realtime, shortcut], outputs, queue=False)
+                               use_pretrained, pretrained_path, realtime, shortcut, variance_embeds], outputs, queue=False)
     stop_button.click(stop, [], outputs, queue=False)
     gr.Timer(2).tick(status, [], outputs, queue=False)
