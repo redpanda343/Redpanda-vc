@@ -89,29 +89,10 @@ class ContentEncoderLayer(nn.Module):
         return (x + F.dropout(y, self.dropout, training=self.training)) * mask
 
 
-class CreakHead(nn.Module):
-    def __init__(self, channels=64, kernel_size=9, dilations=(1, 2, 4, 8)):
-        super().__init__()
-        self.input = nn.Conv1d(3, channels, 1)
-        self.layers = nn.ModuleList([
-            nn.Conv1d(channels, channels, kernel_size, padding=kernel_size // 2 * dilation, dilation=dilation)
-            for dilation in dilations
-        ])
-        self.output = nn.Conv1d(channels, 1, 1)
-        for module in self.modules():
-            module.use_adamw = True
-
-    def forward(self, x, mask):
-        h = self.input(x) * mask
-        for layer in self.layers:
-            h = (h + layer(F.gelu(h))) * mask
-        return self.output(F.gelu(h))[:, 0]
-
-
 class ContentConditionEncoder(nn.Module):
     def __init__(self, content_channels, hidden_channels, speaker_count, layers, content_step,
                  key_shift=True, speed=True, use_spk_id=False, enc_ffn_kernel_size=3,
-                 use_rope=True, rope_interleaved=False, rope_theta=10000.0, variances=(), creak=False):
+                 use_rope=True, rope_interleaved=False, rope_theta=10000.0, variances=()):
         super().__init__()
         if not content_step > 0:
             raise ValueError('Content encoding requires the mel hop in content frames.')
@@ -131,10 +112,6 @@ class ContentConditionEncoder(nn.Module):
         self.speed = adamw_linear(1, hidden_channels) if speed else None
         self.variance_names = list(variances)
         self.variance_embeds = nn.ModuleDict({name: adamw_linear(1, hidden_channels) for name in self.variance_names})
-        self.creak_head = CreakHead() if creak else None
-        self.creak_embed = adamw_linear(1, hidden_channels) if creak else None
-        if self.creak_embed is not None:
-            nn.init.zeros_(self.creak_embed.weight)
         self.speaker = nn.Embedding(speaker_count, hidden_channels) if use_spk_id else None
         if self.speaker is not None:
             nn.init.normal_(self.speaker.weight, std=hidden_channels ** -0.5)
@@ -144,15 +121,7 @@ class ContentConditionEncoder(nn.Module):
         nn.init.normal_(self.content.weight, std=1.0 / (math.sqrt(fan_in * fan_out) * float(rms)))
         nn.init.zeros_(self.content.bias)
 
-    def creak_logits(self, f0, uv, mask):
-        voiced = mask[:, 0]
-        pitch = torch.log2(f0.float().clamp(min=1.0) / 440.0) * voiced
-        jump = F.pad((pitch[:, 1:] - pitch[:, :-1]).abs(), (1, 0)).clamp(max=1.0) * voiced
-        features = torch.stack((pitch, uv.float() * voiced, jump), 1)
-        return self.creak_head(features.to(mask.dtype), mask)
-
-    def forward(self, content, f0, speaker, mask, content_mask=None, key_shift=None, speed=None, variances=None,
-                uv=None, fry=None, fry_strength=1.0):
+    def forward(self, content, f0, speaker, mask, content_mask=None, key_shift=None, speed=None, variances=None):
         if content_mask is None:
             content_mask = mask.new_ones(content.shape[0], 1, content.shape[1])
         padding = ~content_mask[:, 0].bool()
@@ -172,14 +141,6 @@ class ContentConditionEncoder(nn.Module):
                 raise ValueError(f'This flow needs {", ".join(self.variance_names)} curves.')
             x = x + torch.stack([self.variance_embeds[name](variances[:, index, :, None] * VARIANCE_SCALE)
                                  for index, name in enumerate(self.variance_names)], dim=-1).sum(-1)
-        if self.creak_head is not None:
-            if fry is not None:
-                creak = fry.to(x.dtype)
-            elif uv is None:
-                raise ValueError('This flow needs unvoiced flags for its vocal fry predictor.')
-            else:
-                creak = torch.sigmoid(self.creak_logits(f0, uv, mask)).detach().to(x.dtype)
-            x = x + self.creak_embed(creak.unsqueeze(-1) * fry_strength) * mask.transpose(1, 2)
         if self.key_shift is not None:
             values = f0.new_zeros(f0.shape[0]) if key_shift is None else key_shift
             x = x + self.key_shift(values.reshape(-1, 1, 1) / 12.0)

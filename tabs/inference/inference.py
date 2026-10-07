@@ -362,10 +362,7 @@ def read_model_info(path, modified, size):
     model_data = torch.load(path, map_location="cpu", weights_only=True)
     rectified = model_data.get("kind") == "rectified_flow"
     speakers = model_data.get("speaker_count", model_data.get("speakers_id")) or 1
-    creak = rectified and bool(
-        model_data.get("config", {}).get("flow", {}).get("model", {}).get("use_creak_embed", False)
-    )
-    return rectified, speakers, creak
+    return rectified, speakers
 
 
 def get_model_info(model):
@@ -376,7 +373,7 @@ def get_model_info(model):
             return read_model_info(path, stat.st_mtime_ns, stat.st_size)
         except Exception:
             pass
-    return False, 1, False
+    return False, 1
 
 
 def get_speakers_id(model):
@@ -394,8 +391,7 @@ def get_vocoders():
 
 
 def update_vocoder_visibility(model):
-    rectified, _, creak = get_model_info(model)
-    return gr.update(visible=rectified), gr.update(visible=creak), gr.update(visible=creak)
+    return gr.update(visible=get_model_info(model)[0])
 
 
 def filter_dropdowns(filter_text):
@@ -456,32 +452,10 @@ def inference_tab():
             allow_custom_value=True,
             visible=get_model_info(default_weight)[0],
         )
-        rectified_fry_source = gr.Radio(
-            label=i18n("Rectified Flow Vocal Fry"),
-            info=i18n(
-                "For models trained with vocal fry conditioning. Predictor uses the model's own fry predictor, as realtime does. creapy runs the creapy detector on the input instead, which takes extra CPU time."
-            ),
-            choices=["predictor", "creapy"],
-            value="predictor",
-            interactive=True,
-            visible=get_model_info(default_weight)[2],
-        )
-        rectified_fry_strength = gr.Slider(
-            minimum=0,
-            maximum=2,
-            value=1,
-            step=0.05,
-            label=i18n("Rectified Flow Vocal Fry Strength"),
-            info=i18n(
-                "Scales the vocal fry curve from the source above. 0 turns vocal fry conditioning off, 1 is as trained, higher values exaggerate it."
-            ),
-            interactive=True,
-            visible=get_model_info(default_weight)[2],
-        )
         model_file.change(
             fn=update_vocoder_visibility,
             inputs=[model_file],
-            outputs=[rectified_vocoder_path, rectified_fry_source, rectified_fry_strength],
+            outputs=[rectified_vocoder_path],
             show_progress=False,
         )
         filter_box_inf.blur(
@@ -2274,8 +2248,6 @@ def inference_tab():
             sid,
             seed,
             rectified_vocoder_path,
-            rectified_fry_source,
-            rectified_fry_strength,
         ],
         outputs=[vc_output1, vc_output2],
     )
@@ -2339,8 +2311,6 @@ def inference_tab():
             sid_batch,
             seed_batch,
             rectified_vocoder_path,
-            rectified_fry_source,
-            rectified_fry_strength,
         ],
         outputs=[vc_output3],
     ).then(

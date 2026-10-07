@@ -8,15 +8,10 @@ from torch.nn import functional as F
 from rvc.infer.pipeline import Pipeline, _INFERENCE_RNG_LOCK
 from rvc.lib.utils import extract_embedding_features
 from rvc.lib.predictors.f0 import RMVPE
-from rvc.rectified.creak import creak_labels
 from rvc.rectified.pitch import parselmouth_pitch, resample_f0, resample_voicing, rmvpe_pitch
 from rvc.rectified.resources import default_vocoder
 from rvc.rectified.variance import extract_variances
 from rvc.rectified.vocoder import load_vocoder
-
-
-FRY_SOURCES = ('predictor', 'creapy')
-FRY_STRENGTH_MAX = 2.0
 
 
 def is_rectified(checkpoint):
@@ -36,8 +31,6 @@ class RectifiedPipeline(Pipeline):
         self.pitch_shift = 0.0
         self.f0_method = 'pm'
         self.source_pad = None
-        self.fry_source = 'predictor'
-        self.fry_strength = 1.0
 
     def pipeline(self, *args, source_audio=None, **kwargs):
         self.pitch_shift = float(kwargs.get('pitch', args[4] if len(args) > 4 else 0))
@@ -49,18 +42,6 @@ class RectifiedPipeline(Pipeline):
             return super().pipeline(*args, **kwargs)
         finally:
             self.source_pad = None
-
-    def set_fry_source(self, source):
-        source = str(source or 'predictor').strip().lower()
-        if source not in FRY_SOURCES:
-            raise ValueError(f'Vocal fry source must be one of {FRY_SOURCES}, not {source!r}.')
-        self.fry_source = source
-
-    def set_fry_strength(self, strength):
-        strength = float(1.0 if strength is None else strength)
-        if not 0.0 <= strength <= FRY_STRENGTH_MAX:
-            raise ValueError(f'Vocal fry strength must be between 0 and {FRY_STRENGTH_MAX}, not {strength}.')
-        self.fry_strength = strength
 
     def set_vocoder(self, path):
         path = str(path or '').strip().strip('"')
@@ -123,16 +104,11 @@ class RectifiedPipeline(Pipeline):
                                           self.device)
             variances = torch.from_numpy(variances).to(self.device)[None]
         f0 = torch.from_numpy(f0).to(self.device)[None] * 2 ** (self.pitch_shift / 12)
-        uv = torch.from_numpy(np.asarray(uv, dtype=np.float32)).to(self.device)[None]
-        fry = None
-        if net_g.uses_creak and self.fry_source == 'creapy':
-            fry = torch.from_numpy(creak_labels(waveform, rate, hop, frames)).to(self.device)[None]
         mask = torch.ones(1, 1, frames, device=self.device)
         with _INFERENCE_RNG_LOCK:
             if inference_rng is not None:
                 inference_rng.seed_next_segment()
-            mel = net_g.sample(content, f0, sid, mask, variances=variances, uv=uv, fry=fry,
-                               fry_strength=self.fry_strength)
+            mel = net_g.sample(content, f0, sid, mask, variances=variances)
             audio = self.vocoder_model(mel, f0)[0, 0, :length]
         if not torch.isfinite(audio).all():
             raise FloatingPointError('Non-finite Rectified Flow audio output.')

@@ -104,8 +104,6 @@ def run_infer_script(
     sid: int = 0,
     seed: int = 0,
     rectified_vocoder_path: str = "",
-    rectified_fry_source: str = "predictor",
-    rectified_fry_strength: float = 1.0,
 ):
     seed = resolve_inference_seed(seed)
     kwargs = {
@@ -162,8 +160,6 @@ def run_infer_script(
         "sid": sid,
         "seed": seed,
         "rectified_vocoder_path": rectified_vocoder_path,
-        "rectified_fry_source": rectified_fry_source,
-        "rectified_fry_strength": rectified_fry_strength,
     }
     infer_pipeline = import_voice_converter()
     infer_pipeline.convert_audio(**kwargs)
@@ -227,8 +223,6 @@ def run_batch_infer_script(
     sid: int = 0,
     seed: int = 0,
     rectified_vocoder_path: str = "",
-    rectified_fry_source: str = "predictor",
-    rectified_fry_strength: float = 1.0,
 ):
     seed = resolve_inference_seed(seed)
     kwargs = {
@@ -285,8 +279,6 @@ def run_batch_infer_script(
         "sid": sid,
         "seed": seed,
         "rectified_vocoder_path": rectified_vocoder_path,
-        "rectified_fry_source": rectified_fry_source,
-        "rectified_fry_strength": rectified_fry_strength,
     }
     infer_pipeline = import_voice_converter()
     infer_pipeline.convert_audio_batch(**kwargs)
@@ -1043,18 +1035,6 @@ def _infer_opts(func):
         ),
         click.option(
             "--sid", type=int, default=0, help="Speaker ID for multi-speaker models."
-        ),
-        click.option(
-            "--rectified-fry-source",
-            type=click.Choice(["predictor", "creapy"]),
-            default="predictor",
-            help="Vocal fry for Rectified Flow models trained with it: the model's predictor, or creapy run on the input.",
-        ),
-        click.option(
-            "--rectified-fry-strength",
-            type=click.FloatRange(0, 2),
-            default=1.0,
-            help="Scale the vocal fry curve of Rectified Flow models trained with it: 0 turns it off, 1 is as trained.",
         ),
     ]
     for opt in reversed(opts):

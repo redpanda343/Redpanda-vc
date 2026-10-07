@@ -1,5 +1,4 @@
 import concurrent.futures
-import json
 import logging
 import multiprocessing
 import os
@@ -35,7 +34,6 @@ from rvc.train.preprocess.dataset import (
     stage_validation_audio,
 )
 from rvc.train.preprocess.processor import PreProcess
-from rvc.rectified.creak import FRY_FOLDER, FRY_MANIFEST
 
 
 logging.getLogger("numba.core.byteflow").setLevel(logging.WARNING)
@@ -176,48 +174,26 @@ def preprocess_training_set(
         )
 
     files = []
-    fry = []
     idx = 0
-    fry_root = next(
-        (
-            os.path.join(input_root, directory)
-            for directory in sorted(os.listdir(input_root))
-            if directory.lower() == FRY_FOLDER
-            and os.path.isdir(os.path.join(input_root, directory))
-        ),
-        None,
-    )
 
-    for source_root in [input_root] + ([fry_root] if fry_root else []):
-        for root, directories, filenames in os.walk(source_root):
-            if root == input_root:
-                directories[:] = [
-                    directory
-                    for directory in directories
-                    if directory.lower() not in ("validation", FRY_FOLDER)
-                ]
-            directories.sort()
-            try:
-                sid = 0 if root == source_root else int(os.path.basename(root))
-                for f in sorted(filenames):
-                    if f.lower().endswith((".wav", ".mp3", ".flac", ".ogg")):
-                        files.append((os.path.join(root, f), idx, sid))
-                        if source_root == fry_root:
-                            fry.append(idx)
-                        idx += 1
-            except ValueError:
-                print(
-                    f'Speaker ID folder is expected to be integer, got "{os.path.basename(root)}" instead.'
-                )
-
-    manifest = os.path.join(exp_dir, FRY_MANIFEST)
-    if fry:
-        os.makedirs(exp_dir, exist_ok=True)
-        with open(manifest, "w", encoding="utf-8") as handle:
-            json.dump({"sources": fry}, handle)
-        print(f"Marked {len(fry)} file(s) from the {FRY_FOLDER} folder as vocal fry.")
-    elif os.path.isfile(manifest):
-        os.remove(manifest)
+    for root, directories, filenames in os.walk(input_root):
+        if root == input_root:
+            directories[:] = [
+                directory
+                for directory in directories
+                if directory.lower() != "validation"
+            ]
+        directories.sort()
+        try:
+            sid = 0 if root == input_root else int(os.path.basename(root))
+            for f in sorted(filenames):
+                if f.lower().endswith((".wav", ".mp3", ".flac", ".ogg")):
+                    files.append((os.path.join(root, f), idx, sid))
+                    idx += 1
+        except ValueError:
+            print(
+                f'Speaker ID folder is expected to be integer, got "{os.path.basename(root)}" instead.'
+            )
 
 
     if len(files) == 0:

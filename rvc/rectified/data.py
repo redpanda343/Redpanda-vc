@@ -151,9 +151,8 @@ def unpack_flow(batch, device, non_blocking=False):
 
 
 class RectifiedDataset(Dataset):
-    def __init__(self, binary_dir, prefix, variances=(), creak=False):
+    def __init__(self, binary_dir, prefix, variances=()):
         self.variances = list(variances)
-        self.creak = bool(creak)
         with open(Path(binary_dir) / f'{prefix}.meta', 'rb') as handle:
             self.metadata = pickle.load(handle)
         self.sizes = self.metadata['lengths']
@@ -168,7 +167,7 @@ class RectifiedDataset(Dataset):
     def __getitem__(self, index):
         item = self.indexed_ds[index]
         return (item['mel'], item['content'], item['f0'], item['key_shift'], item['speed'], item['spk_id'],
-                self._variances(item), self._creak(item))
+                self._variances(item))
 
     def _variances(self, item, frames=None):
         if not self.variances:
@@ -177,13 +176,6 @@ class RectifiedDataset(Dataset):
         if missing:
             raise ValueError(f'The binary data has no {", ".join(missing)} curves; delete the binary folder to rebuild it.')
         return torch.stack([item[name][:frames].float() for name in self.variances])
-
-    def _creak(self, item):
-        if not self.creak:
-            return torch.zeros(0, item['mel'].shape[-1])
-        if 'uv' not in item or 'creak' not in item:
-            raise ValueError('The binary data has no vocal fry labels; delete the binary folder to rebuild it.')
-        return torch.stack((item['uv'].float(), item['creak'].float()))
 
     def references(self, count, data, max_seconds=10.0):
         hop, sample_rate = int(data['hop_length']), int(data['sample_rate'])
@@ -199,10 +191,9 @@ class RectifiedDataset(Dataset):
             audio, _ = sf.read(name, dtype='float32')
             audio = torch.from_numpy(audio.mean(-1) if audio.ndim == 2 else audio)[: frames * hop]
             content_frames = min(item['content'].shape[0], int((frames - 1) * content_step) // 2 + 2)
-            uv = item['uv'][None, :frames].float() if 'uv' in item else torch.zeros(1, frames)
             result.append((item['mel'][None, :, :frames], item['content'][None, :content_frames],
                            item['f0'][None, :frames], audio[None], int(item['spk_id']), name,
-                           self._variances(item, frames)[None], uv))
+                           self._variances(item, frames)[None]))
         return result
 
 
@@ -219,8 +210,7 @@ def collate_flow(batch):
     speaker = torch.zeros(size, dtype=torch.long)
     mask = torch.zeros(size, 1, frames)
     variances = torch.zeros(size, batch[0][6].shape[0], frames)
-    creak = torch.zeros(size, batch[0][7].shape[0], frames)
-    for i, (m, c, p, k, v, s, r, u) in enumerate(batch):
+    for i, (m, c, p, k, v, s, r) in enumerate(batch):
         n = m.shape[-1]
         mel[i, :, :n] = m
         content[i, :c.shape[0]] = c
@@ -231,8 +221,7 @@ def collate_flow(batch):
         speaker[i] = s
         mask[i, :, :n] = 1.0
         variances[i, :, :n] = r
-        creak[i, :, :n] = u
-    return mel, content, content_mask, f0, key_shift, speed, speaker, mask, variances, creak
+    return mel, content, content_mask, f0, key_shift, speed, speaker, mask, variances
 
 
 def content_rms(entries, limit=64):

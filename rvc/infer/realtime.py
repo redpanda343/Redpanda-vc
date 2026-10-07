@@ -479,12 +479,11 @@ class RealTimeRVC:
             curves = self.variance_stream(source.cpu().numpy(), f0, uv, position, frames)
             variances = torch.from_numpy(curves).to(self.device)[None]
         f0 = torch.from_numpy(f0).to(waveform.device)[None] * 2 ** (self.pitch / 12)
-        uv = torch.from_numpy(np.asarray(uv, dtype=np.float32)).to(waveform.device)[None]
         mask = torch.ones(1, 1, frames, device=self.device)
         first_frame = max(0, start // hop - self.vocoder_context_frames)
         window = 0 if self.flow_context_frames is None else max(0, first_frame - self.flow_context_frames)
         mel = self.flow_sampler(features.float(), f0, speaker, mask, steps=self.rectified_steps, variances=variances,
-                                start=window, uv=uv)
+                                start=window)
         audio = self.pipeline.vocoder_model(mel[..., first_frame - window:], f0[..., first_frame:])[0, 0]
         start -= first_frame * hop
         audio = audio[start:start + count]

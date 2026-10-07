@@ -106,16 +106,16 @@ def preview(model, vocoder, reference, data, writer, step, index=None):
     if reference is None:
         return
     device = next(model.parameters()).device
-    mel, content, f0, audio, sid, path, variances, uv = reference
-    content, f0, variances, uv = content.to(device), f0.to(device), variances.to(device), uv.to(device)
+    mel, content, f0, audio, sid, path, variances = reference
+    content, f0, variances = content.to(device), f0.to(device), variances.to(device)
     mask = torch.ones(1, 1, f0.shape[1], device=device)
     speaker = torch.tensor([sid], device=device)
     suffix = '' if index is None else f'/{index}'
     with evaluation_model(model):
         generated = model.sample(content, f0, speaker, mask,
                                  source_mel=normalize_mel(mel.to(device), data) if model.val_gt_start else None,
-                                 variances=variances, uv=uv)
-        predicted = model.predict_mel(content, f0, speaker, mask, variances=variances, uv=uv)
+                                 variances=variances)
+        predicted = model.predict_mel(content, f0, speaker, mask, variances=variances)
     if not torch.isfinite(generated).all() or not torch.isfinite(predicted).all():
         raise FloatingPointError('Non-finite flow preview.')
     for name, value in (('flow', generated[0]), ('reference', normalize_mel(mel[0], data)), ('predictor', predicted[0])):
@@ -145,7 +145,7 @@ def experiment_pitch_extractor(experiment):
 
 
 def load_training_config(experiment, pretrained_flow=None, use_fused_kernels=False, preset='standard',
-                         pitch_extractor='parselmouth', shortcut=None, variance_embeds=None, creak_embed=None):
+                         pitch_extractor='parselmouth', shortcut=None, variance_embeds=None):
     config_path = experiment / 'rectified_config.json'
     if config_path.exists():
         config = resolve_config(json.loads(config_path.read_text(encoding='utf-8')))
@@ -166,8 +166,6 @@ def load_training_config(experiment, pretrained_flow=None, use_fused_kernels=Fal
         if variance_embeds is not None:
             config['flow']['model'].update(use_breathiness_embed=bool(variance_embeds),
                                            use_voicing_embed=bool(variance_embeds))
-        if creak_embed is not None:
-            config['flow']['model']['use_creak_embed'] = bool(creak_embed)
         if use_fused_kernels and not pretrained_flow:
             config['flow']['model']['backbone_args']['glu_type'] = 'softsign_glu'
     if architecture(config['flow']['model']) != architecture(default_config(preset=preset)['flow']['model']):
@@ -180,10 +178,6 @@ def load_training_config(experiment, pretrained_flow=None, use_fused_kernels=Fal
     if variance_embeds is not None and (model['use_breathiness_embed'] or model['use_voicing_embed']) != bool(variance_embeds):
         state = 'with' if variance_embeds is False else 'without'
         raise ValueError(f'This experiment was started {state} breathiness/voicing conditioning. Set it to match, '
-                         'or start a new experiment.')
-    if creak_embed is not None and model['use_creak_embed'] != bool(creak_embed):
-        state = 'with' if creak_embed is False else 'without'
-        raise ValueError(f'This experiment was started {state} vocal fry conditioning. Set it to match, '
                          'or start a new experiment.')
     if config['flow']['pitch_extractor'] != pitch_extractor:
         raise ValueError(f"This experiment trains on {config['flow']['pitch_extractor']} F0, but its features were "
@@ -203,8 +197,7 @@ def train(args):
     config = load_training_config(experiment, args.pretrained_flow, getattr(args, 'use_fused_kernels', False),
                                   getattr(args, 'preset', 'standard'),
                                   getattr(args, 'pitch_extractor', None) or experiment_pitch_extractor(experiment),
-                                  getattr(args, 'shortcut', None), getattr(args, 'variance_embeds', None),
-                                  getattr(args, 'creak_embed', None))
+                                  getattr(args, 'shortcut', None), getattr(args, 'variance_embeds', None))
     configure_arguments(args, config['flow'])
     if config['data']['sample_rate'] != 44100:
         raise ValueError('This recipe requires 44100 Hz audio.')
@@ -233,10 +226,6 @@ def configure_flow(config):
         value = settings[f'{name}_smooth_width']
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
             raise ValueError(f'{name}_smooth_width must be a nonnegative number of seconds.')
-    for name in ('aux_mel_weight', 'creak_weight'):
-        value = settings[name]
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
-            raise ValueError(f'{name} must be a nonnegative number.')
     if settings['precision'] not in {'fp32', 'fp16', 'bf16'}:
         raise ValueError('precision must be fp32, fp16 or bf16.')
     for name in ('sort_by_len', 'val_with_vocoder'):
@@ -305,10 +294,6 @@ def main():
     parser.add_argument('--variance-embeds', action=argparse.BooleanOptionalAction, default=None,
                         help="Condition the flow on DiffSinger's breathiness and voicing curves. New experiments "
                              'default to on; fine-tunes default to the pretrained setting.')
-    parser.add_argument('--creak-embed', action=argparse.BooleanOptionalAction, default=None,
-                        help='Predict vocal fry from F0, unvoiced flags and pitch jumps, and condition the flow on it. '
-                             "Labels come from creapy and the dataset's vocal_fry folder. New experiments default to on; "
-                             'fine-tunes default to the pretrained setting.')
     parser.add_argument('--fresh', action='store_true')
     train(parser.parse_args())
 

@@ -208,7 +208,6 @@ class RectifiedFlow(nn.Module):
         speed: bool = True,
         use_breathiness_embed: bool = False,
         use_voicing_embed: bool = False,
-        use_creak_embed: bool = False,
         backbone_args: Optional[dict] = None,
         aux_decoder: Optional[dict] = None,
         aux_grad: float = 0.1,
@@ -244,7 +243,6 @@ class RectifiedFlow(nn.Module):
             use_rope=use_rope, rope_interleaved=rope_interleaved, rope_theta=rope_theta,
             variances=variance_names(dict(use_breathiness_embed=use_breathiness_embed,
                                           use_voicing_embed=use_voicing_embed)),
-            creak=bool(use_creak_embed),
         )
         self.shortcut = bool(shortcut)
         self.shortcut_steps = int(shortcut_steps)
@@ -275,10 +273,6 @@ class RectifiedFlow(nn.Module):
     def variance_names(self):
         return self.encoder.variance_names
 
-    @property
-    def uses_creak(self):
-        return self.encoder.creak_head is not None
-
     def _uniform_times(self, batch, device):
         return self.t_start + (1.0 - self.t_start) * torch.rand(batch, device=device)
 
@@ -300,15 +294,9 @@ class RectifiedFlow(nn.Module):
             target = ((first + second) / 2).clamp(-4.0, 4.0)
         return x_t, t, target.to(mel.dtype), level.float()
 
-    def creak_loss(self, f0, uv, mask, creak):
-        logits = self.encoder.creak_logits(f0, uv, mask).float()
-        loss = F.binary_cross_entropy_with_logits(logits, creak.float(), reduction='none') * mask[:, 0]
-        return loss.sum() / mask.sum().clamp(min=1.0)
-
     def forward(self, mel, content, f0, speaker, mask, content_mask=None, key_shift=None, speed=None, variances=None,
-                teacher=None, uv=None, creak=None):
-        cond = self.encoder(content, f0, speaker, mask, content_mask, key_shift, speed, variances, uv)
-        creak_loss = self.creak_loss(f0, uv, mask, creak) if self.uses_creak and creak is not None else None
+                teacher=None):
+        cond = self.encoder(content, f0, speaker, mask, content_mask, key_shift, speed, variances)
         t = self._uniform_times(mel.shape[0], mel.device)
         if self.dual_timestep:
             t2 = self._uniform_times(mel.shape[0], mel.device)
@@ -320,7 +308,7 @@ class RectifiedFlow(nn.Module):
             predicted = self.aux(cond * self.aux_grad + cond.detach() * (1.0 - self.aux_grad))
         aux = F.l1_loss(predicted, mel) if predicted is not None else None
         if not self.train_diffusion:
-            return cond.sum() * 0.0, aux, creak_loss
+            return cond.sum() * 0.0, aux
         mixing = t[:, None, None] if t.ndim == 1 else t[:, None, :]
         x_t = (1.0 - mixing) * noise + mixing * mel
         target = mel - noise
@@ -334,18 +322,17 @@ class RectifiedFlow(nn.Module):
             if count:
                 if teacher is None:
                     raise ValueError('Shortcut training needs the EMA teacher for its self-consistency targets.')
-                inputs = (content, f0, speaker, mask, content_mask, key_shift, speed, variances, uv)
+                inputs = (content, f0, speaker, mask, content_mask, key_shift, speed, variances)
                 boot_x, boot_t, boot_target, boot_step = self._shortcut_targets(teacher, count, mel, noise, inputs)
                 x_t, target, t, step = x_t.clone(), target.clone(), t.clone(), step.clone()
                 x_t[:count], target[:count], step[:count] = boot_x, boot_target, boot_step
                 t[:count] = boot_t if t.ndim == 1 else boot_t[:, None]
         prediction = self.backbone(x_t, t, cond, step=step)
         flow = ((prediction.float() - target.float()).square() * mask).mean()
-        return flow, aux, creak_loss
+        return flow, aux
 
-    def predict_mel(self, content, f0, speaker, mask, content_mask=None, key_shift=None, speed=None, variances=None,
-                    uv=None):
-        return self.aux(self.encoder(content, f0, speaker, mask, content_mask, key_shift, speed, variances, uv)) * mask
+    def predict_mel(self, content, f0, speaker, mask, content_mask=None, key_shift=None, speed=None, variances=None):
+        return self.aux(self.encoder(content, f0, speaker, mask, content_mask, key_shift, speed, variances)) * mask
 
     @torch.no_grad()
     def sample(
@@ -363,9 +350,6 @@ class RectifiedFlow(nn.Module):
         source_mel: Optional[torch.Tensor] = None,
         variances: Optional[torch.Tensor] = None,
         start: int = 0,
-        uv: Optional[torch.Tensor] = None,
-        fry: Optional[torch.Tensor] = None,
-        fry_strength: float = 1.0,
     ):
         method = self.sampling_method if method is None else method
         steps = max(1, int(self.sampling_steps if steps is None else steps))
@@ -378,7 +362,7 @@ class RectifiedFlow(nn.Module):
                 raise ValueError(f"Shortcut flows sample with a power of two up to {self.shortcut_steps} steps, not {steps}.")
             method = "euler"
             step = torch.full((batch,), math.log2(steps), device=content.device)
-        cond = self.encoder(content, f0, speaker, mask, content_mask, key_shift, speed, variances, uv, fry, fry_strength)
+        cond = self.encoder(content, f0, speaker, mask, content_mask, key_shift, speed, variances)
         if start:
             cond, mask = cond[..., start:], mask[..., start:]
             source_mel = None if source_mel is None else source_mel[..., start:]
@@ -421,7 +405,7 @@ class RectifiedFlow(nn.Module):
 def validate_model_config(model: dict):
     for name in ('use_rope', 'rope_interleaved', 'use_spk_id', 'key_shift', 'speed', 'dual_timestep',
                  'train_aux_decoder', 'train_diffusion', 'val_gt_start', 'use_breathiness_embed',
-                 'use_voicing_embed', 'use_creak_embed', 'shortcut'):
+                 'use_voicing_embed', 'shortcut'):
         if not isinstance(model[name], bool):
             raise ValueError(f'{name} must be a boolean.')
     for section, key in ((model, 'enc_ffn_kernel_size'), (model['aux_decoder'], 'kernel_size'),

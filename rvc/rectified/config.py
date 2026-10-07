@@ -36,7 +36,6 @@ DEFAULT_CONFIG = {
         'breathiness_smooth_width': 0.06,
         'voicing_smooth_width': 0.06,
         'aux_mel_weight': 0.2,
-        'creak_weight': 1.0,
         'augmentation_args': {
             'random_pitch_shifting': {'enabled': True, 'range': [-5.0, 5.0], 'scale': 0.75},
             'random_time_stretching': {'enabled': True, 'range': [0.5, 2.0], 'scale': 0.75},
@@ -80,7 +79,6 @@ DEFAULT_CONFIG = {
             'speed': True,
             'use_breathiness_embed': False,
             'use_voicing_embed': False,
-            'use_creak_embed': False,
             'backbone_args': {
                 'channels': 1024,
                 'layers': 6,
@@ -113,7 +111,6 @@ NEW_EXPERIMENT_OVERRIDES = {
         'model': {
             'use_breathiness_embed': True,
             'use_voicing_embed': True,
-            'use_creak_embed': True,
         },
     },
 }
