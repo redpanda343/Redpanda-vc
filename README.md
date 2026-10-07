@@ -159,6 +159,5 @@ its license is included in that directory.
 
 - [Applio](https://github.com/IAHispano/Applio)
 - [FireRedVAD](https://github.com/FireRedTeam/FireRedVAD)
-- [UTMOSV2](https://github.com/sarulab-speech/UTMOSv2)
 - [ECAPA-TDNN](https://github.com/TaoRuijie/ECAPA-TDNN)
 - [DiffSinger](https://github.com/openvpi/DiffSinger)

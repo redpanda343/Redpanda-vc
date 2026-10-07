@@ -569,7 +569,8 @@ class RealtimeGUI:
         self.index_rate = tk.DoubleVar(value=value.get("index_rate", 0.0))
         self.rms_mix_rate = tk.DoubleVar(value=value.get("rms_mix_rate", 0.0))
         self.threshold = tk.IntVar(value=value.get("threshold", -60))
-        self.f0_method = tk.StringVar(value=value.get("f0_method", "rmvpe"))
+        f0_method = value.get("f0_method", "rmvpe")
+        self.f0_method = tk.StringVar(value=f0_method if f0_method in {"rmvpe", "swift", "pm"} else "rmvpe")
         self.block_time = tk.DoubleVar(value=value.get("block_time", 0.25))
         self.crossfade_time = tk.DoubleVar(
             value=value.get("crossfade_time", 0.05)
@@ -676,7 +677,6 @@ class RealtimeGUI:
         pitch_methods.grid(row=5, column=1, sticky="w", pady=4)
         for label, method in (
             ("rmvpe", "rmvpe"),
-            ("fcpe", "fcpe"),
             ("swift", "swift"),
             ("parselmouth", "pm"),
         ):

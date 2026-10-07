@@ -42,13 +42,10 @@ from rvc.train.utils import (
 # Zluda hijack
 import rvc.lib.zluda
 from rvc.lib.algorithm import commons
-from rvc.train.mos_validation import (
-    UTMOSv2Validator,
-    deterministic_validation_scope,
-)
 from rvc.train.process.extract_model import extract_model
 from rvc.train.timbre_validation import ECAPATimbreValidator
 from rvc.train.validation_data import (
+    deterministic_validation_scope,
     infer_validation_audio,
     prepare_validation_reference,
     should_run_external_validation,
@@ -371,15 +368,12 @@ def evaluate_external_validation(
     audio_reference,
     timbre_reference,
     timbre_validator,
-    mos_validator,
     global_step,
 ):
     validation_scalars = {}
     audio_o = None
     timbre_o = None
-    if should_run_external_validation(
-        timbre_reference, timbre_validator, mos_validator
-    ):
+    if should_run_external_validation(timbre_reference, timbre_validator):
         inference_model = model.module if hasattr(model, "module") else model
         was_training = inference_model.training
         inference_model.eval()
@@ -457,22 +451,6 @@ def evaluate_external_validation(
                 )
         except Exception as error:
             print(f"ECAPA timbre validation failed: {error}")
-    if (
-        mos_validator is not None
-        and timbre_o is not None
-        and generated_lengths is not None
-    ):
-        try:
-            validation_scalars["validation/MOS_utmosv2"] = (
-                mos_validator.score_batch(
-                    timbre_o.detach(),
-                    generated_lengths,
-                    timbre_reference[3],
-                    config.data.sample_rate,
-                )
-            )
-        except Exception as error:
-            print(f"UTMOSv2 validation failed: {error}")
     audio_dict = {}
     if audio_o is not None:
         audio_dict[f"gen/audio_{global_step:07d}"] = audio_o[0, :, :]
@@ -910,33 +888,6 @@ def run(
             print(f"ECAPA timbre validation disabled: {error}")
             timbre_validator = None
 
-    mos_validator = None
-    if rank == 0 and timbre_reference is not None:
-        try:
-            mos_model_paths = [
-                os.path.join(
-                    "rvc",
-                    "models",
-                    "pretraineds",
-                    "utmosv2",
-                    f"fold{fold}_s42_best_model.pth",
-                )
-                for fold in range(5)
-            ]
-            mos_device = (
-                torch.device("cuda", device_id) if device.type == "cuda" else device
-            )
-            mos_validator = UTMOSv2Validator(
-                mos_model_paths, config.train.seed, mos_device
-            )
-            print(
-                "UTMOSv2 paper-style five-fold, five-frame batched validation enabled "
-                f"with deterministic FP32 {mos_device.type.upper()} inference."
-            )
-        except Exception as error:
-            print(f"UTMOSv2 validation disabled: {error}")
-            mos_validator = None
-
     inference_exporter = None
     if rank == 0 and save_every_steps > 0:
         export_device = (
@@ -966,7 +917,6 @@ def run(
                 device_id,
                 audio_reference,
                 timbre_validator,
-                mos_validator,
                 timbre_reference,
                 fn_mel_loss,
                 scaler,
@@ -998,7 +948,6 @@ def train_and_evaluate(
     device_id,
     audio_reference,
     timbre_validator,
-    mos_validator,
     timbre_reference,
     fn_mel_loss,
     scaler,
@@ -1262,9 +1211,7 @@ def train_and_evaluate(
                         vocoder=vocoder,
                         version=version,
                     )
-                    if should_run_external_validation(
-                        timbre_reference, timbre_validator, mos_validator
-                    ):
+                    if should_run_external_validation(timbre_reference, timbre_validator):
                         inference_exporter.wait_for_completion()
                         print(f"Validating saved model '{inference_model_path}'")
                         try:
@@ -1283,7 +1230,6 @@ def train_and_evaluate(
                                     audio_reference,
                                     timbre_reference,
                                     timbre_validator,
-                                    mos_validator,
                                     global_step,
                                 )
                             finally:
@@ -1349,7 +1295,6 @@ def train_and_evaluate(
                     audio_reference,
                     timbre_reference,
                     timbre_validator,
-                    mos_validator,
                     global_step,
                 )
             summarize(

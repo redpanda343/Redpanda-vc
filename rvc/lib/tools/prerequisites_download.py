@@ -48,13 +48,9 @@ pretraineds_refinegan_list = [
     ),
 ]
 models_list = [
-    ("predictors/", ["rmvpe.pt", "fcpe.pt"]),
+    ("predictors/", ["rmvpe.pt"]),
     ("FireRedVAD/AED/", ["model.pth.tar", "cmvn.ark"]),
     ("ecapa_tdnn/", ["pretrain.model"]),
-    (
-        "utmosv2/",
-        [f"fold{fold}_s42_best_model.pth" for fold in range(5)],
-    ),
 ]
 embedders_list = [("embedders/contentvec/", ["pytorch_model.bin", "config.json"])]
 executables_list = [
@@ -69,7 +65,6 @@ folder_mapping_list = {
     "predictors/": "rvc/models/predictors/",
     "FireRedVAD/AED/": "rvc/models/pretraineds/FireRedVAD/AED/",
     "ecapa_tdnn/": "rvc/models/pretraineds/ecapa_tdnn/",
-    "utmosv2/": "rvc/models/pretraineds/utmosv2/",
 }
 
 remote_base_mapping = {
@@ -84,7 +79,6 @@ remote_base_mapping = {
         "https://raw.githubusercontent.com/TaoRuijie/ECAPA-TDNN/"
         f"{ECAPA_TDNN_REVISION}/exps/"
     ),
-    "utmosv2/": "https://huggingface.co/sarulab-speech/UTMOSv2/resolve/main/",
 }
 
 archive_mapping = {
@@ -115,21 +109,6 @@ expected_sha256_mapping = {
     ),
     ("ecapa_tdnn/", "pretrain.model"): (
         "a435faa17622a6bf99db8ec6fb51aafe41eb5396d3d1b837eed7e74af8c5d64f"
-    ),
-    ("utmosv2/", "fold0_s42_best_model.pth"): (
-        "c8149d988e4bbf3f347e6966b5d769de347a5f8c59ffca1dc4bd4bf5b8585e57"
-    ),
-    ("utmosv2/", "fold1_s42_best_model.pth"): (
-        "b25a27b8ce23d722395f76a2fff7c259421950458ffb240066edd01d3f28cd1f"
-    ),
-    ("utmosv2/", "fold2_s42_best_model.pth"): (
-        "c0beedbbed7ceef760adc556b925bf760639f281b20f75103b23fcdbdc5568f2"
-    ),
-    ("utmosv2/", "fold3_s42_best_model.pth"): (
-        "ec4b56921617c762428195daef9449855798bfdd651c95933afa9a29212b8567"
-    ),
-    ("utmosv2/", "fold4_s42_best_model.pth"): (
-        "f5176ac65f92653a14b3aea1878575a44ebe94ff7eaac4e9057029c19f52c720"
     ),
 }
 

@@ -1,6 +1,8 @@
 import hashlib
 import json
 import os
+import random
+from contextlib import contextmanager
 
 import numpy as np
 import soundfile as sf
@@ -15,10 +17,56 @@ MAXIMUM_VALIDATION_SECONDS = 20
 VALIDATION_INFERENCE_BATCH_SECONDS = 40
 
 
-def should_run_external_validation(reference, timbre_validator, mos_validator):
-    return reference is not None and (
-        timbre_validator is not None or mos_validator is not None
+def should_run_external_validation(reference, timbre_validator):
+    return reference is not None and timbre_validator is not None
+
+
+@contextmanager
+def deterministic_validation_scope(seed, cuda_devices=None):
+    seed = int(seed) % (2**63 - 1)
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    previous_settings = (
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
+        torch.backends.cudnn.benchmark,
+        torch.backends.cudnn.deterministic,
+        torch.backends.cuda.matmul.fp32_precision,
+        torch.backends.cudnn.fp32_precision,
     )
+    devices = list(cuda_devices or [])
+    try:
+        with torch.random.fork_rng(devices=devices):
+            random.seed(seed)
+            np.random.seed(seed % (2**32))
+            torch.manual_seed(seed)
+            torch.use_deterministic_algorithms(True)
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cuda.matmul.fp32_precision = "ieee"
+            torch.backends.cudnn.fp32_precision = "ieee"
+            try:
+                yield
+            finally:
+                (
+                    deterministic_algorithms,
+                    deterministic_warn_only,
+                    cudnn_benchmark,
+                    cudnn_deterministic,
+                    matmul_precision,
+                    cudnn_precision,
+                ) = previous_settings
+                torch.use_deterministic_algorithms(
+                    deterministic_algorithms,
+                    warn_only=deterministic_warn_only,
+                )
+                torch.backends.cudnn.benchmark = cudnn_benchmark
+                torch.backends.cudnn.deterministic = cudnn_deterministic
+                torch.backends.cuda.matmul.fp32_precision = matmul_precision
+                torch.backends.cudnn.fp32_precision = cudnn_precision
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
 
 
 def infer_validation_audio(model, inference_inputs, sample_rate, hop_length):

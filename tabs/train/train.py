@@ -693,7 +693,6 @@ def rvc_train_tab():
                 choices=[
                     "swift",
                     "rmvpe",
-                    # "fcpe"
                 ],
                 value="rmvpe",
                 interactive=True,

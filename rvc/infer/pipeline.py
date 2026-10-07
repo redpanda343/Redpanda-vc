@@ -11,7 +11,7 @@ from torch import Tensor
 now_dir = os.getcwd()
 sys.path.append(now_dir)
 
-from rvc.lib.predictors.f0 import FCPE, RMVPE, Swift
+from rvc.lib.predictors.f0 import RMVPE, Swift
 from rvc.infer.pm import extract_pm
 from rvc.lib.utils import extract_embedding_features
 
@@ -116,14 +116,6 @@ class Pipeline:
             f0 = self.model_rmvpe.get_f0(
                 x, filter_radius=0.03, decoder=f0_decoder
             )
-        elif f0_method == "fcpe":
-            if not hasattr(self, "model_fcpe"):
-                self.model_fcpe = FCPE(
-                    device=self.device,
-                    sample_rate=self.sample_rate,
-                    hop_size=self.window,
-                )
-            f0 = self.model_fcpe.get_f0(x, p_len, filter_radius=0.006)
         elif f0_method == "swift":
             if not hasattr(self, "model_swift"):
                 self.model_swift = Swift(

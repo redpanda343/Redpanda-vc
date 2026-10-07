@@ -985,10 +985,8 @@ def _infer_opts(func):
             type=click.Choice(
                 [
                     "rmvpe",
-                    "fcpe",
                     "swift",
                     "pm",
-                    "hybrid[rmvpe+fcpe]",
                 ]
             ),
             default="rmvpe",
