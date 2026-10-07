@@ -222,7 +222,7 @@ class RealTimeRVC:
             from torchaudio.transforms import Resample
             from rvc.rectified.resources import default_vocoder
             from rvc.rectified.vocoder import load_vocoder
-            from rvc.rectified.realtime import RealtimeFlowSampler
+            from rvc.rectified.realtime import RealtimeFlowSampler, RealtimeGraph
             from rvc.rectified.variance import StreamingVariances
 
             if int(rectified_steps) != rectified_steps or not 0 <= rectified_steps <= 1000:
@@ -237,10 +237,17 @@ class RealTimeRVC:
                     FLOW_WINDOW_CONTEXT * self.sample_rate / int(self.pipeline.data["hop_length"])
                 )
             self.flow_sampler = RealtimeFlowSampler(self.model, enabled=rectified_cuda_graph)
+            self.feature_graph = RealtimeGraph(
+                lambda source: extract_embedding_features(self.embedder, source, self.version),
+                "content feature", rectified_cuda_graph,
+            )
+            self.rmvpe_graph = None
+            self.rectified_cuda_graph = bool(rectified_cuda_graph)
             self.pipeline.set_vocoder(rectified_vocoder_path)
             path = self.pipeline.vocoder_path or default_vocoder()
             vocoder, _ = load_vocoder(path, self.pipeline.data)
             self.pipeline.vocoder_model = vocoder.to(self.device).float()
+            self.vocoder_graph = RealtimeGraph(self.pipeline.vocoder_model, "vocoder", rectified_cuda_graph)
             self.flow_resampler = Resample(16000, self.sample_rate).to(self.device)
             self.source_resampler = None
             self.variance_stream = None
@@ -315,7 +322,10 @@ class RealTimeRVC:
         source = input_wav.float().view(1, -1)
         if getattr(self.embedder, "audio_requires_normalization", False):
             source = F.layer_norm(source, source.shape)
-        features = extract_embedding_features(self.embedder, source, self.version)
+        if self.is_rectified:
+            features = self.feature_graph(source)
+        else:
+            features = extract_embedding_features(self.embedder, source, self.version)
         if features.shape[-1] != self.expected_feature_dim:
             raise RuntimeError(
                 f"{self.embedder_name} outputs {features.shape[-1]} channels, but "
@@ -379,6 +389,9 @@ class RealTimeRVC:
         if method != self.last_f0_method:
             self.rmvpe_viterbi.reset()
             self.last_f0_method = method
+        if self.is_rectified and method in ("pm", "rmvpe"):
+            self.pitch_sample_count += int(block_frame_16k)
+            return
         if method not in self.prepared_f0_methods:
             self._prepare_pitch_predictor(method)
         self.pitch_sample_count += int(block_frame_16k)
@@ -453,7 +466,11 @@ class RealTimeRVC:
             else:
                 predictor = getattr(self.pipeline, "model_rmvpe", None)
                 model = predictor.model if predictor is not None else rmvpe_model(self.device)
-                f0, uv = rmvpe_pitch(model, audio, rate, hop, frames)
+                if self.rmvpe_graph is None or self.rmvpe_graph.function is not model.model:
+                    from rvc.rectified.realtime import RealtimeGraph
+
+                    self.rmvpe_graph = RealtimeGraph(model.model, "RMVPE", self.rectified_cuda_graph)
+                f0, uv = rmvpe_pitch(model, audio, rate, hop, frames, self.rmvpe_graph)
             return f0, uv, source
         p_len = input_wav.shape[0] // 160
         pitchf = self.cache_pitchf[-p_len:].cpu().numpy()
@@ -484,7 +501,7 @@ class RealTimeRVC:
         window = 0 if self.flow_context_frames is None else max(0, first_frame - self.flow_context_frames)
         mel = self.flow_sampler(features.float(), f0, speaker, mask, steps=self.rectified_steps, variances=variances,
                                 start=window)
-        audio = self.pipeline.vocoder_model(mel[..., first_frame - window:], f0[..., first_frame:])[0, 0]
+        audio = self.vocoder_graph(mel[..., first_frame - window:], f0[..., first_frame:])[0, 0]
         start -= first_frame * hop
         audio = audio[start:start + count]
         if audio.numel() != count:

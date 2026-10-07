@@ -57,7 +57,7 @@ class RMVPE:
         return f0
 
     @torch.no_grad()
-    def infer_hidden(self, audio, sample_rate=16000):
+    def infer_hidden(self, audio, sample_rate=16000, network=None):
         audio = torch.from_numpy(np.asarray(audio)).float().unsqueeze(0).to(self.device)
         if sample_rate == 16000:
             audio_res = audio
@@ -73,7 +73,7 @@ class RMVPE:
         T_pad = self.seg_length * ((T1 - 1) // self.seg_length + 1) - T1
         audio_res = F.pad(audio_res, (0, T_pad))
         mel = self.mel_extractor(audio_res, center=True)
-        hidden = self.model(mel)
+        hidden = (self.model if network is None else network)(mel)
         return hidden[:, :n_frames]
 
     def infer_from_audio(self, audio, sample_rate=16000, thred=0.03, use_viterbi=False):

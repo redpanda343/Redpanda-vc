@@ -76,6 +76,15 @@ do not change the output; on a GTX 1660 Ti this took a realtime-preset flow from
 203 ms to 141 ms per 250 ms block. Turning it off runs the flow over the full
 context as before.
 
+Realtime flow inference also runs the content encoder, the RMVPE network and the
+vocoder as CUDA Graphs, captured on the first (warm-up) block and replayed after
+that like the flow steps, and falls back to eager inference if a capture fails.
+The VR harmonic-noise separator cannot be captured and stays eager. On a GTX
+1660 Ti these stages are compute-bound and the graphs change little; they cut
+launch overhead on faster GPUs. With Parselmouth or RMVPE, realtime flows skip
+the 16 kHz RVC pitch cache, since the flow extracts its own F0 from the
+full-rate input; this saved about 21 ms per 250 ms block on the GTX 1660 Ti.
+
 Shortcut training is optional (**Shortcut (few-step) flow** in the training tab,
 `--shortcut` on the command line; off by default, which keeps the DiffSinger flow
 unchanged). It follows Frans et al., "One Step Diffusion via Shortcut Models"

@@ -66,10 +66,10 @@ def rmvpe_model(device):
     return _RMVPE[key]
 
 
-def rmvpe_pitch(model, waveform, sample_rate, hop, frames):
+def rmvpe_pitch(model, waveform, sample_rate, hop, frames, network=None):
     from rvc.lib.predictors.rmvpe import interp_f0, resample_align_curve
 
-    hidden = model.infer_hidden(np.asarray(waveform, dtype=np.float32), sample_rate)
+    hidden = model.infer_hidden(np.asarray(waveform, dtype=np.float32), sample_rate, network)
     f0 = model.decode(hidden)
     uv = f0 == 0
     f0, _ = interp_f0(f0, uv)
