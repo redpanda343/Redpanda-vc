@@ -34,16 +34,12 @@ methods are interpolated and resampled to the mel hop. Realtime follows the
 selected pitch method the same way, extracting Parselmouth and RMVPE F0 from the
 full-rate input stream.
 
-Conversion adds an unvoiced guard that DiffSinger does not need. The flow
-always receives interpolated F0, so breaths, noise and whispers in the input
-can come out as sung vowels. Frames the pitch method marks unvoiced are guarded:
-RMVPE counts a voiced run only when its peak salience reaches 0.5, Parselmouth
-uses its own voicing, and other methods use their nonzero F0. In guarded frames
-the vocoder gets zero F0, so it renders noise instead of harmonics, and each mel
-bin is capped at the input's level plus 6 dB, after shifting the input by the
-median level gap between output and input over voiced frames. Bins the input
-does not reach (for example above 8 kHz in a 16 kHz recording) are left alone.
-Voiced frames are untouched.
+As in DiffSinger, the vocoder gets the same interpolated F0 as the flow, and
+conversion does not post-process unvoiced frames. The interpolated F0 does not
+tell the flow which frames are breaths, noise or whispers; models trained with
+breathiness/voicing conditioning learn that from those curves, the way RVC
+learns it from zero F0. Models trained without it can render unvoiced input as
+sung vowels.
 
 **Breathiness / voicing conditioning** (training tab, on by default;
 `--variance-embeds` / `--no-variance-embeds` on the command line) conditions the
@@ -74,7 +70,7 @@ steps setting counts RK2 steps, each costing two evaluations.
 
 Realtime can run the flow on the newest audio only (Flow window, on by default
 in the realtime GUI). The content encoder still sees the whole context, as
-seed-vc does, but the aux decoder, the flow steps and the guard run on the frames
+seed-vc does, but the aux decoder and the flow steps run on the frames
 the vocoder needs plus 0.5 s. The backbone is convolutional, so frames further back
 do not change the output; on a GTX 1660 Ti this took a realtime-preset flow from
 203 ms to 141 ms per 250 ms block. Turning it off runs the flow over the full

@@ -449,22 +449,20 @@ class RealTimeRVC:
         if f0_method in ("pm", "rmvpe"):
             audio = source.cpu().numpy()
             if f0_method == "pm":
-                f0, uv, voiced = parselmouth_pitch(audio, rate, hop, frames)
+                f0, uv = parselmouth_pitch(audio, rate, hop, frames)
             else:
                 predictor = getattr(self.pipeline, "model_rmvpe", None)
                 model = predictor.model if predictor is not None else rmvpe_model(self.device)
-                f0, uv, voiced = rmvpe_pitch(model, audio, rate, hop, frames)
-            return f0, uv, voiced, source
+                f0, uv = rmvpe_pitch(model, audio, rate, hop, frames)
+            return f0, uv, source
         p_len = input_wav.shape[0] // 160
         pitchf = self.cache_pitchf[-p_len:].cpu().numpy()
         f0 = resample_f0(pitchf, 100, frames, rate / hop) / 2 ** (self.pitch / 12)
-        voiced = resample_voicing(pitchf > 0, 100, frames, rate / hop)
-        return f0, ~voiced, voiced, source
+        uv = ~resample_voicing(pitchf > 0, 100, frames, rate / hop)
+        return f0, uv, source
 
     def _infer_rectified(self, features, input_wav, speaker, skip_head, return_length,
                          f0_method, source_wav=None, source_rate=None):
-        from rvc.rectified.guard import guard_unvoiced
-
         rate = self.sample_rate
         hop = int(self.pipeline.data["hop_length"])
         waveform = self.flow_resampler(input_wav.float()).view(1, -1)
@@ -474,7 +472,7 @@ class RealTimeRVC:
         if start < 0 or count < 1 or start + count > length:
             raise ValueError("The requested flow output exceeds the input context.")
         frames = math.ceil(length / hop)
-        f0, uv, voiced, source = self._rectified_f0(waveform, input_wav, f0_method, source_wav, source_rate, frames)
+        f0, uv, source = self._rectified_f0(waveform, input_wav, f0_method, source_wav, source_rate, frames)
         variances = None
         if self.variance_stream is not None:
             position = self.pitch_sample_count * rate // 16000
@@ -486,10 +484,7 @@ class RealTimeRVC:
         window = 0 if self.flow_context_frames is None else max(0, first_frame - self.flow_context_frames)
         mel = self.flow_sampler(features.float(), f0, speaker, mask, steps=self.rectified_steps, variances=variances,
                                 start=window)
-        mel, vocoder_f0 = guard_unvoiced(mel, f0[..., window:], source[window * hop:], voiced[window:],
-                                         self.pipeline.data)
-        offset = first_frame - window
-        audio = self.pipeline.vocoder_model(mel[..., offset:], vocoder_f0[..., offset:])[0, 0]
+        audio = self.pipeline.vocoder_model(mel[..., first_frame - window:], f0[..., first_frame:])[0, 0]
         start -= first_frame * hop
         audio = audio[start:start + count]
         if audio.numel() != count:
