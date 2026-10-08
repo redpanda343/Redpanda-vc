@@ -86,7 +86,7 @@ def start(name, batch, max_frames, max_updates, checkpoint_interval, device, use
                                ('--max-batch-frames', max_frames, 'Max frames per batch'),
                                ('--max-updates', max_updates, 'Max training updates'),
                                ('--checkpoint-interval', checkpoint_interval, 'Checkpoint interval')):
-        if value is not None:
+        if value is not None and float(value) != 0:
             arguments.extend([flag, positive_integer(value, label)])
     if str(device).strip().lower() != 'auto':
         arguments.extend(['--device', str(device).strip().lower()])
@@ -121,14 +121,14 @@ def rectified_train_tab():
         vocoder = gr.Dropdown(label='Vocoder', choices=list(VOCODERS), value=DEFAULT_VOCODER)
         gr.Markdown('Training precision follows **Settings → Training → Precision**.')
         with gr.Row():
-            batch = gr.Number(label='Max clips per batch (per GPU)', value=None, minimum=1, precision=0,
-                              info='Blank uses config, default 64.')
-            max_frames = gr.Number(label='Max frames per batch (per GPU)', value=None, minimum=1, precision=0,
-                                   info='Blank uses config, default 50000 padded frames. Lower to reduce GPU memory use.')
-            max_updates = gr.Number(label='Max training updates', value=None, minimum=1, precision=0,
-                               info='Blank uses config, default 100000 Lightning training steps.')
-            checkpoint_interval = gr.Number(label='Checkpoint interval (updates)', value=None, minimum=1, precision=0,
-                                   info='Blank uses config, default 4000 updates.')
+            batch = gr.Number(label='Max clips per batch (per GPU)', value=0, minimum=0, precision=0,
+                              info='0 uses config, default 64.')
+            max_frames = gr.Number(label='Max frames per batch (per GPU)', value=0, minimum=0, precision=0,
+                                   info='0 uses config, default 50000 padded frames. Lower to reduce GPU memory use.')
+            max_updates = gr.Number(label='Max training updates', value=0, minimum=0, precision=0,
+                               info='0 uses config, default 100000 Lightning training steps.')
+            checkpoint_interval = gr.Number(label='Checkpoint interval (updates)', value=0, minimum=0, precision=0,
+                                   info='0 uses config, default 4000 updates.')
         realtime = gr.Checkbox(label='Smaller model', value=False,
                                info='Lower vram usage and faster inference speeds, may decrease the quality of the model')
         use_fused_kernels = gr.Checkbox(label='Fused Linear + SoftSignGLU kernels', value=False,
