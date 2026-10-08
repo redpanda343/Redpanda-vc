@@ -34,25 +34,6 @@ methods are interpolated and resampled to the mel hop. Realtime follows the
 selected pitch method the same way, extracting Parselmouth and RMVPE F0 from the
 full-rate input stream.
 
-File conversion applies the pitch shift to the input audio before extracting
-anything: the full-rate input is shifted with Rubber Band (Pedalboard's
-`PitchShift`, which also moves the formants), its 16 kHz copy for the content
-encoder is resampled from the shifted audio, and content, F0 and the
-breathiness/voicing curves all come from the shifted audio, so the F0 is not
-scaled afterwards. Realtime does the same on the GPU with a phase vocoder
-(torchaudio's `phase_vocoder`, then resampling by the pitch ratio rounded to a
-fraction with a denominator of at most 128, within 2 cents from -24 to +24
-semitones): each block shifts the full-rate context window, resamples the
-shifted window to 16 kHz for the content encoder, and takes F0 and the
-breathiness/voicing curves from it, a few milliseconds per 250 ms block with no
-added latency. torchaudio's own `pitch_shift` resamples between unrelated rates
-and took 35 ms per block on a GTX 1660 Ti. Rubber Band is not used in
-realtime because streaming it holds back about a second of audio and shifting
-the whole window on the CPU costs 80-150 ms per block. Realtime shifts whole
-semitones, the step of its pitch control. Training, whose pitch-shift
-augmentation keeps the original content and only shifts the mel and F0, still
-shifts only the F0, and RVC models are unchanged.
-
 As in DiffSinger, the vocoder gets the same interpolated F0 as the flow, and
 conversion does not post-process unvoiced frames. The interpolated F0 does not
 tell the flow which frames are breaths, noise or whispers; models trained with
@@ -71,9 +52,8 @@ DiffSinger's harmonic-noise separator (`flow.hnsep`: `vr`, the default, or
 sine window (`breathiness_smooth_width`, `voicing_smooth_width`). Each curve is
 scaled by 1/96 into its own linear embedding. Pitch-shifted copies keep the
 original curves and time-stretched copies resample them, as in DiffSinger.
-Conversion extracts the same curves from the full-rate source after the input is
-pitch-shifted (see above), and realtime from its shifted window. VR runs
-in 15 s windows with 1 s crossfades so long files fit in GPU
+Conversion extracts the same curves from the full-rate source before pitch
+shifting. VR runs in 15 s windows with 1 s crossfades so long files fit in GPU
 memory, and realtime separates only the newest audio with 1 s (VR) or 0.3 s
 (WORLD) of context and reuses the rest. The app downloads the VR model
 (`hnsep_240512`) to `rvc/models/predictors/hnsep/vr` when first needed.

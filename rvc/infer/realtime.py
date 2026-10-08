@@ -250,7 +250,6 @@ class RealTimeRVC:
             self.vocoder_graph = RealtimeGraph(self.pipeline.vocoder_model, "vocoder", rectified_cuda_graph)
             self.flow_resampler = Resample(16000, self.sample_rate).to(self.device)
             self.source_resampler = None
-            self.shift_resampler = None
             self.variance_stream = None
             if self.model.variance_names:
                 self.variance_stream = StreamingVariances(
@@ -417,7 +416,7 @@ class RealTimeRVC:
             source,
             source.shape[0] // 160,
             f0_method=method,
-            pitch=self.f0_pitch,
+            pitch=self.pitch,
             f0_decoder=decoder,
         )
         if method not in self.prepared_f0_methods:
@@ -438,45 +437,6 @@ class RealTimeRVC:
         if count:
             self.cache_pitch[-count:] = usable_pitch[-count:]
             self.cache_pitchf[-count:] = usable_pitchf[-count:]
-
-    @property
-    def f0_pitch(self):
-        return 0 if self.is_rectified else self.pitch
-
-    @staticmethod
-    def _phase_vocoder_shift(audio, rate, steps):
-        from fractions import Fraction
-
-        import torchaudio.functional as AF
-
-        n_fft = 1 << max(8, round(math.log2(rate * 2048 / 44100)))
-        hop = n_fft // 8
-        stretch = 2.0 ** (-steps / 12)
-        window = torch.hann_window(n_fft, device=audio.device)
-        spec = torch.stft(audio[None], n_fft, hop, window=window, return_complex=True)
-        advance = torch.linspace(0, math.pi * hop, spec.shape[-2], device=audio.device)[..., None]
-        stretched = torch.istft(AF.phase_vocoder(spec, stretch, advance), n_fft, hop, window=window,
-                                length=int(round(audio.numel() / stretch)))
-        ratio = Fraction(1 / stretch).limit_denominator(128)
-        shifted = AF.resample(stretched, ratio.numerator, ratio.denominator)[0]
-        return F.pad(shifted, (0, max(0, audio.numel() - shifted.numel())))[:audio.numel()]
-
-    def _shift_input(self, input_wav, source_wav, source_rate):
-        steps = int(self.pitch)
-        if not self.is_rectified or not steps:
-            return input_wav, source_wav
-        if source_wav is None:
-            return self._phase_vocoder_shift(input_wav.float().view(-1), 16000, steps), None
-        rate = int(source_rate)
-        shifted = self._phase_vocoder_shift(source_wav.float().view(-1), rate, steps)
-        if self.shift_resampler is None or self.shift_resampler[0] != rate:
-            from torchaudio.transforms import Resample
-
-            self.shift_resampler = (rate, Resample(rate, 16000).to(self.device))
-        length = input_wav.shape[0]
-        resampled = self.shift_resampler[1](shifted)
-        resampled = F.pad(resampled, (max(0, length - resampled.numel()), 0))[-length:]
-        return resampled, shifted
 
     def _full_rate_source(self, source_wav, source_rate, length):
         source = source_wav.float().view(-1)
@@ -514,7 +474,7 @@ class RealTimeRVC:
             return f0, uv, source
         p_len = input_wav.shape[0] // 160
         pitchf = self.cache_pitchf[-p_len:].cpu().numpy()
-        f0 = resample_f0(pitchf, 100, frames, rate / hop) / 2 ** (self.f0_pitch / 12)
+        f0 = resample_f0(pitchf, 100, frames, rate / hop) / 2 ** (self.pitch / 12)
         uv = ~resample_voicing(pitchf > 0, 100, frames, rate / hop)
         return f0, uv, source
 
@@ -535,7 +495,7 @@ class RealTimeRVC:
             position = self.pitch_sample_count * rate // 16000
             curves = self.variance_stream(source.cpu().numpy(), f0, uv, position, frames)
             variances = torch.from_numpy(curves).to(self.device)[None]
-        f0 = torch.from_numpy(f0).to(waveform.device)[None] * 2 ** (self.f0_pitch / 12)
+        f0 = torch.from_numpy(f0).to(waveform.device)[None] * 2 ** (self.pitch / 12)
         mask = torch.ones(1, 1, frames, device=self.device)
         first_frame = max(0, start // hop - self.vocoder_context_frames)
         window = 0 if self.flow_context_frames is None else max(0, first_frame - self.flow_context_frames)
@@ -569,7 +529,6 @@ class RealTimeRVC:
         with deterministic_torch_scope():
             with self.lock:
                 torch.manual_seed(self.seed)
-                input_wav, source_wav = self._shift_input(input_wav, source_wav, source_rate)
                 features = self._extract_features(input_wav)
                 features = self._apply_index(features, skip_head)
                 self._update_pitch(input_wav, block_frame_16k, f0_method)
