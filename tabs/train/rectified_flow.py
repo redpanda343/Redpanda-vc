@@ -39,7 +39,8 @@ def _active():
 
 def _status():
     active = _active()
-    return gr.update(interactive=not active), gr.update(interactive=not active), gr.update(interactive=active)
+    return (gr.update(interactive=not active), gr.update(interactive=not active), gr.update(interactive=active),
+            gr.Timer(active=active))
 
 
 def status():
@@ -268,7 +269,8 @@ def rectified_train_tab():
         with gr.Row():
             train_button = gr.Button('Start / resume rectified training', variant='primary')
             stop_button = gr.Button('Stop current rectified job', interactive=False)
-    outputs = [preprocess_button, train_button, stop_button]
+    timer = gr.Timer(2)
+    outputs = [preprocess_button, train_button, stop_button, timer]
     cutting_inputs = [cutting, truncate_silence, silence_action]
     cutting_outputs = [chunk_len, overlap_len, truncate_silence, silence_action, silence_threshold, silence_minimum,
                        silence_to, silence_compress]
@@ -280,4 +282,4 @@ def rectified_train_tab():
     train_button.click(start, [name, batch, max_frames, max_updates, checkpoint_interval, device, use_fused_kernels,
                                use_pretrained, pretrained_path, realtime, vocoder], outputs, queue=False)
     stop_button.click(stop, [], outputs, queue=False)
-    gr.Timer(2).tick(status, [], outputs, queue=False)
+    timer.tick(status, [], outputs, queue=False, show_progress='hidden')

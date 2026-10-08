@@ -26,7 +26,7 @@ def latest_export():
 
 def _status():
     active = _process is not None and _process.poll() is None
-    return gr.update(interactive=not active), gr.update(interactive=active)
+    return gr.update(interactive=not active), gr.update(interactive=active), gr.Timer(active=active)
 
 
 def status():
@@ -134,7 +134,8 @@ def beatrice_train_tab():
     with gr.Row():
         train_button = gr.Button('Start / resume Beatrice training', variant='primary')
         stop_button = gr.Button('Stop current Beatrice job', interactive=False)
-    outputs = [train_button, stop_button]
+    timer = gr.Timer(2)
+    outputs = [train_button, stop_button, timer]
     train_button.click(start, [name, dataset, steps, batch, save_interval, workers, device], outputs, queue=False)
     stop_button.click(stop, [], outputs, queue=False)
-    gr.Timer(2).tick(status, [], outputs, queue=False)
+    timer.tick(status, [], outputs, queue=False, show_progress='hidden')

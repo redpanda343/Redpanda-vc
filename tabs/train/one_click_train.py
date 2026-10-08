@@ -396,6 +396,12 @@ def _training_ui_state(model_name):
     return gr.update(interactive=not is_active), message
 
 
+def _training_tick(model_name):
+    status = get_train_state(model_name).get("status", "idle")
+    active = status in {"running", "paused", "stopping", "finalizing"}
+    return (*_training_ui_state(model_name), gr.Timer(active=active))
+
+
 def _run_one_click_training(
     model_name,
     dataset_path,
@@ -951,6 +957,13 @@ def one_click_train_tab():
         queue=False,
     )
 
+    training_status_timer = gr.Timer(value=2.0, active=True)
+    wake_training_timer = dict(
+        fn=lambda: gr.Timer(active=True),
+        outputs=[training_status_timer],
+        queue=False,
+        show_progress="hidden",
+    )
     one_click_button.click(
         fn=_run_one_click_training,
         inputs=[
@@ -991,12 +1004,12 @@ def one_click_train_tab():
         concurrency_limit=1,
         concurrency_id="one-click-training",
         trigger_mode="once",
-    )
-
-    training_status_timer = gr.Timer(value=2.0, active=True)
+    ).then(**wake_training_timer)
+    model_name.change(**wake_training_timer)
     training_status_timer.tick(
-        fn=_training_ui_state,
+        fn=_training_tick,
         inputs=[model_name],
-        outputs=[one_click_button, training_status],
+        outputs=[one_click_button, training_status, training_status_timer],
         queue=False,
+        show_progress="hidden",
     )

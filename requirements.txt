@@ -34,7 +34,7 @@ huggingface_hub>=1.5.0,<2
 
 matplotlib==3.11.0
 tensorboard==2.21.0
-gradio==6.20.0
+gradio==6.29.1
 
 beautifulsoup4==4.15.0
 psutil==7.2.2

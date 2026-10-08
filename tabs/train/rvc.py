@@ -930,6 +930,11 @@ def rvc_train_tab():
                 display_message,
             )
 
+        def training_tick(selected_model):
+            status = get_train_state(selected_model).get("status", "idle")
+            active = status in {"running", "paused", "stopping", "finalizing"}
+            return (*training_ui_state(selected_model), gr.Timer(active=active))
+
         def control_training(action, selected_model):
             message = action(selected_model)
             gr.Info(message)
@@ -1219,6 +1224,13 @@ def rvc_train_tab():
                 training_status_info,
             ]
 
+            training_status_timer = gr.Timer(value=2.0, active=True)
+            wake_training_timer = dict(
+                fn=lambda: gr.Timer(active=True),
+                outputs=[training_status_timer],
+                queue=False,
+                show_progress="hidden",
+            )
             train_button.click(
                 fn=start_training,
                 inputs=[
@@ -1244,36 +1256,32 @@ def rvc_train_tab():
                     model_version,
                 ],
                 outputs=training_outputs,
-            )
+            ).then(**wake_training_timer)
 
             pause_train_button.click(
                 fn=lambda selected_model: control_training(pause_train, selected_model),
                 inputs=[model_name],
                 outputs=training_outputs,
-            )
+            ).then(**wake_training_timer)
             resume_train_button.click(
                 fn=lambda selected_model: control_training(resume_train, selected_model),
                 inputs=[model_name],
                 outputs=training_outputs,
-            )
+            ).then(**wake_training_timer)
             stop_train_button.click(
                 fn=lambda selected_model: control_training(stop_train, selected_model),
                 inputs=[model_name],
                 outputs=training_outputs,
-            )
+            ).then(**wake_training_timer)
 
-            training_status_timer = gr.Timer(value=2.0, active=True)
             training_status_timer.tick(
-                fn=training_ui_state,
+                fn=training_tick,
                 inputs=[model_name],
-                outputs=[
-                    train_button,
-                    pause_train_button,
-                    resume_train_button,
-                    stop_train_button,
-                    training_status_info,
-                ],
+                outputs=[*training_outputs, training_status_timer],
+                queue=False,
+                show_progress="hidden",
             )
+            model_name.change(**wake_training_timer)
             pth_dropdown_export.change(
                 fn=export_pth,
                 inputs=[pth_dropdown_export],
