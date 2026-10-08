@@ -1292,9 +1292,12 @@ def rvc_train_tab():
 
 
 def train_tab():
+    from tabs.train.beatrice import beatrice_train_tab
     from tabs.train.rectified import rectified_train_tab
 
     with gr.Tab("RVC"):
         rvc_train_tab()
     with gr.Tab("Rectified Flow"):
         rectified_train_tab()
+    with gr.Tab("Beatrice"):
+        beatrice_train_tab()

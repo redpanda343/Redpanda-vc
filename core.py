@@ -918,12 +918,23 @@ def run_prerequisites_script(
     pretraineds_hifigan: bool,
     models: bool,
     exe: bool,
+    beatrice: bool = False,
 ):
     prequisites_download_pipeline(
         pretraineds_hifigan,
         models,
         exe,
     )
+    if beatrice:
+        from rvc.beatrice.resources import ensure_trainer
+
+        try:
+            ensure_trainer()
+        except Exception as error:
+            print(
+                f"Beatrice Trainer download failed: {error}. "
+                "It is retried when Beatrice training starts."
+            )
     return "Prerequisites installed successfully."
 
 
@@ -1563,10 +1574,18 @@ def download(**kwargs):
 )
 @click.option("--models/--no-models", default=True, help="Download additional models.")
 @click.option("--exe/--no-exe", default=True, help="Download required executables.")
+@click.option(
+    "--beatrice/--no-beatrice",
+    default=True,
+    help="Download Beatrice Trainer with its pretrained models.",
+)
 def prerequisites(**kwargs):
     """Install prerequisites for RVC."""
     result = run_prerequisites_script(
-        kwargs["pretraineds_hifigan"], kwargs["models"], kwargs["exe"]
+        kwargs["pretraineds_hifigan"],
+        kwargs["models"],
+        kwargs["exe"],
+        kwargs["beatrice"],
     )
     click.echo(result)
 
