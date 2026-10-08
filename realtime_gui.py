@@ -4,6 +4,7 @@ import queue
 import threading
 import time
 import traceback
+from collections import deque
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -16,6 +17,8 @@ import numpy as np
 import sounddevice as sd
 import torch
 import torch.nn.functional as F
+from noisereduce.torchgate import TorchGate
+from noisereduce.torchgate.utils import amp_to_db
 from torchaudio.transforms import Resample
 
 from rvc.beatrice.inference import OUT_SAMPLE_RATE, find_paraphernalia
@@ -25,81 +28,147 @@ from rvc.infer.realtime import RealTimeRVC
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "assets" / "realtime_config.json"
+MONITOR_DISABLED = "Disabled"
+MAIN_HOST_APIS = ("ASIO", "Windows WASAPI")
 
 
-class AudioRingBuffer:
-    def __init__(self, capacity, channels):
-        self.capacity = int(capacity)
+class BlockTorchGate(TorchGate):
+    def forward(self, x, xn=None):
+        window = torch.hann_window(self.win_length, device=x.device)
+        spectrum = torch.stft(x, n_fft=self.n_fft, hop_length=self.hop_length, win_length=self.win_length,
+                              return_complex=True, pad_mode="constant", center=True, window=window)
+        if self.nonstationary:
+            mask = self._nonstationary_mask(spectrum.abs())
+        else:
+            mask = self._stationary_mask(amp_to_db(spectrum), xn)
+        mask = self.prop_decrease * (mask.float() - 1.0) + 1.0
+        if self.smoothing_filter is not None:
+            mask = F.conv2d(mask.unsqueeze(1), self.smoothing_filter.to(mask.dtype), padding="same")
+        y = torch.istft(spectrum * mask.squeeze(1), n_fft=self.n_fft, hop_length=self.hop_length,
+                        win_length=self.win_length, center=True, window=window)
+        return y.to(dtype=x.dtype)
+
+
+def db_to_linear(db):
+    return 10.0 ** (float(db) / 20.0)
+
+
+def enqueue_latest(block_queue, block):
+    try:
+        block_queue.put_nowait(block)
+        return
+    except queue.Full:
+        pass
+    try:
+        block_queue.get_nowait()
+    except queue.Empty:
+        pass
+    try:
+        block_queue.put_nowait(block)
+    except queue.Full:
+        pass
+
+
+class AudioFrameFifo:
+    def __init__(self, channels=1, max_frames=None):
         self.channels = int(channels)
-        self.data = np.zeros((self.capacity, self.channels), dtype=np.float32)
-        self.read_position = 0
-        self.write_position = 0
+        self.max_frames = None if max_frames is None else int(max_frames)
+        self._chunks = deque()
+        self._frames = 0
+        self._lock = threading.Lock()
 
-    @property
-    def available(self):
-        return self.write_position - self.read_position
+    def write(self, data):
+        array = np.asarray(data, dtype=np.float32)
+        if array.ndim == 1:
+            array = array[:, None]
+        if not array.shape[0]:
+            return
+        with self._lock:
+            self._chunks.append(array.copy())
+            self._frames += array.shape[0]
+            if self.max_frames is not None and self._frames > self.max_frames:
+                self._discard_locked(self._frames - self.max_frames)
 
-    @property
-    def free(self):
-        return self.capacity - self.available
+    def read(self, frames):
+        with self._lock:
+            take = min(int(frames), self._frames)
+            if take <= 0:
+                return None
+            parts = []
+            remaining = take
+            while remaining:
+                chunk = self._chunks[0]
+                count = min(remaining, chunk.shape[0])
+                parts.append(chunk[:count])
+                if count == chunk.shape[0]:
+                    self._chunks.popleft()
+                else:
+                    self._chunks[0] = chunk[count:]
+                self._frames -= count
+                remaining -= count
+        return parts[0] if len(parts) == 1 else np.concatenate(parts, axis=0)
 
-    def write(self, values):
-        count = min(int(values.shape[0]), self.free)
-        if count <= 0:
-            return 0
-        start = self.write_position % self.capacity
-        first = min(count, self.capacity - start)
-        self.data[start : start + first] = values[:first]
-        remaining = count - first
-        if remaining:
-            self.data[:remaining] = values[first : first + remaining]
-        self.write_position += count
-        return count
+    def _discard_locked(self, frames):
+        remaining = int(frames)
+        while remaining > 0 and self._chunks:
+            chunk = self._chunks[0]
+            count = min(remaining, chunk.shape[0])
+            if count == chunk.shape[0]:
+                self._chunks.popleft()
+            else:
+                self._chunks[0] = chunk[count:]
+            self._frames -= count
+            remaining -= count
 
-    def read_into(self, target):
-        count = min(int(target.shape[0]), self.available)
-        if count <= 0:
-            return 0
-        start = self.read_position % self.capacity
-        first = min(count, self.capacity - start)
-        target[:first] = self.data[start : start + first]
-        remaining = count - first
-        if remaining:
-            target[first : first + remaining] = self.data[:remaining]
-        self.read_position += count
-        return count
+
+def friendly_device_label(api_name, device_name, direction):
+    if "voicemeeter" in device_name.lower():
+        if api_name == "ASIO":
+            return f"[Voicemeeter ASIO] {device_name}"
+        arrow = "→ RVC input" if direction == "input" else "← RVC output"
+        return f"[Voicemeeter] {device_name} {arrow}"
+    api_label = "WASAPI" if api_name == "Windows WASAPI" else api_name
+    return f"[{api_label}] {device_name}"
+
+
+def device_sort_key(label):
+    lower_label = label.lower()
+    if "voicemeeter" in lower_label:
+        priority = 0
+    elif label.startswith("[ASIO]"):
+        priority = 1
+    elif label.startswith("[WASAPI]"):
+        priority = 2
+    else:
+        priority = 3
+    return priority, lower_label
 
 
 class AudioEngine:
-    SOLA_SILENCE_RMS = 1e-4
-    SOLA_MIN_CORRELATION = 0.2
-    SOLA_MIN_IMPROVEMENT = 0.05
-
     def __init__(self, error_queue):
         self.error_queue = error_queue
-        self.stream = None
+        self.input_stream = None
+        self.output_stream = None
+        self.monitor_stream = None
+        self.output_queue = None
+        self.monitor_queue = None
         self.rvc = None
         self.beatrice = None
         self.running = False
+        self.settings = {}
+        self.sample_rate = 0
         self.last_infer_ms = 0
         self.last_block_ms = 0
         self.algorithm_latency_ms = 0
-        self.worker_thread = None
-        self.worker_event = threading.Event()
-        self.worker_stop = threading.Event()
-        self.input_ring = None
-        self.output_ring = None
-        self.worker_input = None
-        self.prime_frames_remaining = 0
-        self.output_primed = False
-        self.input_overflow_reported = False
-        self.output_underflow_reported = False
         self.base_latency_ms = 0.0
+        self.reported_statuses = set()
+        self.shared_fallbacks = []
 
     def start(self, settings):
         self.stop()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        self.settings = settings
         beatrice_path = find_paraphernalia(settings["model_path"])
         self.rvc = None
         self.beatrice = None
@@ -116,225 +185,250 @@ class AudioEngine:
                 rectified_flow_window=settings.get("rectified_flow_window", True),
             )
             model_rate = self.rvc.sample_rate
+            self.device = self.rvc.device
         else:
             model_rate = OUT_SAMPLE_RATE
-        input_info = sd.query_devices(settings["input_device"])
-        output_info = sd.query_devices(settings["output_device"])
-        stream_rate = (
-            model_rate
-            if settings["sample_rate_mode"] == "model"
-            else int(input_info["default_samplerate"])
+            self.device = torch.device("cpu")
+        self.input_device = settings["input_device"]
+        self.output_device = settings["output_device"]
+        self.monitor_device = settings.get("monitor_device")
+        if self.monitor_device == self.output_device:
+            self.monitor_device = None
+        self.channels = self._channels(self.input_device, "max_input_channels")
+        self.output_channels = self._channels(self.output_device, "max_output_channels")
+        self.monitor_channels = (
+            self._channels(self.monitor_device, "max_output_channels")
+            if self.monitor_device is not None
+            else 0
         )
-        channels = min(
-            int(input_info["max_input_channels"]),
-            int(output_info["max_output_channels"]),
-            2,
-        )
-        if channels < 1:
-            raise ValueError("The selected devices do not support full-duplex audio.")
-        sd.check_input_settings(
-            device=settings["input_device"],
-            channels=channels,
-            dtype="float32",
-            samplerate=stream_rate,
-        )
-        sd.check_output_settings(
-            device=settings["output_device"],
-            channels=channels,
-            dtype="float32",
-            samplerate=stream_rate,
-        )
-        self.settings = settings
-        self.sample_rate = stream_rate
-        self.channels = channels
-        self.zero_crossing = stream_rate // 100
-        self.block_frame = (
-            round(settings["block_time"] * stream_rate / self.zero_crossing)
-            * self.zero_crossing
-        )
-        self.block_frame_16k = 160 * self.block_frame // self.zero_crossing
-        if beatrice_path is None:
-            self._prepare_rvc_buffers(settings)
-        else:
+        self.sample_rate = self._routing_samplerate(model_rate)
+        self._prepare_buffers()
+        if beatrice_path is not None:
             self.beatrice = BeatriceRealtime(
                 beatrice_path,
-                stream_rate,
+                self.sample_rate,
                 speaker=settings["speaker_id"],
                 pitch=settings["pitch"],
                 formant=settings["formant_shift"],
                 vq_neighbors=settings["vq_neighbors"],
             )
-        extra_settings = None
-        if settings["wasapi_exclusive"] and "WASAPI" in settings["host_api"]:
-            extra_settings = sd.WasapiSettings(exclusive=True)
-        ring_capacity = self.block_frame * 4
-        self.input_ring = AudioRingBuffer(ring_capacity, channels)
-        self.output_ring = AudioRingBuffer(ring_capacity, channels)
-        self.worker_input = np.empty(
-            (self.block_frame, channels), dtype=np.float32
-        )
-        self.prime_frames_remaining = (
-            2 if self.beatrice is not None else 5
-        ) * self.zero_crossing
-        self.output_primed = False
-        self.input_overflow_reported = False
-        self.output_underflow_reported = False
-        self.worker_stop.clear()
-        self.worker_event.clear()
-        self.stream = sd.Stream(
-            device=(settings["input_device"], settings["output_device"]),
-            samplerate=stream_rate,
-            blocksize=0,
-            channels=channels,
+        self._prewarm()
+        self.reported_statuses = set()
+        self.output_queue = queue.Queue(maxsize=3)
+        self.output_stream = sd.OutputStream(
+            callback=self._output_callback,
+            blocksize=self.block_frame,
+            samplerate=self.sample_rate,
+            channels=self.output_channels,
+            device=self.output_device,
             dtype="float32",
-            latency="low",
-            extra_settings=extra_settings,
-            callback=self._callback,
+            extra_settings=self.output_extra,
         )
-        if self.beatrice is None:
-            self._warm_up_rvc(settings)
-        else:
-            for _ in range(3):
-                self._process_block(
-                    np.zeros((self.block_frame, channels), dtype=np.float32)
-                )
-            self.beatrice.reset()
+        self.input_stream = sd.InputStream(
+            callback=self._input_callback,
+            blocksize=self.block_frame,
+            samplerate=self.sample_rate,
+            channels=self.channels,
+            device=self.input_device,
+            dtype="float32",
+            extra_settings=self.input_extra,
+        )
         self.running = True
-        self.worker_thread = threading.Thread(
-            target=self._worker_loop,
-            name="ApplioRealtimeWorker",
-            daemon=True,
-        )
-        self.worker_thread.start()
-        self.stream.start()
-        stream_latency = self.stream.latency
-        if isinstance(stream_latency, tuple):
-            input_latency, output_latency = stream_latency
+        self.output_stream.start()
+        self.input_stream.start()
+        self._start_monitor_stream()
+        input_latency = self.input_stream.latency
+        output_latency = self.output_stream.latency
+        if self.beatrice is not None:
+            model_latency = self.beatrice.latency_seconds
         else:
-            input_latency = output_latency = stream_latency
-        model_latency = (
-            self.beatrice.latency_seconds
-            if self.beatrice is not None
-            else settings["crossfade_time"] + 0.01
-        )
+            model_latency = settings["crossfade_time"] + 0.01
         self.base_latency_ms = (
-            input_latency
-            + output_latency
-            + settings["block_time"]
-            + model_latency
-            + self.prime_frames_remaining / stream_rate
+            input_latency + output_latency + settings["block_time"] + model_latency
         ) * 1000
         self._refresh_latency()
 
-    def _prepare_rvc_buffers(self, settings):
-        stream_rate = self.sample_rate
-        self.crossfade_frame = (
-            round(settings["crossfade_time"] * stream_rate / self.zero_crossing)
-            * self.zero_crossing
-        )
-        self.sola_buffer_frame = min(self.crossfade_frame, 4 * self.zero_crossing)
-        self.sola_search_frame = self.zero_crossing
-        self.extra_frame = (
-            round(settings["extra_time"] * stream_rate / self.zero_crossing)
-            * self.zero_crossing
-        )
-        device = self.rvc.device
-        total_input = (
-            self.extra_frame
-            + self.crossfade_frame
-            + self.sola_search_frame
-            + self.block_frame
-        )
-        self.input_wav = torch.zeros(total_input, device=device, dtype=torch.float32)
-        self.input_wav_res = torch.zeros(
-            160 * total_input // self.zero_crossing,
-            device=device,
-            dtype=torch.float32,
-        )
-        self.sola_buffer = torch.zeros(
-            self.sola_buffer_frame, device=device, dtype=torch.float32
-        )
-        self.sola_den_kernel = torch.ones(
-            1, 1, self.sola_buffer_frame, device=device, dtype=torch.float32
-        )
-        self.skip_head = self.extra_frame // self.zero_crossing
-        self.return_length = (
-            self.block_frame + self.sola_buffer_frame + self.sola_search_frame
-        ) // self.zero_crossing
-        phase = torch.linspace(
-            0.0,
-            1.0,
-            steps=self.sola_buffer_frame,
-            device=device,
-            dtype=torch.float32,
-        )
-        self.fade_in = torch.sin(0.5 * np.pi * phase) ** 2
-        self.fade_out = 1.0 - self.fade_in
-        self.input_resampler = Resample(
-            orig_freq=stream_rate,
-            new_freq=16000,
-            dtype=torch.float32,
-        ).to(device)
-        self.output_resampler = None
-        if self.rvc.sample_rate != stream_rate:
-            self.output_resampler = Resample(
-                orig_freq=self.rvc.sample_rate,
-                new_freq=stream_rate,
-                dtype=torch.float32,
-            ).to(device)
+    def _channels(self, device, key):
+        return max(1, min(int(sd.query_devices(device)[key]), 2))
 
-    def _warm_up_rvc(self, settings):
-        self.rvc.reset_caches()
-        self.rvc.infer(
-            self.input_wav_res,
-            self.block_frame_16k,
-            self.skip_head,
-            self.return_length,
-            settings["f0_method"],
-            self.input_wav,
-            self.sample_rate,
+    def _routing_samplerate(self, model_rate):
+        exclusive = self.settings.get("wasapi_exclusive", False)
+
+        def check(checker, device, channels, rate):
+            api = sd.query_hostapis(sd.query_devices(device)["hostapi"])["name"]
+            if "WASAPI" in api and exclusive:
+                settings = sd.WasapiSettings(exclusive=True)
+                try:
+                    checker(device=device, channels=channels, dtype="float32",
+                            samplerate=rate, extra_settings=settings)
+                    return settings, False
+                except sd.PortAudioError:
+                    pass
+                checker(device=device, channels=channels, dtype="float32", samplerate=rate)
+                return None, True
+            checker(device=device, channels=channels, dtype="float32", samplerate=rate)
+            return None, False
+
+        candidates = []
+        for rate in (
+            sd.query_devices(self.input_device)["default_samplerate"],
+            sd.query_devices(self.output_device)["default_samplerate"],
+            48000,
+            44100,
+            model_rate,
+            40000,
+        ):
+            rate = int(round(rate))
+            if rate > 0 and rate not in candidates:
+                candidates.append(rate)
+        errors = []
+        for rate in candidates:
+            try:
+                self.input_extra, input_shared = check(
+                    sd.check_input_settings, self.input_device, self.channels, rate
+                )
+                self.output_extra, output_shared = check(
+                    sd.check_output_settings, self.output_device, self.output_channels, rate
+                )
+                self.monitor_extra, monitor_shared = None, False
+                if self.monitor_device is not None:
+                    self.monitor_extra, monitor_shared = check(
+                        sd.check_output_settings, self.monitor_device, self.monitor_channels, rate
+                    )
+                self.shared_fallbacks = [
+                    sd.query_devices(device)["name"]
+                    for shared, device in (
+                        (input_shared, self.input_device),
+                        (output_shared, self.output_device),
+                        (monitor_shared, self.monitor_device),
+                    )
+                    if shared and device is not None
+                ]
+                return rate
+            except sd.PortAudioError as error:
+                errors.append(f"{rate} Hz: {error}")
+        raise ValueError(
+            "The selected input, output and monitor devices have no common sample rate. "
+            "Set them to the same rate (usually 48 kHz or 44.1 kHz).\n" + "\n".join(errors[-3:])
         )
-        self.rvc.reset_caches()
-        self._process_block(
-            np.zeros((self.block_frame, self.channels), dtype=np.float32)
+
+    def _prepare_buffers(self):
+        settings = self.settings
+        rate = self.sample_rate
+        device = self.device
+        self.zc = rate // 100
+        self.block_frame = int(np.round(settings["block_time"] * rate / self.zc)) * self.zc
+        self.block_frame_16k = 160 * self.block_frame // self.zc
+        self.crossfade_frame = int(np.round(settings["crossfade_time"] * rate / self.zc)) * self.zc
+        self.sola_buffer_frame = min(self.crossfade_frame, 4 * self.zc)
+        self.sola_search_frame = self.zc
+        self.extra_frame = int(np.round(settings["extra_time"] * rate / self.zc)) * self.zc
+        self.input_wav = torch.zeros(
+            self.extra_frame + self.crossfade_frame + self.sola_search_frame + self.block_frame,
+            device=device,
+            dtype=torch.float32,
         )
-        self.rvc.reset_caches()
-        self.input_wav.zero_()
-        self.input_wav_res.zero_()
-        self.sola_buffer.zero_()
+        self.input_wav_denoise = self.input_wav.clone()
+        self.input_wav_res = torch.zeros(
+            160 * self.input_wav.shape[0] // self.zc, device=device, dtype=torch.float32
+        )
+        self.rms_buffer = np.zeros(4 * self.zc, dtype="float32")
+        self.sola_buffer = torch.zeros(self.sola_buffer_frame, device=device, dtype=torch.float32)
+        self.sola_den_kernel = torch.ones(1, 1, self.sola_buffer_frame, device=device, dtype=torch.float32)
+        self.nr_buffer = self.sola_buffer.clone()
+        self.output_buffer = self.input_wav.clone()
+        self.skip_head = self.extra_frame // self.zc
+        self.return_length = (self.block_frame + self.sola_buffer_frame + self.sola_search_frame) // self.zc
+        self.fade_in_window = (
+            torch.sin(
+                0.5 * np.pi * torch.linspace(0.0, 1.0, steps=self.sola_buffer_frame, device=device,
+                                             dtype=torch.float32)
+            )
+            ** 2
+        )
+        self.fade_out_window = 1 - self.fade_in_window
+        self.resampler = Resample(orig_freq=rate, new_freq=16000, dtype=torch.float32).to(device)
+        self.resampler2 = None
+        if self.rvc is not None and self.rvc.sample_rate != rate:
+            self.resampler2 = Resample(
+                orig_freq=self.rvc.sample_rate, new_freq=rate, dtype=torch.float32
+            ).to(device)
+        self.tg = BlockTorchGate(sr=rate, n_fft=4 * self.zc, prop_decrease=0.9).to(device)
+
+    def _reset_buffers(self):
+        for buffer in (self.input_wav, self.input_wav_denoise, self.input_wav_res, self.output_buffer,
+                       self.sola_buffer, self.nr_buffer):
+            buffer.zero_()
+        self.rms_buffer[:] = 0
+        if self.rvc is not None:
+            self.rvc.reset_caches()
+        if self.beatrice is not None:
+            self.beatrice.reset()
+
+    def _prewarm(self):
+        try:
+            silence = np.zeros((self.block_frame, self.channels), dtype=np.float32)
+            for _ in range(2 if self.beatrice is None else 3):
+                self._process(silence)
+        finally:
+            self._reset_buffers()
+
+    def _start_monitor_stream(self):
+        self.monitor_stream = None
+        self.monitor_queue = None
+        if self.monitor_device is None:
+            return
+        try:
+            self.monitor_queue = AudioFrameFifo(1, max_frames=self.block_frame * 4)
+            self.monitor_stream = sd.OutputStream(
+                device=self.monitor_device,
+                callback=self._monitor_callback,
+                blocksize=0,
+                samplerate=self.sample_rate,
+                channels=self.monitor_channels,
+                dtype="float32",
+                extra_settings=self.monitor_extra,
+            )
+            self.monitor_stream.start()
+        except Exception as error:
+            if self.monitor_stream is not None:
+                self.monitor_stream.close()
+            self.monitor_stream = None
+            self.monitor_queue = None
+            self.error_queue.put_nowait(
+                f"The monitor device could not start; continuing with the main output only. {error}"
+            )
 
     def _refresh_latency(self):
         lookahead_ms = 0
-        if self.rvc is not None and not self.settings["monitor_input"]:
-            lookahead_ms = 10 * self.rvc.pitch_lookahead_frames(
-                self.settings["f0_method"]
-            )
+        if self.rvc is not None and not self.settings["passthrough"]:
+            lookahead_ms = 10 * self.rvc.pitch_lookahead_frames(self.settings["f0_method"])
+        noise_reduction_ms = 0
+        if self.settings["input_noise_reduce"]:
+            noise_reduction_ms = 1000 * min(self.settings["crossfade_time"], 0.04)
         self.algorithm_latency_ms = round(
-            self.base_latency_ms + lookahead_ms + self.last_block_ms
+            self.base_latency_ms + lookahead_ms + noise_reduction_ms + self.last_block_ms
         )
 
     def stop(self):
         self.running = False
-        self.worker_stop.set()
-        self.worker_event.set()
-        if self.stream is not None:
+        for name in ("input_stream", "output_stream", "monitor_stream"):
+            stream = getattr(self, name)
+            if stream is None:
+                continue
             try:
-                if self.stream.active:
-                    self.stream.abort()
+                if stream.active:
+                    stream.abort()
             except sd.PortAudioError:
                 pass
             finally:
                 try:
-                    self.stream.close()
+                    stream.close()
                 except sd.PortAudioError:
                     pass
-                self.stream = None
-        if (
-            self.worker_thread is not None
-            and self.worker_thread is not threading.current_thread()
-        ):
-            self.worker_thread.join(timeout=5)
-        self.worker_thread = None
+                setattr(self, name, None)
+        self.output_queue = None
+        self.monitor_queue = None
 
     def update_pitch(self, pitch):
         if self.beatrice is not None:
@@ -352,232 +446,170 @@ class AudioEngine:
             self.beatrice.model.set_formant_shift(formant_shift)
             self.beatrice.model.set_vq_neighbors(vq_neighbors)
 
-    def _gate_silence(self, mono):
-        threshold = self.settings["threshold"]
-        if threshold <= -60:
-            return mono
-        gated = mono.copy()
-        complete = gated.shape[0] // self.zero_crossing
-        if complete:
-            frames = gated[: complete * self.zero_crossing].reshape(
-                complete, self.zero_crossing
-            )
-            rms = np.sqrt(np.mean(np.square(frames), axis=1) + 1e-12)
-            frames[20 * np.log10(rms) < threshold] = 0
-        return gated
+    def _gate(self, indata):
+        indata = np.append(self.rms_buffer, indata)
+        rms = librosa.feature.rms(y=indata, frame_length=4 * self.zc, hop_length=self.zc)[:, 2:]
+        self.rms_buffer[:] = indata[-4 * self.zc :]
+        indata = indata[2 * self.zc - self.zc // 2 :]
+        quiet = librosa.amplitude_to_db(rms, ref=1.0)[0] < self.settings["threshold"]
+        for index in range(quiet.shape[0]):
+            if quiet[index]:
+                indata[index * self.zc : (index + 1) * self.zc] = 0
+        return indata[self.zc // 2 :]
 
-    def _resample_input(self, source):
-        converted = self.input_resampler(source)
-        expected = self.block_frame_16k + 160
-        converted = converted[160:]
-        if converted.shape[0] < expected:
-            converted = F.pad(converted, (expected - converted.shape[0], 0))
-        return converted[-expected:]
-
-    def _mix_volume(self, converted):
+    def _mix_volume(self, converted, source):
         rate = self.settings["rms_mix_rate"]
-        if rate >= 1:
-            return converted
         lookahead = self.rvc.pitch_lookahead_frames(self.settings["f0_method"])
-        source_start = self.extra_frame - lookahead * self.zero_crossing
-        source = self.input_wav[source_start : source_start + converted.shape[0]]
+        start = self.extra_frame - lookahead * self.zc
+        source = source[start : start + converted.shape[0]]
         rms_source = librosa.feature.rms(
-            y=source.detach().cpu().numpy(),
-            frame_length=4 * self.zero_crossing,
-            hop_length=self.zero_crossing,
+            y=source.cpu().numpy(), frame_length=4 * self.zc, hop_length=self.zc
         )
-        rms_converted = librosa.feature.rms(
-            y=converted.detach().cpu().numpy(),
-            frame_length=4 * self.zero_crossing,
-            hop_length=self.zero_crossing,
-        )
-        rms_source = torch.from_numpy(rms_source).to(converted.device)
-        rms_converted = torch.from_numpy(rms_converted).to(converted.device)
+        rms_source = torch.from_numpy(rms_source).to(self.device)
         rms_source = F.interpolate(
-            rms_source.unsqueeze(0),
-            size=converted.shape[0] + 1,
-            mode="linear",
-            align_corners=True,
+            rms_source.unsqueeze(0), size=converted.shape[0] + 1, mode="linear", align_corners=True
         )[0, 0, :-1]
+        rms_converted = librosa.feature.rms(
+            y=converted[:].cpu().numpy(), frame_length=4 * self.zc, hop_length=self.zc
+        )
+        rms_converted = torch.from_numpy(rms_converted).to(self.device)
         rms_converted = F.interpolate(
-            rms_converted.unsqueeze(0),
-            size=converted.shape[0] + 1,
-            mode="linear",
-            align_corners=True,
+            rms_converted.unsqueeze(0), size=converted.shape[0] + 1, mode="linear", align_corners=True
         )[0, 0, :-1]
-        rms_converted = torch.clamp(rms_converted, min=1e-3)
-        return converted * torch.pow(
-            rms_source / rms_converted, 1.0 - rate
-        )
-
-    def _find_sola_offset(self, converted):
-        search = converted[
-            None, None, : self.sola_buffer_frame + self.sola_search_frame
-        ]
-        reference = self.sola_buffer
-        reference_centered = reference - reference.mean()
-        reference_energy = reference_centered.square().sum()
-        candidate_sum = F.conv1d(search, self.sola_den_kernel)
-        candidate_square_sum = F.conv1d(search.square(), self.sola_den_kernel)
-        candidate_energy = torch.clamp(
-            candidate_square_sum
-            - candidate_sum.square() / self.sola_buffer_frame,
-            min=0.0,
-        )
-        numerator = F.conv1d(search, reference_centered[None, None])
-        denominator = torch.sqrt(reference_energy * candidate_energy).clamp_min(
-            torch.finfo(converted.dtype).eps
-        )
-        correlation = (numerator / denominator)[0, 0]
-        best_correlation, best_offset = torch.max(correlation, dim=0)
-        reference_rms = torch.sqrt(reference_energy / self.sola_buffer_frame)
-        candidate_rms = torch.sqrt(
-            candidate_energy[0, 0, best_offset] / self.sola_buffer_frame
-        )
-        confident = (
-            (reference_rms >= self.SOLA_SILENCE_RMS)
-            & (candidate_rms >= self.SOLA_SILENCE_RMS)
-            & torch.isfinite(best_correlation)
-            & (best_correlation >= self.SOLA_MIN_CORRELATION)
-            & (
-                best_correlation - correlation[0]
-                >= self.SOLA_MIN_IMPROVEMENT
-            )
-        )
-        selected_offset = torch.where(
-            confident, best_offset, torch.zeros_like(best_offset)
-        )
-        return int(selected_offset.item())
+        rms_converted = torch.max(rms_converted, torch.zeros_like(rms_converted) + 1e-3)
+        return converted * torch.pow(rms_source / rms_converted, 1.0 - rate)
 
     def _apply_sola(self, converted):
         needed = self.block_frame + self.sola_buffer_frame + self.sola_search_frame
         if converted.shape[0] < needed:
             converted = F.pad(converted, (0, needed - converted.shape[0]))
-        offset = self._find_sola_offset(converted)
-        converted = converted[offset:]
-        converted[: self.sola_buffer_frame] *= self.fade_in
-        converted[: self.sola_buffer_frame] += self.sola_buffer * self.fade_out
-        self.sola_buffer[:] = converted[
-            self.block_frame : self.block_frame + self.sola_buffer_frame
-        ]
+        conv_input = converted[None, None, : self.sola_buffer_frame + self.sola_search_frame]
+        cor_nom = F.conv1d(conv_input, self.sola_buffer[None, None, :])
+        cor_den = torch.sqrt(F.conv1d(conv_input**2, self.sola_den_kernel) + 1e-8)
+        sola_offset = int(torch.argmax(cor_nom[0, 0] / cor_den[0, 0]).item())
+        converted = converted[sola_offset:]
+        converted[: self.sola_buffer_frame] *= self.fade_in_window
+        converted[: self.sola_buffer_frame] += self.sola_buffer * self.fade_out_window
+        self.sola_buffer[:] = converted[self.block_frame : self.block_frame + self.sola_buffer_frame]
         return converted[: self.block_frame]
 
-    def _process_block(self, indata):
+    def _process(self, indata):
         started = time.perf_counter()
-        mono = librosa.to_mono(indata.T).astype(np.float32, copy=False)
-        mono = self._gate_silence(mono)
-        if self.beatrice is not None:
-            return self._process_beatrice_block(mono, started)
-        self.input_wav[:-self.block_frame] = self.input_wav[
-            self.block_frame:
-        ].clone()
-        self.input_wav[-self.block_frame:] = torch.from_numpy(mono).to(
-            self.rvc.device
-        )
-        self.input_wav_res[:-self.block_frame_16k] = self.input_wav_res[
-            self.block_frame_16k:
-        ].clone()
-        resample_source = self.input_wav[
-            -self.block_frame - 2 * self.zero_crossing :
-        ]
-        resampled = self._resample_input(resample_source)
-        self.input_wav_res[-resampled.shape[0] :] = resampled
-        if self.settings["monitor_input"]:
-            self.rvc.pitch_sample_count += self.block_frame_16k
-            converted = self.input_wav[self.extra_frame :].clone()
-            infer_seconds = 0.0
-        else:
-            converted, infer_seconds = self.rvc.infer(
-                self.input_wav_res,
-                self.block_frame_16k,
-                self.skip_head,
-                self.return_length,
-                self.settings["f0_method"],
-                self.input_wav,
-                self.sample_rate,
-            )
-            if self.output_resampler is not None:
-                converted = self.output_resampler(converted)
-            converted = self._mix_volume(converted)
-        output = self._apply_sola(converted)
-        output = output.repeat(self.channels, 1).t().detach().cpu().numpy()
-        np.clip(output, -1.0, 1.0, out=output)
-        self.last_infer_ms = round(infer_seconds * 1000)
-        self.last_block_ms = round((time.perf_counter() - started) * 1000)
-        self._refresh_latency()
-        return output
-
-    def _process_beatrice_block(self, mono, started):
+        settings = self.settings
+        indata = librosa.to_mono(indata.T).astype(np.float32)
+        indata *= np.float32(db_to_linear(settings["input_gain_db"]))
+        np.clip(indata, -1.0, 1.0, out=indata)
+        if settings["threshold"] > -60:
+            indata = self._gate(indata)
+        self.input_wav[: -self.block_frame] = self.input_wav[self.block_frame :].clone()
+        self.input_wav[-indata.shape[0] :] = torch.from_numpy(indata).to(self.device)
+        self.input_wav_res[: -self.block_frame_16k] = self.input_wav_res[self.block_frame_16k :].clone()
+        denoise = settings["input_noise_reduce"]
+        if denoise:
+            self.input_wav_denoise[: -self.block_frame] = self.input_wav_denoise[self.block_frame :].clone()
+            input_wav = self.input_wav[-self.sola_buffer_frame - self.block_frame :]
+            input_wav = self.tg(input_wav.unsqueeze(0), self.input_wav.unsqueeze(0)).squeeze(0)
+            input_wav[: self.sola_buffer_frame] *= self.fade_in_window
+            input_wav[: self.sola_buffer_frame] += self.nr_buffer * self.fade_out_window
+            self.input_wav_denoise[-self.block_frame :] = input_wav[: self.block_frame]
+            self.nr_buffer[:] = input_wav[self.block_frame :]
+            if self.rvc is not None:
+                resample_input = self.input_wav_denoise[-self.block_frame - 2 * self.zc :]
+                self.input_wav_res[-self.block_frame_16k - 160 :] = self.resampler(resample_input)[160:]
+        elif self.rvc is not None:
+            resample_input = self.input_wav[-indata.shape[0] - 2 * self.zc :]
+            self.input_wav_res[-160 * (indata.shape[0] // self.zc + 1) :] = self.resampler(resample_input)[160:]
+        source = self.input_wav_denoise if denoise else self.input_wav
+        passthrough = settings["passthrough"]
         infer_seconds = 0.0
-        if self.settings["monitor_input"]:
-            converted = mono
+        if self.beatrice is not None:
+            block = source[-self.block_frame :]
+            if passthrough:
+                infer_wav = block.clone()
+            else:
+                infer_started = time.perf_counter()
+                infer_wav = torch.from_numpy(self.beatrice.process(block.cpu().numpy())).to(self.device)
+                infer_seconds = time.perf_counter() - infer_started
+            if settings["output_noise_reduce"] and not passthrough:
+                self.output_buffer[: -self.block_frame] = self.output_buffer[self.block_frame :].clone()
+                self.output_buffer[-self.block_frame :] = infer_wav
+                infer_wav = self.tg(infer_wav.unsqueeze(0), self.output_buffer.unsqueeze(0)).squeeze(0)
+            output_block = infer_wav[: self.block_frame]
         else:
-            converted = self.beatrice.process(mono)
-            infer_seconds = time.perf_counter() - started
-        output = np.repeat(converted[:, None], self.channels, axis=1)
-        np.clip(output, -1.0, 1.0, out=output)
+            if passthrough:
+                self.rvc.pitch_sample_count += self.block_frame_16k
+                infer_wav = source[self.extra_frame :].clone()
+            else:
+                infer_wav, infer_seconds = self.rvc.infer(
+                    self.input_wav_res,
+                    self.block_frame_16k,
+                    self.skip_head,
+                    self.return_length,
+                    settings["f0_method"],
+                    source,
+                    self.sample_rate,
+                )
+                if self.resampler2 is not None:
+                    infer_wav = self.resampler2(infer_wav)
+            if settings["output_noise_reduce"] and not passthrough:
+                self.output_buffer[: -self.block_frame] = self.output_buffer[self.block_frame :].clone()
+                self.output_buffer[-self.block_frame :] = infer_wav[-self.block_frame :]
+                infer_wav = self.tg(infer_wav.unsqueeze(0), self.output_buffer.unsqueeze(0)).squeeze(0)
+            if settings["rms_mix_rate"] < 1 and not passthrough:
+                infer_wav = self._mix_volume(infer_wav, source)
+            output_block = self._apply_sola(infer_wav)
+        gain = db_to_linear(settings["output_gain_db"])
+        output = torch.clamp(output_block * gain, -1.0, 1.0).cpu().numpy().astype(np.float32)
         self.last_infer_ms = round(infer_seconds * 1000)
         self.last_block_ms = round((time.perf_counter() - started) * 1000)
         self._refresh_latency()
         return output
 
-    def _worker_loop(self):
-        try:
-            while not self.worker_stop.is_set():
-                self.worker_event.wait(0.1)
-                self.worker_event.clear()
-                while (
-                    not self.worker_stop.is_set()
-                    and self.input_ring.available >= self.block_frame
-                    and self.output_ring.free >= self.block_frame
-                ):
-                    count = self.input_ring.read_into(self.worker_input)
-                    if count != self.block_frame:
-                        break
-                    output = self._process_block(self.worker_input)
-                    if self.worker_stop.is_set():
-                        break
-                    written = self.output_ring.write(output)
-                    if written != self.block_frame:
-                        raise RuntimeError("The real-time output buffer is full.")
-        except Exception:
-            self.running = False
-            self.worker_stop.set()
-            self.error_queue.put_nowait(traceback.format_exc())
+    def _report_status(self, status):
+        text = str(status)
+        if text not in self.reported_statuses:
+            self.reported_statuses.add(text)
+            self.error_queue.put_nowait(text)
 
-    def _callback(self, indata, outdata, frames, timing, status):
+    def _input_callback(self, indata, frames, times, status):
+        if not self.running:
+            return
         try:
-            if not self.running:
-                outdata.fill(0)
-                raise sd.CallbackStop
             if status:
-                self.error_queue.put_nowait(str(status))
-            written = self.input_ring.write(indata)
-            if written != frames and not self.input_overflow_reported:
-                self.input_overflow_reported = True
-                self.error_queue.put_nowait("Real-time input buffer overflow.")
-            outdata.fill(0)
-            if not self.output_primed:
-                if self.output_ring.available >= self.block_frame:
-                    self.prime_frames_remaining -= frames
-                    if self.prime_frames_remaining <= 0:
-                        self.output_primed = True
-                self.worker_event.set()
-                return
-            count = self.output_ring.read_into(outdata)
-            if count != frames and not self.output_underflow_reported:
-                self.output_underflow_reported = True
-                self.error_queue.put_nowait("Real-time output buffer underflow.")
-            self.worker_event.set()
-        except sd.CallbackStop:
-            raise
+                self._report_status(status)
+            output = self._process(indata)
+            output_queue = self.output_queue
+            if output_queue is not None:
+                enqueue_latest(output_queue, output)
+            monitor_queue = self.monitor_queue
+            if monitor_queue is not None:
+                monitor_queue.write(
+                    np.clip(output * np.float32(db_to_linear(self.settings["monitor_gain_db"])), -1.0, 1.0)
+                )
         except Exception:
-            outdata.fill(0)
             self.running = False
-            self.worker_stop.set()
-            self.worker_event.set()
             self.error_queue.put_nowait(traceback.format_exc())
             raise sd.CallbackAbort
+
+    def _output_callback(self, outdata, frames, times, status):
+        outdata.fill(0)
+        output_queue = self.output_queue
+        if output_queue is None:
+            return
+        try:
+            block = output_queue.get_nowait()
+        except queue.Empty:
+            return
+        count = min(frames, block.shape[0])
+        outdata[:count] = block[:count, None]
+
+    def _monitor_callback(self, outdata, frames, times, status):
+        outdata.fill(0)
+        monitor_queue = self.monitor_queue
+        block = monitor_queue.read(frames) if monitor_queue is not None else None
+        if block is None:
+            return
+        outdata[: block.shape[0]] = block[:, :1]
 
 
 class RealtimeGUI:
@@ -587,22 +619,20 @@ class RealtimeGUI:
         self.root.minsize(760, 620)
         self.error_queue = queue.Queue()
         self.engine = AudioEngine(self.error_queue)
-        self.devices = {}
         self.input_devices = {}
         self.output_devices = {}
+        self.device_names = {}
         self.saved = self._load_config()
         self._make_variables()
         self._build()
         self._load_devices()
-        self.pitch.trace_add("write", self._hot_update)
-        self.index_rate.trace_add("write", self._hot_update)
-        self.rms_mix_rate.trace_add("write", self._hot_update)
-        self.threshold.trace_add("write", self._hot_update)
-        self.f0_method.trace_add("write", self._hot_update)
-        self.monitor_input.trace_add("write", self._hot_update)
-        self.speaker_id.trace_add("write", self._hot_update)
-        self.formant_shift.trace_add("write", self._hot_update)
-        self.vq_neighbors.trace_add("write", self._hot_update)
+        for variable in (
+            self.pitch, self.index_rate, self.rms_mix_rate, self.threshold, self.f0_method,
+            self.passthrough, self.speaker_id, self.formant_shift, self.vq_neighbors,
+            self.input_gain_db, self.output_gain_db, self.monitor_gain_db,
+            self.input_noise_reduce, self.output_noise_reduce,
+        ):
+            variable.trace_add("write", self._hot_update)
         self.root.after(100, self._poll)
         self.root.protocol("WM_DELETE_WINDOW", self._close)
 
@@ -622,12 +652,10 @@ class RealtimeGUI:
         self.embedder_model = tk.StringVar(
             value=value.get("embedder_model", "contentvec")
         )
-        self.host_api = tk.StringVar(value=value.get("host_api", ""))
         self.input_device = tk.StringVar(value=value.get("input_device", ""))
         self.output_device = tk.StringVar(value=value.get("output_device", ""))
-        self.sample_rate_mode = tk.StringVar(
-            value=value.get("sample_rate_mode", "device")
-        )
+        self.monitor_device = tk.StringVar(value=value.get("monitor_device", MONITOR_DISABLED))
+        self.show_legacy_devices = tk.BooleanVar(value=value.get("show_legacy_devices", False))
         self.wasapi_exclusive = tk.BooleanVar(
             value=value.get("wasapi_exclusive", False)
         )
@@ -636,6 +664,11 @@ class RealtimeGUI:
         self.index_rate = tk.DoubleVar(value=value.get("index_rate", 0.0))
         self.rms_mix_rate = tk.DoubleVar(value=value.get("rms_mix_rate", 0.0))
         self.threshold = tk.IntVar(value=value.get("threshold", -60))
+        self.input_gain_db = tk.DoubleVar(value=value.get("input_gain_db", 0.0))
+        self.output_gain_db = tk.DoubleVar(value=value.get("output_gain_db", 0.0))
+        self.monitor_gain_db = tk.DoubleVar(value=value.get("monitor_gain_db", 0.0))
+        self.input_noise_reduce = tk.BooleanVar(value=value.get("input_noise_reduce", False))
+        self.output_noise_reduce = tk.BooleanVar(value=value.get("output_noise_reduce", False))
         self.formant_shift = tk.DoubleVar(value=value.get("formant_shift", 0.0))
         self.vq_neighbors = tk.IntVar(value=value.get("vq_neighbors", 0))
         f0_method = value.get("f0_method", "rmvpe")
@@ -645,7 +678,7 @@ class RealtimeGUI:
             value=value.get("crossfade_time", 0.05)
         )
         self.extra_time = tk.DoubleVar(value=value.get("extra_time", 2.5))
-        self.monitor_input = tk.BooleanVar(value=False)
+        self.passthrough = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="Ready")
         self.latency = tk.StringVar(value="Estimated latency: 0 ms")
         self.infer_time = tk.StringVar(value="Processing: 0 ms (Model: 0 ms)")
@@ -697,41 +730,34 @@ class RealtimeGUI:
         model.columnconfigure(1, weight=1)
         devices = ttk.LabelFrame(root, text="Audio devices", padding=10)
         devices.pack(fill="x", pady=(0, 8))
-        ttk.Label(devices, text="Host API").grid(row=0, column=0, sticky="w")
-        self.host_combo = ttk.Combobox(
-            devices, textvariable=self.host_api, state="readonly"
-        )
-        self.host_combo.grid(row=0, column=1, sticky="ew", padx=8)
-        self.host_combo.bind("<<ComboboxSelected>>", self._host_changed)
-        ttk.Button(devices, text="Reload", command=self._load_devices).grid(row=0, column=2)
-        ttk.Label(devices, text="Input").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(devices, text="Input").grid(row=0, column=0, sticky="w")
         self.input_combo = ttk.Combobox(
             devices, textvariable=self.input_device, state="readonly"
         )
-        self.input_combo.grid(row=1, column=1, columnspan=2, sticky="ew", padx=(8, 0), pady=(8, 0))
-        ttk.Label(devices, text="Output").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.input_combo.grid(row=0, column=1, sticky="ew", padx=8)
+        ttk.Button(devices, text="Reload", command=self._load_devices).grid(row=0, column=2)
+        ttk.Label(devices, text="Output").grid(row=1, column=0, sticky="w", pady=(8, 0))
         self.output_combo = ttk.Combobox(
             devices, textvariable=self.output_device, state="readonly"
         )
-        self.output_combo.grid(row=2, column=1, columnspan=2, sticky="ew", padx=(8, 0), pady=(8, 0))
-        rate_frame = ttk.Frame(devices)
-        rate_frame.grid(row=3, column=1, columnspan=2, sticky="w", pady=(8, 0))
-        ttk.Radiobutton(
-            rate_frame,
-            text="Device sample rate",
-            variable=self.sample_rate_mode,
-            value="device",
-        ).pack(side="left")
-        ttk.Radiobutton(
-            rate_frame,
-            text="Model sample rate",
-            variable=self.sample_rate_mode,
-            value="model",
-        ).pack(side="left", padx=(12, 0))
+        self.output_combo.grid(row=1, column=1, columnspan=2, sticky="ew", padx=(8, 0), pady=(8, 0))
+        ttk.Label(devices, text="Monitor").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.monitor_combo = ttk.Combobox(
+            devices, textvariable=self.monitor_device, state="readonly"
+        )
+        self.monitor_combo.grid(row=2, column=1, columnspan=2, sticky="ew", padx=(8, 0), pady=(8, 0))
+        options = ttk.Frame(devices)
+        options.grid(row=3, column=1, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Checkbutton(
-            rate_frame,
+            options,
             text="WASAPI exclusive",
             variable=self.wasapi_exclusive,
+        ).pack(side="left")
+        ttk.Checkbutton(
+            options,
+            text="Show MME / DirectSound / WDM-KS devices",
+            variable=self.show_legacy_devices,
+            command=self._load_devices,
         ).pack(side="left", padx=(12, 0))
         devices.columnconfigure(1, weight=1)
         settings = ttk.LabelFrame(root, text="Conversion", padding=10)
@@ -741,9 +767,12 @@ class RealtimeGUI:
         self._scale(settings, "Index rate", self.index_rate, 0, 1, 2, 0.01)
         self._scale(settings, "RMS mix", self.rms_mix_rate, 0, 1, 3, 0.01)
         self._scale(settings, "Gate threshold", self.threshold, -60, 0, 4)
-        ttk.Label(settings, text="Pitch extraction").grid(row=5, column=0, sticky="w")
+        self._scale(settings, "Input gain (dB)", self.input_gain_db, -24, 24, 5, 0.5)
+        self._scale(settings, "Output gain (dB)", self.output_gain_db, -24, 24, 6, 0.5)
+        self._scale(settings, "Monitor gain (dB)", self.monitor_gain_db, -24, 24, 7, 0.5)
+        ttk.Label(settings, text="Pitch extraction").grid(row=8, column=0, sticky="w")
         pitch_methods = ttk.Frame(settings)
-        pitch_methods.grid(row=5, column=1, sticky="w", pady=4)
+        pitch_methods.grid(row=8, column=1, sticky="w", pady=4)
         for label, method in (
             ("rmvpe", "rmvpe"),
             ("swift", "swift"),
@@ -755,13 +784,13 @@ class RealtimeGUI:
                 variable=self.f0_method,
                 value=method,
             ).pack(side="left", padx=(0, 10))
-        self._scale(settings, "Block time", self.block_time, 0.02, 1.5, 6, 0.01)
+        self._scale(settings, "Block time", self.block_time, 0.02, 1.5, 9, 0.01)
         self._scale(
-            settings, "Crossfade", self.crossfade_time, 0.01, 0.15, 7, 0.01
+            settings, "Crossfade", self.crossfade_time, 0.01, 0.15, 10, 0.01
         )
-        self._scale(settings, "Extra context", self.extra_time, 0.5, 5.0, 8, 0.1)
-        self._scale(settings, "Formant shift (Beatrice)", self.formant_shift, -2.0, 2.0, 9, 0.5)
-        self._scale(settings, "VQ neighbors (Beatrice)", self.vq_neighbors, 0, 8, 10)
+        self._scale(settings, "Extra context", self.extra_time, 0.05, 5.0, 11, 0.01)
+        self._scale(settings, "Formant shift (Beatrice)", self.formant_shift, -2.0, 2.0, 12, 0.5)
+        self._scale(settings, "VQ neighbors (Beatrice)", self.vq_neighbors, 0, 8, 13)
         ttk.Label(
             settings,
             text=(
@@ -771,14 +800,24 @@ class RealtimeGUI:
                 "and Rectified Flow models."
             ),
             wraplength=700,
-        ).grid(row=11, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ).grid(row=14, column=0, columnspan=2, sticky="w", pady=(4, 0))
         toggles = ttk.Frame(settings)
-        toggles.grid(row=12, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        toggles.grid(row=15, column=0, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Checkbutton(
             toggles,
-            text="Monitor input",
-            variable=self.monitor_input,
+            text="Input noise reduction",
+            variable=self.input_noise_reduce,
         ).pack(side="left")
+        ttk.Checkbutton(
+            toggles,
+            text="Output noise reduction",
+            variable=self.output_noise_reduce,
+        ).pack(side="left", padx=(12, 0))
+        ttk.Checkbutton(
+            toggles,
+            text="Passthrough",
+            variable=self.passthrough,
+        ).pack(side="left", padx=(12, 0))
         settings.columnconfigure(1, weight=1)
         actions = ttk.Frame(root)
         actions.pack(fill="x")
@@ -837,62 +876,57 @@ class RealtimeGUI:
         try:
             sd._terminate()
             sd._initialize()
-            device_list = sd.query_devices()
-            host_list = sd.query_hostapis()
-            self.devices = {index: dict(device) for index, device in enumerate(device_list)}
-            host_names = [host["name"] for host in host_list]
-            self.host_combo["values"] = host_names
-            if self.host_api.get() not in host_names:
-                default_input = sd.default.device[0]
-                default_host = (
-                    self.devices[default_input]["hostapi"]
-                    if default_input in self.devices
-                    else 0
-                )
-                self.host_api.set(host_names[default_host] if host_names else "")
-            self._populate_devices()
+            devices = sd.query_devices()
+            hostapis = sd.query_hostapis()
+            show_legacy = self.show_legacy_devices.get()
+            self.input_devices = {}
+            self.output_devices = {}
+            self.device_names = {}
+            for index, device in enumerate(devices):
+                api_name = hostapis[device["hostapi"]]["name"]
+                if not show_legacy and api_name not in MAIN_HOST_APIS:
+                    continue
+                self.device_names[index] = device["name"]
+                if device["max_input_channels"] > 0:
+                    self.input_devices[friendly_device_label(api_name, device["name"], "input")] = index
+                if device["max_output_channels"] > 0:
+                    self.output_devices[friendly_device_label(api_name, device["name"], "output")] = index
+            self.input_devices = dict(sorted(self.input_devices.items(), key=lambda item: device_sort_key(item[0])))
+            self.output_devices = dict(sorted(self.output_devices.items(), key=lambda item: device_sort_key(item[0])))
+            defaults = self._default_devices(hostapis)
+            self.input_combo["values"] = list(self.input_devices)
+            self.output_combo["values"] = list(self.output_devices)
+            self.monitor_combo["values"] = [MONITOR_DISABLED, *self.output_devices]
+            self.input_device.set(self._normalize_choice(self.input_device.get(), self.input_devices, defaults[0]))
+            self.output_device.set(self._normalize_choice(self.output_device.get(), self.output_devices, defaults[1]))
+            monitor = self.monitor_device.get()
+            if monitor != MONITOR_DISABLED:
+                monitor = self._normalize_choice(monitor, self.output_devices, None, MONITOR_DISABLED)
+            self.monitor_device.set(monitor)
         except Exception as error:
             self.status.set(f"Audio device error: {error}")
 
-    def _host_changed(self, event=None):
-        self._populate_devices()
+    @staticmethod
+    def _default_devices(hostapis):
+        for hostapi in hostapis:
+            if hostapi["name"] == "Windows WASAPI":
+                return hostapi["default_input_device"], hostapi["default_output_device"]
+        return sd.default.device[0], sd.default.device[1]
 
-    def _populate_devices(self):
-        host_list = sd.query_hostapis()
-        host_index = next(
-            (
-                index
-                for index, host in enumerate(host_list)
-                if host["name"] == self.host_api.get()
-            ),
-            0,
+    def _normalize_choice(self, saved, choices, default_index, fallback=None):
+        if saved in choices:
+            return saved
+        if saved:
+            name = saved.split("] ", 1)[-1].removesuffix(" → RVC input").removesuffix(" ← RVC output")
+            match = next((label for label, index in choices.items() if self.device_names.get(index) == name), None)
+            if match:
+                return match
+        if fallback is not None:
+            return fallback
+        return next(
+            (label for label, index in choices.items() if index == default_index),
+            next(iter(choices), ""),
         )
-        self.input_devices = {
-            f"{index}: {device['name']}": index
-            for index, device in self.devices.items()
-            if device["hostapi"] == host_index and device["max_input_channels"] > 0
-        }
-        self.output_devices = {
-            f"{index}: {device['name']}": index
-            for index, device in self.devices.items()
-            if device["hostapi"] == host_index and device["max_output_channels"] > 0
-        }
-        self.input_combo["values"] = list(self.input_devices)
-        self.output_combo["values"] = list(self.output_devices)
-        if self.input_device.get() not in self.input_devices:
-            default = sd.default.device[0]
-            selected = next(
-                (label for label, index in self.input_devices.items() if index == default),
-                next(iter(self.input_devices), ""),
-            )
-            self.input_device.set(selected)
-        if self.output_device.get() not in self.output_devices:
-            default = sd.default.device[1]
-            selected = next(
-                (label for label, index in self.output_devices.items() if index == default),
-                next(iter(self.output_devices), ""),
-            )
-            self.output_device.set(selected)
 
     def _settings(self):
         if not self.model_path.get().strip():
@@ -901,40 +935,47 @@ class RealtimeGUI:
             raise ValueError("Select an input device.")
         if self.output_device.get() not in self.output_devices:
             raise ValueError("Select an output device.")
-        index_path = self.index_path.get().strip()
+        monitor = self.monitor_device.get()
         return {
             "model_path": self.model_path.get().strip(),
-            "index_path": index_path,
+            "index_path": self.index_path.get().strip(),
             "rectified_vocoder_path": self.rectified_vocoder_path.get().strip(),
             "rectified_steps": self.rectified_steps.get(),
             "rectified_flow_window": self.rectified_flow_window.get(),
             "embedder_model": self.embedder_model.get(),
-            "host_api": self.host_api.get(),
             "input_device": self.input_devices[self.input_device.get()],
             "output_device": self.output_devices[self.output_device.get()],
+            "monitor_device": self.output_devices.get(monitor),
             "input_device_label": self.input_device.get(),
             "output_device_label": self.output_device.get(),
-            "sample_rate_mode": self.sample_rate_mode.get(),
+            "monitor_device_label": monitor,
+            "show_legacy_devices": self.show_legacy_devices.get(),
             "wasapi_exclusive": self.wasapi_exclusive.get(),
             "pitch": self.pitch.get(),
             "speaker_id": self.speaker_id.get(),
             "index_rate": self.index_rate.get(),
             "rms_mix_rate": self.rms_mix_rate.get(),
             "threshold": self.threshold.get(),
+            "input_gain_db": self.input_gain_db.get(),
+            "output_gain_db": self.output_gain_db.get(),
+            "monitor_gain_db": self.monitor_gain_db.get(),
+            "input_noise_reduce": self.input_noise_reduce.get(),
+            "output_noise_reduce": self.output_noise_reduce.get(),
             "formant_shift": self.formant_shift.get(),
             "vq_neighbors": self.vq_neighbors.get(),
             "f0_method": self.f0_method.get(),
             "block_time": self.block_time.get(),
             "crossfade_time": self.crossfade_time.get(),
             "extra_time": self.extra_time.get(),
-            "monitor_input": self.monitor_input.get(),
+            "passthrough": self.passthrough.get(),
         }
 
     def _save_config(self, settings):
         saved = dict(settings)
         saved["input_device"] = saved.pop("input_device_label")
         saved["output_device"] = saved.pop("output_device_label")
-        saved.pop("monitor_input", None)
+        saved["monitor_device"] = saved.pop("monitor_device_label")
+        saved.pop("passthrough", None)
         CONFIG_PATH.write_text(
             json.dumps(saved, ensure_ascii=False, indent=2), encoding="utf-8"
         )
@@ -942,23 +983,28 @@ class RealtimeGUI:
     def _start(self):
         try:
             settings = self._settings()
-            self.status.set("Loading model and starting audio stream...")
+            self.status.set("Loading model and starting audio streams...")
             self.root.update_idletasks()
             self.engine.start(settings)
             self._save_config(settings)
             self.start_button.configure(state="disabled")
             self.stop_button.configure(state="normal")
             if self.engine.beatrice is not None:
-                self.status.set(
+                status = (
                     f"Running Beatrice model {self.engine.beatrice.model.name} "
                     f"on the CPU in FP32 at {self.engine.sample_rate} Hz"
                 )
             else:
-                self.status.set(
+                status = (
                     f"Running {self.engine.rvc.vocoder} with "
                     f"{self.engine.rvc.embedder_name} in FP32 at "
                     f"{self.engine.sample_rate} Hz"
                 )
+            if self.engine.shared_fallbacks:
+                status += "; WASAPI exclusive unavailable, shared mode for " + ", ".join(
+                    self.engine.shared_fallbacks
+                )
+            self.status.set(status)
             self.latency.set(
                 f"Estimated latency: {self.engine.algorithm_latency_ms} ms"
             )
@@ -984,10 +1030,18 @@ class RealtimeGUI:
                 self.formant_shift.get(),
                 self.vq_neighbors.get(),
             )
-            self.engine.settings["rms_mix_rate"] = self.rms_mix_rate.get()
-            self.engine.settings["threshold"] = self.threshold.get()
-            self.engine.settings["f0_method"] = self.f0_method.get()
-            self.engine.settings["monitor_input"] = self.monitor_input.get()
+            for key, variable in (
+                ("rms_mix_rate", self.rms_mix_rate),
+                ("threshold", self.threshold),
+                ("f0_method", self.f0_method),
+                ("passthrough", self.passthrough),
+                ("input_gain_db", self.input_gain_db),
+                ("output_gain_db", self.output_gain_db),
+                ("monitor_gain_db", self.monitor_gain_db),
+                ("input_noise_reduce", self.input_noise_reduce),
+                ("output_noise_reduce", self.output_noise_reduce),
+            ):
+                self.engine.settings[key] = variable.get()
         except (tk.TclError, ValueError) as error:
             self.status.set(str(error))
 
