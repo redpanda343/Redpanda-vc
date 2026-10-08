@@ -1,6 +1,8 @@
+import ctypes
 import json
 import os
 import queue
+import sys
 import threading
 import time
 import traceback
@@ -8,6 +10,11 @@ from collections import deque
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+
+try:
+    import sv_ttk
+except ImportError:
+    sv_ttk = None
 
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("OMP_NUM_THREADS", "4")
@@ -30,6 +37,9 @@ ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "assets" / "realtime_config.json"
 MONITOR_DISABLED = "Disabled"
 MAIN_HOST_APIS = ("ASIO", "Windows WASAPI")
+EMBEDDERS = ("contentvec", "spin-v2")
+PITCH_METHODS = {"rmvpe": "rmvpe", "swift": "swift", "parselmouth": "pm"}
+METER_FLOOR_DB = -60.0
 
 
 class BlockTorchGate(TorchGate):
@@ -161,6 +171,8 @@ class AudioEngine:
         self.last_block_ms = 0
         self.algorithm_latency_ms = 0
         self.base_latency_ms = 0.0
+        self.input_level = 0.0
+        self.output_level = 0.0
         self.reported_statuses = set()
         self.shared_fallbacks = []
 
@@ -412,6 +424,8 @@ class AudioEngine:
 
     def stop(self):
         self.running = False
+        self.input_level = 0.0
+        self.output_level = 0.0
         for name in ("input_stream", "output_stream", "monitor_stream"):
             stream = getattr(self, name)
             if stream is None:
@@ -499,6 +513,7 @@ class AudioEngine:
         indata = librosa.to_mono(indata.T).astype(np.float32)
         indata *= np.float32(db_to_linear(settings["input_gain_db"]))
         np.clip(indata, -1.0, 1.0, out=indata)
+        self.input_level = float(np.abs(indata).max(initial=0.0))
         if settings["threshold"] > -60:
             indata = self._gate(indata)
         self.input_wav[: -self.block_frame] = self.input_wav[self.block_frame :].clone()
@@ -560,6 +575,7 @@ class AudioEngine:
             output_block = self._apply_sola(infer_wav)
         gain = db_to_linear(settings["output_gain_db"])
         output = torch.clamp(output_block * gain, -1.0, 1.0).cpu().numpy().astype(np.float32)
+        self.output_level = float(np.abs(output).max(initial=0.0))
         self.last_infer_ms = round(infer_seconds * 1000)
         self.last_block_ms = round((time.perf_counter() - started) * 1000)
         self._refresh_latency()
@@ -612,20 +628,79 @@ class AudioEngine:
         outdata[: block.shape[0]] = block[:, :1]
 
 
+def system_theme():
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+        ) as key:
+            return "light" if winreg.QueryValueEx(key, "AppsUseLightTheme")[0] else "dark"
+    except (ImportError, OSError):
+        return "light"
+
+
+def level_percent(level):
+    if level <= 0:
+        return 0.0
+    db = 20.0 * np.log10(level)
+    return max(0.0, min(100.0, 100.0 * (db - METER_FLOOR_DB) / -METER_FLOOR_DB))
+
+
+class Tooltip:
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self.window = None
+        widget.bind("<Enter>", self._show, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _show(self, _event=None):
+        if self.window is not None:
+            return
+        self.window = tk.Toplevel(self.widget)
+        self.window.wm_overrideredirect(True)
+        self.window.wm_geometry(
+            f"+{self.widget.winfo_rootx() + 12}+{self.widget.winfo_rooty() + self.widget.winfo_height() + 4}"
+        )
+        frame = ttk.Frame(self.window, padding=1, style="Tooltip.TFrame")
+        frame.pack()
+        ttk.Label(frame, text=self.text, wraplength=340, padding=(8, 5)).pack()
+
+    def _hide(self, _event=None):
+        if self.window is not None:
+            self.window.destroy()
+            self.window = None
+
+
 class RealtimeGUI:
     def __init__(self):
+        if sys.platform == "win32":
+            try:
+                ctypes.windll.shcore.SetProcessDpiAwareness(1)
+            except (AttributeError, OSError):
+                pass
         self.root = tk.Tk()
-        self.root.title("Applio Real-Time Voice Conversion")
-        self.root.minsize(760, 620)
+        self.root.title("Applio Real-Time")
+        try:
+            self.root.iconbitmap(str(ROOT / "assets" / "red_panda_favicon.ico"))
+        except tk.TclError:
+            pass
         self.error_queue = queue.Queue()
         self.engine = AudioEngine(self.error_queue)
         self.input_devices = {}
         self.output_devices = {}
         self.device_names = {}
+        self.rvc_widgets = set()
+        self.locked_widgets = set()
+        self.meter_values = {"input": 0.0, "output": 0.0, "monitor": 0.0}
         self.saved = self._load_config()
         self._make_variables()
+        self._apply_theme(self.saved.get("theme") or system_theme())
         self._build()
         self._load_devices()
+        self._refresh_states()
         for variable in (
             self.pitch, self.index_rate, self.rms_mix_rate, self.threshold, self.f0_method,
             self.passthrough, self.speaker_id, self.formant_shift, self.vq_neighbors,
@@ -633,6 +708,9 @@ class RealtimeGUI:
             self.input_noise_reduce, self.output_noise_reduce,
         ):
             variable.trace_add("write", self._hot_update)
+        self.model_path.trace_add("write", self._refresh_states)
+        self.root.update_idletasks()
+        self.root.minsize(self.root.winfo_reqwidth(), self.root.winfo_reqheight())
         self.root.after(100, self._poll)
         self.root.protocol("WM_DELETE_WINDOW", self._close)
 
@@ -642,6 +720,9 @@ class RealtimeGUI:
         except (OSError, ValueError):
             return {}
 
+    def _write_config(self, data):
+        CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
     def _make_variables(self):
         value = self.saved
         self.model_path = tk.StringVar(value=value.get("model_path", ""))
@@ -649,16 +730,19 @@ class RealtimeGUI:
         self.rectified_vocoder_path = tk.StringVar(value=value.get("rectified_vocoder_path", ""))
         self.rectified_steps = tk.IntVar(value=value.get("rectified_steps", 0))
         self.rectified_flow_window = tk.BooleanVar(value=value.get("rectified_flow_window", True))
-        self.embedder_model = tk.StringVar(
-            value=value.get("embedder_model", "contentvec")
+        self.show_flow_options = tk.BooleanVar(
+            value=value.get(
+                "show_flow_options",
+                bool(value.get("rectified_vocoder_path") or value.get("rectified_steps")),
+            )
         )
+        embedder = value.get("embedder_model", "contentvec")
+        self.embedder_model = tk.StringVar(value=embedder if embedder in EMBEDDERS else "contentvec")
         self.input_device = tk.StringVar(value=value.get("input_device", ""))
         self.output_device = tk.StringVar(value=value.get("output_device", ""))
         self.monitor_device = tk.StringVar(value=value.get("monitor_device", MONITOR_DISABLED))
         self.show_legacy_devices = tk.BooleanVar(value=value.get("show_legacy_devices", False))
-        self.wasapi_exclusive = tk.BooleanVar(
-            value=value.get("wasapi_exclusive", False)
-        )
+        self.wasapi_exclusive = tk.BooleanVar(value=value.get("wasapi_exclusive", False))
         self.pitch = tk.IntVar(value=value.get("pitch", 0))
         self.speaker_id = tk.IntVar(value=value.get("speaker_id", 0))
         self.index_rate = tk.DoubleVar(value=value.get("index_rate", 0.0))
@@ -672,178 +756,289 @@ class RealtimeGUI:
         self.formant_shift = tk.DoubleVar(value=value.get("formant_shift", 0.0))
         self.vq_neighbors = tk.IntVar(value=value.get("vq_neighbors", 0))
         f0_method = value.get("f0_method", "rmvpe")
-        self.f0_method = tk.StringVar(value=f0_method if f0_method in {"rmvpe", "swift", "pm"} else "rmvpe")
+        self.f0_method = tk.StringVar(value=f0_method if f0_method in PITCH_METHODS.values() else "rmvpe")
         self.block_time = tk.DoubleVar(value=value.get("block_time", 0.25))
-        self.crossfade_time = tk.DoubleVar(
-            value=value.get("crossfade_time", 0.05)
-        )
+        self.crossfade_time = tk.DoubleVar(value=value.get("crossfade_time", 0.05))
         self.extra_time = tk.DoubleVar(value=value.get("extra_time", 2.5))
         self.passthrough = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="Ready")
-        self.latency = tk.StringVar(value="Estimated latency: 0 ms")
-        self.infer_time = tk.StringVar(value="Processing: 0 ms (Model: 0 ms)")
+        self.stats = tk.StringVar()
+        self.sample_rate_text = tk.StringVar()
+
+    def _apply_theme(self, theme):
+        self.theme = "dark" if theme == "dark" else "light"
+        style = ttk.Style(self.root)
+        if sv_ttk is not None:
+            sv_ttk.set_theme(self.theme, self.root)
+        else:
+            if "vista" in style.theme_names():
+                style.theme_use("vista")
+            style.layout("Accent.TButton", style.layout("TButton"))
+            style.layout("Switch.TCheckbutton", style.layout("TCheckbutton"))
+        muted = "#9a9a9a" if self.theme == "dark" else "#6b6b6b"
+        style.configure("Title.TLabel", font=("Segoe UI Semibold", 14))
+        style.configure("Muted.TLabel", foreground=muted)
+        style.configure("Value.TLabel", foreground=muted, anchor="e")
+        style.configure("Tooltip.TFrame", background=muted)
+
+    def _toggle_theme(self):
+        self._apply_theme("light" if self.theme == "dark" else "dark")
+        self.theme_button.configure(text="Light mode" if self.theme == "dark" else "Dark mode")
+        data = self._load_config()
+        data["theme"] = self.theme
+        try:
+            self._write_config(data)
+        except OSError:
+            pass
 
     def _build(self):
-        root = ttk.Frame(self.root, padding=12)
+        root = ttk.Frame(self.root, padding=(16, 12, 16, 14))
         root.pack(fill="both", expand=True)
-        model = ttk.LabelFrame(root, text="Model", padding=10)
-        model.pack(fill="x", pady=(0, 8))
-        ttk.Label(model, text="Voice model").grid(row=0, column=0, sticky="w")
-        ttk.Entry(model, textvariable=self.model_path).grid(
-            row=0, column=1, sticky="ew", padx=8
+        root.columnconfigure(0, weight=1, uniform="half")
+        root.columnconfigure(1, weight=1, uniform="half")
+        root.rowconfigure(3, weight=1)
+        header = ttk.Frame(root)
+        header.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+        ttk.Label(header, text="Real-Time Voice Conversion", style="Title.TLabel").pack(side="left")
+        self.theme_button = ttk.Button(
+            header,
+            text="Light mode" if self.theme == "dark" else "Dark mode",
+            command=self._toggle_theme,
+            width=11,
         )
-        ttk.Button(model, text="Browse", command=self._browse_model).grid(row=0, column=2)
-        ttk.Label(model, text="Feature index").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(model, textvariable=self.index_path).grid(
-            row=1, column=1, sticky="ew", padx=8, pady=(8, 0)
-        )
-        ttk.Button(model, text="Browse", command=self._browse_index).grid(
-            row=1, column=2, pady=(8, 0)
-        )
-        ttk.Label(model, text="Embedder").grid(row=2, column=0, sticky="w", pady=(8, 0))
-        embedders = ttk.Frame(model)
-        embedders.grid(row=2, column=1, columnspan=2, sticky="w", padx=8, pady=(8, 0))
-        for embedder in ("contentvec", "spin-v2"):
-            ttk.Radiobutton(
-                embedders,
-                text=embedder,
-                variable=self.embedder_model,
-                value=embedder,
-            ).pack(side="left", padx=(0, 10))
-        ttk.Label(model, text="Flow vocoder (optional)").grid(row=3, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(model, textvariable=self.rectified_vocoder_path).grid(
-            row=3, column=1, sticky="ew", padx=8, pady=(8, 0)
-        )
-        ttk.Button(model, text="Browse", command=self._browse_vocoder).grid(
-            row=3, column=2, pady=(8, 0)
-        )
-        ttk.Label(model, text="Flow steps").grid(row=4, column=0, sticky="w", pady=(8, 0))
-        flow_settings = ttk.Frame(model)
-        flow_settings.grid(row=4, column=1, columnspan=2, sticky="w", padx=8, pady=(8, 0))
-        ttk.Spinbox(flow_settings, from_=0, to=1000, textvariable=self.rectified_steps, width=6).pack(side="left")
-        ttk.Label(flow_settings, text="0 uses model settings; fewer steps process faster").pack(side="left", padx=8)
-        ttk.Checkbutton(
-            model,
-            text="Flow window: generate only the newest audio plus 0.5 s of context (faster, same output)",
-            variable=self.rectified_flow_window,
-        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 0))
-        model.columnconfigure(1, weight=1)
-        devices = ttk.LabelFrame(root, text="Audio devices", padding=10)
-        devices.pack(fill="x", pady=(0, 8))
-        ttk.Label(devices, text="Input").grid(row=0, column=0, sticky="w")
-        self.input_combo = ttk.Combobox(
-            devices, textvariable=self.input_device, state="readonly"
-        )
-        self.input_combo.grid(row=0, column=1, sticky="ew", padx=8)
-        ttk.Button(devices, text="Reload", command=self._load_devices).grid(row=0, column=2)
-        ttk.Label(devices, text="Output").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        self.output_combo = ttk.Combobox(
-            devices, textvariable=self.output_device, state="readonly"
-        )
-        self.output_combo.grid(row=1, column=1, columnspan=2, sticky="ew", padx=(8, 0), pady=(8, 0))
-        ttk.Label(devices, text="Monitor").grid(row=2, column=0, sticky="w", pady=(8, 0))
-        self.monitor_combo = ttk.Combobox(
-            devices, textvariable=self.monitor_device, state="readonly"
-        )
-        self.monitor_combo.grid(row=2, column=1, columnspan=2, sticky="ew", padx=(8, 0), pady=(8, 0))
-        options = ttk.Frame(devices)
-        options.grid(row=3, column=1, columnspan=2, sticky="w", pady=(8, 0))
-        ttk.Checkbutton(
-            options,
-            text="WASAPI exclusive",
-            variable=self.wasapi_exclusive,
-        ).pack(side="left")
-        ttk.Checkbutton(
-            options,
-            text="Show MME / DirectSound / WDM-KS devices",
-            variable=self.show_legacy_devices,
-            command=self._load_devices,
-        ).pack(side="left", padx=(12, 0))
-        devices.columnconfigure(1, weight=1)
-        settings = ttk.LabelFrame(root, text="Conversion", padding=10)
-        settings.pack(fill="both", expand=True, pady=(0, 8))
-        self._scale(settings, "Pitch", self.pitch, -24, 24, 0)
-        self._scale(settings, "Speaker ID", self.speaker_id, 0, 255, 1)
-        self._scale(settings, "Index rate", self.index_rate, 0, 1, 2, 0.01)
-        self._scale(settings, "RMS mix", self.rms_mix_rate, 0, 1, 3, 0.01)
-        self._scale(settings, "Gate threshold", self.threshold, -60, 0, 4)
-        self._scale(settings, "Input gain (dB)", self.input_gain_db, -24, 24, 5, 0.5)
-        self._scale(settings, "Output gain (dB)", self.output_gain_db, -24, 24, 6, 0.5)
-        self._scale(settings, "Monitor gain (dB)", self.monitor_gain_db, -24, 24, 7, 0.5)
-        ttk.Label(settings, text="Pitch extraction").grid(row=8, column=0, sticky="w")
-        pitch_methods = ttk.Frame(settings)
-        pitch_methods.grid(row=8, column=1, sticky="w", pady=4)
-        for label, method in (
-            ("rmvpe", "rmvpe"),
-            ("swift", "swift"),
-            ("parselmouth", "pm"),
-        ):
-            ttk.Radiobutton(
-                pitch_methods,
-                text=label,
-                variable=self.f0_method,
-                value=method,
-            ).pack(side="left", padx=(0, 10))
-        self._scale(settings, "Block time", self.block_time, 0.02, 1.5, 9, 0.01)
-        self._scale(
-            settings, "Crossfade", self.crossfade_time, 0.01, 0.15, 10, 0.01
-        )
-        self._scale(settings, "Extra context", self.extra_time, 0.05, 5.0, 11, 0.01)
-        self._scale(settings, "Formant shift (Beatrice)", self.formant_shift, -2.0, 2.0, 12, 0.5)
-        self._scale(settings, "VQ neighbors (Beatrice)", self.vq_neighbors, 0, 8, 13)
-        ttk.Label(
-            settings,
-            text=(
-                "Beatrice models (the beatrice_paraphernalia_*.toml file) run on the CPU in FP32 "
-                "with 37.5 ms of model latency; use a block time of 0.02-0.05 s. Index rate, "
-                "embedder, pitch extraction, RMS mix, crossfade and extra context apply to RVC "
-                "and Rectified Flow models."
-            ),
-            wraplength=700,
-        ).grid(row=14, column=0, columnspan=2, sticky="w", pady=(4, 0))
-        toggles = ttk.Frame(settings)
-        toggles.grid(row=15, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        ttk.Checkbutton(
-            toggles,
-            text="Input noise reduction",
-            variable=self.input_noise_reduce,
-        ).pack(side="left")
-        ttk.Checkbutton(
-            toggles,
-            text="Output noise reduction",
-            variable=self.output_noise_reduce,
-        ).pack(side="left", padx=(12, 0))
-        ttk.Checkbutton(
-            toggles,
-            text="Passthrough",
-            variable=self.passthrough,
-        ).pack(side="left", padx=(12, 0))
-        settings.columnconfigure(1, weight=1)
-        actions = ttk.Frame(root)
-        actions.pack(fill="x")
-        self.start_button = ttk.Button(actions, text="Start conversion", command=self._start)
-        self.start_button.pack(side="left")
-        self.stop_button = ttk.Button(actions, text="Stop", command=self._stop, state="disabled")
-        self.stop_button.pack(side="left", padx=(8, 0))
-        ttk.Label(actions, textvariable=self.latency).pack(side="left", padx=(18, 0))
-        ttk.Label(actions, textvariable=self.infer_time).pack(side="left", padx=(18, 0))
-        ttk.Label(root, textvariable=self.status, wraplength=720).pack(
-            fill="x", pady=(8, 0)
-        )
+        self.theme_button.pack(side="right")
+        if sv_ttk is None:
+            self.theme_button.pack_forget()
+        self._build_model(root).grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(0, 10))
+        self._build_devices(root).grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(0, 10))
+        self._build_voice(root).grid(row=3, column=0, sticky="nsew", padx=(0, 5), pady=(0, 12))
+        self._build_performance(root).grid(row=3, column=1, sticky="nsew", padx=(5, 0), pady=(0, 12))
+        self._build_actions(root).grid(row=4, column=0, columnspan=2, sticky="ew")
 
-    def _scale(self, parent, label, variable, minimum, maximum, row, resolution=1):
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w")
-        scale = tk.Scale(
-            parent,
-            variable=variable,
-            from_=minimum,
-            to=maximum,
-            resolution=resolution,
-            orient="horizontal",
-            showvalue=True,
-            highlightthickness=0,
+    def _card(self, parent, title):
+        frame = ttk.LabelFrame(parent, text=title, padding=(12, 6, 12, 10))
+        frame.columnconfigure(1, weight=1)
+        return frame
+
+    def _build_model(self, parent):
+        frame = self._card(parent, "Model")
+        self.locked_widgets.update(self._path_row(frame, 0, "Voice model", self.model_path, self._browse_model))
+        index_row = self._path_row(frame, 1, "Feature index", self.index_path, self._browse_index)
+        self.rvc_widgets.update(index_row)
+        self.locked_widgets.update(index_row)
+        embedder_label = ttk.Label(frame, text="Embedder")
+        embedder_label.grid(row=2, column=0, sticky="w", padx=(0, 12), pady=3)
+        options = ttk.Frame(frame)
+        options.grid(row=2, column=1, columnspan=2, sticky="ew", pady=3)
+        options.columnconfigure(3, weight=1)
+        embedder = ttk.Combobox(options, textvariable=self.embedder_model, values=EMBEDDERS,
+                                state="readonly", width=12)
+        embedder.grid(row=0, column=0, sticky="w")
+        self.rvc_widgets.update((embedder_label, embedder))
+        self.locked_widgets.add(embedder)
+        ttk.Label(options, text="Speaker ID").grid(row=0, column=1, sticky="w", padx=(20, 8))
+        ttk.Spinbox(options, from_=0, to=255, textvariable=self.speaker_id, width=5).grid(row=0, column=2, sticky="w")
+        self.flow_toggle = ttk.Checkbutton(
+            options,
+            text="Rectified Flow options",
+            variable=self.show_flow_options,
+            command=self._refresh_states,
+            style="Switch.TCheckbutton",
         )
-        scale.grid(row=row, column=1, sticky="ew")
+        self.flow_toggle.grid(row=0, column=3, sticky="e")
+        self.flow_rows = self._path_row(frame, 3, "Flow vocoder", self.rectified_vocoder_path, self._browse_vocoder)
+        Tooltip(self.flow_rows[1], "Optional vocoder for Rectified Flow models. Leave empty to use the model's own.")
+        steps_label = ttk.Label(frame, text="Flow steps")
+        steps_label.grid(row=4, column=0, sticky="w", padx=(0, 12), pady=3)
+        steps = ttk.Frame(frame)
+        steps.grid(row=4, column=1, columnspan=2, sticky="ew", pady=3)
+        steps_box = ttk.Spinbox(steps, from_=0, to=1000, textvariable=self.rectified_steps, width=6)
+        steps_box.pack(side="left")
+        ttk.Label(steps, text="0 = model default, fewer = faster", style="Muted.TLabel").pack(side="left", padx=(8, 0))
+        flow_window = ttk.Checkbutton(steps, text="Flow window", variable=self.rectified_flow_window)
+        flow_window.pack(side="right")
+        Tooltip(flow_window, "Generate only the newest audio plus 0.5 s of context. Faster, same output.")
+        self.flow_rows += [steps_label, steps]
+        self.locked_widgets.update((*self.flow_rows[:3], steps_box, flow_window))
+        beatrice_label = ttk.Label(frame, text="Beatrice")
+        beatrice_label.grid(row=5, column=0, sticky="w", padx=(0, 12), pady=3)
+        beatrice = ttk.Frame(frame)
+        beatrice.grid(row=5, column=1, columnspan=2, sticky="ew", pady=3)
+        beatrice.columnconfigure(1, weight=1)
+        beatrice.columnconfigure(4, weight=1)
+        self._slider(beatrice, 0, "Formant", self.formant_shift, -2.0, 2.0, 0.5)
+        self._slider(beatrice, 0, "VQ neighbors", self.vq_neighbors, 0, 8, 1, column=3, padx=(20, 10))
+        self.beatrice_rows = [beatrice_label, beatrice]
+        return frame
+
+    def _path_row(self, parent, row, label, variable, command):
+        text = ttk.Label(parent, text=label)
+        text.grid(row=row, column=0, sticky="w", padx=(0, 12), pady=3)
+        entry = ttk.Entry(parent, textvariable=variable)
+        entry.grid(row=row, column=1, sticky="ew", pady=3)
+        button = ttk.Button(parent, text="Browse", command=command, width=8)
+        button.grid(row=row, column=2, padx=(8, 0), pady=3)
+        return [text, entry, button]
+
+    def _slider(self, parent, row, label, variable, minimum, maximum, resolution=1, column=0,
+                padx=(0, 12), tooltip=None):
+        digits = 0 if resolution >= 1 else len(f"{resolution:g}".split(".")[1])
+        widgets = []
+        if label is not None:
+            text = ttk.Label(parent, text=label)
+            text.grid(row=row, column=column, sticky="w", padx=padx, pady=3)
+            widgets.append(text)
+            if tooltip:
+                Tooltip(text, tooltip)
+
+        def moved(raw):
+            snapped = round(round(float(raw) / resolution) * resolution, digits)
+            if isinstance(variable, tk.IntVar):
+                snapped = int(snapped)
+            try:
+                current = variable.get()
+            except tk.TclError:
+                current = None
+            if current != snapped:
+                variable.set(snapped)
+
+        try:
+            initial = variable.get()
+        except tk.TclError:
+            initial = minimum
+        scale = ttk.Scale(parent, from_=minimum, to=maximum, value=initial, command=moved)
+        scale.grid(row=row, column=column + 1, sticky="ew", pady=3)
+        value = ttk.Label(parent, width=5, style="Value.TLabel")
+        value.grid(row=row, column=column + 2, sticky="e", padx=(6, 0), pady=3)
+
+        def show(*_):
+            try:
+                value.configure(text=f"{variable.get():.{digits}f}")
+            except tk.TclError:
+                pass
+
+        variable.trace_add("write", show)
+        show()
+        return widgets + [scale, value]
+
+    def _build_devices(self, parent):
+        frame = self._card(parent, "Audio")
+        frame.columnconfigure(1, weight=3)
+        frame.columnconfigure(2, weight=1, minsize=110)
+        for column, text in ((1, "Device"), (2, "Gain (dB)"), (4, "Level")):
+            ttk.Label(frame, text=text, style="Muted.TLabel").grid(
+                row=0, column=column, sticky="w", padx=(0 if column == 1 else 12, 0)
+            )
+        self.meters = {}
+        combos = []
+        for row, (label, device, gain, key) in enumerate(
+            (
+                ("Input", self.input_device, self.input_gain_db, "input"),
+                ("Output", self.output_device, self.output_gain_db, "output"),
+                ("Monitor", self.monitor_device, self.monitor_gain_db, "monitor"),
+            ),
+            start=1,
+        ):
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", padx=(0, 12), pady=3)
+            combo = ttk.Combobox(frame, textvariable=device, state="readonly", width=38)
+            combo.grid(row=row, column=1, sticky="ew", pady=3, padx=(0, 12))
+            self._slider(frame, row, None, gain, -24, 24, 0.5, column=1)
+            meter = ttk.Progressbar(frame, maximum=100, length=90)
+            meter.grid(row=row, column=4, sticky="ew", padx=(12, 0), pady=3)
+            self.meters[key] = meter
+            combos.append(combo)
+        self.input_combo, self.output_combo, self.monitor_combo = combos
+        Tooltip(self.monitor_combo, "Optional second output to hear yourself, e.g. headphones.")
+        options = ttk.Frame(frame)
+        options.grid(row=4, column=0, columnspan=5, sticky="ew", pady=(8, 0))
+        reload_button = ttk.Button(options, text="Reload devices", command=self._load_devices)
+        reload_button.pack(side="left")
+        exclusive = ttk.Checkbutton(options, text="WASAPI exclusive", variable=self.wasapi_exclusive)
+        exclusive.pack(side="left", padx=(16, 0))
+        legacy = ttk.Checkbutton(
+            options, text="Legacy drivers", variable=self.show_legacy_devices, command=self._load_devices
+        )
+        legacy.pack(side="left", padx=(16, 0))
+        Tooltip(legacy, "Also list MME, DirectSound and WDM-KS devices.")
+        ttk.Label(options, textvariable=self.sample_rate_text, style="Muted.TLabel").pack(side="right")
+        self.locked_widgets.update((*combos, reload_button, exclusive, legacy))
+        return frame
+
+    def _build_voice(self, parent):
+        frame = self._card(parent, "Voice")
+        self._slider(frame, 0, "Pitch", self.pitch, -24, 24, 1, tooltip="Shift in semitones. +12 is one octave up.")
+        self.rvc_widgets.update(self._slider(
+            frame, 1, "Index rate", self.index_rate, 0, 1, 0.01,
+            tooltip="How strongly the feature index pulls the voice toward the training data.",
+        ))
+        self.rvc_widgets.update(self._slider(
+            frame, 2, "RMS mix", self.rms_mix_rate, 0, 1, 0.01,
+            tooltip="0 follows your input loudness, 1 keeps the model's own loudness.",
+        ))
+        self._slider(
+            frame, 3, "Noise gate", self.threshold, -60, 0, 1,
+            tooltip="Input quieter than this (dB) is muted. -60 turns the gate off.",
+        )
+        toggles = ttk.Frame(frame)
+        toggles.grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(toggles, text="Input noise reduction", variable=self.input_noise_reduce).pack(side="left")
+        ttk.Checkbutton(toggles, text="Output noise reduction", variable=self.output_noise_reduce).pack(
+            side="left", padx=(16, 0)
+        )
+        return frame
+
+    def _build_performance(self, parent):
+        frame = self._card(parent, "Performance")
+        self.locked_widgets.update(self._slider(
+            frame, 0, "Block time", self.block_time, 0.02, 1.5, 0.01,
+            tooltip="Seconds of audio per step. Lower is less latency but more load. Beatrice: 0.02-0.05 s.",
+        ))
+        crossfade = self._slider(frame, 1, "Crossfade", self.crossfade_time, 0.01, 0.15, 0.01)
+        extra = self._slider(
+            frame, 2, "Extra context", self.extra_time, 0.05, 5.0, 0.01,
+            tooltip="Seconds of past audio the model sees. More is smoother but slower.",
+        )
+        self.rvc_widgets.update(crossfade + extra)
+        self.locked_widgets.update(crossfade + extra)
+        pitch_label = ttk.Label(frame, text="Pitch extraction")
+        pitch_label.grid(row=3, column=0, sticky="w", padx=(0, 12), pady=(6, 3))
+        methods = ttk.Frame(frame)
+        methods.grid(row=3, column=1, columnspan=2, sticky="w", pady=(6, 3))
+        self.rvc_widgets.add(pitch_label)
+        for label, method in PITCH_METHODS.items():
+            radio = ttk.Radiobutton(methods, text=label, variable=self.f0_method, value=method)
+            radio.pack(side="left", padx=(0, 12))
+            self.rvc_widgets.add(radio)
+        return frame
+
+    def _build_actions(self, parent):
+        frame = ttk.Frame(parent)
+        frame.columnconfigure(2, weight=1)
+        self.start_button = ttk.Button(frame, text="Start", style="Accent.TButton", width=12, command=self._toggle)
+        self.start_button.grid(row=0, column=0, sticky="w")
+        passthrough = ttk.Checkbutton(frame, text="Passthrough", variable=self.passthrough,
+                                      style="Switch.TCheckbutton")
+        passthrough.grid(row=0, column=1, sticky="w", padx=(16, 0))
+        Tooltip(passthrough, "Send the input straight to the output without conversion.")
+        ttk.Label(frame, textvariable=self.stats, style="Muted.TLabel").grid(row=0, column=2, sticky="e")
+        status = ttk.Label(frame, textvariable=self.status, style="Muted.TLabel")
+        status.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        frame.bind("<Configure>", lambda event: status.configure(wraplength=max(200, event.width)))
+        return frame
+
+    def _refresh_states(self, *_):
+        path = self.model_path.get().strip()
+        beatrice = bool(path) and find_paraphernalia(path) is not None
+        running = self.engine.running
+        for widget in self.rvc_widgets | self.locked_widgets:
+            disabled = (beatrice and widget in self.rvc_widgets) or (running and widget in self.locked_widgets)
+            widget.state(["disabled"] if disabled else ["!disabled"])
+        show_flow = not beatrice and self.show_flow_options.get()
+        for widget in self.flow_rows:
+            widget.grid() if show_flow else widget.grid_remove()
+        for widget in self.beatrice_rows:
+            widget.grid() if beatrice else widget.grid_remove()
+        self.flow_toggle.grid_remove() if beatrice else self.flow_toggle.grid()
 
     def _browse_model(self):
         path = filedialog.askopenfilename(
@@ -976,19 +1171,29 @@ class RealtimeGUI:
         saved["output_device"] = saved.pop("output_device_label")
         saved["monitor_device"] = saved.pop("monitor_device_label")
         saved.pop("passthrough", None)
-        CONFIG_PATH.write_text(
-            json.dumps(saved, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        saved["theme"] = self.theme
+        saved["show_flow_options"] = self.show_flow_options.get()
+        self._write_config(saved)
+
+    def _toggle(self):
+        if self.engine.running:
+            self._stop()
+        else:
+            self._start()
+
+    def _set_running(self, running):
+        self.start_button.configure(text="Stop" if running else "Start")
+        self.sample_rate_text.set(f"{self.engine.sample_rate / 1000:g} kHz" if running else "")
+        self._refresh_states()
 
     def _start(self):
         try:
             settings = self._settings()
             self.status.set("Loading model and starting audio streams...")
+            self.start_button.state(["disabled"])
             self.root.update_idletasks()
             self.engine.start(settings)
             self._save_config(settings)
-            self.start_button.configure(state="disabled")
-            self.stop_button.configure(state="normal")
             if self.engine.beatrice is not None:
                 status = (
                     f"Running Beatrice model {self.engine.beatrice.model.name} "
@@ -1005,18 +1210,17 @@ class RealtimeGUI:
                     self.engine.shared_fallbacks
                 )
             self.status.set(status)
-            self.latency.set(
-                f"Estimated latency: {self.engine.algorithm_latency_ms} ms"
-            )
         except Exception as error:
             self.engine.stop()
             self.status.set(f"Start failed: {error}")
             messagebox.showerror("Applio Real-Time", str(error))
+        finally:
+            self.start_button.state(["!disabled"])
+            self._set_running(self.engine.running)
 
     def _stop(self):
         self.engine.stop()
-        self.start_button.configure(state="normal")
-        self.stop_button.configure(state="disabled")
+        self._set_running(False)
         self.status.set("Stopped")
 
     def _hot_update(self, *args):
@@ -1045,24 +1249,38 @@ class RealtimeGUI:
         except (tk.TclError, ValueError) as error:
             self.status.set(str(error))
 
+    def _update_meters(self):
+        engine = self.engine
+        monitor = 0.0
+        if engine.running and engine.monitor_stream is not None:
+            try:
+                monitor = engine.output_level * db_to_linear(self.monitor_gain_db.get())
+            except tk.TclError:
+                pass
+        for key, level in (("input", engine.input_level), ("output", engine.output_level), ("monitor", monitor)):
+            value = max(level_percent(level), self.meter_values[key] - 6.0)
+            self.meter_values[key] = value
+            self.meters[key]["value"] = value
+
     def _poll(self):
-        self.infer_time.set(
-            f"Processing: {self.engine.last_block_ms} ms "
-            f"(Model: {self.engine.last_infer_ms} ms)"
-        )
-        self.latency.set(
-            f"Estimated latency: {self.engine.algorithm_latency_ms} ms"
-        )
+        if self.engine.running:
+            self.stats.set(
+                f"Latency {self.engine.algorithm_latency_ms} ms   ·   "
+                f"Processing {self.engine.last_block_ms} ms   ·   "
+                f"Model {self.engine.last_infer_ms} ms"
+            )
+        else:
+            self.stats.set("")
+        self._update_meters()
         try:
             while True:
                 error = self.error_queue.get_nowait()
                 self.status.set(error.strip().splitlines()[-1])
                 if not self.engine.running:
-                    self.start_button.configure(state="normal")
-                    self.stop_button.configure(state="disabled")
+                    self._set_running(False)
         except queue.Empty:
             pass
-        self.root.after(100, self._poll)
+        self.root.after(50, self._poll)
 
     def _close(self):
         self.engine.stop()

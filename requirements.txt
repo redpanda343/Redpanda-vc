@@ -13,6 +13,7 @@ scipy==1.17.1; python_version < "3.12"
 scikit-learn==1.9.0
 soundfile==0.14.0
 sounddevice>=0.5.0,<1
+sv-ttk==2.6.1
 noisereduce==3.0.3
 pedalboard==0.9.24
 stftpitchshift==2.0
