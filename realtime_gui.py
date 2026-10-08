@@ -18,6 +18,8 @@ import torch
 import torch.nn.functional as F
 from torchaudio.transforms import Resample
 
+from rvc.beatrice.inference import OUT_SAMPLE_RATE, find_paraphernalia
+from rvc.beatrice.realtime import BeatriceRealtime
 from rvc.infer.realtime import RealTimeRVC
 
 
@@ -77,6 +79,7 @@ class AudioEngine:
         self.error_queue = error_queue
         self.stream = None
         self.rvc = None
+        self.beatrice = None
         self.running = False
         self.last_infer_ms = 0
         self.last_block_ms = 0
@@ -97,21 +100,28 @@ class AudioEngine:
         self.stop()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        self.rvc = RealTimeRVC(
-            model_path=settings["model_path"],
-            index_path=settings["index_path"],
-            index_rate=settings["index_rate"],
-            pitch=settings["pitch"],
-            speaker_id=settings["speaker_id"],
-            embedder_model=settings["embedder_model"],
-            rectified_vocoder_path=settings.get("rectified_vocoder_path", ""),
-            rectified_steps=settings.get("rectified_steps", 0),
-            rectified_flow_window=settings.get("rectified_flow_window", True),
-        )
+        beatrice_path = find_paraphernalia(settings["model_path"])
+        self.rvc = None
+        self.beatrice = None
+        if beatrice_path is None:
+            self.rvc = RealTimeRVC(
+                model_path=settings["model_path"],
+                index_path=settings["index_path"],
+                index_rate=settings["index_rate"],
+                pitch=settings["pitch"],
+                speaker_id=settings["speaker_id"],
+                embedder_model=settings["embedder_model"],
+                rectified_vocoder_path=settings.get("rectified_vocoder_path", ""),
+                rectified_steps=settings.get("rectified_steps", 0),
+                rectified_flow_window=settings.get("rectified_flow_window", True),
+            )
+            model_rate = self.rvc.sample_rate
+        else:
+            model_rate = OUT_SAMPLE_RATE
         input_info = sd.query_devices(settings["input_device"])
         output_info = sd.query_devices(settings["output_device"])
         stream_rate = (
-            self.rvc.sample_rate
+            model_rate
             if settings["sample_rate_mode"] == "model"
             else int(input_info["default_samplerate"])
         )
@@ -143,6 +153,81 @@ class AudioEngine:
             * self.zero_crossing
         )
         self.block_frame_16k = 160 * self.block_frame // self.zero_crossing
+        if beatrice_path is None:
+            self._prepare_rvc_buffers(settings)
+        else:
+            self.beatrice = BeatriceRealtime(
+                beatrice_path,
+                stream_rate,
+                speaker=settings["speaker_id"],
+                pitch=settings["pitch"],
+                formant=settings["formant_shift"],
+                vq_neighbors=settings["vq_neighbors"],
+            )
+        extra_settings = None
+        if settings["wasapi_exclusive"] and "WASAPI" in settings["host_api"]:
+            extra_settings = sd.WasapiSettings(exclusive=True)
+        ring_capacity = self.block_frame * 4
+        self.input_ring = AudioRingBuffer(ring_capacity, channels)
+        self.output_ring = AudioRingBuffer(ring_capacity, channels)
+        self.worker_input = np.empty(
+            (self.block_frame, channels), dtype=np.float32
+        )
+        self.prime_frames_remaining = (
+            2 if self.beatrice is not None else 5
+        ) * self.zero_crossing
+        self.output_primed = False
+        self.input_overflow_reported = False
+        self.output_underflow_reported = False
+        self.worker_stop.clear()
+        self.worker_event.clear()
+        self.stream = sd.Stream(
+            device=(settings["input_device"], settings["output_device"]),
+            samplerate=stream_rate,
+            blocksize=0,
+            channels=channels,
+            dtype="float32",
+            latency="low",
+            extra_settings=extra_settings,
+            callback=self._callback,
+        )
+        if self.beatrice is None:
+            self._warm_up_rvc(settings)
+        else:
+            for _ in range(3):
+                self._process_block(
+                    np.zeros((self.block_frame, channels), dtype=np.float32)
+                )
+            self.beatrice.reset()
+        self.running = True
+        self.worker_thread = threading.Thread(
+            target=self._worker_loop,
+            name="ApplioRealtimeWorker",
+            daemon=True,
+        )
+        self.worker_thread.start()
+        self.stream.start()
+        stream_latency = self.stream.latency
+        if isinstance(stream_latency, tuple):
+            input_latency, output_latency = stream_latency
+        else:
+            input_latency = output_latency = stream_latency
+        model_latency = (
+            self.beatrice.latency_seconds
+            if self.beatrice is not None
+            else settings["crossfade_time"] + 0.01
+        )
+        self.base_latency_ms = (
+            input_latency
+            + output_latency
+            + settings["block_time"]
+            + model_latency
+            + self.prime_frames_remaining / stream_rate
+        ) * 1000
+        self._refresh_latency()
+
+    def _prepare_rvc_buffers(self, settings):
+        stream_rate = self.sample_rate
         self.crossfade_frame = (
             round(settings["crossfade_time"] * stream_rate / self.zero_crossing)
             * self.zero_crossing
@@ -197,31 +282,8 @@ class AudioEngine:
                 new_freq=stream_rate,
                 dtype=torch.float32,
             ).to(device)
-        extra_settings = None
-        if settings["wasapi_exclusive"] and "WASAPI" in settings["host_api"]:
-            extra_settings = sd.WasapiSettings(exclusive=True)
-        ring_capacity = self.block_frame * 4
-        self.input_ring = AudioRingBuffer(ring_capacity, channels)
-        self.output_ring = AudioRingBuffer(ring_capacity, channels)
-        self.worker_input = np.empty(
-            (self.block_frame, channels), dtype=np.float32
-        )
-        self.prime_frames_remaining = 5 * self.zero_crossing
-        self.output_primed = False
-        self.input_overflow_reported = False
-        self.output_underflow_reported = False
-        self.worker_stop.clear()
-        self.worker_event.clear()
-        self.stream = sd.Stream(
-            device=(settings["input_device"], settings["output_device"]),
-            samplerate=stream_rate,
-            blocksize=0,
-            channels=channels,
-            dtype="float32",
-            latency="low",
-            extra_settings=extra_settings,
-            callback=self._callback,
-        )
+
+    def _warm_up_rvc(self, settings):
         self.rvc.reset_caches()
         self.rvc.infer(
             self.input_wav_res,
@@ -234,38 +296,16 @@ class AudioEngine:
         )
         self.rvc.reset_caches()
         self._process_block(
-            np.zeros((self.block_frame, channels), dtype=np.float32)
+            np.zeros((self.block_frame, self.channels), dtype=np.float32)
         )
         self.rvc.reset_caches()
         self.input_wav.zero_()
         self.input_wav_res.zero_()
         self.sola_buffer.zero_()
-        self.running = True
-        self.worker_thread = threading.Thread(
-            target=self._worker_loop,
-            name="ApplioRealtimeWorker",
-            daemon=True,
-        )
-        self.worker_thread.start()
-        self.stream.start()
-        stream_latency = self.stream.latency
-        if isinstance(stream_latency, tuple):
-            input_latency, output_latency = stream_latency
-        else:
-            input_latency = output_latency = stream_latency
-        self.base_latency_ms = (
-            input_latency
-            + output_latency
-            + settings["block_time"]
-            + settings["crossfade_time"]
-            + 0.01
-            + self.prime_frames_remaining / stream_rate
-        ) * 1000
-        self._refresh_latency()
 
     def _refresh_latency(self):
         lookahead_ms = 0
-        if not self.settings["monitor_input"]:
+        if self.rvc is not None and not self.settings["monitor_input"]:
             lookahead_ms = 10 * self.rvc.pitch_lookahead_frames(
                 self.settings["f0_method"]
             )
@@ -297,12 +337,20 @@ class AudioEngine:
         self.worker_thread = None
 
     def update_pitch(self, pitch):
-        if self.rvc is not None:
+        if self.beatrice is not None:
+            self.beatrice.model.set_pitch_shift(pitch)
+        elif self.rvc is not None:
             self.rvc.change_pitch(pitch)
 
     def update_index_rate(self, index_rate):
         if self.rvc is not None:
             self.rvc.change_index_rate(index_rate)
+
+    def update_beatrice(self, speaker, formant_shift, vq_neighbors):
+        if self.beatrice is not None:
+            self.beatrice.model.set_speaker(speaker)
+            self.beatrice.model.set_formant_shift(formant_shift)
+            self.beatrice.model.set_vq_neighbors(vq_neighbors)
 
     def _gate_silence(self, mono):
         threshold = self.settings["threshold"]
@@ -418,6 +466,8 @@ class AudioEngine:
         started = time.perf_counter()
         mono = librosa.to_mono(indata.T).astype(np.float32, copy=False)
         mono = self._gate_silence(mono)
+        if self.beatrice is not None:
+            return self._process_beatrice_block(mono, started)
         self.input_wav[:-self.block_frame] = self.input_wav[
             self.block_frame:
         ].clone()
@@ -451,6 +501,20 @@ class AudioEngine:
             converted = self._mix_volume(converted)
         output = self._apply_sola(converted)
         output = output.repeat(self.channels, 1).t().detach().cpu().numpy()
+        np.clip(output, -1.0, 1.0, out=output)
+        self.last_infer_ms = round(infer_seconds * 1000)
+        self.last_block_ms = round((time.perf_counter() - started) * 1000)
+        self._refresh_latency()
+        return output
+
+    def _process_beatrice_block(self, mono, started):
+        infer_seconds = 0.0
+        if self.settings["monitor_input"]:
+            converted = mono
+        else:
+            converted = self.beatrice.process(mono)
+            infer_seconds = time.perf_counter() - started
+        output = np.repeat(converted[:, None], self.channels, axis=1)
         np.clip(output, -1.0, 1.0, out=output)
         self.last_infer_ms = round(infer_seconds * 1000)
         self.last_block_ms = round((time.perf_counter() - started) * 1000)
@@ -536,6 +600,9 @@ class RealtimeGUI:
         self.threshold.trace_add("write", self._hot_update)
         self.f0_method.trace_add("write", self._hot_update)
         self.monitor_input.trace_add("write", self._hot_update)
+        self.speaker_id.trace_add("write", self._hot_update)
+        self.formant_shift.trace_add("write", self._hot_update)
+        self.vq_neighbors.trace_add("write", self._hot_update)
         self.root.after(100, self._poll)
         self.root.protocol("WM_DELETE_WINDOW", self._close)
 
@@ -569,6 +636,8 @@ class RealtimeGUI:
         self.index_rate = tk.DoubleVar(value=value.get("index_rate", 0.0))
         self.rms_mix_rate = tk.DoubleVar(value=value.get("rms_mix_rate", 0.0))
         self.threshold = tk.IntVar(value=value.get("threshold", -60))
+        self.formant_shift = tk.DoubleVar(value=value.get("formant_shift", 0.0))
+        self.vq_neighbors = tk.IntVar(value=value.get("vq_neighbors", 0))
         f0_method = value.get("f0_method", "rmvpe")
         self.f0_method = tk.StringVar(value=f0_method if f0_method in {"rmvpe", "swift", "pm"} else "rmvpe")
         self.block_time = tk.DoubleVar(value=value.get("block_time", 0.25))
@@ -691,8 +760,20 @@ class RealtimeGUI:
             settings, "Crossfade", self.crossfade_time, 0.01, 0.15, 7, 0.01
         )
         self._scale(settings, "Extra context", self.extra_time, 0.5, 5.0, 8, 0.1)
+        self._scale(settings, "Formant shift (Beatrice)", self.formant_shift, -2.0, 2.0, 9, 0.5)
+        self._scale(settings, "VQ neighbors (Beatrice)", self.vq_neighbors, 0, 8, 10)
+        ttk.Label(
+            settings,
+            text=(
+                "Beatrice models (the beatrice_paraphernalia_*.toml file) run on the CPU in FP32 "
+                "with 37.5 ms of model latency; use a block time of 0.02-0.05 s. Index rate, "
+                "embedder, pitch extraction, RMS mix, crossfade and extra context apply to RVC "
+                "and Rectified Flow models."
+            ),
+            wraplength=700,
+        ).grid(row=11, column=0, columnspan=2, sticky="w", pady=(4, 0))
         toggles = ttk.Frame(settings)
-        toggles.grid(row=9, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        toggles.grid(row=12, column=0, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Checkbutton(
             toggles,
             text="Monitor input",
@@ -728,7 +809,10 @@ class RealtimeGUI:
     def _browse_model(self):
         path = filedialog.askopenfilename(
             initialdir=ROOT / "logs",
-            filetypes=(("RVC / Rectified Flow model", "*.pth"), ("All files", "*.*")),
+            filetypes=(
+                ("RVC / Rectified Flow / Beatrice model", "*.pth *.toml"),
+                ("All files", "*.*"),
+            ),
         )
         if path:
             self.model_path.set(path)
@@ -837,6 +921,8 @@ class RealtimeGUI:
             "index_rate": self.index_rate.get(),
             "rms_mix_rate": self.rms_mix_rate.get(),
             "threshold": self.threshold.get(),
+            "formant_shift": self.formant_shift.get(),
+            "vq_neighbors": self.vq_neighbors.get(),
             "f0_method": self.f0_method.get(),
             "block_time": self.block_time.get(),
             "crossfade_time": self.crossfade_time.get(),
@@ -862,11 +948,17 @@ class RealtimeGUI:
             self._save_config(settings)
             self.start_button.configure(state="disabled")
             self.stop_button.configure(state="normal")
-            self.status.set(
-                f"Running {self.engine.rvc.vocoder} with "
-                f"{self.engine.rvc.embedder_name} in FP32 at "
-                f"{self.engine.sample_rate} Hz"
-            )
+            if self.engine.beatrice is not None:
+                self.status.set(
+                    f"Running Beatrice model {self.engine.beatrice.model.name} "
+                    f"on the CPU in FP32 at {self.engine.sample_rate} Hz"
+                )
+            else:
+                self.status.set(
+                    f"Running {self.engine.rvc.vocoder} with "
+                    f"{self.engine.rvc.embedder_name} in FP32 at "
+                    f"{self.engine.sample_rate} Hz"
+                )
             self.latency.set(
                 f"Estimated latency: {self.engine.algorithm_latency_ms} ms"
             )
@@ -887,6 +979,11 @@ class RealtimeGUI:
         try:
             self.engine.update_pitch(self.pitch.get())
             self.engine.update_index_rate(self.index_rate.get())
+            self.engine.update_beatrice(
+                self.speaker_id.get(),
+                self.formant_shift.get(),
+                self.vq_neighbors.get(),
+            )
             self.engine.settings["rms_mix_rate"] = self.rms_mix_rate.get()
             self.engine.settings["threshold"] = self.threshold.get()
             self.engine.settings["f0_method"] = self.f0_method.get()

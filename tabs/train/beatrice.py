@@ -132,8 +132,8 @@ def beatrice_train_tab():
     gr.Markdown('### Beatrice')
     gr.Markdown('Fine-tunes a [Beatrice 2](https://prj-beatrice.com) low-latency voice conversion model with '
                 '[Beatrice Trainer](https://huggingface.co/fierce-cats/beatrice-trainer) 2.0.0-rc.0 (MIT). Each save '
-                'writes a `paraphernalia_*` folder under `logs/<model>/beatrice` that loads in the Beatrice VST, '
-                'VCClient or beatrice-client. The app downloads the trainer with its pretrained models, noise and '
+                'writes a `paraphernalia_*` folder under `logs/<model>/beatrice` that loads in the realtime GUI '
+                '(select its `.toml` file), the Beatrice VST, VCClient or beatrice-client. The app downloads the trainer with its pretrained models, noise and '
                 'impulse-response sets (about 440 MB) at startup, and training retries an interrupted download.')
     with gr.Row():
         name = gr.Textbox(label='Model name', value='my-beatrice')
