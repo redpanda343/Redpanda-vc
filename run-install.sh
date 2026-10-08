@@ -64,7 +64,7 @@ accept_channel_tos() {
 
 create_conda_env() {
     echo "Creating Conda environment..."
-    "$CONDA_EXE" create -y --prefix "$ENV_DIR" python=3.12
+    "$CONDA_EXE" create -y --prefix "$ENV_DIR" python=3.13
     echo "Conda environment created successfully."
     echo
 
