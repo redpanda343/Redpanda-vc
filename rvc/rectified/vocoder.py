@@ -23,11 +23,14 @@ def mel_mismatch(data: dict, vocoder_data: dict):
 
 
 def load_vocoder(path: str, data: dict):
-    from rvc.rectified.openvpi import NSFHiFiGAN, generator_state, openvpi_spec
+    from rvc.rectified.openvpi import NSFHiFiGAN, generator_state, onnx_generator_state, openvpi_spec
 
-    state = generator_state(torch.load(path, map_location="cpu", weights_only=True))
+    if str(path).lower().endswith(".onnx"):
+        state = onnx_generator_state(path)
+    else:
+        state = generator_state(torch.load(path, map_location="cpu", weights_only=True))
     if state is None:
-        raise ValueError(f"{path} is not an OpenVPI NSF-HiFiGAN checkpoint.")
+        raise ValueError(f"{path} is not an NSF-HiFiGAN vocoder.")
     hparams, vocoder_data, weights = openvpi_spec(path, state)
     generator = NSFHiFiGAN(**hparams)
     generator.load_state_dict(weights)

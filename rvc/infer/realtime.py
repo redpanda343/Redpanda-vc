@@ -220,7 +220,6 @@ class RealTimeRVC:
         )
         if self.is_rectified:
             from torchaudio.transforms import Resample
-            from rvc.rectified.resources import default_vocoder
             from rvc.rectified.vocoder import load_vocoder
             from rvc.rectified.realtime import RealtimeFlowSampler, RealtimeGraph
             from rvc.rectified.variance import StreamingVariances
@@ -244,8 +243,9 @@ class RealTimeRVC:
             self.rmvpe_graph = None
             self.rectified_cuda_graph = bool(rectified_cuda_graph)
             self.pipeline.set_vocoder(rectified_vocoder_path)
-            path = self.pipeline.vocoder_path or default_vocoder()
-            vocoder, _ = load_vocoder(path, self.pipeline.data)
+            vocoder, _ = load_vocoder(self.pipeline.resolved_vocoder_path(), self.pipeline.data)
+            if self.pipeline.vocoder_path:
+                self.vocoder = os.path.basename(self.pipeline.vocoder_path)
             self.pipeline.vocoder_model = vocoder.to(self.device).float()
             self.vocoder_graph = RealtimeGraph(self.pipeline.vocoder_model, "vocoder", rectified_cuda_graph)
             self.flow_resampler = Resample(16000, self.sample_rate).to(self.device)

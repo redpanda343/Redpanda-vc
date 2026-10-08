@@ -9,7 +9,7 @@ import psutil
 
 from tabs.settings.sections.precision import get_precision
 from rvc.rectified.distributed import parse_devices
-from rvc.rectified.resources import default_vocoder
+from rvc.rectified.resources import DEFAULT_VOCODER, VOCODERS, vocoder_path
 
 ROOT = Path(__file__).resolve().parents[2]
 _lock = threading.Lock()
@@ -138,11 +138,11 @@ def device_id(device):
     return '-' if devices == ['cpu'] else '-'.join(item[5:] for item in devices)
 
 
-def resolve_vocoder():
+def resolve_vocoder(name=DEFAULT_VOCODER):
     try:
-        return default_vocoder()
+        return vocoder_path(name)
     except Exception as error:
-        raise gr.Error(f'Could not download NSF-HiFiGAN vocoder: {error}') from error
+        raise gr.Error(f'Could not download the {name} vocoder: {error}') from error
 
 
 def resolve_pretrained(directory, enabled, preferred=''):
@@ -157,7 +157,8 @@ def resolve_pretrained(directory, enabled, preferred=''):
 
 
 def start(name, batch, max_frames, max_updates, checkpoint_interval, device, use_fused_kernels=False,
-          use_pretrained=False, pretrained_path='', realtime=False, shortcut=False, variance_embeds=True):
+          use_pretrained=False, pretrained_path='', realtime=False, shortcut=False, variance_embeds=True,
+          vocoder=DEFAULT_VOCODER):
     directory = experiment_path(name)
     device_id(device)
     if not (directory / 'filelist.txt').is_file():
@@ -176,7 +177,10 @@ def start(name, batch, max_frames, max_updates, checkpoint_interval, device, use
     precision = get_precision() or selected['flow'].get('precision', 'fp32')
     if precision not in {'fp32', 'fp16', 'bf16'}:
         raise gr.Error(f'Unsupported training precision: {precision}')
-    vocoder = resolve_vocoder() if selected['flow'].get('val_with_vocoder', True) else ''
+    if vocoder not in VOCODERS:
+        raise gr.Error(f'Choose one of these vocoders: {", ".join(VOCODERS)}.')
+    if selected['flow'].get('val_with_vocoder', True):
+        resolve_vocoder(vocoder)
     arguments = ['--model-name', str(name).strip(), '--vocoder', vocoder,
                  '--precision', precision, '--preset', preset, '--pitch-extractor', pitch_extractor]
     for flag, value, label in (('--batch-size', batch, 'Max clips per batch'),
@@ -270,6 +274,12 @@ def rectified_train_tab():
         use_pretrained = gr.Checkbox(label='Pretrained', value=False)
         pretrained_path = gr.Textbox(label='Voice checkpoint to fine-tune', value='',
                                     info='Optional exported flow .pth path, used when Pretrained is checked.')
+        vocoder = gr.Dropdown(label='Vocoder', choices=list(VOCODERS), value=DEFAULT_VOCODER,
+                              info='Renders the TensorBoard audio previews and is saved in exported checkpoints as their '
+                                   'default inference vocoder. pc_nsf_hifigan: OpenVPI PC-NSF-HiFiGAN 2025.02. '
+                                   'tgm_hifigan: pc-tgm-hifigan v100 by tigermeat, fine-tuned from OpenVPI NSF-HiFiGAN, '
+                                   'CC BY-NC 4.0 (non-commercial only, credit tigermeat). Downloaded on first use. '
+                                   'Both use the same mel, so you can switch at any time.')
         gr.Markdown('Training precision follows **Settings → Training → Precision**.')
         with gr.Row():
             batch = gr.Number(label='Max clips per batch (per GPU)', value=None, minimum=1, precision=0,
@@ -315,6 +325,7 @@ def rectified_train_tab():
                                          silence_compress], outputs, queue=False)
     extract_button.click(extract, [name, workers, device, embedder, pitch_extractor], outputs, queue=False)
     train_button.click(start, [name, batch, max_frames, max_updates, checkpoint_interval, device, use_fused_kernels,
-                               use_pretrained, pretrained_path, realtime, shortcut, variance_embeds], outputs, queue=False)
+                               use_pretrained, pretrained_path, realtime, shortcut, variance_embeds, vocoder], outputs,
+                       queue=False)
     stop_button.click(stop, [], outputs, queue=False)
     gr.Timer(2).tick(status, [], outputs, queue=False)

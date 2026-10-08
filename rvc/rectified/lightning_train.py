@@ -23,6 +23,7 @@ from rvc.rectified.distributed import parse_devices
 from rvc.rectified.flow_model import build_flow
 from rvc.rectified.mel import normalize_mel
 from rvc.rectified.muon import MuonAdamW
+from rvc.rectified.resources import VOCODERS, vocoder_path
 from rvc.rectified.schedule import learning_rate
 from rvc.rectified.train_flow import (
     atomic_save, configure_fused_backbone, preview, prune_checkpoints,
@@ -266,7 +267,8 @@ class FlowTask(pl.LightningModule):
         return dict(config=self.config, speaker_count=self.model.speaker_count,
                     embedder_model=data.embedder, step=self.global_step,
                     finetune=self.finetune, precision=self.args.precision, trained_epoch=self.trained_epoch,
-                    speaker_ids=sorted(data.inventory), feature_metadata=data.feature_metadata)
+                    speaker_ids=sorted(data.inventory), feature_metadata=data.feature_metadata,
+                    vocoder=self.args.vocoder if self.args.vocoder in VOCODERS else None)
 
     def on_save_checkpoint(self, checkpoint):
         checkpoint.update(self.metadata())
@@ -391,7 +393,8 @@ class FlowPreview(pl.Callback):
 
     def on_fit_start(self, trainer, task):
         if trainer.is_global_zero and self.args.vocoder and task.settings['val_with_vocoder']:
-            self.vocoder, _ = load_vocoder(self.args.vocoder, task.data)
+            path = vocoder_path(self.args.vocoder) if self.args.vocoder in VOCODERS else self.args.vocoder
+            self.vocoder, _ = load_vocoder(path, task.data)
             self.vocoder = self.vocoder.to(task.device)
 
     def render(self, trainer, task):

@@ -9,7 +9,7 @@ from rvc.infer.pipeline import Pipeline, _INFERENCE_RNG_LOCK
 from rvc.lib.utils import extract_embedding_features
 from rvc.lib.predictors.f0 import RMVPE
 from rvc.rectified.pitch import parselmouth_pitch, resample_f0, resample_voicing, rmvpe_pitch
-from rvc.rectified.resources import default_vocoder
+from rvc.rectified.resources import recorded_vocoder, vocoder_path as named_vocoder_path
 from rvc.rectified.variance import extract_variances
 from rvc.rectified.vocoder import load_vocoder
 
@@ -34,6 +34,7 @@ class RectifiedPipeline(Pipeline):
         self.settings = checkpoint['config']['flow']
         self.content_channels = int(checkpoint['config']['flow']['model']['content_channels'])
         self.vocoder_path = vocoder_path
+        self.recorded_vocoder = recorded_vocoder(checkpoint)
         self.vocoder_model = None
         self.pitch_shift = 0.0
         self.f0_method = 'pm'
@@ -75,11 +76,14 @@ class RectifiedPipeline(Pipeline):
             self.vocoder_model = None
             self.vocoder_path = path
 
+    def resolved_vocoder_path(self):
+        return self.vocoder_path or named_vocoder_path(self.recorded_vocoder)
+
     @torch.inference_mode()
     def voice_conversion(self, model, net_g, sid, audio0, pitch, pitchf, index,
                          big_npy, index_rate, version, protect, inference_rng=None, segment_start=0):
         if self.vocoder_model is None:
-            vocoder, _ = load_vocoder(self.vocoder_path or default_vocoder(), self.data)
+            vocoder, _ = load_vocoder(self.resolved_vocoder_path(), self.data)
             self.vocoder_model = vocoder.to(self.device).float()
         speaker = int(sid.item())
         if net_g.use_spk_id and not 0 <= speaker < net_g.speaker_count:

@@ -29,6 +29,18 @@ CONFIG_MEL_KEYS = {
     "fmax": "mel_fmax",
 }
 
+YAML_CONFIG_KEYS = {
+    "sample_rate": "sampling_rate",
+    "hop_size": "hop_size",
+    "fft_size": "n_fft",
+    "win_size": "win_size",
+    "num_mel_bins": "num_mels",
+    "mel_fmin": "fmin",
+    "mel_fmax": "fmax",
+}
+
+ONNX_FLOAT = 1
+
 
 def _padding(kernel_size, dilation=1):
     return (kernel_size * dilation - dilation) // 2
@@ -179,7 +191,99 @@ def _fold_weight_norm(state: dict) -> dict:
     return folded
 
 
+def _varint(buffer, position):
+    value = shift = 0
+    while True:
+        byte = buffer[position]
+        position += 1
+        value |= (byte & 0x7F) << shift
+        shift += 7
+        if byte < 0x80:
+            return value, position
+
+
+def _protobuf_fields(buffer):
+    position = 0
+    while position < len(buffer):
+        key, position = _varint(buffer, position)
+        number, wire = key >> 3, key & 7
+        if wire == 0:
+            value, position = _varint(buffer, position)
+        elif wire == 1:
+            value, position = buffer[position:position + 8], position + 8
+        elif wire == 2:
+            size, position = _varint(buffer, position)
+            value, position = buffer[position:position + size], position + size
+        elif wire == 5:
+            value, position = buffer[position:position + 4], position + 4
+        else:
+            raise ValueError(f"Unsupported protobuf wire type {wire}.")
+        yield number, wire, value
+
+
+def _onnx_tensor(message):
+    dims, name, raw, dtype, floats, external = [], "", None, 0, [], False
+    for number, wire, value in _protobuf_fields(message):
+        if number == 1:
+            if wire == 0:
+                dims.append(value)
+            else:
+                position = 0
+                while position < len(value):
+                    item, position = _varint(value, position)
+                    dims.append(item)
+        elif number == 2:
+            dtype = value
+        elif number == 4:
+            floats.append(np.frombuffer(value, dtype="<f4"))
+        elif number == 8:
+            name = bytes(value).decode("utf-8")
+        elif number == 9:
+            raw = value
+        elif number == 14:
+            external = True
+    if dtype != ONNX_FLOAT or external:
+        return name, None
+    values = np.frombuffer(raw, dtype="<f4") if raw is not None else np.concatenate(floats or [np.zeros(0, "<f4")])
+    if values.size != int(np.prod(dims, dtype=np.int64)):
+        raise ValueError(f"ONNX tensor {name} has {values.size} values for shape {dims}.")
+    return name, torch.from_numpy(values.reshape(dims).copy())
+
+
+def onnx_generator_state(path: str):
+    with open(path, "rb") as handle:
+        model = memoryview(handle.read())
+    graph = next((value for number, wire, value in _protobuf_fields(model) if number == 7 and wire == 2), None)
+    if graph is None:
+        raise ValueError(f"{path} is not an ONNX model.")
+    state = {}
+    for number, wire, value in _protobuf_fields(graph):
+        if number == 5 and wire == 2:
+            name, tensor = _onnx_tensor(value)
+            if not name.startswith("generator."):
+                continue
+            if tensor is None:
+                raise ValueError(f"{path} stores {name} as external or non-FP32 data, which is not supported.")
+            state[name[len("generator."):]] = tensor
+    return state if "conv_pre.bias" in state else None
+
+
+def _read_yaml_config(path: str) -> dict:
+    import yaml
+
+    config_path = os.path.join(os.path.dirname(path), "vocoder.yaml")
+    if not os.path.isfile(config_path):
+        return {}
+    with open(config_path, encoding="utf-8") as handle:
+        config = yaml.safe_load(handle) or {}
+    if str(config.get("mel_base", "e")) != "e" or str(config.get("mel_scale", "slaney")) != "slaney":
+        raise ValueError(f"{path} needs a natural-log Slaney mel, not {config.get('mel_base')} / {config.get('mel_scale')}.")
+    return {target: config[source] for source, target in YAML_CONFIG_KEYS.items() if source in config}
+
+
 def _read_config(path: str) -> dict:
+    if path.lower().endswith(".onnx"):
+        return _read_yaml_config(path)
     config_path = os.path.join(os.path.dirname(path), "config.json")
     if not os.path.isfile(config_path):
         return {}

@@ -736,7 +736,7 @@ class RealtimeGUI:
     def _browse_vocoder(self):
         path = filedialog.askopenfilename(
             initialdir=ROOT / "rvc" / "models" / "pretraineds" / "rectified",
-            filetypes=(("Flow vocoder", "*.pth"), ("All files", "*.*")),
+            filetypes=(("Flow vocoder", "*.pth *.ckpt *.onnx"), ("All files", "*.*")),
         )
         if path:
             self.rectified_vocoder_path.set(path)

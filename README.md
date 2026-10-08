@@ -186,9 +186,24 @@ unsupported GPUs use the eager path. The port in `rvc/rectified/kernels` is
 adapted from [DiffSinger](https://github.com/openvpi/DiffSinger) under Apache 2.0;
 its license is included in that directory.
 
+The training tab's **Vocoder** choice (`--vocoder`) picks the NSF-HiFiGAN that
+renders the TensorBoard audio previews and is saved in voice exports as their
+default inference vocoder: `pc_nsf_hifigan` (OpenVPI PC-NSF-HiFiGAN 2025.02, the
+default) or `tgm_hifigan`
+([pc-tgm-hifigan v100](https://github.com/mrtigermeat/tgm_hifigan/releases/tag/pc100)
+by tigermeat, fine-tuned from OpenVPI NSF-HiFiGAN, CC BY-NC 4.0: non-commercial use
+only, with credit to tigermeat). Each is downloaded from its release on first use
+and checked against fixed SHA-256 hashes. Both render the same 44.1 kHz,
+512-hop, 128-bin mel, so the flow does not depend on the choice. ONNX vocoders
+with a DiffSinger `vocoder.yaml` beside them load into the same PyTorch
+generator, so they also work in realtime and with CUDA Graphs. Exports without
+a recorded vocoder use `pc_nsf_hifigan`, and the inference vocoder selector
+overrides the recorded one.
+
  ## Credits
 
 - [Applio](https://github.com/IAHispano/Applio)
 - [FireRedVAD](https://github.com/FireRedTeam/FireRedVAD)
 - [ECAPA-TDNN](https://github.com/TaoRuijie/ECAPA-TDNN)
 - [DiffSinger](https://github.com/openvpi/DiffSinger)
+- [tgm_hifigan](https://github.com/mrtigermeat/tgm_hifigan) by tigermeat

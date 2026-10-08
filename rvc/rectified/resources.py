@@ -10,17 +10,43 @@ from tqdm import tqdm
 from rvc.lib.tools.prerequisites_download import _sha256, download_file
 
 ROOT = Path(__file__).resolve().parents[2]
-VOCODER_DIRECTORY = 'pc_nsf_hifigan_44.1k_hop512_128bin_2025.02'
-VOCODER_FILENAME = 'model.ckpt'
-VOCODER_URL = ('https://github.com/openvpi/vocoders/releases/download/'
-               'pc-nsf-hifigan-44.1k-hop512-128bin-2025.02/' + VOCODER_DIRECTORY + '.zip')
-VOCODER_ARCHIVE_SHA256 = '9d98ba73727f2abb75172cf8249d75182237e8472fc3b6ed09c721ae8b0e83c6'
-VOCODER_FILES = {
-    'model.ckpt': 'd6dd28909d2a1a2dcf74b3e3aa0b82b48695b87979fdf41561940aeecd85c67f',
-    'config.json': '983bb78f45f6790e573033bfab46163743e0182d564fc5eca6938743cca6a2ea',
-    'NOTICE.txt': 'fcfca845812eb462e82f4c19985fce2abc772af979226b9297287c97e9a97f65',
-    'NOTICE.zh-CN.txt': '8983f1ac07a0b240b9d4c970c8081007b0f932e5e223d88f8f8aef0e6570ed81',
-    'STATEMENTS.txt': 'fe208abd522fd9e77ee16063ca2b3d6466fe3a35db70578f615d28543dd62d85',
+VOCODER_ROOT = ROOT / 'rvc' / 'models' / 'pretraineds' / 'rectified'
+DEFAULT_VOCODER = 'pc_nsf_hifigan'
+VOCODERS = {
+    'pc_nsf_hifigan': dict(
+        title='OpenVPI PC-NSF-HiFiGAN',
+        directory='pc_nsf_hifigan_44.1k_hop512_128bin_2025.02',
+        filename='model.ckpt',
+        url=('https://github.com/openvpi/vocoders/releases/download/'
+             'pc-nsf-hifigan-44.1k-hop512-128bin-2025.02/pc_nsf_hifigan_44.1k_hop512_128bin_2025.02.zip'),
+        archive_sha256='9d98ba73727f2abb75172cf8249d75182237e8472fc3b6ed09c721ae8b0e83c6',
+        archive_size=52675337,
+        archive_folder='pc_nsf_hifigan_44.1k_hop512_128bin_2025.02',
+        files={
+            'model.ckpt': 'd6dd28909d2a1a2dcf74b3e3aa0b82b48695b87979fdf41561940aeecd85c67f',
+            'config.json': '983bb78f45f6790e573033bfab46163743e0182d564fc5eca6938743cca6a2ea',
+            'NOTICE.txt': 'fcfca845812eb462e82f4c19985fce2abc772af979226b9297287c97e9a97f65',
+            'NOTICE.zh-CN.txt': '8983f1ac07a0b240b9d4c970c8081007b0f932e5e223d88f8f8aef0e6570ed81',
+            'STATEMENTS.txt': 'fe208abd522fd9e77ee16063ca2b3d6466fe3a35db70578f615d28543dd62d85',
+        },
+    ),
+    'tgm_hifigan': dict(
+        title='tgm_hifigan (pc100) by tigermeat',
+        directory='pc_tgm_hifigan_100',
+        filename='pc_tgm_hifigan_100.onnx',
+        url='https://github.com/mrtigermeat/tgm_hifigan/releases/download/pc100/dsvocoder.zip',
+        archive_sha256='379c25c1642038abd32771f91dc4053cd6e8954e7cb09ae5d565c7809cdb8a09',
+        archive_size=52726638,
+        archive_folder='dsvocoder',
+        files={
+            'pc_tgm_hifigan_100.onnx': '02ef00608d504ac4136a64a72b653cc812419bc958ee3996fa5429b32eb6599c',
+            'vocoder.yaml': '6ea1f299241165565e6cb311548457ff96e40dee755c7dbfd7ffab5b98231843',
+            'readme.txt': '2558b6726ec666a24ff94b3b4cb729e93150111c963a87930fd14006cfa2810e',
+            'documents/LICENSE.txt': 'eaede9100eb76a99273b6dda37b36ae5d2c3f2495b97dc4ebde12eb69f5e3fd5',
+            'documents/readme.txt': '92a87a354e7d1c5de45513d1ec48098b77d6a045803010f02566a39d831041d1',
+            'documents/tgm_hifigan Data Credits.xlsx': '626f3180f9be4d2ae666031a6b1e4f796741d36b7d11c06276a664e4dc2b82f5',
+        },
+    ),
 }
 HNSEP_URL = 'https://github.com/yxlllc/vocal-remover/releases/download/hnsep_240512/hnsep_240512.zip'
 HNSEP_ARCHIVE_SHA256 = '3d353d6a14005690819210ad0cb8134326caa286e30f329da266049ed9cdff13'
@@ -31,54 +57,52 @@ HNSEP_FILES = {
 _download_lock = threading.Lock()
 
 
-def _valid_bundle(directory, files=VOCODER_FILES):
+def _valid_bundle(directory, files):
     return all((directory / name).is_file() and _sha256(directory / name) == checksum
                for name, checksum in files.items())
 
 
-def default_vocoder():
-    destination = ROOT / 'rvc' / 'models' / 'pretraineds' / 'rectified' / VOCODER_DIRECTORY
+def _install_bundle(destination, url, archive_sha256, archive_size, archive_folder, files, primary, description):
     with _download_lock:
-        if not _valid_bundle(destination):
-            print('Downloading the official OpenVPI Rectified Flow NSF-HiFiGAN vocoder...', flush=True)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.TemporaryDirectory(dir=destination.parent, prefix='.nsf-hifigan-') as temporary:
-                temporary = Path(temporary)
-                archive_path = temporary / (VOCODER_DIRECTORY + '.zip')
-                with tqdm(total=52675337, unit='B', unit_scale=True, desc='NSF-HiFiGAN vocoder') as progress:
-                    download_file(VOCODER_URL, str(archive_path), progress, expected_sha256=VOCODER_ARCHIVE_SHA256)
-                with zipfile.ZipFile(archive_path) as archive:
-                    for name, checksum in VOCODER_FILES.items():
-                        extracted = temporary / name
-                        with archive.open(VOCODER_DIRECTORY + '/' + name) as source, extracted.open('wb') as target:
-                            shutil.copyfileobj(source, target)
-                        if _sha256(extracted) != checksum:
-                            raise IOError(f'Checksum verification failed for vocoder file {name}.')
-                destination.mkdir(parents=True, exist_ok=True)
-                for name in (*[name for name in VOCODER_FILES if name != VOCODER_FILENAME], VOCODER_FILENAME):
-                    os.replace(temporary / name, destination / name)
-    return str(destination / VOCODER_FILENAME)
+        if _valid_bundle(destination, files):
+            return
+        print(f'Downloading the {description}...', flush=True)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=destination.parent, prefix='.download-') as temporary:
+            temporary = Path(temporary)
+            archive_path = temporary / 'bundle.zip'
+            with tqdm(total=archive_size, unit='B', unit_scale=True, desc=description) as progress:
+                download_file(url, str(archive_path), progress, expected_sha256=archive_sha256)
+            with zipfile.ZipFile(archive_path) as archive:
+                for name, checksum in files.items():
+                    extracted = temporary / 'files' / name
+                    extracted.parent.mkdir(parents=True, exist_ok=True)
+                    with archive.open(archive_folder + '/' + name) as source, extracted.open('wb') as target:
+                        shutil.copyfileobj(source, target)
+                    if _sha256(extracted) != checksum:
+                        raise IOError(f'Checksum verification failed for {description} file {name}.')
+            for name in (*[name for name in files if name != primary], primary):
+                (destination / name).parent.mkdir(parents=True, exist_ok=True)
+                os.replace(temporary / 'files' / name, destination / name)
+
+
+def vocoder_path(name=DEFAULT_VOCODER):
+    if name not in VOCODERS:
+        raise ValueError(f'Unknown flow vocoder {name!r}. Choose one of {", ".join(VOCODERS)}.')
+    spec = VOCODERS[name]
+    destination = VOCODER_ROOT / spec['directory']
+    _install_bundle(destination, spec['url'], spec['archive_sha256'], spec['archive_size'], spec['archive_folder'],
+                    spec['files'], spec['filename'], f"{spec['title']} vocoder")
+    return str(destination / spec['filename'])
+
+
+def recorded_vocoder(checkpoint):
+    name = checkpoint.get('vocoder')
+    return name if name in VOCODERS else DEFAULT_VOCODER
 
 
 def hnsep_model():
     destination = ROOT / 'rvc' / 'models' / 'predictors' / 'hnsep' / 'vr'
-    with _download_lock:
-        if not _valid_bundle(destination, HNSEP_FILES):
-            print('Downloading the DiffSinger harmonic-noise separation model...', flush=True)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            with tempfile.TemporaryDirectory(dir=destination.parent, prefix='.hnsep-') as temporary:
-                temporary = Path(temporary)
-                archive_path = temporary / 'hnsep_240512.zip'
-                with tqdm(total=54974388, unit='B', unit_scale=True, desc='Harmonic-noise separator') as progress:
-                    download_file(HNSEP_URL, str(archive_path), progress, expected_sha256=HNSEP_ARCHIVE_SHA256)
-                with zipfile.ZipFile(archive_path) as archive:
-                    for name, checksum in HNSEP_FILES.items():
-                        extracted = temporary / name
-                        with archive.open('vr/' + name) as source, extracted.open('wb') as target:
-                            shutil.copyfileobj(source, target)
-                        if _sha256(extracted) != checksum:
-                            raise IOError(f'Checksum verification failed for separator file {name}.')
-                destination.mkdir(parents=True, exist_ok=True)
-                for name in ('config.yaml', 'model.pt'):
-                    os.replace(temporary / name, destination / name)
+    _install_bundle(destination, HNSEP_URL, HNSEP_ARCHIVE_SHA256, 54974388, 'vr', HNSEP_FILES, 'model.pt',
+                    'DiffSinger harmonic-noise separation model')
     return str(destination / 'model.pt')

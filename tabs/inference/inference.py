@@ -386,7 +386,7 @@ def get_vocoders():
         os.path.relpath(os.path.join(folder, name), now_dir)
         for folder, _, files in os.walk(root)
         for name in files
-        if name.lower().endswith((".pth", ".ckpt"))
+        if name.lower().endswith((".pth", ".ckpt", ".onnx"))
     )
 
 
@@ -444,7 +444,7 @@ def inference_tab():
         rectified_vocoder_path = gr.Dropdown(
             label=i18n("Rectified Flow Vocoder"),
             info=i18n(
-                "Optional: select a compatible NSF-HiFiGAN vocoder or enter its .pth/.ckpt path. Leave empty to use the model's recorded vocoder or the default. Keep any config.json beside the vocoder."
+                "Optional: select a compatible NSF-HiFiGAN vocoder or enter its .pth/.ckpt/.onnx path. Leave empty to use the model's recorded vocoder or the default. Keep any config.json or vocoder.yaml beside the vocoder."
             ),
             choices=get_vocoders(),
             value=None,
