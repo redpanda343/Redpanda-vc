@@ -12,11 +12,10 @@ from rvc.rectified.distributed import parse_devices
 from rvc.rectified.resources import DEFAULT_VOCODER, VOCODERS, vocoder_path
 
 ROOT = Path(__file__).resolve().parents[2]
+QUIET_WARNINGS = ('ignore:pkg_resources is deprecated,ignore:Checkpoint directory,'
+                  'ignore:`isinstance(treespec,ignore::FutureWarning')
 _lock = threading.Lock()
 _process = None
-_log_handle = None
-_log_path = None
-_description = 'No rectified-flow job has been started.'
 
 
 def experiment_path(name):
@@ -33,24 +32,9 @@ def positive_integer(value, label):
 
 
 def _status():
-    global _log_handle
-    code = _process.poll() if _process is not None else None
-    active = _process is not None and code is None
-    if not active and _log_handle is not None:
-        _log_handle.close()
-        _log_handle = None
-    status = _description
-    if _process is not None:
-        if code == 0 and _description.startswith('Preprocessing:'):
-            status += ' Dataset preparation completed. Ready to extract content and F0.'
-        else:
-            status += ' Running.' if active else f' Finished with exit code {code}.'
-    log = ''
-    if _log_path is not None and _log_path.exists():
-        with _log_path.open('rb') as handle:
-            handle.seek(max(0, _log_path.stat().st_size - 16000))
-            log = handle.read().decode('utf-8', errors='replace')
-    return status, log, gr.update(interactive=not active), gr.update(interactive=not active), gr.update(interactive=not active), gr.update(interactive=active)
+    active = _process is not None and _process.poll() is None
+    return (gr.update(interactive=not active), gr.update(interactive=not active), gr.update(interactive=not active),
+            gr.update(interactive=active))
 
 
 def status():
@@ -60,37 +44,27 @@ def status():
 
 def print_job_completion(process, description):
     code = process.wait()
-    if code == 0 and description.startswith('Preprocessing:'):
-        message = 'Dataset preparation completed. Ready to extract content and F0.'
+    if code == 0:
+        message = 'done. Ready to extract content and F0.' if description.startswith('Preprocessing') else 'done.'
     else:
-        message = f'Finished with exit code {code}.'
+        message = f'stopped with exit code {code}.'
     print(f'{description} {message}', flush=True)
 
 
 def launch(name, module, arguments, description):
-    global _process, _log_handle, _log_path, _description
+    global _process
     directory = experiment_path(name)
     with _lock:
         if _process is not None and _process.poll() is None:
             raise gr.Error('A rectified-flow job is already running. Wait for it to finish or stop it first.')
-        if _log_handle is not None:
-            _log_handle.close()
         directory.mkdir(parents=True, exist_ok=True)
-        _log_path = directory / 'rectified_webui.log'
-        _log_handle = _log_path.open('wb')
-        environment = dict(os.environ, PYTHONUNBUFFERED='1', PYTHONIOENCODING='utf-8')
-        try:
-            _process = subprocess.Popen(
-                [sys.executable, '-u', '-m', module, *arguments], cwd=ROOT,
-                stdout=_log_handle, stderr=subprocess.STDOUT, env=environment,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
-            )
-        except Exception:
-            _log_handle.close()
-            _log_handle = None
-            raise
-        _description = f'{description}: {name}.'
-        threading.Thread(target=print_job_completion, args=(_process, _description), daemon=True).start()
+        warnings = ','.join(filter(None, (os.environ.get('PYTHONWARNINGS'), QUIET_WARNINGS)))
+        environment = dict(os.environ, PYTHONUNBUFFERED='1', PYTHONIOENCODING='utf-8', PYTHONWARNINGS=warnings)
+        _process = subprocess.Popen([sys.executable, '-u', '-m', module, *arguments], cwd=ROOT, env=environment)
+        label = f'{description} {name}:'
+        print(f'{label} started.', flush=True)
+        threading.Thread(target=print_job_completion, args=(_process, label), daemon=True).start()
+        gr.Info(f'{description} started. Progress is shown in the console.')
         return _status()
 
 
@@ -157,11 +131,12 @@ def resolve_pretrained(directory, enabled, preferred=''):
 
 
 def start(name, batch, max_frames, max_updates, checkpoint_interval, device, use_fused_kernels=False,
-          use_pretrained=False, pretrained_path='', realtime=False, variance_embeds=True, vocoder=DEFAULT_VOCODER):
+          use_pretrained=False, pretrained_path='', realtime=False, vocoder=DEFAULT_VOCODER):
     directory = experiment_path(name)
     device_id(device)
     if not (directory / 'filelist.txt').is_file():
         raise gr.Error('Extract features for this experiment first.')
+    variance_embeds = None if (directory / 'rectified_config.json').is_file() else True
     pretrained = resolve_pretrained(directory, use_pretrained, pretrained_path)
     preset = 'realtime' if realtime else 'standard'
     from rvc.rectified.train_flow import experiment_pitch_extractor, load_training_config
@@ -170,7 +145,7 @@ def start(name, batch, max_frames, max_updates, checkpoint_interval, device, use
 
     try:
         selected = load_training_config(directory, pretrained or None, use_fused_kernels, preset, pitch_extractor,
-                                        bool(variance_embeds))
+                                        variance_embeds)
     except ValueError as error:
         raise gr.Error(str(error)) from error
     precision = get_precision() or selected['flow'].get('precision', 'fp32')
@@ -192,14 +167,14 @@ def start(name, batch, max_frames, max_updates, checkpoint_interval, device, use
         arguments.extend(['--device', str(device).strip().lower()])
     if use_fused_kernels:
         arguments.append('--use-fused-kernels')
-    arguments.append('--variance-embeds' if variance_embeds else '--no-variance-embeds')
+    if variance_embeds:
+        arguments.append('--variance-embeds')
     if pretrained:
         arguments.extend(['--pretrained-flow', pretrained])
     return launch(name, 'rvc.rectified.train_flow', arguments, 'Training rectified flow')
 
 
 def stop():
-    global _description
     with _lock:
         if _process is not None and _process.poll() is None:
             try:
@@ -219,7 +194,7 @@ def stop():
                 _process.wait(timeout=5)
             except psutil.NoSuchProcess:
                 pass
-            _description = 'Stopped. Resume starts from the last saved checkpoint; unsaved steps are lost.'
+            print('Stopped. Resume starts from the last saved checkpoint; unsaved steps are lost.', flush=True)
         return _status()
 
 
@@ -261,42 +236,25 @@ def rectified_train_tab():
         preprocess_button = gr.Button('Preprocess dataset')
         with gr.Row():
             embedder = gr.Dropdown(label='Content embedder', choices=['contentvec', 'spin-v2'], value='contentvec')
-            pitch_extractor = gr.Dropdown(label='Pitch extractor', choices=['parselmouth', 'rmvpe'], value='parselmouth',
-                                          info='As in DiffSinger. Parselmouth: 65-1100 Hz autocorrelation. RMVPE: neural '
-                                               'tracker (230917 model), more robust on breathy or fry voices. Training '
-                                               'extracts F0 with it, interpolates unvoiced frames and skips clips without '
-                                               'voiced frames. Fixed once training starts.')
+            pitch_extractor = gr.Dropdown(label='Pitch extractor', choices=['parselmouth', 'rmvpe'], value='parselmouth')
         extract_button = gr.Button('Extract content and F0')
     with gr.Accordion('2. Train rectified flow', open=True):
         use_pretrained = gr.Checkbox(label='Pretrained', value=False)
         pretrained_path = gr.Textbox(label='Voice checkpoint to fine-tune', value='',
                                     info='Optional exported flow .pth path, used when Pretrained is checked.')
-        vocoder = gr.Dropdown(label='Vocoder', choices=list(VOCODERS), value=DEFAULT_VOCODER,
-                              info='Renders the TensorBoard audio previews and is saved in exported checkpoints as their '
-                                   'default inference vocoder. pc_nsf_hifigan: OpenVPI PC-NSF-HiFiGAN 2025.02. '
-                                   'tgm_hifigan: pc-tgm-hifigan v100 by tigermeat, fine-tuned from OpenVPI NSF-HiFiGAN, '
-                                   'CC BY-NC 4.0 (non-commercial only, credit tigermeat). Downloaded on first use. '
-                                   'Both use the same mel, so you can switch at any time.')
+        vocoder = gr.Dropdown(label='Vocoder', choices=list(VOCODERS), value=DEFAULT_VOCODER)
         gr.Markdown('Training precision follows **Settings → Training → Precision**.')
         with gr.Row():
             batch = gr.Number(label='Max clips per batch (per GPU)', value=None, minimum=1, precision=0,
-                              info='Blank uses config, default 64. Whole clips are trained without cropping.')
+                              info='Blank uses config, default 64.')
             max_frames = gr.Number(label='Max frames per batch (per GPU)', value=None, minimum=1, precision=0,
                                    info='Blank uses config, default 50000 padded frames. Lower to reduce GPU memory use.')
             max_updates = gr.Number(label='Max training updates', value=None, minimum=1, precision=0,
                                info='Blank uses config, default 100000 Lightning training steps.')
             checkpoint_interval = gr.Number(label='Checkpoint interval (updates)', value=None, minimum=1, precision=0,
                                    info='Blank uses config, default 4000 updates.')
-        realtime = gr.Checkbox(label='Realtime', value=False,
-                               info='Smaller, deeper model for new experiments: 256 hidden / 6 encoder layers, '
-                                    '512-channel backbone with 12 layers, 384-channel aux decoder with 8 layers. '
-                                    'Keep it set the same when resuming.')
-        variance_embeds = gr.Checkbox(label='Breathiness / voicing conditioning', value=True,
-                                      info="Optional. Conditions the flow on DiffSinger's breathiness and voicing curves, "
-                                           'extracted from the source with the VR harmonic-noise separator, for more '
-                                           'natural breaths and noise. Adds the separator to binarization, conversion '
-                                           'and realtime (about 60 ms per realtime block on a GTX 1660 Ti). Off matches '
-                                           "DiffSinger's default. Set it when the experiment starts and keep it when resuming.")
+        realtime = gr.Checkbox(label='Smaller model', value=False,
+                               info='Lower vram usage and faster inference speeds, may decrease the quality of the model')
         use_fused_kernels = gr.Checkbox(label='Fused Linear + SoftSignGLU kernels', value=False,
                                        info='Set it when starting a new experiment: the experiment then trains with SoftSignGLU so the '
                                             'kernels can run. Experiments and pretrained checkpoints that use ATanGLU cannot enable it. '
@@ -304,9 +262,7 @@ def rectified_train_tab():
         with gr.Row():
             train_button = gr.Button('Start / resume rectified training', variant='primary')
             stop_button = gr.Button('Stop current rectified job', interactive=False)
-    state = gr.Textbox(label='Rectified job status', interactive=False)
-    log = gr.Textbox(label='Rectified job log', lines=12, max_lines=20, interactive=False)
-    outputs = [state, log, preprocess_button, extract_button, train_button, stop_button]
+    outputs = [preprocess_button, extract_button, train_button, stop_button]
     cutting_inputs = [cutting, truncate_silence, silence_action]
     cutting_outputs = [chunk_len, overlap_len, truncate_silence, silence_action, silence_threshold, silence_minimum,
                        silence_to, silence_compress]
@@ -317,6 +273,6 @@ def rectified_train_tab():
                                          silence_compress], outputs, queue=False)
     extract_button.click(extract, [name, workers, device, embedder, pitch_extractor], outputs, queue=False)
     train_button.click(start, [name, batch, max_frames, max_updates, checkpoint_interval, device, use_fused_kernels,
-                               use_pretrained, pretrained_path, realtime, variance_embeds, vocoder], outputs, queue=False)
+                               use_pretrained, pretrained_path, realtime, vocoder], outputs, queue=False)
     stop_button.click(stop, [], outputs, queue=False)
     gr.Timer(2).tick(status, [], outputs, queue=False)

@@ -6,7 +6,6 @@ import os
 import pickle
 import platform
 import random
-import time
 import traceback
 from pathlib import Path
 
@@ -14,6 +13,7 @@ import numpy as np
 import soundfile as sf
 import torch
 from torch.multiprocessing import Manager, Process, get_context
+from tqdm import tqdm
 
 from rvc.rectified.data import CONTENT_RATE, mel_frames
 from rvc.rectified.indexed_dataset import IndexedDatasetBuilder
@@ -108,7 +108,6 @@ class ItemBuilder:
     def original(self, audio, content, frames, sid, name):
         f0, uv = self.f0(audio, self.hop, frames)
         if uv.all():
-            print(f"Skipped '{name}': empty gt f0", flush=True)
             return None
         clip = audio[: frames * self.hop].to(self.device)
         mel = self.mel(clip.unsqueeze(0), 0.0, self.hop)[0, :, :frames]
@@ -226,7 +225,7 @@ def _read_meta(path):
         return None
 
 
-def process_dataset(binary_dir, prefix, entries, tasks, config, device, num_workers, recipe):
+def process_dataset(binary_dir, prefix, entries, tasks, config, device, num_workers, recipe, progress):
     grouped = {}
     for task in tasks:
         grouped.setdefault(task['index'], []).append(task)
@@ -236,7 +235,7 @@ def process_dataset(binary_dir, prefix, entries, tasks, config, device, num_work
     writer = IndexedDatasetBuilder(temporary)
     meta = dict(lengths=[], spk_ids=[], names=[], augmented=[], recipe=recipe)
     seconds = {'original': 0.0, 'total': 0.0}
-    total, completed, last_report = len(entries) + len(tasks), 0, time.monotonic()
+    skipped = 0
 
     def add(item, index, augmented):
         writer.add_item(item)
@@ -256,17 +255,15 @@ def process_dataset(binary_dir, prefix, entries, tasks, config, device, num_work
         results = (process_item(*a) for a in args)
     try:
         for index, item in enumerate(results):
-            completed += 1 + len(grouped.get(index, []))
+            progress.update(1 + len(grouped.get(index, [])))
             if item is None:
+                skipped += 1
                 continue
             add(item, index, False)
             if index in grouped:
                 audio, content, _ = builder.source(entries[index])
                 for task in grouped[index]:
                     add(builder.augmented(audio, content, task, int(entries[index][4]), item), index, True)
-            if completed == total or time.monotonic() - last_report >= 5:
-                print(f'| binarize {prefix}: {completed:,}/{total:,}', flush=True)
-                last_report = time.monotonic()
     finally:
         writer.finalize()
     os.replace(temporary, data_path)
@@ -274,12 +271,7 @@ def process_dataset(binary_dir, prefix, entries, tasks, config, device, num_work
     with open(meta_path.with_suffix('.meta.tmp'), 'wb') as handle:
         pickle.dump(meta, handle)
     os.replace(meta_path.with_suffix('.meta.tmp'), meta_path)
-    if tasks:
-        print(f'| {prefix} total duration (before augmentation): {seconds["original"]:.2f}s', flush=True)
-        print(f'| {prefix} total duration (after augmentation): {seconds["total"]:.2f}s '
-              f'({seconds["total"] / max(seconds["original"], 1e-9):.2f}x)', flush=True)
-    else:
-        print(f'| {prefix} total duration: {seconds["total"]:.2f}s', flush=True)
+    return len(meta['lengths']), seconds['total'], skipped
 
 
 def binarize(experiment, config, training, held, seed, device, num_workers):
@@ -297,6 +289,11 @@ def binarize(experiment, config, training, held, seed, device, num_workers):
     args = settings['augmentation_args']
     augment = any(args[name]['enabled'] for name in ('random_pitch_shifting', 'random_time_stretching'))
     tasks = augmentation_plan(training, settings, seed) if augment else []
-    process_dataset(binary_dir, 'valid', held, [], config, device, 0, recipe)
-    process_dataset(binary_dir, 'train', training, tasks, config, device, int(num_workers), recipe)
+    with tqdm(total=len(held) + len(training) + len(tasks), desc='Binarizing', unit='clip', dynamic_ncols=True) as progress:
+        valid, _, skipped_valid = process_dataset(binary_dir, 'valid', held, [], config, device, 0, recipe, progress)
+        train, seconds, skipped_train = process_dataset(binary_dir, 'train', training, tasks, config, device,
+                                                        int(num_workers), recipe, progress)
+    skipped = skipped_valid + skipped_train
+    print(f'| binary data ready: {train:,} train, {valid:,} valid, {seconds / 60:.1f} min of training audio'
+          + (f', skipped {skipped} clip(s) without voiced frames' if skipped else ''), flush=True)
     return binary_dir

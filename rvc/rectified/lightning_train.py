@@ -1,4 +1,6 @@
 import json
+import logging
+import math
 import os
 import re
 import time
@@ -11,6 +13,7 @@ from lightning.pytorch.loggers import TensorBoardLogger
 from lightning.pytorch.strategies import DDPStrategy, StrategyRegistry
 from torch.utils.data import DataLoader
 from torchmetrics import MeanMetric
+from tqdm import tqdm
 
 from rvc.rectified.binarizer import binarize
 from rvc.rectified.config import resolve_config
@@ -32,6 +35,8 @@ from rvc.rectified.variance import variance_names
 from rvc.rectified.vocoder import load_vocoder
 
 torch.multiprocessing.set_sharing_strategy(os.getenv('TORCH_SHARE_STRATEGY', 'file_system'))
+for _name in ('lightning.pytorch', 'lightning.fabric'):
+    logging.getLogger(_name).setLevel(logging.WARNING)
 
 
 FINETUNE_OPTIONAL_KEYS = ('sampling_method', 'sampling_steps', 'use_breathiness_embed', 'use_voicing_embed')
@@ -394,6 +399,42 @@ class FlowPreview(pl.Callback):
             self.render(trainer, task)
 
 
+class FlowProgress(pl.Callback):
+    def __init__(self):
+        self.bar = None
+        self.step = 0
+
+    def on_train_start(self, trainer, task):
+        if not trainer.is_global_zero:
+            return
+        total = trainer.max_steps if trainer.max_steps > 0 else None
+        if total is None and trainer.max_epochs > 0 and math.isfinite(trainer.num_training_batches):
+            total = trainer.max_epochs * math.ceil(trainer.num_training_batches / trainer.accumulate_grad_batches)
+        self.step = trainer.global_step
+        self.bar = tqdm(total=total, initial=self.step, desc='Training', unit='step', dynamic_ncols=True)
+
+    def on_train_batch_end(self, trainer, task, outputs, batch, batch_idx):
+        if self.bar is None or trainer.global_step == self.step:
+            return
+        metrics = trainer.progress_bar_metrics
+        postfix = {name: f'{float(metrics[key]):.4f}' for name, key in
+                   (('loss', 'mel_loss'), ('aux', 'aux_mel_loss'), ('val', 'val_loss')) if key in metrics}
+        self.bar.set_postfix(postfix, refresh=False)
+        self.bar.update(trainer.global_step - self.step)
+        self.step = trainer.global_step
+
+    def close(self):
+        if self.bar is not None:
+            self.bar.close()
+            self.bar = None
+
+    def on_train_end(self, trainer, task):
+        self.close()
+
+    def on_exception(self, trainer, task, exception):
+        self.close()
+
+
 def trainer_device_options(args, settings):
     selected = args.device
     accelerator = settings['accelerator']
@@ -447,7 +488,8 @@ def fit(args, config, root):
     has_validation = bool(data.held and settings['eval_interval'])
     trainer = pl.Trainer(
         **options, num_nodes=settings['num_nodes'], strategy=strategy, precision=precision,
-        callbacks=[FlowCheckpoint(output, args, settings, has_validation), FlowPreview(args)],
+        callbacks=[FlowCheckpoint(output, args, settings, has_validation), FlowPreview(args), FlowProgress()],
+        enable_progress_bar=False, enable_model_summary=False,
         logger=TensorBoardLogger(save_dir=str(output), name='lightning_logs', version='latest'),
         gradient_clip_val=settings['grad_clip'],
         val_check_interval=max(1, settings['eval_interval']) * settings['accumulate_grad_batches'],

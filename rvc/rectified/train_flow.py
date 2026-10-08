@@ -168,7 +168,7 @@ def load_training_config(experiment, pretrained_flow=None, use_fused_kernels=Fal
         if use_fused_kernels and not pretrained_flow:
             config['flow']['model']['backbone_args']['glu_type'] = 'softsign_glu'
     if architecture(config['flow']['model']) != architecture(default_config(preset=preset)['flow']['model']):
-        raise ValueError(f'{source} does not use the {preset} model size. Set the Realtime option to match it, '
+        raise ValueError(f'{source} does not use the {preset} model size. Set the Smaller model option to match it, '
                          'or start a new experiment.')
     model = config['flow']['model']
     if variance_embeds is not None and (model['use_breathiness_embed'] or model['use_voicing_embed']) != bool(variance_embeds):

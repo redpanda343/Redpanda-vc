@@ -3,8 +3,8 @@ import glob
 import json
 import multiprocessing as mp
 import os
+import queue
 import sys
-import time
 
 import numpy as np
 import parselmouth
@@ -124,15 +124,27 @@ class FeatureInput:
             ) from error
 
 
-def process_files(files, f0_method, device, force=False):
+def process_files(files, f0_method, device, force, updates):
     fe = FeatureInput(f0_method=f0_method, device=device)
-    with tqdm.tqdm(total=len(files), leave=True) as pbar:
-        for file_info in files:
-            fe.process_file(file_info, force=force)
-            pbar.update(1)
+    for file_info in files:
+        fe.process_file(file_info, force=force)
+        updates.put(1)
 
 
-def run_pitch_extraction(files, devices, f0_method, threads, force=False):
+def follow_progress(tasks, updates, progress):
+    pending = set(tasks)
+    while pending:
+        done, pending = concurrent.futures.wait(pending, timeout=0.2)
+        for task in done:
+            task.result()
+        while True:
+            try:
+                progress.update(updates.get_nowait())
+            except queue.Empty:
+                break
+
+
+def run_pitch_extraction(files, devices, f0_method, threads, progress, updates, force=False):
     if not files:
         return
     if not devices:
@@ -148,15 +160,10 @@ def run_pitch_extraction(files, devices, f0_method, threads, force=False):
     if f0_method == "pm":
         worker_count = min(threads, len(files))
         worker_devices = ["cpu"] * worker_count
-        print(
-            f"Starting pitch extraction with {worker_count} CPU worker(s) using pm..."
-        )
     else:
         worker_count = min(len(devices), len(files))
         worker_devices = devices[:worker_count]
-        devices_str = ", ".join(worker_devices)
-        print(f"Starting pitch extraction on {devices_str} using {f0_method}...")
-    start_time = time.time()
+    progress.set_description(f"Extracting F0 ({f0_method})")
 
     with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count) as executor:
         tasks = [
@@ -166,18 +173,20 @@ def run_pitch_extraction(files, devices, f0_method, threads, force=False):
                 f0_method,
                 worker_devices[i],
                 force,
+                updates,
             )
             for i in range(worker_count)
         ]
-        for task in concurrent.futures.as_completed(tasks):
-            task.result()
-
-    print(f"Pitch extraction completed in {time.time() - start_time:.2f} seconds.")
+        follow_progress(tasks, updates, progress)
 
 
 def process_file_embedding(
-    files, embedder_model, version, device_num, device, n_threads
+    files, embedder_model, version, device, n_threads, updates
 ):
+    from transformers.utils import logging as transformers_logging
+
+    transformers_logging.disable_progress_bar()
+    transformers_logging.set_verbosity_error()
     model = load_embedding(embedder_model, version).to(device).float()
     model.eval()
     n_threads = max(1, n_threads)
@@ -204,20 +213,15 @@ def process_file_embedding(
             raise RuntimeError(f"{wav_file_path} produced non-finite values.")
         np.save(out_file_path, feats_out, allow_pickle=False)
 
-    with tqdm.tqdm(total=len(files), leave=True, position=device_num) as pbar:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=n_threads) as executor:
-            futures = [executor.submit(worker, f) for f in files]
-            for future in concurrent.futures.as_completed(futures):
-                future.result()
-                pbar.update(1)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n_threads) as executor:
+        futures = [executor.submit(worker, f) for f in files]
+        for future in concurrent.futures.as_completed(futures):
+            future.result()
+            updates.put(1)
 
 
-def run_embedding_extraction(files, devices, embedder_model, version, threads):
-    devices_str = ", ".join(devices)
-    print(
-        f"Starting embedding extraction with {threads} cores on {devices_str}..."
-    )
-    start_time = time.time()
+def run_embedding_extraction(files, devices, embedder_model, version, threads, progress, updates):
+    progress.set_description(f"Extracting features ({embedder_model})")
     with concurrent.futures.ProcessPoolExecutor(max_workers=len(devices)) as executor:
         tasks = [
             executor.submit(
@@ -225,16 +229,13 @@ def run_embedding_extraction(files, devices, embedder_model, version, threads):
                 files[i :: len(devices)],
                 embedder_model,
                 version,
-                i,
                 devices[i],
                 threads // len(devices),
+                updates,
             )
             for i in range(len(devices))
         ]
-        for task in concurrent.futures.as_completed(tasks):
-            task.result()
-
-    print(f"Embedding extraction completed in {time.time() - start_time:.2f} seconds.")
+        follow_progress(tasks, updates, progress)
 
 
 if __name__ == "__main__":
@@ -358,16 +359,21 @@ if __name__ == "__main__":
 
     devices = ["cpu"] if gpus == "-" else [f"cuda:{idx}" for idx in gpus.split("-")]
 
-    run_pitch_extraction(
-        extraction_files, devices, f0_method, num_processes, force=force_pitch_extraction
-    )
-    data["f0_method"] = f0_method
-    with open(file_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4)
+    with mp.Manager() as manager, tqdm.tqdm(
+        total=2 * len(extraction_files), unit="file", dynamic_ncols=True
+    ) as progress:
+        updates = manager.Queue()
+        run_pitch_extraction(
+            extraction_files, devices, f0_method, num_processes, progress, updates,
+            force=force_pitch_extraction,
+        )
+        data["f0_method"] = f0_method
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4)
 
-    run_embedding_extraction(
-        extraction_files, devices, embedder_model, version, num_processes
-    )
+        run_embedding_extraction(
+            extraction_files, devices, embedder_model, version, num_processes, progress, updates
+        )
 
     write_validation_manifest(exp_dir, validation_entries)
 

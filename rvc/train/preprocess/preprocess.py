@@ -220,14 +220,12 @@ def preprocess_training_set(
     active_workers = max(1, min(num_processes, len(files), available_cpus))
     if use_fireredvad_gpu:
         active_workers = min(active_workers, GPU_PREPROCESS_MAX_WORKERS)
-    print(f"Starting preprocess with {active_workers} workers...")
     pp = PreProcess(sr, exp_dir, dataset_format, use_fireredvad_gpu, version)
     pp.audio_write_workers = (
         min(AUDIO_WRITE_MAX_WORKERS, available_cpus)
         if not use_fireredvad_gpu and active_workers == 1
         else 1
     )
-    print(f"Audio output pipeline: {pp.audio_write_workers} workers per source")
     work_pp = pp if use_fireredvad_gpu else None
 
     if cut_preprocess == "Simple":
@@ -292,7 +290,7 @@ def preprocess_training_set(
     audio_length = 0.0
     skipped_short_outputs = 0
     try:
-        with tqdm(total=len(work_items)) as pbar:
+        with tqdm(total=len(work_items), desc="Preprocessing", unit="file", dynamic_ncols=True) as pbar:
             with executor_class(
                 max_workers=active_workers, **executor_kwargs
             ) as executor:
@@ -315,7 +313,6 @@ def preprocess_training_set(
                         except StopIteration:
                             continue
                         pending.add(executor.submit(worker, work_item))
-                print("\nSlicing completed. Finalizing preprocessing...", flush=True)
     finally:
         if use_fireredvad_gpu:
             shutdown_fireredvad_gpu()
