@@ -8,15 +8,13 @@ import gradio as gr
 import psutil
 
 from tabs.settings.sections.precision import get_precision
-from tabs.train.rectified import experiment_path, positive_integer
+from tabs.train.rectified import QUIET_WARNINGS, experiment_path, positive_integer
 
 ROOT = Path(__file__).resolve().parents[2]
+BEATRICE_WARNINGS = 'ignore:wav_length % 160 != 0,ignore:Some clusters have no assigned data points'
 _lock = threading.Lock()
 _process = None
-_log_handle = None
-_log_path = None
 _experiment = None
-_description = 'No Beatrice job has been started.'
 
 
 def latest_export():
@@ -27,24 +25,8 @@ def latest_export():
 
 
 def _status():
-    global _log_handle
-    code = _process.poll() if _process is not None else None
-    active = _process is not None and code is None
-    if not active and _log_handle is not None:
-        _log_handle.close()
-        _log_handle = None
-    status = _description
-    if _process is not None:
-        status += ' Running.' if active else f' Finished with exit code {code}.'
-    export = latest_export()
-    if export is not None:
-        status += f' Latest VST model folder: {export}'
-    log = ''
-    if _log_path is not None and _log_path.exists():
-        with _log_path.open('rb') as handle:
-            handle.seek(max(0, _log_path.stat().st_size - 16000))
-            log = handle.read().decode('utf-8', errors='replace')
-    return status, log, gr.update(interactive=not active), gr.update(interactive=active)
+    active = _process is not None and _process.poll() is None
+    return gr.update(interactive=not active), gr.update(interactive=active)
 
 
 def status():
@@ -52,35 +34,31 @@ def status():
         return _status()
 
 
-def print_job_completion(process, description):
-    print(f'{description} Finished with exit code {process.wait()}.', flush=True)
+def print_job_completion(process, label):
+    code = process.wait()
+    if code != 0:
+        print(f'{label} stopped with exit code {code}.', flush=True)
+        return
+    export = latest_export()
+    print(f'{label} done.' + (f' VST model folder: {export}' if export is not None else ''), flush=True)
 
 
 def launch(name, arguments):
-    global _process, _log_handle, _log_path, _experiment, _description
+    global _process, _experiment
     directory = experiment_path(name)
     with _lock:
         if _process is not None and _process.poll() is None:
             raise gr.Error('A Beatrice job is already running. Wait for it to finish or stop it first.')
-        if _log_handle is not None:
-            _log_handle.close()
         directory.mkdir(parents=True, exist_ok=True)
-        _log_path = directory / 'beatrice_webui.log'
-        _log_handle = _log_path.open('wb')
-        environment = dict(os.environ, PYTHONUNBUFFERED='1', PYTHONIOENCODING='utf-8')
-        try:
-            _process = subprocess.Popen(
-                [sys.executable, '-u', '-m', 'rvc.beatrice.train', *arguments], cwd=ROOT,
-                stdout=_log_handle, stderr=subprocess.STDOUT, env=environment,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
-            )
-        except Exception:
-            _log_handle.close()
-            _log_handle = None
-            raise
+        warnings = ','.join(filter(None, (os.environ.get('PYTHONWARNINGS'), QUIET_WARNINGS, BEATRICE_WARNINGS)))
+        environment = dict(os.environ, PYTHONUNBUFFERED='1', PYTHONIOENCODING='utf-8', PYTHONWARNINGS=warnings)
+        _process = subprocess.Popen([sys.executable, '-u', '-m', 'rvc.beatrice.train', *arguments], cwd=ROOT,
+                                    env=environment)
         _experiment = directory
-        _description = f'Training Beatrice: {name}.'
-        threading.Thread(target=print_job_completion, args=(_process, _description), daemon=True).start()
+        label = f'Training Beatrice {name}:'
+        print(f'{label} started.', flush=True)
+        threading.Thread(target=print_job_completion, args=(_process, label), daemon=True).start()
+        gr.Info('Beatrice training started. Progress is shown in the console.')
         return _status()
 
 
@@ -104,7 +82,6 @@ def start(name, dataset, steps, batch, save_interval, workers, device):
 
 
 def stop():
-    global _description
     with _lock:
         if _process is not None and _process.poll() is None:
             try:
@@ -124,7 +101,7 @@ def stop():
                 _process.wait(timeout=5)
             except psutil.NoSuchProcess:
                 pass
-            _description = 'Stopped. Resume starts from the last saved checkpoint; unsaved steps are lost.'
+            print('Stopped. Resume starts from the last saved checkpoint; unsaved steps are lost.', flush=True)
         return _status()
 
 
@@ -157,9 +134,7 @@ def beatrice_train_tab():
     with gr.Row():
         train_button = gr.Button('Start / resume Beatrice training', variant='primary')
         stop_button = gr.Button('Stop current Beatrice job', interactive=False)
-    state = gr.Textbox(label='Beatrice job status', interactive=False)
-    log = gr.Textbox(label='Beatrice job log', lines=12, max_lines=20, interactive=False)
-    outputs = [state, log, train_button, stop_button]
+    outputs = [train_button, stop_button]
     train_button.click(start, [name, dataset, steps, batch, save_interval, workers, device], outputs, queue=False)
     stop_button.click(stop, [], outputs, queue=False)
     gr.Timer(2).tick(status, [], outputs, queue=False)

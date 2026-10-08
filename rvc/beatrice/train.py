@@ -68,7 +68,6 @@ def prepare_dataset(experiment, dataset):
     data_dir.mkdir(parents=True, exist_ok=True)
     for speaker, source in speakers:
         link_directory(source, data_dir / speaker)
-    print(f'Speakers: {", ".join(speaker for speaker, _ in speakers)}', flush=True)
     return data_dir
 
 
@@ -82,6 +81,28 @@ def write_config(experiment, args):
     path = experiment / 'beatrice_config.json'
     path.write_text(json.dumps(config, indent=4), encoding='utf-8')
     return path
+
+
+def quiet_trainer_output():
+    import functools
+
+    import torch
+    import tqdm.auto
+
+    class TrainingProgress(tqdm.auto.tqdm):
+        def __init__(self, iterable=None, *args, desc=None, **kwargs):
+            if desc != 'Training':
+                kwargs['disable'] = True
+            elif isinstance(iterable, range) and iterable.step == 1:
+                kwargs.setdefault('total', iterable.stop)
+                kwargs.setdefault('initial', iterable.start)
+            kwargs.setdefault('unit', 'step')
+            kwargs.setdefault('dynamic_ncols', True)
+            super().__init__(iterable, *args, desc=desc, **kwargs)
+
+    tqdm.auto.tqdm = TrainingProgress
+    torch.hub.load = functools.partial(torch.hub.load, verbose=False)
+    sys.stdout = open(os.devnull, 'w', encoding='utf-8')
 
 
 def select_device(device):
@@ -117,6 +138,7 @@ def main():
         arguments.append('-r')
     launcher = write_launcher()
     sys.argv = [str(launcher), *arguments]
+    quiet_trainer_output()
     runpy.run_path(str(launcher), run_name='__main__')
 
 
