@@ -157,8 +157,7 @@ def resolve_pretrained(directory, enabled, preferred=''):
 
 
 def start(name, batch, max_frames, max_updates, checkpoint_interval, device, use_fused_kernels=False,
-          use_pretrained=False, pretrained_path='', realtime=False, shortcut=False, variance_embeds=True,
-          vocoder=DEFAULT_VOCODER):
+          use_pretrained=False, pretrained_path='', realtime=False, variance_embeds=True, vocoder=DEFAULT_VOCODER):
     directory = experiment_path(name)
     device_id(device)
     if not (directory / 'filelist.txt').is_file():
@@ -171,7 +170,7 @@ def start(name, batch, max_frames, max_updates, checkpoint_interval, device, use
 
     try:
         selected = load_training_config(directory, pretrained or None, use_fused_kernels, preset, pitch_extractor,
-                                        bool(shortcut), bool(variance_embeds))
+                                        bool(variance_embeds))
     except ValueError as error:
         raise gr.Error(str(error)) from error
     precision = get_precision() or selected['flow'].get('precision', 'fp32')
@@ -193,8 +192,6 @@ def start(name, batch, max_frames, max_updates, checkpoint_interval, device, use
         arguments.extend(['--device', str(device).strip().lower()])
     if use_fused_kernels:
         arguments.append('--use-fused-kernels')
-    if shortcut:
-        arguments.append('--shortcut')
     arguments.append('--variance-embeds' if variance_embeds else '--no-variance-embeds')
     if pretrained:
         arguments.extend(['--pretrained-flow', pretrained])
@@ -287,8 +284,7 @@ def rectified_train_tab():
             max_frames = gr.Number(label='Max frames per batch (per GPU)', value=None, minimum=1, precision=0,
                                    info='Blank uses config, default 50000 padded frames. Lower to reduce GPU memory use.')
             max_updates = gr.Number(label='Max training updates', value=None, minimum=1, precision=0,
-                               info='Blank uses config, default 100000 Lightning training steps '
-                                    '(200000 for new shortcut flows).')
+                               info='Blank uses config, default 100000 Lightning training steps.')
             checkpoint_interval = gr.Number(label='Checkpoint interval (updates)', value=None, minimum=1, precision=0,
                                    info='Blank uses config, default 4000 updates.')
         realtime = gr.Checkbox(label='Realtime', value=False,
@@ -301,10 +297,6 @@ def rectified_train_tab():
                                            'natural breaths and noise. Adds the separator to binarization, conversion '
                                            'and realtime (about 60 ms per realtime block on a GTX 1660 Ti). Off matches '
                                            "DiffSinger's default. Set it when the experiment starts and keep it when resuming.")
-        shortcut = gr.Checkbox(label='Shortcut (few-step) flow', value=False,
-                               info='Optional. Trains the flow to also take larger steps (Frans et al., 2024), so it can '
-                                    'sample in 1, 2, 4, 8... steps. Costs about 15% more per update. Off keeps the '
-                                    'DiffSinger flow unchanged. Set it when the experiment starts and keep it when resuming.')
         use_fused_kernels = gr.Checkbox(label='Fused Linear + SoftSignGLU kernels', value=False,
                                        info='Set it when starting a new experiment: the experiment then trains with SoftSignGLU so the '
                                             'kernels can run. Experiments and pretrained checkpoints that use ATanGLU cannot enable it. '
@@ -325,7 +317,6 @@ def rectified_train_tab():
                                          silence_compress], outputs, queue=False)
     extract_button.click(extract, [name, workers, device, embedder, pitch_extractor], outputs, queue=False)
     train_button.click(start, [name, batch, max_frames, max_updates, checkpoint_interval, device, use_fused_kernels,
-                               use_pretrained, pretrained_path, realtime, shortcut, variance_embeds, vocoder], outputs,
-                       queue=False)
+                               use_pretrained, pretrained_path, realtime, variance_embeds, vocoder], outputs, queue=False)
     stop_button.click(stop, [], outputs, queue=False)
     gr.Timer(2).tick(status, [], outputs, queue=False)

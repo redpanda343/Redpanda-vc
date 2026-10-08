@@ -95,10 +95,6 @@ DEFAULT_CONFIG = {
             'dual_timestep': True,
             'sampling_method': 'rk2',
             'sampling_steps': 10,
-            'shortcut': False,
-            'shortcut_steps': 128,
-            'shortcut_bootstrap_every': 8,
-            'shortcut_ema': 0.999,
             'train_aux_decoder': True,
             'train_diffusion': True,
             'val_gt_start': False,
@@ -112,23 +108,6 @@ NEW_EXPERIMENT_OVERRIDES = {
             'use_breathiness_embed': True,
             'use_voicing_embed': True,
         },
-    },
-}
-
-SHORTCUT_OVERRIDES = {
-    'flow': {
-        'model': {
-            'shortcut': True,
-            'sampling_method': 'euler',
-            'sampling_steps': 8,
-        },
-    },
-}
-
-SHORTCUT_SCHEDULE_OVERRIDES = {
-    'flow': {
-        'decay_step': 10000,
-        'max_updates': 200000,
     },
 }
 
@@ -162,6 +141,8 @@ PRESETS = {'standard': {}, 'realtime': REALTIME_OVERRIDES}
 
 FREE_FORM_KEYS = {('flow', 'strategy')}
 
+REMOVED_SHORTCUT_KEYS = ('shortcut', 'shortcut_steps', 'shortcut_bootstrap_every', 'shortcut_ema')
+
 
 def _merge(base, overrides, path=()):
     result = deepcopy(base)
@@ -180,6 +161,13 @@ def _merge(base, overrides, path=()):
 def resolve_config(config):
     if not isinstance(config, dict):
         raise ValueError('Rectified-flow config must be a JSON object.')
+    flow = config.get('flow')
+    model = flow.get('model') if isinstance(flow, dict) else None
+    if isinstance(model, dict) and any(key in model for key in REMOVED_SHORTCUT_KEYS):
+        if model.get('shortcut'):
+            raise ValueError('Shortcut (few-step) flows are no longer supported. Retrain this voice as a standard flow.')
+        model = {key: value for key, value in model.items() if key not in REMOVED_SHORTCUT_KEYS}
+        config = dict(config, flow=dict(flow, model=model))
     return _merge(DEFAULT_CONFIG, config)
 
 

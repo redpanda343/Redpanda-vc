@@ -227,9 +227,6 @@ class RealTimeRVC:
             if int(rectified_steps) != rectified_steps or not 0 <= rectified_steps <= 1000:
                 raise ValueError("Flow steps must be an integer between 0 and 1000.")
             self.rectified_steps = int(rectified_steps) or None
-            steps = self.rectified_steps or self.model.sampling_steps
-            if self.model.shortcut and (steps & (steps - 1) or steps > self.model.shortcut_steps):
-                raise ValueError(f"This shortcut flow needs a power of two up to {self.model.shortcut_steps} flow steps.")
             self.flow_context_frames = None
             if rectified_flow_window:
                 self.flow_context_frames = math.ceil(

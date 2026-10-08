@@ -10,9 +10,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from rvc.rectified.config import (
-    PRESETS, SHORTCUT_OVERRIDES, SHORTCUT_SCHEDULE_OVERRIDES, _merge, architecture, default_config, resolve_config,
-)
+from rvc.rectified.config import PRESETS, architecture, default_config, resolve_config
 from rvc.rectified.flow_model import validate_model_config
 from rvc.rectified.pitch import PITCH_EXTRACTORS
 from rvc.rectified.mel import normalize_mel
@@ -148,7 +146,7 @@ def experiment_pitch_extractor(experiment):
 
 
 def load_training_config(experiment, pretrained_flow=None, use_fused_kernels=False, preset='standard',
-                         pitch_extractor='parselmouth', shortcut=None, variance_embeds=None):
+                         pitch_extractor='parselmouth', variance_embeds=None):
     config_path = experiment / 'rectified_config.json'
     if config_path.exists():
         config = resolve_config(json.loads(config_path.read_text(encoding='utf-8')))
@@ -164,10 +162,6 @@ def load_training_config(experiment, pretrained_flow=None, use_fused_kernels=Fal
             pretrained = resolve_config(checkpoint['config'])
             config['data'] = pretrained['data']
             config['flow']['model'] = pretrained['flow']['model']
-        if shortcut:
-            config = _merge(config, SHORTCUT_OVERRIDES)
-            if not pretrained_flow:
-                config = _merge(config, SHORTCUT_SCHEDULE_OVERRIDES)
         if variance_embeds is not None:
             config['flow']['model'].update(use_breathiness_embed=bool(variance_embeds),
                                            use_voicing_embed=bool(variance_embeds))
@@ -176,9 +170,6 @@ def load_training_config(experiment, pretrained_flow=None, use_fused_kernels=Fal
     if architecture(config['flow']['model']) != architecture(default_config(preset=preset)['flow']['model']):
         raise ValueError(f'{source} does not use the {preset} model size. Set the Realtime option to match it, '
                          'or start a new experiment.')
-    if shortcut is not None and config['flow']['model']['shortcut'] != bool(shortcut):
-        kind = 'a shortcut' if config['flow']['model']['shortcut'] else 'a standard'
-        raise ValueError(f'This experiment trains {kind} flow. Set Shortcut to match it, or start a new experiment.')
     model = config['flow']['model']
     if variance_embeds is not None and (model['use_breathiness_embed'] or model['use_voicing_embed']) != bool(variance_embeds):
         state = 'with' if variance_embeds is False else 'without'
@@ -202,7 +193,7 @@ def train(args):
     config = load_training_config(experiment, args.pretrained_flow, getattr(args, 'use_fused_kernels', False),
                                   getattr(args, 'preset', 'standard'),
                                   getattr(args, 'pitch_extractor', None) or experiment_pitch_extractor(experiment),
-                                  getattr(args, 'shortcut', None), getattr(args, 'variance_embeds', None))
+                                  getattr(args, 'variance_embeds', None))
     configure_arguments(args, config['flow'])
     if config['data']['sample_rate'] != 44100:
         raise ValueError('This recipe requires 44100 Hz audio.')
@@ -295,9 +286,6 @@ def main():
                         help='Model size for new experiments. realtime uses narrower, deeper networks.')
     parser.add_argument('--pitch-extractor', choices=PITCH_EXTRACTORS, default=None,
                         help='F0 extractor for new experiments (default: the one chosen at extraction).')
-    parser.add_argument('--shortcut', action='store_true', default=None,
-                        help='Train a shortcut flow (Frans et al., 2024) that samples in a power-of-two number of steps, '
-                             'down to one. New experiments and fine-tunes only.')
     parser.add_argument('--variance-embeds', action=argparse.BooleanOptionalAction, default=None,
                         help="Condition the flow on DiffSinger's breathiness and voicing curves. New experiments "
                              'default to on; fine-tunes default to the pretrained setting.')
