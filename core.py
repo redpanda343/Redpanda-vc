@@ -12,13 +12,17 @@ from datetime import datetime, timedelta
 now_dir = os.getcwd()
 sys.path.append(now_dir)
 
+from shared.platform import migrate_models_folder
+
+migrate_models_folder(now_dir)
+
 current_script_directory = os.path.dirname(os.path.realpath(__file__))
 logs_path = os.path.join(current_script_directory, "logs")
 
-from rvc.lib.tools.analyzer import analyze_audio
-from rvc.lib.tools.launch_tensorboard import launch_tensorboard_pipeline
-from rvc.lib.tools.model_download import model_download_pipeline
-from rvc.lib.tools.prerequisites_download import prequisites_download_pipeline
+from shared.tools.analyzer import analyze_audio
+from shared.tools.launch_tensorboard import launch_tensorboard_pipeline
+from shared.tools.model_download import model_download_pipeline
+from shared.tools.prerequisites_download import prequisites_download_pipeline
 from rvc.train.process.checkpoint_exporter import export_generator_checkpoint
 from rvc.train.process.model_blender import model_blender as blend_models
 from rvc.train.process.model_information import model_information
@@ -501,7 +505,7 @@ def run_preprocess_script(
         raise ValueError(f"Unsupported RVC version: {version}")
     if version == "v1" and int(sample_rate) != 40000:
         raise ValueError("RVC v1 preprocessing requires a 40000 Hz model.")
-    preprocess_script_path = os.path.join("rvc", "train", "preprocess", "preprocess.py")
+    preprocess_script_path = os.path.join("shared", "preprocess", "preprocess.py")
     command = [
         python,
         preprocess_script_path,
@@ -555,7 +559,7 @@ def run_extract_script(
     ):
         raise ValueError("RVC v1 extraction requires ContentVec at 40000 Hz.")
     model_path = os.path.join(logs_path, model_name)
-    extract = os.path.join("rvc", "train", "extract", "extract.py")
+    extract = os.path.join("shared", "extract", "extract.py")
 
     command_1 = [
         python,
@@ -673,7 +677,7 @@ def _build_train_command(
             f"RVC {version}."
         )
     if pretrained == True:
-        from rvc.lib.tools.pretrained_selector import pretrained_selector
+        from shared.tools.pretrained_selector import pretrained_selector
 
         if custom_pretrained == False:
             pg, pd = pretrained_selector(str(vocoder), int(sample_rate), version)
@@ -926,7 +930,7 @@ def run_prerequisites_script(
         exe,
     )
     if beatrice:
-        from rvc.beatrice.resources import ensure_trainer
+        from beatrice.resources import ensure_trainer
 
         try:
             ensure_trainer()

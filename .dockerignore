@@ -23,4 +23,4 @@ assets/audios
 assets/datasets
 assets/config.json
 logs
-rvc/models
+models

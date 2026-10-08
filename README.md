@@ -6,6 +6,20 @@
 
 This project is a fork of [Applio](https://github.com/IAHispano/Applio), with changes focused on dataset preprocessing, inference, training, normalization, and a cleaner WebUI experience.
 
+## Project layout
+
+| Folder | Contents |
+| --- | --- |
+| `rvc/` | RVC: network architecture (`algorithm`), sample-rate configs, training and inference |
+| `rectified_flow/` | Rectified Flow: model, data pipeline, Lightning training, offline and realtime inference |
+| `beatrice/` | Beatrice 2: trainer wrapper, offline and realtime inference |
+| `shared/` | Code used by more than one model: dataset preprocessing, content and F0 extraction, pitch predictors, tools |
+| `tabs/` | WebUI tabs; `tabs/train` holds one file per model (`rvc.py`, `rectified_flow.py`, `beatrice.py`) |
+| `models/` | Downloaded weights (embedders, predictors, pretrained models, Beatrice trainer) |
+| `logs/` | Experiments and trained models |
+
+Installs from before this layout keep their downloaded weights: on the first start the app moves `rvc/models` to `models`.
+
 Rectified Flow follows DiffSinger's acoustic model with ContentVec in place of
 phonemes: a transformer content encoder over ContentVec frames at their native
 50 Hz, expanded to mel frames before speaker, pitch, key-shift and speed
@@ -23,7 +37,7 @@ on the command line). `parselmouth` uses
 autocorrelation on the 44.1 kHz audio at the mel hop, 65-1100 Hz, voicing
 threshold 0.6. `rmvpe` uses DiffSinger's RMVPE code (from
 [yxlllc/RMVPE](https://github.com/yxlllc/RMVPE)) with the 230917 model, which
-the app downloads to `rvc/models/predictors/rmvpe.pt`. It runs at 16 kHz and is
+the app downloads to `models/predictors/rmvpe.pt`. It runs at 16 kHz and is
 resampled to the mel hop. Unvoiced frames are interpolated in log frequency.
 Time stretching re-extracts F0 at the stretched hop and pitch shifting scales
 it. Like DiffSinger, binarization skips clips with no voiced frames. The
@@ -56,7 +70,7 @@ Conversion extracts the same curves from the full-rate source before pitch
 shifting. VR runs in 15 s windows with 1 s crossfades so long files fit in GPU
 memory, and realtime separates only the newest audio with 1 s (VR) or 0.3 s
 (WORLD) of context and reuses the rest. The app downloads the VR model
-(`hnsep_240512`) to `rvc/models/predictors/hnsep/vr` when first needed.
+(`hnsep_240512`) to `models/predictors/hnsep/vr` when first needed.
 Experiments and checkpoints made before this keep both embeddings off; turn the
 option off to resume them. Turning it off matches DiffSinger's default. Enabling
 it while fine-tuning a checkpoint without it starts both embeddings at zero, so
@@ -94,7 +108,7 @@ clips are binarized in the main process, originals use
 `flow.augmentation_workers` worker processes (0 processes them in the main
 process, the default), and augmented copies are computed in the main process.
 
-The recipe defaults live in `rvc/rectified/config.py` and are written to
+The recipe defaults live in `rectified_flow/config.py` and are written to
 `logs/<model>/rectified_config.json` when training starts. Edit the experiment
 config to change the model, optimizer, scheduler, batching, validation or
 checkpoint policy. Architecture changes require a new experiment. Training
@@ -141,7 +155,7 @@ checkpoints that use another activation refuse the switch instead of changing
 their activation. Disabling the switch later turns off fused kernels and keeps the
 saved activation. Evaluation and inference use eager kernels.
 Fused CUDA FP16/BF16 training requires a working Triton installation; CPU/FP32 and
-unsupported GPUs use the eager path. The port in `rvc/rectified/kernels` is
+unsupported GPUs use the eager path. The port in `rectified_flow/kernels` is
 adapted from [DiffSinger](https://github.com/openvpi/DiffSinger) under Apache 2.0;
 its license is included in that directory.
 

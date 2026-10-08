@@ -30,11 +30,11 @@ now_dir = os.getcwd()
 sys.path.append(now_dir)
 
 from rvc.infer.pipeline import InferenceRNG, Pipeline as VC
-from rvc.lib.utils import load_audio_infer, load_embedding
-from rvc.lib.tools.split_audio import process_audio, merge_audio
-from rvc.lib.algorithm.synthesizers import Synthesizer
+from shared.utils import load_audio_infer, load_embedding
+from shared.tools.split_audio import process_audio, merge_audio
+from rvc.algorithm.synthesizers import Synthesizer
 from rvc.configs.config import Config
-from rvc.train.preprocess.slicer import (
+from shared.preprocess.slicer import (
     FIRERED_LONG_AUDIO_SECONDS,
     FIRERED_SAMPLE_RATE,
     Slicer,
@@ -684,10 +684,10 @@ class VoiceConverter:
         """
         if self.cpt is not None:
             if isinstance(self.cpt.get('config'), dict):
-                from rvc.rectified.config import resolve_config
-                from rvc.rectified.flow_model import build_flow
-                from rvc.rectified.infer import is_rectified
-                from rvc.rectified.resources import VOCODERS, recorded_vocoder
+                from rectified_flow.config import resolve_config
+                from rectified_flow.flow_model import build_flow
+                from rectified_flow.infer import is_rectified
+                from rectified_flow.resources import VOCODERS, recorded_vocoder
 
                 if not is_rectified(self.cpt):
                     raise ValueError('Select an RVC model or Rectified Flow voice checkpoint, not a vocoder checkpoint.')
@@ -731,7 +731,7 @@ class VoiceConverter:
         if self.cpt is not None:
             previous_vc = self.vc
             if isinstance(self.cpt.get('config'), dict):
-                from rvc.rectified.infer import RectifiedPipeline
+                from rectified_flow.infer import RectifiedPipeline
 
                 self.vc = RectifiedPipeline(self.tgt_sr, self.config, self.cpt)
             else:

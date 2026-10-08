@@ -24,8 +24,8 @@ assets/realtime_config.json
 
 logs/*
 !logs/.gitkeep
-rvc/models/*
-!rvc/models/.gitkeep
+models/*
+!models/.gitkeep
 env
 venv
 .venv

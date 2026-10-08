@@ -40,11 +40,11 @@ from rvc.train.utils import (
 )
 
 # Zluda hijack
-import rvc.lib.zluda
-from rvc.lib.algorithm import commons
+import shared.zluda
+from rvc.algorithm import commons
 from rvc.train.process.extract_model import extract_model
 from rvc.train.timbre_validation import ECAPATimbreValidator
-from rvc.train.validation_data import (
+from shared.validation_data import (
     deterministic_validation_scope,
     infer_validation_audio,
     prepare_validation_reference,
@@ -331,7 +331,7 @@ class AsyncInferenceExporter:
 
 
 def load_saved_validation_model(model_path, device):
-    from rvc.lib.algorithm.synthesizers import Synthesizer
+    from rvc.algorithm.synthesizers import Synthesizer
     from rvc.train.utils import replace_keys_in_dict
 
     checkpoint = torch.load(model_path, map_location="cpu", weights_only=True)
@@ -625,7 +625,7 @@ def run(
         torch.cuda.set_device(device_id)
 
     # Create datasets and dataloaders
-    from data_utils import (
+    from rvc.train.data_utils import (
         DistributedBucketSampler,
         TextAudioCollateMultiNSFsid,
         TextAudioLoaderMultiNSFsid,
@@ -711,8 +711,8 @@ def run(
             timbre_reference = None
 
     # Initialize models and optimizers
-    from rvc.lib.algorithm.discriminators import MultiPeriodDiscriminator
-    from rvc.lib.algorithm.synthesizers import Synthesizer
+    from rvc.algorithm.discriminators import MultiPeriodDiscriminator
+    from rvc.algorithm.synthesizers import Synthesizer
 
     net_g = Synthesizer(
         config.data.filter_length // 2 + 1,
@@ -864,7 +864,7 @@ def run(
     if rank == 0 and timbre_reference is not None:
         try:
             timbre_model_path = os.path.join(
-                "rvc", "models", "pretraineds", "ecapa_tdnn", "pretrain.model"
+                "models", "pretraineds", "ecapa_tdnn", "pretrain.model"
             )
             timbre_validator = ECAPATimbreValidator(timbre_model_path)
             enrollment_wave, enrollment_lengths, enrollment_speakers = (

@@ -1,7 +1,7 @@
 import gradio as gr
 
 from assets.i18n.i18n import I18nAuto
-from rvc.lib.tools.launch_tensorboard import launch_tensorboard
+from shared.tools.launch_tensorboard import launch_tensorboard
 
 i18n = I18nAuto()
 

@@ -14,7 +14,7 @@ from core import (
 )
 from rvc.configs.config import get_number_of_gpus
 from tabs.settings.sections.restart import get_train_state
-from tabs.train.train import (
+from tabs.train.rvc import (
     get_datasets_list,
     get_models_list,
     get_pretrained_list,

@@ -6,7 +6,7 @@ import torch.nn.functional as F
 import torchaudio.functional as audio_functional
 from sklearn import metrics
 
-from rvc.lib.algorithm.ecapa_tdnn import load_ecapa_tdnn
+from rvc.algorithm.ecapa_tdnn import load_ecapa_tdnn
 
 
 def _error_rates(scores, labels):

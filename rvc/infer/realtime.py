@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from rvc.infer.infer import VoiceConverter, deterministic_torch_scope
-from rvc.lib.utils import extract_embedding_features
+from shared.utils import extract_embedding_features
 
 
 SUPPORTED_VOCODERS = {"HiFi-GAN", "RefineGAN"}
@@ -220,9 +220,9 @@ class RealTimeRVC:
         )
         if self.is_rectified:
             from torchaudio.transforms import Resample
-            from rvc.rectified.vocoder import load_vocoder
-            from rvc.rectified.realtime import RealtimeFlowSampler, RealtimeGraph
-            from rvc.rectified.variance import StreamingVariances
+            from rectified_flow.vocoder import load_vocoder
+            from rectified_flow.realtime import RealtimeFlowSampler, RealtimeGraph
+            from rectified_flow.variance import StreamingVariances
 
             if int(rectified_steps) != rectified_steps or not 0 <= rectified_steps <= 1000:
                 raise ValueError("Flow steps must be an integer between 0 and 1000.")
@@ -358,7 +358,7 @@ class RealTimeRVC:
     def _prepare_pitch_predictor(self, method):
         predictor = getattr(self.pipeline, f"model_{method}", None)
         if predictor is None and method == "swift":
-            from rvc.lib.predictors.f0 import Swift
+            from shared.predictors.f0 import Swift
 
             predictor = Swift(
                 device=self.device,
@@ -449,7 +449,7 @@ class RealTimeRVC:
         return source[-length:]
 
     def _rectified_f0(self, waveform, input_wav, f0_method, source_wav, source_rate, frames):
-        from rvc.rectified.pitch import parselmouth_pitch, resample_f0, resample_voicing, rmvpe_model, rmvpe_pitch
+        from rectified_flow.pitch import parselmouth_pitch, resample_f0, resample_voicing, rmvpe_model, rmvpe_pitch
 
         rate = self.sample_rate
         hop = int(self.pipeline.data["hop_length"])
@@ -464,7 +464,7 @@ class RealTimeRVC:
                 predictor = getattr(self.pipeline, "model_rmvpe", None)
                 model = predictor.model if predictor is not None else rmvpe_model(self.device)
                 if self.rmvpe_graph is None or self.rmvpe_graph.function is not model.model:
-                    from rvc.rectified.realtime import RealtimeGraph
+                    from rectified_flow.realtime import RealtimeGraph
 
                     self.rmvpe_graph = RealtimeGraph(model.model, "RMVPE", self.rectified_cuda_graph)
                 f0, uv = rmvpe_pitch(model, audio, rate, hop, frames, self.rmvpe_graph)

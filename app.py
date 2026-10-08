@@ -63,6 +63,10 @@ if __name__ == "__main__":
 now_dir = os.getcwd()
 sys.path.append(now_dir)
 
+from shared.platform import migrate_models_folder
+
+migrate_models_folder(now_dir)
+
 # TODO: This path is regenerated all over the place in Applio
 # should probably be in a static module for everything to reference
 CONFIG_PATH = os.path.join(now_dir, "assets", "config.json")
@@ -75,7 +79,7 @@ if not os.path.exists(CONFIG_PATH):
     shutil.copy(CONFIG_TEMPLATE_PATH, CONFIG_PATH)
 
 # Plataform config
-from rvc.lib.platform import platform_config
+from shared.platform import platform_config
 
 platform_config()
 
@@ -142,7 +146,7 @@ gr.Number.preprocess = lambda self, payload: (
 GRADIO_6 = int(gr.__version__.split(".")[0]) >= 6
 
 # Zluda hijack
-import rvc.lib.zluda
+import shared.zluda
 
 # Import Tabs
 from tabs.inference.inference import inference_tab
@@ -559,7 +563,7 @@ with gr.Blocks(
 
 def launch_gradio(server_name: str, server_port: int, auth=None) -> None:
     if auth is None:
-        from rvc.lib.tools.web_auth import build_launch_auth
+        from shared.tools.web_auth import build_launch_auth
 
         auth = build_launch_auth(server_name, _has_share)
     app, local_url, share_url = Applio.launch(
@@ -581,7 +585,7 @@ def launch_gradio(server_name: str, server_port: int, auth=None) -> None:
             else {}
         ),
     )
-    from rvc.lib.tools.tensorboard_proxy import register_tensorboard_proxy
+    from shared.tools.tensorboard_proxy import register_tensorboard_proxy
 
     try:
         register_tensorboard_proxy(app)
@@ -596,7 +600,7 @@ def launch_gradio(server_name: str, server_port: int, auth=None) -> None:
 
 
 if __name__ == "__main__":
-    from rvc.lib.tools.web_auth import build_launch_auth
+    from shared.tools.web_auth import build_launch_auth
 
     port = _args.port
     server = _args.server_name

@@ -11,9 +11,9 @@ from torch import Tensor
 now_dir = os.getcwd()
 sys.path.append(now_dir)
 
-from rvc.lib.predictors.f0 import RMVPE, Swift
+from shared.predictors.f0 import RMVPE, Swift
 from rvc.infer.pm import extract_pm
-from rvc.lib.utils import extract_embedding_features
+from shared.utils import extract_embedding_features
 
 import logging
 

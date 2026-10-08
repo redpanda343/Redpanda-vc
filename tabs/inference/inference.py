@@ -16,7 +16,7 @@ from core import (
     run_multi_model_batch_infer_script,
     run_multi_model_infer_script,
 )
-from rvc.lib.utils import format_title
+from shared.utils import format_title
 from tabs.settings.sections.filter import get_filter_trigger, load_config_filter
 from tabs.settings.sections.restart import stop_infer
 
@@ -381,7 +381,7 @@ def get_speakers_id(model):
 
 
 def get_vocoders():
-    root = os.path.join(now_dir, "rvc", "models", "pretraineds", "rectified")
+    root = os.path.join(now_dir, "models", "pretraineds", "rectified")
     return sorted(
         os.path.relpath(os.path.join(folder, name), now_dir)
         for folder, _, files in os.walk(root)

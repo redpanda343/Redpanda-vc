@@ -28,12 +28,14 @@ from noisereduce.torchgate import TorchGate
 from noisereduce.torchgate.utils import amp_to_db
 from torchaudio.transforms import Resample
 
-from rvc.beatrice.inference import OUT_SAMPLE_RATE, find_paraphernalia
-from rvc.beatrice.realtime import BeatriceRealtime
+from beatrice.inference import OUT_SAMPLE_RATE, find_paraphernalia
+from beatrice.realtime import BeatriceRealtime
 from rvc.infer.realtime import RealTimeRVC
+from shared.platform import migrate_models_folder
 
 
 ROOT = Path(__file__).resolve().parent
+migrate_models_folder(ROOT)
 CONFIG_PATH = ROOT / "assets" / "realtime_config.json"
 MONITOR_DISABLED = "Disabled"
 MAIN_HOST_APIS = ("ASIO", "Windows WASAPI")
@@ -1053,7 +1055,7 @@ class RealtimeGUI:
 
     def _browse_vocoder(self):
         path = filedialog.askopenfilename(
-            initialdir=ROOT / "rvc" / "models" / "pretraineds" / "rectified",
+            initialdir=ROOT / "models" / "pretraineds" / "rectified",
             filetypes=(("Flow vocoder", "*.pth *.ckpt *.onnx"), ("All files", "*.*")),
         )
         if path:

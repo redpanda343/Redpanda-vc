@@ -2,7 +2,7 @@ import os
 import gradio as gr
 from matplotlib import pyplot as plt
 
-from rvc.lib.predictors.F0Extractor import F0Extractor
+from shared.predictors.F0Extractor import F0Extractor
 
 from assets.i18n.i18n import I18nAuto
 

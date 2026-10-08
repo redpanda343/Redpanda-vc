@@ -14,7 +14,7 @@ now_dir = os.getcwd()
 sys.path.append(now_dir)
 
 from core import run_download_script
-from rvc.lib.utils import format_title
+from shared.utils import format_title
 
 from assets.i18n.i18n import I18nAuto
 
@@ -112,7 +112,7 @@ json_url = "https://huggingface.co/IAHispano/Applio/raw/main/pretrains.json"
 
 
 def fetch_pretrained_data():
-    pretraineds_custom_path = os.path.join("rvc", "models", "pretraineds", "custom")
+    pretraineds_custom_path = os.path.join("models", "pretraineds", "custom")
     os.makedirs(pretraineds_custom_path, exist_ok=True)
     try:
         with open(
@@ -209,7 +209,7 @@ def download_pretrained_presets(selected_models):
     if isinstance(selected_models, str):
         selected_models = [selected_models]
 
-    save_path = os.path.join(now_dir, "rvc", "models", "pretraineds", "custom")
+    save_path = os.path.join(now_dir, "models", "pretraineds", "custom")
     tasks = [
         (url, os.path.join(save_path, filename))
         for model in selected_models
@@ -237,7 +237,7 @@ def download_pretrained_presets(selected_models):
 
 
 def download_pretrained_model(model, sample_rate, url_g="", url_d=""):
-    save_path = os.path.join("rvc", "models", "pretraineds", "custom")
+    save_path = os.path.join("models", "pretraineds", "custom")
     os.makedirs(save_path, exist_ok=True)
     tasks = []
 
