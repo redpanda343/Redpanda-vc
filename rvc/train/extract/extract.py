@@ -360,7 +360,8 @@ if __name__ == "__main__":
     devices = ["cpu"] if gpus == "-" else [f"cuda:{idx}" for idx in gpus.split("-")]
 
     with mp.Manager() as manager, tqdm.tqdm(
-        total=2 * len(extraction_files), unit="file", dynamic_ncols=True
+        total=2 * len(extraction_files), desc=f"Extracting F0 ({f0_method})", unit="file",
+        dynamic_ncols=True,
     ) as progress:
         updates = manager.Queue()
         run_pitch_extraction(

@@ -16,6 +16,8 @@ QUIET_WARNINGS = ('ignore:pkg_resources is deprecated,ignore:Checkpoint director
                   'ignore:`isinstance(treespec,ignore::FutureWarning')
 _lock = threading.Lock()
 _process = None
+_runner = None
+_cancelled = False
 
 
 def experiment_path(name):
@@ -31,10 +33,13 @@ def positive_integer(value, label):
     return str(int(value))
 
 
+def _active():
+    return _runner is not None and _runner.is_alive()
+
+
 def _status():
-    active = _process is not None and _process.poll() is None
-    return (gr.update(interactive=not active), gr.update(interactive=not active), gr.update(interactive=not active),
-            gr.update(interactive=active))
+    active = _active()
+    return gr.update(interactive=not active), gr.update(interactive=not active), gr.update(interactive=active)
 
 
 def status():
@@ -42,46 +47,60 @@ def status():
         return _status()
 
 
-def print_job_completion(process, description):
-    code = process.wait()
-    if code == 0:
-        message = 'done. Ready to extract content and F0.' if description.startswith('Preprocessing') else 'done.'
-    else:
-        message = f'stopped with exit code {code}.'
-    print(f'{description} {message}', flush=True)
-
-
-def launch(name, module, arguments, description):
+def run_steps(label, steps, finished):
     global _process
+    warnings = ','.join(filter(None, (os.environ.get('PYTHONWARNINGS'), QUIET_WARNINGS)))
+    environment = dict(os.environ, PYTHONUNBUFFERED='1', PYTHONIOENCODING='utf-8', PYTHONWARNINGS=warnings)
+    for module, arguments in steps:
+        with _lock:
+            if _cancelled:
+                return
+            _process = subprocess.Popen([sys.executable, '-u', '-m', module, *arguments], cwd=ROOT, env=environment)
+        code = _process.wait()
+        if _cancelled:
+            return
+        if code != 0:
+            print(f'{label} stopped with exit code {code}.', flush=True)
+            return
+    print(f'{label} {finished}', flush=True)
+
+
+def launch(name, steps, description, finished='done.'):
+    global _runner, _cancelled
     directory = experiment_path(name)
     with _lock:
-        if _process is not None and _process.poll() is None:
+        if _active():
             raise gr.Error('A rectified-flow job is already running. Wait for it to finish or stop it first.')
         directory.mkdir(parents=True, exist_ok=True)
-        warnings = ','.join(filter(None, (os.environ.get('PYTHONWARNINGS'), QUIET_WARNINGS)))
-        environment = dict(os.environ, PYTHONUNBUFFERED='1', PYTHONIOENCODING='utf-8', PYTHONWARNINGS=warnings)
-        _process = subprocess.Popen([sys.executable, '-u', '-m', module, *arguments], cwd=ROOT, env=environment)
+        _cancelled = False
         label = f'{description} {name}:'
         print(f'{label} started.', flush=True)
-        threading.Thread(target=print_job_completion, args=(_process, label), daemon=True).start()
+        _runner = threading.Thread(target=run_steps, args=(label, steps, finished), daemon=True)
+        _runner.start()
         gr.Info(f'{description} started. Progress is shown in the console.')
         return _status()
 
 
-def preprocess(name, dataset, workers, cutting='Automatic', chunk_len=3.0, overlap_len=0.3, truncate_silence=False,
-               silence_action='truncate', silence_threshold=-45.0, silence_minimum=0.3, silence_to=0.3,
-               silence_compress=50.0):
+def preprocess(name, dataset, workers, device, cutting='Automatic', chunk_len=3.0, overlap_len=0.3,
+               truncate_silence=False, silence_action='truncate', silence_threshold=-45.0, silence_minimum=0.3,
+               silence_to=0.3, silence_compress=50.0):
     directory = experiment_path(name)
     dataset = str(dataset).strip().strip('"')
     if not Path(dataset).is_dir():
         raise gr.Error('The dataset folder does not exist.')
     if cutting not in ('Skip', 'Simple', 'Automatic'):
         raise gr.Error('Choose Skip, Simple or Automatic audio cutting.')
-    return launch(name, 'rvc.train.preprocess.preprocess',
-                  [str(directory), dataset, '44100', positive_integer(workers, 'CPU workers'), cutting, 'False', 'False',
-                   '0.0', str(float(chunk_len)), str(float(overlap_len)), 'none', 'WAV', str(bool(truncate_silence)),
-                   str(float(silence_threshold)), str(float(silence_to)), str(float(silence_minimum)), silence_action,
-                   str(float(silence_compress))], 'Preprocessing')
+    workers = positive_integer(workers, 'CPU workers')
+    gpu = device_id(device)
+    steps = [
+        ('rvc.train.preprocess.preprocess',
+         [str(directory), dataset, '44100', workers, cutting, 'False', 'False', '0.0', str(float(chunk_len)),
+          str(float(overlap_len)), 'none', 'WAV', str(bool(truncate_silence)), str(float(silence_threshold)),
+          str(float(silence_to)), str(float(silence_minimum)), silence_action, str(float(silence_compress))]),
+        ('rvc.train.extract.extract',
+         [str(directory), 'rmvpe', workers, gpu, '44100', 'contentvec', '0', 'v2', '--rectified']),
+    ]
+    return launch(name, steps, 'Preprocessing', 'done. Ready to train.')
 
 
 def cutting_visibility(cutting, truncate_silence, silence_action):
@@ -91,17 +110,6 @@ def cutting_visibility(cutting, truncate_silence, silence_action):
             gr.update(visible=silence), gr.update(visible=silence), gr.update(visible=silence),
             gr.update(visible=silence and silence_action == 'truncate'),
             gr.update(visible=silence and silence_action == 'compress'))
-
-
-def extract(name, workers, device, embedder, pitch_extractor='parselmouth'):
-    directory = experiment_path(name)
-    if not (directory / 'sliced_audios').is_dir():
-        raise gr.Error('Preprocess this experiment first.')
-    gpu = device_id(device)
-    method = 'pm' if pitch_extractor == 'parselmouth' else pitch_extractor
-    return launch(name, 'rvc.train.extract.extract',
-                  [str(directory), method, positive_integer(workers, 'CPU workers'), gpu,
-                   '44100', embedder, '0', 'v2', '--rectified'], 'Extracting content and F0')
 
 
 def device_id(device):
@@ -171,11 +179,13 @@ def start(name, batch, max_frames, max_updates, checkpoint_interval, device, use
         arguments.append('--variance-embeds')
     if pretrained:
         arguments.extend(['--pretrained-flow', pretrained])
-    return launch(name, 'rvc.rectified.train_flow', arguments, 'Training rectified flow')
+    return launch(name, [('rvc.rectified.train_flow', arguments)], 'Training rectified flow')
 
 
 def stop():
+    global _cancelled
     with _lock:
+        _cancelled = True
         if _process is not None and _process.poll() is None:
             try:
                 parent = psutil.Process(_process.pid)
@@ -234,10 +244,6 @@ def rectified_train_tab():
                                      info='Keeps the minimum silence plus this percentage of the silence beyond '
                                           'that minimum.')
         preprocess_button = gr.Button('Preprocess dataset')
-        with gr.Row():
-            embedder = gr.Dropdown(label='Content embedder', choices=['contentvec', 'spin-v2'], value='contentvec')
-            pitch_extractor = gr.Dropdown(label='Pitch extractor', choices=['parselmouth', 'rmvpe'], value='parselmouth')
-        extract_button = gr.Button('Extract content and F0')
     with gr.Accordion('2. Train rectified flow', open=True):
         use_pretrained = gr.Checkbox(label='Pretrained', value=False)
         pretrained_path = gr.Textbox(label='Voice checkpoint to fine-tune', value='',
@@ -262,16 +268,15 @@ def rectified_train_tab():
         with gr.Row():
             train_button = gr.Button('Start / resume rectified training', variant='primary')
             stop_button = gr.Button('Stop current rectified job', interactive=False)
-    outputs = [preprocess_button, extract_button, train_button, stop_button]
+    outputs = [preprocess_button, train_button, stop_button]
     cutting_inputs = [cutting, truncate_silence, silence_action]
     cutting_outputs = [chunk_len, overlap_len, truncate_silence, silence_action, silence_threshold, silence_minimum,
                        silence_to, silence_compress]
     for control in cutting_inputs:
         control.change(cutting_visibility, cutting_inputs, cutting_outputs, queue=False)
-    preprocess_button.click(preprocess, [name, dataset, workers, cutting, chunk_len, overlap_len, truncate_silence,
-                                         silence_action, silence_threshold, silence_minimum, silence_to,
-                                         silence_compress], outputs, queue=False)
-    extract_button.click(extract, [name, workers, device, embedder, pitch_extractor], outputs, queue=False)
+    preprocess_button.click(preprocess, [name, dataset, workers, device, cutting, chunk_len, overlap_len,
+                                         truncate_silence, silence_action, silence_threshold, silence_minimum,
+                                         silence_to, silence_compress], outputs, queue=False)
     train_button.click(start, [name, batch, max_frames, max_updates, checkpoint_interval, device, use_fused_kernels,
                                use_pretrained, pretrained_path, realtime, vocoder], outputs, queue=False)
     stop_button.click(stop, [], outputs, queue=False)
