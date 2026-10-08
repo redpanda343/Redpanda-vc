@@ -17,3 +17,6 @@ The realtime GUI (`run-realtime-gui.bat`) supports RVC, Beatrice and Rectified F
 - [Retrieval-based-Voice-Conversion-WebUI](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI)
 - [Applio](https://github.com/IAHispano/Applio)
 - [FireRedVAD](https://github.com/FireRedTeam/FireRedVAD)
+- [Beatrice Trainer](https://huggingface.co/fierce-cats/beatrice-trainer)
+- [OpenVPI PC-NSF-HiFiGAN](https://github.com/openvpi/vocoders)
+- [tgm_hifigan](https://github.com/mrtigermeat/tgm_hifigan) by tigermeat (CC BY-NC 4.0)
