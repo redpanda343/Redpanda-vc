@@ -8,7 +8,7 @@ import gradio as gr
 import psutil
 
 from tabs.settings.sections.precision import get_precision
-from tabs.train.rectified_flow import QUIET_WARNINGS, experiment_path, positive_integer
+from tabs.train.jobs import QUIET_WARNINGS, experiment_path, positive_integer
 
 ROOT = Path(__file__).resolve().parents[2]
 BEATRICE_WARNINGS = 'ignore:wav_length % 160 != 0,ignore:Some clusters have no assigned data points'
