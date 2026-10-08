@@ -283,14 +283,15 @@ class AudioEngine:
         self.reported_statuses = set()
         self.asio_callback_frames = 0
         self.prefill_margin = max(self.block_frame // 4, self.zc)
-        if self.output_selectors:
+        if self.output_selectors or self.input_selectors:
             self.output_fifo = AudioFrameFifo(1)
             self._resize_asio_fifo(self.output_fifo)
         else:
             self.output_queue = queue.Queue(maxsize=3)
+        if not self.output_selectors:
             self.output_stream = sd.OutputStream(
-                callback=self._output_callback,
-                blocksize=self.block_frame,
+                callback=self._output_callback if self.output_fifo is None else self._fifo_output_callback,
+                blocksize=self.block_frame if self.output_fifo is None else 0,
                 samplerate=self.sample_rate,
                 channels=self.output_channels,
                 device=self.output_device,
@@ -319,9 +320,7 @@ class AudioEngine:
         if self.output_stream is not None:
             output_latency = self.output_stream.latency
         else:
-            output_latency = (
-                self._stream_latency(self.asio_stream, 1) + self.output_fifo.prefill / self.sample_rate
-            )
+            output_latency = self._stream_latency(self.asio_stream, 1)
         if self.beatrice is not None:
             model_latency = self.beatrice.latency_seconds
         else:
@@ -477,6 +476,8 @@ class AudioEngine:
             return
         try:
             self.monitor_queue = AudioFrameFifo(1, max_frames=self.block_frame * 4)
+            if self.input_selectors:
+                self._resize_asio_fifo(self.monitor_queue)
             self.monitor_stream = sd.OutputStream(
                 device=self.monitor_device,
                 callback=self._monitor_callback,
@@ -505,7 +506,8 @@ class AudioEngine:
         if frames <= self.asio_callback_frames:
             return
         self.asio_callback_frames = frames
-        for fifo in (self.output_fifo, self.monitor_queue if self.monitor_selectors else None):
+        monitor_queue = self.monitor_queue if self.monitor_selectors or self.input_selectors else None
+        for fifo in (self.output_fifo, monitor_queue):
             if fifo is not None:
                 self._resize_asio_fifo(fifo)
         input_fifo = self.input_fifo
@@ -582,8 +584,12 @@ class AudioEngine:
         noise_reduction_ms = 0
         if self.settings["input_noise_reduce"]:
             noise_reduction_ms = 1000 * min(self.settings["crossfade_time"], 0.04)
+        prefill_ms = 0
+        output_fifo = self.output_fifo
+        if output_fifo is not None and self.sample_rate:
+            prefill_ms = 1000 * output_fifo.prefill / self.sample_rate
         self.algorithm_latency_ms = round(
-            self.base_latency_ms + lookahead_ms + noise_reduction_ms + self.last_block_ms
+            self.base_latency_ms + lookahead_ms + noise_reduction_ms + prefill_ms + self.last_block_ms
         )
 
     def stop(self):
@@ -805,7 +811,7 @@ class AudioEngine:
     def _asio_output_callback(self, outdata, frames, times, status):
         outdata.fill(0)
         self._track_asio_frames(frames)
-        output_fifo = self.output_fifo
+        output_fifo = self.output_fifo if self.output_selectors else None
         monitor_queue = self.monitor_queue if self.monitor_selectors else None
         main_channels = self.asio_main_channels
         block = output_fifo.read(frames) if output_fifo is not None else None
@@ -831,13 +837,18 @@ class AudioEngine:
         count = min(frames, block.shape[0])
         outdata[:count] = block[:count, None]
 
-    def _monitor_callback(self, outdata, frames, times, status):
+    @staticmethod
+    def _play_fifo(outdata, fifo, frames):
         outdata.fill(0)
-        monitor_queue = self.monitor_queue
-        block = monitor_queue.read(frames) if monitor_queue is not None else None
-        if block is None:
-            return
-        outdata[: block.shape[0]] = block[:, :1]
+        block = fifo.read(frames) if fifo is not None else None
+        if block is not None:
+            outdata[: block.shape[0]] = block[:, :1]
+
+    def _fifo_output_callback(self, outdata, frames, times, status):
+        self._play_fifo(outdata, self.output_fifo, frames)
+
+    def _monitor_callback(self, outdata, frames, times, status):
+        self._play_fifo(outdata, self.monitor_queue, frames)
 
 
 def system_theme():
