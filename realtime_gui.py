@@ -2,6 +2,7 @@ import ctypes
 import json
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -18,6 +19,7 @@ except ImportError:
 
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("OMP_NUM_THREADS", "4")
+os.environ.setdefault("SD_ENABLE_ASIO", "1")
 
 import librosa
 import numpy as np
@@ -85,8 +87,10 @@ class AudioFrameFifo:
     def __init__(self, channels=1, max_frames=None):
         self.channels = int(channels)
         self.max_frames = None if max_frames is None else int(max_frames)
+        self.prefill = 0
         self._chunks = deque()
         self._frames = 0
+        self._starved = True
         self._lock = threading.Lock()
 
     def write(self, data):
@@ -96,14 +100,22 @@ class AudioFrameFifo:
         if not array.shape[0]:
             return
         with self._lock:
+            if self._starved and self.prefill > 0:
+                self._chunks.append(np.zeros((self.prefill, array.shape[1]), dtype=np.float32))
+                self._frames += self.prefill
+            self._starved = False
             self._chunks.append(array.copy())
             self._frames += array.shape[0]
             if self.max_frames is not None and self._frames > self.max_frames:
                 self._discard_locked(self._frames - self.max_frames)
 
-    def read(self, frames):
+    def read(self, frames, exact=False):
         with self._lock:
+            if exact and self._frames < int(frames):
+                return None
             take = min(int(frames), self._frames)
+            if take < int(frames):
+                self._starved = True
             if take <= 0:
                 return None
             parts = []
@@ -143,6 +155,18 @@ def friendly_device_label(api_name, device_name, direction):
     return f"[{api_label}] {device_name}"
 
 
+def asio_channel_choices(count, prefix, mono):
+    choices = {}
+    if mono:
+        for channel in range(count):
+            choices[f"{prefix} {channel + 1}"] = [channel]
+    for first in range(0, count - 1, 2):
+        choices[f"{prefix} {first + 1}+{first + 2}"] = [first, first + 1]
+    if count % 2:
+        choices[f"{prefix} {count}"] = [count - 1]
+    return choices
+
+
 def device_sort_key(label):
     lower_label = label.lower()
     if "voicemeeter" in lower_label:
@@ -153,7 +177,8 @@ def device_sort_key(label):
         priority = 2
     else:
         priority = 3
-    return priority, lower_label
+    parts = re.split(r"(\d+)", lower_label)
+    return priority, [int(part) if index % 2 else part for index, part in enumerate(parts)]
 
 
 class AudioEngine:
@@ -162,8 +187,17 @@ class AudioEngine:
         self.input_stream = None
         self.output_stream = None
         self.monitor_stream = None
+        self.asio_stream = None
         self.output_queue = None
+        self.output_fifo = None
         self.monitor_queue = None
+        self.input_fifo = None
+        self.worker = None
+        self.worker_stop = None
+        self.worker_wakeup = None
+        self.asio_device = None
+        self.asio_main_channels = 0
+        self.asio_callback_frames = 0
         self.rvc = None
         self.beatrice = None
         self.running = False
@@ -206,12 +240,31 @@ class AudioEngine:
         self.input_device = settings["input_device"]
         self.output_device = settings["output_device"]
         self.monitor_device = settings.get("monitor_device")
-        if self.monitor_device == self.output_device:
+        self.input_selectors = settings.get("input_selectors")
+        self.output_selectors = settings.get("output_selectors")
+        self.monitor_selectors = settings.get("monitor_selectors")
+        if (self.monitor_device, self.monitor_selectors) == (self.output_device, self.output_selectors):
             self.monitor_device = None
-        self.channels = self._channels(self.input_device, "max_input_channels")
-        self.output_channels = self._channels(self.output_device, "max_output_channels")
+            self.monitor_selectors = None
+        asio_devices = {
+            device
+            for device, selectors in (
+                (self.input_device, self.input_selectors),
+                (self.output_device, self.output_selectors),
+                (self.monitor_device, self.monitor_selectors),
+            )
+            if device is not None and selectors
+        }
+        if len(asio_devices) > 1:
+            raise ValueError(
+                "Only one ASIO driver can be open at a time. Pick channels of the same ASIO driver "
+                "for every ASIO device, or use WASAPI devices for the rest."
+            )
+        self.asio_device = next(iter(asio_devices), None)
+        self.channels = self._channels(self.input_device, "max_input_channels", self.input_selectors)
+        self.output_channels = self._channels(self.output_device, "max_output_channels", self.output_selectors)
         self.monitor_channels = (
-            self._channels(self.monitor_device, "max_output_channels")
+            self._channels(self.monitor_device, "max_output_channels", self.monitor_selectors)
             if self.monitor_device is not None
             else 0
         )
@@ -228,31 +281,47 @@ class AudioEngine:
             )
         self._prewarm()
         self.reported_statuses = set()
-        self.output_queue = queue.Queue(maxsize=3)
-        self.output_stream = sd.OutputStream(
-            callback=self._output_callback,
-            blocksize=self.block_frame,
-            samplerate=self.sample_rate,
-            channels=self.output_channels,
-            device=self.output_device,
-            dtype="float32",
-            extra_settings=self.output_extra,
-        )
-        self.input_stream = sd.InputStream(
-            callback=self._input_callback,
-            blocksize=self.block_frame,
-            samplerate=self.sample_rate,
-            channels=self.channels,
-            device=self.input_device,
-            dtype="float32",
-            extra_settings=self.input_extra,
-        )
+        self.asio_callback_frames = 0
+        self.prefill_margin = max(self.block_frame // 4, self.zc)
+        if self.output_selectors:
+            self.output_fifo = AudioFrameFifo(1)
+            self._resize_asio_fifo(self.output_fifo)
+        else:
+            self.output_queue = queue.Queue(maxsize=3)
+            self.output_stream = sd.OutputStream(
+                callback=self._output_callback,
+                blocksize=self.block_frame,
+                samplerate=self.sample_rate,
+                channels=self.output_channels,
+                device=self.output_device,
+                dtype="float32",
+                extra_settings=self.output_extra,
+            )
+        if not self.input_selectors:
+            self.input_stream = sd.InputStream(
+                callback=self._input_callback,
+                blocksize=self.block_frame,
+                samplerate=self.sample_rate,
+                channels=self.channels,
+                device=self.input_device,
+                dtype="float32",
+                extra_settings=self.input_extra,
+            )
         self.running = True
-        self.output_stream.start()
-        self.input_stream.start()
-        self._start_monitor_stream()
-        input_latency = self.input_stream.latency
-        output_latency = self.output_stream.latency
+        if self.output_stream is not None:
+            self.output_stream.start()
+        self._start_asio_stream()
+        if self.input_stream is not None:
+            self.input_stream.start()
+        if not self.monitor_selectors:
+            self._start_monitor_stream()
+        input_latency = self._stream_latency(self.input_stream or self.asio_stream, 0)
+        if self.output_stream is not None:
+            output_latency = self.output_stream.latency
+        else:
+            output_latency = (
+                self._stream_latency(self.asio_stream, 1) + self.output_fifo.prefill / self.sample_rate
+            )
         if self.beatrice is not None:
             model_latency = self.beatrice.latency_seconds
         else:
@@ -262,13 +331,25 @@ class AudioEngine:
         ) * 1000
         self._refresh_latency()
 
-    def _channels(self, device, key):
+    def _channels(self, device, key, selectors=None):
+        if selectors:
+            return len(selectors)
         return max(1, min(int(sd.query_devices(device)[key]), 2))
+
+    @staticmethod
+    def _stream_latency(stream, index):
+        latency = stream.latency
+        return latency[index] if isinstance(latency, tuple) else latency
 
     def _routing_samplerate(self, model_rate):
         exclusive = self.settings.get("wasapi_exclusive", False)
 
-        def check(checker, device, channels, rate):
+        def check(checker, device, channels, rate, selectors=None):
+            if selectors:
+                settings = sd.AsioSettings(channel_selectors=selectors)
+                checker(device=device, channels=channels, dtype="float32",
+                        samplerate=rate, extra_settings=settings)
+                return settings, False
             api = sd.query_hostapis(sd.query_devices(device)["hostapi"])["name"]
             if "WASAPI" in api and exclusive:
                 settings = sd.WasapiSettings(exclusive=True)
@@ -299,15 +380,17 @@ class AudioEngine:
         for rate in candidates:
             try:
                 self.input_extra, input_shared = check(
-                    sd.check_input_settings, self.input_device, self.channels, rate
+                    sd.check_input_settings, self.input_device, self.channels, rate, self.input_selectors
                 )
                 self.output_extra, output_shared = check(
-                    sd.check_output_settings, self.output_device, self.output_channels, rate
+                    sd.check_output_settings, self.output_device, self.output_channels, rate,
+                    self.output_selectors,
                 )
                 self.monitor_extra, monitor_shared = None, False
                 if self.monitor_device is not None:
                     self.monitor_extra, monitor_shared = check(
-                        sd.check_output_settings, self.monitor_device, self.monitor_channels, rate
+                        sd.check_output_settings, self.monitor_device, self.monitor_channels, rate,
+                        self.monitor_selectors,
                     )
                 self.shared_fallbacks = [
                     sd.query_devices(device)["name"]
@@ -413,6 +496,85 @@ class AudioEngine:
                 f"The monitor device could not start; continuing with the main output only. {error}"
             )
 
+    def _resize_asio_fifo(self, fifo):
+        frames = self.asio_callback_frames
+        fifo.prefill = 2 * frames + max(0, frames - self.block_frame) + self.prefill_margin
+        fifo.max_frames = 2 * (self.block_frame + fifo.prefill)
+
+    def _track_asio_frames(self, frames):
+        if frames <= self.asio_callback_frames:
+            return
+        self.asio_callback_frames = frames
+        for fifo in (self.output_fifo, self.monitor_queue if self.monitor_selectors else None):
+            if fifo is not None:
+                self._resize_asio_fifo(fifo)
+        input_fifo = self.input_fifo
+        if input_fifo is not None:
+            input_fifo.max_frames = 4 * self.block_frame + 2 * frames
+
+    def _start_asio_stream(self):
+        if self.asio_device is None:
+            return
+        output_selectors = list(self.output_selectors or [])
+        self.asio_main_channels = len(output_selectors)
+        if self.monitor_selectors:
+            self.monitor_queue = AudioFrameFifo(1)
+            self._resize_asio_fifo(self.monitor_queue)
+            output_selectors += self.monitor_selectors
+        common = dict(samplerate=self.sample_rate, dtype="float32", blocksize=0)
+        if self.input_selectors:
+            self.input_fifo = AudioFrameFifo(self.channels, max_frames=self.block_frame * 4)
+            self.worker_stop = threading.Event()
+            self.worker_wakeup = threading.Event()
+            self.worker = threading.Thread(
+                target=self._worker,
+                args=(self.input_fifo, self.worker_wakeup, self.worker_stop),
+                name="realtime-asio-inference",
+                daemon=True,
+            )
+            input_settings = sd.AsioSettings(channel_selectors=self.input_selectors)
+            if output_selectors:
+                self.asio_stream = sd.Stream(
+                    callback=self._asio_duplex_callback,
+                    device=(self.asio_device, self.asio_device),
+                    channels=(self.channels, len(output_selectors)),
+                    extra_settings=(input_settings, sd.AsioSettings(channel_selectors=output_selectors)),
+                    **common,
+                )
+            else:
+                self.asio_stream = sd.InputStream(
+                    callback=self._asio_input_callback,
+                    device=self.asio_device,
+                    channels=self.channels,
+                    extra_settings=input_settings,
+                    **common,
+                )
+            self.worker.start()
+        else:
+            self.asio_stream = sd.OutputStream(
+                callback=self._asio_output_callback,
+                device=self.asio_device,
+                channels=len(output_selectors),
+                extra_settings=sd.AsioSettings(channel_selectors=output_selectors),
+                **common,
+            )
+        self.asio_stream.start()
+
+    def _worker(self, fifo, wakeup, stop):
+        while not stop.is_set():
+            wakeup.wait(0.05)
+            wakeup.clear()
+            while not stop.is_set() and self.running:
+                block = fifo.read(self.block_frame, exact=True)
+                if block is None:
+                    break
+                try:
+                    self._handle_block(block)
+                except Exception:
+                    self.running = False
+                    self.error_queue.put_nowait(traceback.format_exc())
+                    return
+
     def _refresh_latency(self):
         lookahead_ms = 0
         if self.rvc is not None and not self.settings["passthrough"]:
@@ -428,7 +590,10 @@ class AudioEngine:
         self.running = False
         self.input_level = 0.0
         self.output_level = 0.0
-        for name in ("input_stream", "output_stream", "monitor_stream"):
+        if self.worker_stop is not None:
+            self.worker_stop.set()
+            self.worker_wakeup.set()
+        for name in ("asio_stream", "input_stream", "output_stream", "monitor_stream"):
             stream = getattr(self, name)
             if stream is None:
                 continue
@@ -443,8 +608,15 @@ class AudioEngine:
                 except sd.PortAudioError:
                     pass
                 setattr(self, name, None)
+        if self.worker is not None and self.worker is not threading.current_thread():
+            self.worker.join(timeout=5)
+        self.worker = None
+        self.worker_stop = None
+        self.worker_wakeup = None
         self.output_queue = None
+        self.output_fifo = None
         self.monitor_queue = None
+        self.input_fifo = None
 
     def update_pitch(self, pitch):
         if self.beatrice is not None:
@@ -568,6 +740,8 @@ class AudioEngine:
                 )
                 if self.resampler2 is not None:
                     infer_wav = self.resampler2(infer_wav)
+                else:
+                    infer_wav = infer_wav.clone()
             if settings["output_noise_reduce"] and not passthrough:
                 self.output_buffer[: -self.block_frame] = self.output_buffer[self.block_frame :].clone()
                 self.output_buffer[-self.block_frame :] = infer_wav[-self.block_frame :]
@@ -589,25 +763,61 @@ class AudioEngine:
             self.reported_statuses.add(text)
             self.error_queue.put_nowait(text)
 
+    def _handle_block(self, indata):
+        output = self._process(indata)
+        output_queue = self.output_queue
+        if output_queue is not None:
+            enqueue_latest(output_queue, output)
+        output_fifo = self.output_fifo
+        if output_fifo is not None:
+            output_fifo.write(output)
+        monitor_queue = self.monitor_queue
+        if monitor_queue is not None:
+            monitor_queue.write(
+                np.clip(output * np.float32(db_to_linear(self.settings["monitor_gain_db"])), -1.0, 1.0)
+            )
+
     def _input_callback(self, indata, frames, times, status):
         if not self.running:
             return
         try:
             if status:
                 self._report_status(status)
-            output = self._process(indata)
-            output_queue = self.output_queue
-            if output_queue is not None:
-                enqueue_latest(output_queue, output)
-            monitor_queue = self.monitor_queue
-            if monitor_queue is not None:
-                monitor_queue.write(
-                    np.clip(output * np.float32(db_to_linear(self.settings["monitor_gain_db"])), -1.0, 1.0)
-                )
+            self._handle_block(indata)
         except Exception:
             self.running = False
             self.error_queue.put_nowait(traceback.format_exc())
             raise sd.CallbackAbort
+
+    def _asio_input_callback(self, indata, frames, times, status):
+        if not self.running:
+            return
+        if status:
+            self._report_status(status)
+        self._track_asio_frames(frames)
+        fifo = self.input_fifo
+        wakeup = self.worker_wakeup
+        if fifo is None or wakeup is None:
+            return
+        fifo.write(indata)
+        wakeup.set()
+
+    def _asio_output_callback(self, outdata, frames, times, status):
+        outdata.fill(0)
+        self._track_asio_frames(frames)
+        output_fifo = self.output_fifo
+        monitor_queue = self.monitor_queue if self.monitor_selectors else None
+        main_channels = self.asio_main_channels
+        block = output_fifo.read(frames) if output_fifo is not None else None
+        if block is not None:
+            outdata[: block.shape[0], :main_channels] = block[:, :1]
+        block = monitor_queue.read(frames) if monitor_queue is not None else None
+        if block is not None:
+            outdata[: block.shape[0], main_channels:] = block[:, :1]
+
+    def _asio_duplex_callback(self, indata, outdata, frames, times, status):
+        self._asio_output_callback(outdata, frames, times, status)
+        self._asio_input_callback(indata, frames, times, status)
 
     def _output_callback(self, outdata, frames, times, status):
         outdata.fill(0)
@@ -693,6 +903,8 @@ class RealtimeGUI:
         self.engine = AudioEngine(self.error_queue)
         self.input_devices = {}
         self.output_devices = {}
+        self.input_selectors = {}
+        self.output_selectors = {}
         self.device_names = {}
         self.rvc_widgets = set()
         self.locked_widgets = set()
@@ -1078,12 +1290,25 @@ class RealtimeGUI:
             show_legacy = self.show_legacy_devices.get()
             self.input_devices = {}
             self.output_devices = {}
+            self.input_selectors = {}
+            self.output_selectors = {}
             self.device_names = {}
             for index, device in enumerate(devices):
                 api_name = hostapis[device["hostapi"]]["name"]
                 if not show_legacy and api_name not in MAIN_HOST_APIS:
                     continue
                 self.device_names[index] = device["name"]
+                if api_name == "ASIO":
+                    base = friendly_device_label(api_name, device["name"], "input")
+                    for devices_map, selectors_map, count, prefix, mono in (
+                        (self.input_devices, self.input_selectors, device["max_input_channels"], "In", True),
+                        (self.output_devices, self.output_selectors, device["max_output_channels"], "Out", False),
+                    ):
+                        for channels, selectors in asio_channel_choices(int(count), prefix, mono).items():
+                            label = f"{base}: {channels}"
+                            devices_map[label] = index
+                            selectors_map[label] = selectors
+                    continue
                 if device["max_input_channels"] > 0:
                     self.input_devices[friendly_device_label(api_name, device["name"], "input")] = index
                 if device["max_output_channels"] > 0:
@@ -1143,6 +1368,9 @@ class RealtimeGUI:
             "input_device": self.input_devices[self.input_device.get()],
             "output_device": self.output_devices[self.output_device.get()],
             "monitor_device": self.output_devices.get(monitor),
+            "input_selectors": self.input_selectors.get(self.input_device.get()),
+            "output_selectors": self.output_selectors.get(self.output_device.get()),
+            "monitor_selectors": self.output_selectors.get(monitor),
             "input_device_label": self.input_device.get(),
             "output_device_label": self.output_device.get(),
             "monitor_device_label": monitor,
@@ -1172,7 +1400,8 @@ class RealtimeGUI:
         saved["input_device"] = saved.pop("input_device_label")
         saved["output_device"] = saved.pop("output_device_label")
         saved["monitor_device"] = saved.pop("monitor_device_label")
-        saved.pop("passthrough", None)
+        for key in ("passthrough", "input_selectors", "output_selectors", "monitor_selectors"):
+            saved.pop(key, None)
         saved["theme"] = self.theme
         saved["show_flow_options"] = self.show_flow_options.get()
         self._write_config(saved)
@@ -1254,7 +1483,7 @@ class RealtimeGUI:
     def _update_meters(self):
         engine = self.engine
         monitor = 0.0
-        if engine.running and engine.monitor_stream is not None:
+        if engine.running and engine.monitor_queue is not None:
             try:
                 monitor = engine.output_level * db_to_linear(self.monitor_gain_db.get())
             except tk.TclError:
@@ -1279,6 +1508,7 @@ class RealtimeGUI:
                 error = self.error_queue.get_nowait()
                 self.status.set(error.strip().splitlines()[-1])
                 if not self.engine.running:
+                    self.engine.stop()
                     self._set_running(False)
         except queue.Empty:
             pass
