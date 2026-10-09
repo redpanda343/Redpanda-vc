@@ -38,15 +38,16 @@ def cutting_visibility(cutting, truncate_silence, silence_action):
 
 
 def slicing_controls(choices=('Skip', 'Simple', 'Automatic'), value='Automatic',
-                     note='Audio is always resampled to 44.1 kHz.'):
+                     note='Audio is always resampled to 44.1 kHz.', chunk_minimum=0.5, chunk_value=3.0):
     cutting = gr.Radio(label='Audio cutting', choices=list(choices), value=value,
                        info=', '.join(CUTTING_INFO[choice] for choice in choices) + '. ' + note)
     with gr.Row():
-        chunk_len = gr.Slider(0.5, 10.0, 3.0, step=0.1, label='Chunk length (sec)',
-                              info="Length of the audio slice for 'Simple' method.", visible=False)
+        chunk_len = gr.Slider(chunk_minimum, 10.0, chunk_value, step=0.1, label='Chunk length (sec)',
+                              info="Length of the audio slice for 'Simple' method.", visible=value == 'Simple')
         overlap_len = gr.Slider(0.0, 0.4, 0.3, step=0.1, label='Overlap length (sec)',
-                                info="Length of the overlap between slices for 'Simple' method.", visible=False)
-    truncate_silence = gr.Checkbox(label='Truncate silence', value=False, visible=False,
+                                info="Length of the overlap between slices for 'Simple' method.",
+                                visible=value == 'Simple')
+    truncate_silence = gr.Checkbox(label='Truncate silence', value=False, visible=value == 'Simple',
                                    info='For Simple slicing only. Shortens qualifying silent regions using the '
                                         'settings below.')
     silence_action = gr.Radio(label='Silence action', value='truncate', visible=False,
@@ -73,11 +74,17 @@ def slicing_controls(choices=('Skip', 'Simple', 'Automatic'), value='Automatic',
     return controls
 
 
-def preprocess_step(directory, dataset, workers, cutting, chunk_len, overlap_len, truncate_silence, silence_action,
-                    silence_threshold, silence_minimum, silence_to, silence_compress,
-                    choices=('Skip', 'Simple', 'Automatic')):
+def check_cutting(cutting, chunk_len, choices, chunk_minimum):
     if cutting not in choices:
         raise gr.Error(f'Choose {", ".join(choices[:-1])} or {choices[-1]} audio cutting.')
+    if cutting == 'Simple' and float(chunk_len) < chunk_minimum:
+        raise gr.Error(f'Chunk length must be at least {chunk_minimum:g} seconds.')
+
+
+def preprocess_step(directory, dataset, workers, cutting, chunk_len, overlap_len, truncate_silence, silence_action,
+                    silence_threshold, silence_minimum, silence_to, silence_compress,
+                    choices=('Skip', 'Simple', 'Automatic'), chunk_minimum=0.5):
+    check_cutting(cutting, chunk_len, choices, chunk_minimum)
     if silence_action not in SILENCE_ACTIONS:
         raise gr.Error('Choose a silence action.')
     return ('shared.preprocess.preprocess',

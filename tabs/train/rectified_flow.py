@@ -8,6 +8,8 @@ from tabs.train.slicing import preprocess_step, slicing_controls
 from rectified_flow.resources import DEFAULT_VOCODER, VOCODERS, vocoder_path
 
 IDLE_CONTROLS = 2
+SLICERS = ('Skip', 'Simple')
+MINIMUM_CHUNK = 5.0
 runner = JobRunner('rectified-flow')
 
 
@@ -19,7 +21,7 @@ def launch(name, steps, description, finished='done.'):
     return runner.launch(name, steps, description, IDLE_CONTROLS, finished)
 
 
-def preprocess(name, dataset, workers, device, cutting='Automatic', chunk_len=3.0, overlap_len=0.3,
+def preprocess(name, dataset, workers, device, cutting='Simple', chunk_len=MINIMUM_CHUNK, overlap_len=0.3,
                truncate_silence=False, silence_action='truncate', silence_threshold=-45.0, silence_minimum=0.3,
                silence_to=0.3, silence_compress=50.0):
     directory = experiment_path(name)
@@ -30,7 +32,8 @@ def preprocess(name, dataset, workers, device, cutting='Automatic', chunk_len=3.
     gpu = device_id(device)
     steps = [
         preprocess_step(directory, dataset, workers, cutting, chunk_len, overlap_len, truncate_silence,
-                        silence_action, silence_threshold, silence_minimum, silence_to, silence_compress),
+                        silence_action, silence_threshold, silence_minimum, silence_to, silence_compress,
+                        choices=SLICERS, chunk_minimum=MINIMUM_CHUNK),
         ('shared.extract.extract',
          [str(directory), 'rmvpe', workers, gpu, '44100', 'contentvec', '0', 'v2', '--rectified']),
     ]
@@ -112,7 +115,8 @@ def rectified_train_tab():
     with gr.Accordion('1. Prepare dataset', open=True):
         dataset = gr.Textbox(label='Dataset folder')
         workers = gr.Number(label='CPU workers', value=4, minimum=1, precision=0)
-        slicing = slicing_controls()
+        slicing = slicing_controls(choices=SLICERS, value='Simple', chunk_minimum=MINIMUM_CHUNK,
+                                   chunk_value=MINIMUM_CHUNK)
         preprocess_button = gr.Button('Preprocess dataset')
     with gr.Accordion('2. Train rectified flow', open=True):
         use_pretrained = gr.Checkbox(label='Pretrained', value=False)

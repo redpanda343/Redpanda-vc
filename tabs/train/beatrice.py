@@ -9,10 +9,12 @@ import psutil
 
 from tabs.settings.sections.precision import get_precision
 from tabs.train.jobs import QUIET_WARNINGS, experiment_path, positive_integer
-from tabs.train.slicing import CUTTING_INFO, SILENCE_ACTIONS, slicing_controls
+from tabs.train.slicing import SILENCE_ACTIONS, check_cutting, slicing_controls
 
 ROOT = Path(__file__).resolve().parents[2]
 BEATRICE_WARNINGS = 'ignore:wav_length % 160 != 0,ignore:Some clusters have no assigned data points'
+SLICERS = ('Skip', 'Simple')
+MINIMUM_CHUNK = 5.0
 _lock = threading.Lock()
 _process = None
 _experiment = None
@@ -71,7 +73,7 @@ def launch(name, arguments):
         return _status()
 
 
-def dataset_arguments(name, dataset, workers, device, cutting='Skip', chunk_len=3.0, overlap_len=0.3,
+def dataset_arguments(name, dataset, workers, device, cutting='Skip', chunk_len=MINIMUM_CHUNK, overlap_len=0.3,
                       truncate_silence=False, silence_action='truncate', silence_threshold=-45.0, silence_minimum=0.3,
                       silence_to=0.3, silence_compress=50.0):
     experiment_path(name)
@@ -81,8 +83,7 @@ def dataset_arguments(name, dataset, workers, device, cutting='Skip', chunk_len=
     device = str(device).strip().lower()
     if device not in {'auto', 'cpu'} and not (device.startswith('cuda:') and device[5:].isdigit()):
         raise gr.Error('Device must be auto, cpu or cuda:N.')
-    if cutting not in CUTTING_INFO:
-        raise gr.Error('Choose Skip, Simple or Automatic audio cutting.')
+    check_cutting(cutting, chunk_len, SLICERS, MINIMUM_CHUNK)
     if silence_action not in SILENCE_ACTIONS:
         raise gr.Error('Choose a silence action.')
     arguments = ['--model-name', str(name).strip(), '--dataset', dataset, '--device', device,
@@ -151,10 +152,11 @@ def beatrice_train_tab():
         workers = gr.Number(label='CPU workers', value=min(8, os.cpu_count() or 1), minimum=1, precision=0,
                             info='Processes that slice the dataset and data loader processes that decode and '
                                  'augment audio.')
-        slicing = slicing_controls(value='Skip',
-                                   note="Skip trains on the files as they are. Simple and Automatic slice the WAV, "
-                                        "FLAC, MP3 and OGG files at the Beatrice model's 24 kHz sample rate into a "
-                                        'temporary folder that is deleted when training ends.')
+        slicing = slicing_controls(choices=SLICERS, value='Skip', chunk_minimum=MINIMUM_CHUNK,
+                                   chunk_value=MINIMUM_CHUNK,
+                                   note="Skip trains on the files as they are. Simple cuts the WAV, FLAC, MP3 and OGG "
+                                        "files into 5-10 second chunks at the Beatrice model's 24 kHz sample rate, in "
+                                        'a temporary folder that is deleted when training ends.')
     with gr.Accordion('2. Train Beatrice', open=True):
         with gr.Row():
             steps = gr.Number(label='Training steps', value=10000, minimum=1, precision=0,
