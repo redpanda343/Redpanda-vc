@@ -63,4 +63,4 @@ def update_and_restart(script_path, app_name):
                 except KeyboardInterrupt:
                     continue
     except (OSError, subprocess.SubprocessError, RuntimeError) as error:
-        print(f"Automatic update skipped: {error}. Starting the installed version.", file=sys.stderr, flush=True)
+        print(f"Automatic update skipped: {str(error).rstrip('.')}. Starting the installed version.", file=sys.stderr, flush=True)
