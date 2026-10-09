@@ -1530,4 +1530,7 @@ class RealtimeGUI:
 
 
 if __name__ == "__main__":
+    from shared.tools.prerequisites_download import prequisites_download_pipeline
+
+    prequisites_download_pipeline(pretraineds_hifigan=False, models=True, exe=False)
     RealtimeGUI().run()
