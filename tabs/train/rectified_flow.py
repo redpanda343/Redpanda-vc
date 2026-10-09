@@ -5,6 +5,7 @@ import gradio as gr
 from tabs.settings.sections.precision import get_precision
 from tabs.train.jobs import ROOT, JobRunner, device_id, experiment_path, positive_integer
 from tabs.train.slicing import preprocess_step, slicing_controls
+from rectified_flow.config import PRESETS, default_config, preset_path
 from rectified_flow.resources import DEFAULT_VOCODER, VOCODERS, vocoder_path
 
 IDLE_CONTROLS = 2
@@ -15,6 +16,20 @@ runner = JobRunner('rectified-flow')
 
 def status():
     return runner.controls(IDLE_CONTROLS)
+
+
+def preset_value(key):
+    try:
+        values = [default_config(preset=preset)['flow'][key] for preset in PRESETS]
+    except (KeyError, ValueError):
+        return 'see the preset files'
+    if all(value == values[0] for value in values):
+        return str(values[0])
+    return ', '.join(f'{preset} {value}' for preset, value in zip(PRESETS, values))
+
+
+def preset_info(key, unit=''):
+    return f'0 uses the experiment config, which new experiments copy from the preset ({preset_value(key)}{unit}).'
 
 
 def launch(name, steps, description, finished='done.'):
@@ -66,7 +81,7 @@ def start(name, batch, max_frames, max_updates, checkpoint_interval, device, use
         raise gr.Error('Extract features for this experiment first.')
     variance_embeds = None if (directory / 'rectified_config.json').is_file() else True
     pretrained = resolve_pretrained(directory, use_pretrained, pretrained_path)
-    preset = 'realtime' if realtime else 'standard'
+    preset = 'smaller' if realtime else 'standard'
     from rectified_flow.train_flow import experiment_pitch_extractor, load_training_config
 
     pitch_extractor = experiment_pitch_extractor(directory)
@@ -76,12 +91,12 @@ def start(name, batch, max_frames, max_updates, checkpoint_interval, device, use
                                         variance_embeds)
     except ValueError as error:
         raise gr.Error(str(error)) from error
-    precision = get_precision() or selected['flow'].get('precision', 'fp32')
+    precision = get_precision() or selected['flow']['precision']
     if precision not in {'fp32', 'fp16', 'bf16'}:
         raise gr.Error(f'Unsupported training precision: {precision}')
     if vocoder not in VOCODERS:
         raise gr.Error(f'Choose one of these vocoders: {", ".join(VOCODERS)}.')
-    if selected['flow'].get('val_with_vocoder', True):
+    if selected['flow']['val_with_vocoder']:
         resolve_vocoder(vocoder)
     arguments = ['--model-name', str(name).strip(), '--vocoder', vocoder,
                  '--precision', precision, '--preset', preset, '--pitch-extractor', pitch_extractor]
@@ -131,16 +146,21 @@ def rectified_train_tab():
         use_pretrained.change(lambda enabled: gr.update(visible=enabled), use_pretrained, pretrained_path,
                               queue=False)
         vocoder = gr.Dropdown(label='Vocoder', choices=list(VOCODERS), value=DEFAULT_VOCODER)
-        gr.Markdown('Training precision follows **Settings → Training → Precision**.')
+        gr.Markdown('Training precision follows **Settings → Training → Precision**. New experiments copy their '
+                    f'training settings from `{preset_path("standard").relative_to(ROOT).as_posix()}`, or '
+                    f'`{preset_path("smaller").relative_to(ROOT).as_posix()}` with **Smaller model**; edit those '
+                    'files to train with custom settings. A started experiment keeps its own copy in '
+                    '`logs/<model>/rectified_config.json`.')
         with gr.Row():
             batch = gr.Number(label='Max clips per batch (per GPU)', value=0, minimum=0, precision=0,
-                              info='0 uses config, default 32.')
+                              info=preset_info('max_batch_size'))
             max_frames = gr.Number(label='Max frames per batch (per GPU)', value=0, minimum=0, precision=0,
-                                   info='0 uses config, default 80000 padded frames. Lower to reduce GPU memory use.')
+                                   info=preset_info('max_batch_frames', ' padded frames') +
+                                        ' Lower to reduce GPU memory use.')
             max_updates = gr.Number(label='Max training updates', value=0, minimum=0, precision=0,
-                               info='0 uses config, default 100000 Lightning training steps.')
+                               info=preset_info('max_updates', ' Lightning training steps'))
             checkpoint_interval = gr.Number(label='Checkpoint interval (updates)', value=0, minimum=0, precision=0,
-                                   info='0 uses config, default 4000 updates.')
+                                   info=preset_info('checkpoint_interval', ' updates'))
         realtime = gr.Checkbox(label='Smaller model', value=False,
                                info='Lower vram usage and faster inference speeds, may decrease the quality of the model')
         use_fused_kernels = gr.Checkbox(label='Fused Linear + SoftSignGLU kernels', value=False,

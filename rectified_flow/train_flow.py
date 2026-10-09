@@ -167,8 +167,11 @@ def load_training_config(experiment, pretrained_flow=None, use_fused_kernels=Fal
                                            use_voicing_embed=bool(variance_embeds))
         if use_fused_kernels and not pretrained_flow:
             config['flow']['model']['backbone_args']['glu_type'] = 'softsign_glu'
-    if architecture(config['flow']['model']) != architecture(default_config(preset=preset)['flow']['model']):
-        raise ValueError(f'{source} does not use the {preset} model size. Set the Smaller model option to match it, '
+    sizes = {name: architecture(default_config(preset=name)['flow']['model']) for name in PRESETS}
+    size = architecture(config['flow']['model'])
+    matches = [name for name in PRESETS if sizes[name] == size]
+    if matches and preset not in matches:
+        raise ValueError(f'{source} uses the {matches[0]} model size. Set the Smaller model option to match it, '
                          'or start a new experiment.')
     model = config['flow']['model']
     if variance_embeds is not None and (model['use_breathiness_embed'] or model['use_voicing_embed']) != bool(variance_embeds):
@@ -283,7 +286,7 @@ def main():
     parser.add_argument('--use-fused-kernels', action='store_true',
                         help='Override the activation with SoftSignGLU and use DiffSinger Triton kernels during CUDA mixed-precision training.')
     parser.add_argument('--preset', choices=sorted(PRESETS), default='standard',
-                        help='Model size for new experiments. realtime uses narrower, deeper networks.')
+                        help='Preset file in rectified_flow/presets that new experiments copy their settings from.')
     parser.add_argument('--pitch-extractor', choices=PITCH_EXTRACTORS, default=None,
                         help='F0 extractor for new experiments (default: the one chosen at extraction).')
     parser.add_argument('--variance-embeds', action=argparse.BooleanOptionalAction, default=None,
