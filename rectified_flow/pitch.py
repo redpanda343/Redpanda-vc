@@ -36,7 +36,8 @@ def resample_voicing(voiced, source_rate, frames, frame_rate):
     return np.interp(positions, np.arange(len(voiced)), voiced) > 0.5
 
 
-def parselmouth_contour(waveform, sample_rate, hop, frames, f0_min=PARSELMOUTH_F0_MIN, f0_max=PARSELMOUTH_F0_MAX):
+def parselmouth_contour(waveform, sample_rate, hop, frames, f0_min=PARSELMOUTH_F0_MIN, f0_max=PARSELMOUTH_F0_MAX,
+                        silence_threshold=0.03):
     import parselmouth
 
     waveform = np.asarray(waveform)
@@ -44,7 +45,7 @@ def parselmouth_contour(waveform, sample_rate, hop, frames, f0_min=PARSELMOUTH_F
     right = hop * ((len(waveform) - 1) // hop + 1) - len(waveform) + left + 1
     waveform = np.pad(waveform, (left, right))
     contour = parselmouth.Sound(waveform, sampling_frequency=sample_rate).to_pitch_ac(
-        time_step=hop / sample_rate, voicing_threshold=0.6,
+        time_step=hop / sample_rate, voicing_threshold=0.6, silence_threshold=silence_threshold,
         pitch_floor=f0_min, pitch_ceiling=f0_max,
     ).selected_array['frequency'].astype(np.float32)
     return np.pad(contour, (0, max(0, frames - len(contour))))[:frames]

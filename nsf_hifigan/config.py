@@ -51,7 +51,6 @@ TRAINING = dict(
 )
 FINETUNE = dict(
     max_updates=100000,
-    grad_clip=1.0,
     checkpoint_interval=2000,
     eval_interval=2000,
     num_valid_plots=100,

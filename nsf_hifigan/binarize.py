@@ -12,11 +12,12 @@ from tqdm import tqdm
 from nsf_hifigan.config import PITCH_EXTRACTORS, default_data, experiment_paths, write_json
 from nsf_hifigan.losses import vocoder_mel
 from rectified_flow.distributed import parse_devices
-from rectified_flow.pitch import extract_pitch
+from rectified_flow.pitch import extract_pitch, interpolate_f0, parselmouth_contour
 
 AUDIO_SUFFIXES = ('.wav', '.flac')
 VALIDATION_SUFFIXES = ('.wav', '.mp3', '.flac', '.ogg')
 _MEL = {}
+PARSELMOUTH_SILENCE_THRESHOLD = 0.01
 
 
 def read_audio(path, sample_rate):
@@ -40,7 +41,11 @@ def clip_features(path, data, extractor, device):
     frames = len(mel)
     if not frames:
         return None
-    f0, _ = extract_pitch(extractor, audio, data['sample_rate'], data['hop_length'], frames, device)
+    if extractor == 'parselmouth':
+        f0 = interpolate_f0(parselmouth_contour(audio, data['sample_rate'], data['hop_length'], frames,
+                                                silence_threshold=PARSELMOUTH_SILENCE_THRESHOLD))
+    else:
+        f0, _ = extract_pitch(extractor, audio, data['sample_rate'], data['hop_length'], frames, device)
     return dict(audio=audio, mel=mel, f0=np.asarray(f0, dtype=np.float32))
 
 
