@@ -15,6 +15,7 @@ DEFAULT_VOCODER = 'pc_nsf_hifigan'
 VOCODERS = {
     'pc_nsf_hifigan': dict(
         title='OpenVPI PC-NSF-HiFiGAN',
+        kind='pc',
         directory='pc_nsf_hifigan_44.1k_hop512_128bin_2025.02',
         filename='model.ckpt',
         url=('https://github.com/openvpi/vocoders/releases/download/'
@@ -30,8 +31,26 @@ VOCODERS = {
             'STATEMENTS.txt': 'fe208abd522fd9e77ee16063ca2b3d6466fe3a35db70578f615d28543dd62d85',
         },
     ),
+    'nsf_hifigan': dict(
+        title='OpenVPI NSF-HiFiGAN (2022.12)',
+        kind='nsf',
+        directory='nsf_hifigan_20221211',
+        filename='model.ckpt',
+        url='https://github.com/openvpi/vocoders/releases/download/nsf-hifigan-v1/nsf_hifigan_20221211.zip',
+        archive_sha256='d86ea84b7e2c9169afb5ccbb720b5542704be519c643f698332f2014a8f2d6bd',
+        archive_size=52778967,
+        archive_folder='nsf_hifigan',
+        members={'model.ckpt': 'model'},
+        files={
+            'model.ckpt': '2c576b63b7ed952161b70fad34e0562ace502ce689195520d8a2a6c051de29d6',
+            'config.json': '9707614b59c299766a91ea25b5ec62cfd813a45a902766c454f75b6868118684',
+            'NOTICE.txt': 'a393b44505ccb6d1da63c2c73ccbbdaeb9b877a5227bf41b1b1e4a8429a51dd6',
+            'NOTICE.zh-CN.txt': 'ea5511e12932a33481c212c1c19f6225af90ff6dc6f3e34a41050f028823ebb5',
+        },
+    ),
     'tgm_hifigan': dict(
         title='tgm_hifigan (pc100) by tigermeat',
+        kind='pc',
         directory='pc_tgm_hifigan_100',
         filename='pc_tgm_hifigan_100.onnx',
         url='https://github.com/mrtigermeat/tgm_hifigan/releases/download/pc100/dsvocoder.zip',
@@ -62,7 +81,8 @@ def _valid_bundle(directory, files):
                for name, checksum in files.items())
 
 
-def _install_bundle(destination, url, archive_sha256, archive_size, archive_folder, files, primary, description):
+def _install_bundle(destination, url, archive_sha256, archive_size, archive_folder, files, primary, description,
+                    members=None):
     with _download_lock:
         if _valid_bundle(destination, files):
             return
@@ -77,7 +97,8 @@ def _install_bundle(destination, url, archive_sha256, archive_size, archive_fold
                 for name, checksum in files.items():
                     extracted = temporary / 'files' / name
                     extracted.parent.mkdir(parents=True, exist_ok=True)
-                    with archive.open(archive_folder + '/' + name) as source, extracted.open('wb') as target:
+                    member = (members or {}).get(name, name)
+                    with archive.open(archive_folder + '/' + member) as source, extracted.open('wb') as target:
                         shutil.copyfileobj(source, target)
                     if _sha256(extracted) != checksum:
                         raise IOError(f'Checksum verification failed for {description} file {name}.')
@@ -92,7 +113,7 @@ def vocoder_path(name=DEFAULT_VOCODER):
     spec = VOCODERS[name]
     destination = VOCODER_ROOT / spec['directory']
     _install_bundle(destination, spec['url'], spec['archive_sha256'], spec['archive_size'], spec['archive_folder'],
-                    spec['files'], spec['filename'], f"{spec['title']} vocoder")
+                    spec['files'], spec['filename'], f"{spec['title']} vocoder", spec.get('members'))
     return str(destination / spec['filename'])
 
 

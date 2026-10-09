@@ -10,7 +10,7 @@ from tabs.train.slicing import preprocess_step, slicing_controls
 
 SLICERS = ('Simple',)
 SCRATCH = 'scratch'
-DEFAULT_SOURCES = {'pc': 'pc_nsf_hifigan', 'nsf': SCRATCH}
+DEFAULT_SOURCES = {'pc': 'pc_nsf_hifigan', 'nsf': 'nsf_hifigan'}
 IDLE_CONTROLS = 3
 runner = JobRunner('vocoder')
 
@@ -69,9 +69,10 @@ def resolve_source(kind, source, resuming):
     if resuming or source in {'', SCRATCH}:
         return ''
     if source in VOCODERS:
-        if kind != 'pc':
-            raise gr.Error(f'{VOCODERS[source]["title"]} is a PC-NSF-HiFiGAN vocoder. Choose the PC-NSF-HiFiGAN '
-                           'type, or train NSF-HiFiGAN from scratch or from a classic NSF-HiFiGAN checkpoint path.')
+        source_kind = VOCODERS[source]['kind']
+        if kind != source_kind:
+            raise gr.Error(f'{VOCODERS[source]["title"]} fine-tunes the {KINDS[source_kind]} vocoder type. '
+                           'Choose that type, or another vocoder to fine-tune.')
         return source
     if not Path(source).is_file() and not (ROOT / source).is_file():
         raise gr.Error(f'Pretrained vocoder not found: {source}')

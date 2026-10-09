@@ -167,7 +167,8 @@ def rectified_train_tab():
         use_pretrained.change(lambda enabled: gr.update(visible=enabled), use_pretrained, pretrained_row,
                               queue=False)
         refresh_pretrained_button.click(refresh_pretrained, pretrained_path, pretrained_path, queue=False)
-        vocoder = gr.Dropdown(label='Vocoder', choices=list(VOCODERS), value=DEFAULT_VOCODER)
+        vocoder = gr.Dropdown(label='Vocoder', choices=[(spec['title'], name) for name, spec in VOCODERS.items()],
+                              value=DEFAULT_VOCODER)
         gr.Markdown('Training precision follows **Settings → Training → Precision**. New experiments copy their '
                     f'training settings from `{preset_path("standard").relative_to(ROOT).as_posix()}`, or '
                     f'`{preset_path("smaller").relative_to(ROOT).as_posix()}` with **Smaller model**; edit those '
