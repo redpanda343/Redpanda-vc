@@ -62,8 +62,8 @@ class BeatriceRealtime:
         self.stream_rate = int(stream_rate)
         self.input_resampler = StreamResampler(self.stream_rate, IN_SAMPLE_RATE)
         self.output_resampler = StreamResampler(OUT_SAMPLE_RATE, self.stream_rate)
-        exact = self.stream_rate % IN_SAMPLE_RATE == 0 and self.stream_rate % OUT_SAMPLE_RATE == 0
-        self.margin = 0 if exact else math.ceil(self.stream_rate / 100)
+        self.hop = math.ceil(self.stream_rate / 100)
+        self.margin = 0 if self.stream_rate % 100 == 0 else self.hop
         self.reset()
 
     @property
@@ -88,7 +88,10 @@ class BeatriceRealtime:
             if self.pending.shape[0] < count + self.margin:
                 return np.zeros(count, dtype=np.float32)
             self.started = True
+            self.pending = self.pending[-(count + self.margin):]
         if self.pending.shape[0] < count:
             self.pending = np.concatenate([np.zeros(count - self.pending.shape[0], dtype=np.float32), self.pending])
         output, self.pending = self.pending[:count], self.pending[count:]
+        if self.pending.shape[0] > self.margin + self.hop:
+            self.pending = self.pending[-self.margin:] if self.margin else self.pending[:0]
         return output

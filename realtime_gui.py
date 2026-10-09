@@ -987,7 +987,12 @@ class RealtimeGUI:
         self.vq_neighbors = tk.IntVar(value=value.get("vq_neighbors", 0))
         f0_method = value.get("f0_method", "rmvpe")
         self.f0_method = tk.StringVar(value=f0_method if f0_method in PITCH_METHODS.values() else "rmvpe")
-        self.block_time = tk.DoubleVar(value=value.get("block_time", 0.25))
+        self.block_times = {
+            "rvc": value.get("block_time", 0.25),
+            "beatrice": value.get("beatrice_block_time", 0.02),
+        }
+        self.block_kind = "rvc"
+        self.block_time = tk.DoubleVar(value=self.block_times["rvc"])
         self.crossfade_time = tk.DoubleVar(value=value.get("crossfade_time", 0.05))
         self.extra_time = tk.DoubleVar(value=value.get("extra_time", 2.5))
         self.passthrough = tk.BooleanVar(value=False)
@@ -1221,7 +1226,10 @@ class RealtimeGUI:
         frame = self._card(parent, "Performance")
         self.locked_widgets.update(self._slider(
             frame, 0, "Block time", self.block_time, 0.02, 1.5, 0.01,
-            tooltip="Seconds of audio per step. Lower is less latency but more load. Beatrice: 0.02-0.05 s.",
+            tooltip=(
+                "Seconds of audio per step. Lower is less latency but more load. Beatrice models keep their "
+                "own value; 0.02-0.05 s works best for them."
+            ),
         ))
         crossfade = self._slider(frame, 1, "Crossfade", self.crossfade_time, 0.01, 0.15, 0.01)
         extra = self._slider(
@@ -1259,6 +1267,11 @@ class RealtimeGUI:
     def _refresh_states(self, *_):
         path = self.model_path.get().strip()
         beatrice = bool(path) and find_paraphernalia(path) is not None
+        kind = "beatrice" if beatrice else "rvc"
+        if kind != self.block_kind:
+            self.block_times[self.block_kind] = self.block_time.get()
+            self.block_kind = kind
+            self.block_time.set(self.block_times[kind])
         running = self.engine.running
         for widget in self.rvc_widgets | self.locked_widgets:
             disabled = (beatrice and widget in self.rvc_widgets) or (running and widget in self.locked_widgets)
@@ -1418,6 +1431,9 @@ class RealtimeGUI:
         saved["monitor_device"] = saved.pop("monitor_device_label")
         for key in ("passthrough", "input_selectors", "output_selectors", "monitor_selectors"):
             saved.pop(key, None)
+        self.block_times[self.block_kind] = self.block_time.get()
+        saved["block_time"] = self.block_times["rvc"]
+        saved["beatrice_block_time"] = self.block_times["beatrice"]
         saved["theme"] = self.theme
         saved["show_flow_options"] = self.show_flow_options.get()
         self._write_config(saved)
