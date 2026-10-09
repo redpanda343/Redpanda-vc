@@ -11,6 +11,7 @@ from rectified_flow.resources import DEFAULT_VOCODER, VOCODERS, vocoder_path
 IDLE_CONTROLS = 2
 SLICERS = ('Skip', 'Simple')
 MINIMUM_CHUNK = 5.0
+PRETRAINED_ROOT = ROOT / 'models' / 'pretraineds' / 'rectified'
 runner = JobRunner('rectified-flow')
 
 
@@ -62,14 +63,30 @@ def resolve_vocoder(name=DEFAULT_VOCODER):
         raise gr.Error(f'Could not download the {name} vocoder: {error}') from error
 
 
+def pretrained_choices():
+    if not PRETRAINED_ROOT.is_dir():
+        return []
+    return sorted(path.relative_to(ROOT).as_posix() for path in PRETRAINED_ROOT.rglob('*.pth'))
+
+
+def refresh_pretrained(current):
+    choices = pretrained_choices()
+    return gr.update(choices=choices, value=current or (choices[0] if choices else None))
+
+
 def resolve_pretrained(directory, enabled, preferred=''):
     from rectified_flow.lightning_train import latest_checkpoint
 
     if not enabled or latest_checkpoint(directory / 'flow') or (directory / 'flow' / 'checkpoint.pth').is_file():
         return ''
-    path = Path(str(preferred).strip().strip('"')) if str(preferred).strip() else ROOT / 'models' / 'pretraineds' / 'rectified' / 'pretrained.pth'
+    preferred = str(preferred or '').strip().strip('"')
+    if not preferred:
+        raise gr.Error(f'Choose a pretrained voice checkpoint. Put exported flow .pth files in {PRETRAINED_ROOT} '
+                       'and press Refresh.')
+    path = Path(preferred)
+    path = path if path.is_absolute() else ROOT / path
     if not path.is_file():
-        raise gr.Error(f'Pretrained model not found. Place your Rectified Flow checkpoint at {path}.')
+        raise gr.Error(f'Pretrained model not found: {path}')
     return str(path)
 
 
@@ -140,11 +157,16 @@ def rectified_train_tab():
         preprocess_button = gr.Button('Preprocess dataset')
     with gr.Accordion('2. Train rectified flow', open=True):
         use_pretrained = gr.Checkbox(label='Pretrained', value=False)
-        pretrained_path = gr.Textbox(label='Voice checkpoint to fine-tune', value='', visible=False,
-                                    info='Optional exported flow .pth path. Blank uses '
-                                         'models/pretraineds/rectified/pretrained.pth.')
-        use_pretrained.change(lambda enabled: gr.update(visible=enabled), use_pretrained, pretrained_path,
+        with gr.Row(visible=False) as pretrained_row:
+            choices = pretrained_choices()
+            pretrained_path = gr.Dropdown(label='Voice checkpoint to fine-tune', choices=choices,
+                                          value=choices[0] if choices else None, allow_custom_value=True, scale=4,
+                                          info='Exported flow .pth files found in '
+                                               f'{PRETRAINED_ROOT.relative_to(ROOT).as_posix()}, or a .pth path.')
+            refresh_pretrained_button = gr.Button('Refresh', scale=1)
+        use_pretrained.change(lambda enabled: gr.update(visible=enabled), use_pretrained, pretrained_row,
                               queue=False)
+        refresh_pretrained_button.click(refresh_pretrained, pretrained_path, pretrained_path, queue=False)
         vocoder = gr.Dropdown(label='Vocoder', choices=list(VOCODERS), value=DEFAULT_VOCODER)
         gr.Markdown('Training precision follows **Settings → Training → Precision**. New experiments copy their '
                     f'training settings from `{preset_path("standard").relative_to(ROOT).as_posix()}`, or '
