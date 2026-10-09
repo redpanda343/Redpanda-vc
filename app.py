@@ -496,7 +496,7 @@ new MutationObserver(updateNormalizationLabels).observe(document.body, {
 
 # Define Gradio interface
 with gr.Blocks(
-    title="Redpanda-rvc",
+    title="redpanda-vc",
     **(
         {
             "theme": my_applio,
@@ -508,7 +508,7 @@ with gr.Blocks(
 ) as Applio:
     with gr.Row(elem_id="applio-header"):
         with gr.Column(elem_id="applio-intro", scale=5):
-            gr.Markdown("## Redpanda-rvc", elem_id="applio-title")
+            gr.Markdown("## redpanda-vc", elem_id="applio-title")
             gr.Markdown(
                 i18n(
                     "A simple, high-quality voice conversion tool focused on ease of use and performance."
@@ -558,7 +558,7 @@ def launch_gradio(server_name: str, server_port: int, auth=None) -> None:
         server_port=server_port,
         js=APP_JS,
         auth=auth,
-        auth_message="Sign in to access this Redpanda-rvc instance.",
+        auth_message="Sign in to access this redpanda-vc instance.",
         prevent_thread_lock=True,
         **(
             {
