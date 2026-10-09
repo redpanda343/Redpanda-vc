@@ -67,22 +67,6 @@ def db_to_linear(db):
     return 10.0 ** (float(db) / 20.0)
 
 
-def enqueue_latest(block_queue, block):
-    try:
-        block_queue.put_nowait(block)
-        return
-    except queue.Full:
-        pass
-    try:
-        block_queue.get_nowait()
-    except queue.Empty:
-        pass
-    try:
-        block_queue.put_nowait(block)
-    except queue.Full:
-        pass
-
-
 class AudioFrameFifo:
     def __init__(self, channels=1, max_frames=None):
         self.channels = int(channels)
@@ -188,7 +172,6 @@ class AudioEngine:
         self.output_stream = None
         self.monitor_stream = None
         self.asio_stream = None
-        self.output_queue = None
         self.output_fifo = None
         self.monitor_queue = None
         self.input_fifo = None
@@ -288,15 +271,16 @@ class AudioEngine:
         self.reported_statuses = set()
         self.asio_callback_frames = 0
         self.prefill_margin = max(self.block_frame // 4, self.zc)
+        self.output_fifo = AudioFrameFifo(1, max_frames=self.block_frame * 4)
         if self.output_selectors or self.input_selectors:
-            self.output_fifo = AudioFrameFifo(1)
             self._resize_asio_fifo(self.output_fifo)
         else:
-            self.output_queue = queue.Queue(maxsize=3)
+            self.output_fifo.prefill = min(self.block_frame, self.sola_buffer_frame)
         if not self.output_selectors:
             self.output_stream = sd.OutputStream(
-                callback=self._output_callback if self.output_fifo is None else self._fifo_output_callback,
-                blocksize=self.block_frame if self.output_fifo is None else 0,
+                callback=self._fifo_output_callback,
+                blocksize=0,
+                latency="low",
                 samplerate=self.sample_rate,
                 channels=self.output_channels,
                 device=self.output_device,
@@ -306,7 +290,8 @@ class AudioEngine:
         if not self.input_selectors:
             self.input_stream = sd.InputStream(
                 callback=self._input_callback,
-                blocksize=self.block_frame,
+                blocksize=0,
+                latency="low",
                 samplerate=self.sample_rate,
                 channels=self.channels,
                 device=self.input_device,
@@ -314,6 +299,7 @@ class AudioEngine:
                 extra_settings=self.input_extra,
             )
         self.running = True
+        self._start_worker()
         if self.output_stream is not None:
             self.output_stream.start()
         self._start_asio_stream()
@@ -329,9 +315,9 @@ class AudioEngine:
         if self.beatrice is not None:
             model_latency = self.beatrice.latency_seconds
         else:
-            model_latency = settings["crossfade_time"] + 0.01
+            model_latency = (self.crossfade_frame + self.sola_search_frame) / self.sample_rate
         self.base_latency_ms = (
-            input_latency + output_latency + settings["block_time"] + model_latency
+            input_latency + output_latency + self.block_frame / self.sample_rate + model_latency
         ) * 1000
         self._refresh_latency()
 
@@ -420,8 +406,10 @@ class AudioEngine:
         self.zc = rate // 100
         self.block_frame = int(np.round(settings["block_time"] * rate / self.zc)) * self.zc
         self.block_frame_16k = 160 * self.block_frame // self.zc
-        self.crossfade_frame = int(np.round(settings["crossfade_time"] * rate / self.zc)) * self.zc
-        self.sola_buffer_frame = min(self.crossfade_frame, 4 * self.zc)
+        self.crossfade_frame = min(
+            int(np.round(settings["crossfade_time"] * rate / self.zc)) * self.zc, 4 * self.zc
+        )
+        self.sola_buffer_frame = self.crossfade_frame
         self.sola_search_frame = self.zc
         self.extra_frame = int(np.round(settings["extra_time"] * rate / self.zc)) * self.zc
         self.input_wav = torch.zeros(
@@ -483,10 +471,13 @@ class AudioEngine:
             self.monitor_queue = AudioFrameFifo(1, max_frames=self.block_frame * 4)
             if self.input_selectors:
                 self._resize_asio_fifo(self.monitor_queue)
+            else:
+                self.monitor_queue.prefill = min(self.block_frame, self.sola_buffer_frame)
             self.monitor_stream = sd.OutputStream(
                 device=self.monitor_device,
                 callback=self._monitor_callback,
                 blocksize=0,
+                latency="low",
                 samplerate=self.sample_rate,
                 channels=self.monitor_channels,
                 dtype="float32",
@@ -511,12 +502,13 @@ class AudioEngine:
         if frames <= self.asio_callback_frames:
             return
         self.asio_callback_frames = frames
+        output_fifo = self.output_fifo if self.output_selectors or self.input_selectors else None
         monitor_queue = self.monitor_queue if self.monitor_selectors or self.input_selectors else None
-        for fifo in (self.output_fifo, monitor_queue):
+        for fifo in (output_fifo, monitor_queue):
             if fifo is not None:
                 self._resize_asio_fifo(fifo)
         input_fifo = self.input_fifo
-        if input_fifo is not None:
+        if input_fifo is not None and self.input_selectors:
             input_fifo.max_frames = 4 * self.block_frame + 2 * frames
 
     def _start_asio_stream(self):
@@ -530,15 +522,6 @@ class AudioEngine:
             output_selectors += self.monitor_selectors
         common = dict(samplerate=self.sample_rate, dtype="float32", blocksize=0)
         if self.input_selectors:
-            self.input_fifo = AudioFrameFifo(self.channels, max_frames=self.block_frame * 4)
-            self.worker_stop = threading.Event()
-            self.worker_wakeup = threading.Event()
-            self.worker = threading.Thread(
-                target=self._worker,
-                args=(self.input_fifo, self.worker_wakeup, self.worker_stop),
-                name="realtime-asio-inference",
-                daemon=True,
-            )
             input_settings = sd.AsioSettings(channel_selectors=self.input_selectors)
             if output_selectors:
                 self.asio_stream = sd.Stream(
@@ -556,7 +539,6 @@ class AudioEngine:
                     extra_settings=input_settings,
                     **common,
                 )
-            self.worker.start()
         else:
             self.asio_stream = sd.OutputStream(
                 callback=self._asio_output_callback,
@@ -566,6 +548,18 @@ class AudioEngine:
                 **common,
             )
         self.asio_stream.start()
+
+    def _start_worker(self):
+        self.input_fifo = AudioFrameFifo(self.channels, max_frames=self.block_frame * 4)
+        self.worker_stop = threading.Event()
+        self.worker_wakeup = threading.Event()
+        self.worker = threading.Thread(
+            target=self._worker,
+            args=(self.input_fifo, self.worker_wakeup, self.worker_stop),
+            name="realtime-inference",
+            daemon=True,
+        )
+        self.worker.start()
 
     def _worker(self, fifo, wakeup, stop):
         while not stop.is_set():
@@ -588,7 +582,7 @@ class AudioEngine:
             lookahead_ms = 10 * self.rvc.pitch_lookahead_frames(self.settings["f0_method"])
         noise_reduction_ms = 0
         if self.settings["input_noise_reduce"]:
-            noise_reduction_ms = 1000 * min(self.settings["crossfade_time"], 0.04)
+            noise_reduction_ms = 1000 * self.sola_buffer_frame / self.sample_rate
         prefill_ms = 0
         output_fifo = self.output_fifo
         if output_fifo is not None and self.sample_rate:
@@ -624,7 +618,6 @@ class AudioEngine:
         self.worker = None
         self.worker_stop = None
         self.worker_wakeup = None
-        self.output_queue = None
         self.output_fifo = None
         self.monitor_queue = None
         self.input_fifo = None
@@ -776,9 +769,6 @@ class AudioEngine:
 
     def _handle_block(self, indata):
         output = self._process(indata)
-        output_queue = self.output_queue
-        if output_queue is not None:
-            enqueue_latest(output_queue, output)
         output_fifo = self.output_fifo
         if output_fifo is not None:
             output_fifo.write(output)
@@ -794,7 +784,11 @@ class AudioEngine:
         try:
             if status:
                 self._report_status(status)
-            self._handle_block(indata)
+            fifo = self.input_fifo
+            wakeup = self.worker_wakeup
+            if fifo is not None and wakeup is not None:
+                fifo.write(indata)
+                wakeup.set()
         except Exception:
             self.running = False
             self.error_queue.put_nowait(traceback.format_exc())
@@ -803,15 +797,8 @@ class AudioEngine:
     def _asio_input_callback(self, indata, frames, times, status):
         if not self.running:
             return
-        if status:
-            self._report_status(status)
         self._track_asio_frames(frames)
-        fifo = self.input_fifo
-        wakeup = self.worker_wakeup
-        if fifo is None or wakeup is None:
-            return
-        fifo.write(indata)
-        wakeup.set()
+        self._input_callback(indata, frames, times, status)
 
     def _asio_output_callback(self, outdata, frames, times, status):
         outdata.fill(0)
@@ -829,18 +816,6 @@ class AudioEngine:
     def _asio_duplex_callback(self, indata, outdata, frames, times, status):
         self._asio_output_callback(outdata, frames, times, status)
         self._asio_input_callback(indata, frames, times, status)
-
-    def _output_callback(self, outdata, frames, times, status):
-        outdata.fill(0)
-        output_queue = self.output_queue
-        if output_queue is None:
-            return
-        try:
-            block = output_queue.get_nowait()
-        except queue.Empty:
-            return
-        count = min(frames, block.shape[0])
-        outdata[:count] = block[:count, None]
 
     @staticmethod
     def _play_fifo(outdata, fifo, frames):
@@ -993,7 +968,7 @@ class RealtimeGUI:
         }
         self.block_kind = "rvc"
         self.block_time = tk.DoubleVar(value=self.block_times["rvc"])
-        self.crossfade_time = tk.DoubleVar(value=value.get("crossfade_time", 0.05))
+        self.crossfade_time = tk.DoubleVar(value=min(value.get("crossfade_time", 0.04), 0.04))
         self.extra_time = tk.DoubleVar(value=value.get("extra_time", 2.5))
         self.passthrough = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="Ready")
@@ -1231,7 +1206,7 @@ class RealtimeGUI:
                 "own value; 0.02-0.05 s works best for them."
             ),
         ))
-        crossfade = self._slider(frame, 1, "Crossfade", self.crossfade_time, 0.01, 0.15, 0.01)
+        crossfade = self._slider(frame, 1, "Crossfade", self.crossfade_time, 0.01, 0.04, 0.01)
         extra = self._slider(
             frame, 2, "Extra context", self.extra_time, 0.05, 5.0, 0.01,
             tooltip="Seconds of past audio the model sees. More is smoother but slower.",
