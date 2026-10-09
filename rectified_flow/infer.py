@@ -19,6 +19,7 @@ def is_rectified(checkpoint):
 
 
 class RectifiedPipeline(Pipeline):
+    rmvpe_class = RMVPE
     high_pass = False
 
     def __init__(self, sample_rate, config, checkpoint, vocoder_path=''):

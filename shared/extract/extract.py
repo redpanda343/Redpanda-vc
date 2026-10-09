@@ -17,7 +17,7 @@ sys.path.append(os.path.join(now_dir))
 # Zluda hijack
 import shared.zluda
 from rvc.configs.config import Config
-from shared.predictors.f0 import RMVPE, Swift
+from shared.predictors.f0 import RMVPE, RVCRMVPE, Swift
 from shared.predictors.swift_dependencies import ensure_swift_f0
 from shared.utils import (
     extract_embedding_features,
@@ -33,7 +33,7 @@ mp.set_start_method("spawn", force=True)
 
 
 class FeatureInput:
-    def __init__(self, f0_method="rmvpe", device="cpu"):
+    def __init__(self, f0_method="rmvpe", device="cpu", rectified=False):
         self.hop_size = 160  # default
         self.sample_rate = 16000  # default
         self.f0_bin = 256
@@ -43,7 +43,8 @@ class FeatureInput:
         self.f0_mel_max = 1127 * np.log(1 + self.f0_max / 700)
         self.device = device
         if f0_method == "rmvpe":
-            self.model = RMVPE(
+            rmvpe_class = RMVPE if rectified else RVCRMVPE
+            self.model = rmvpe_class(
                 device=self.device, sample_rate=self.sample_rate, hop_size=self.hop_size
             )
         elif f0_method == "swift":
@@ -120,8 +121,8 @@ class FeatureInput:
             ) from error
 
 
-def process_files(files, f0_method, device, force, updates):
-    fe = FeatureInput(f0_method=f0_method, device=device)
+def process_files(files, f0_method, device, force, updates, rectified):
+    fe = FeatureInput(f0_method=f0_method, device=device, rectified=rectified)
     for file_info in files:
         fe.process_file(file_info, force=force)
         updates.put(1)
@@ -140,7 +141,7 @@ def follow_progress(tasks, updates, progress):
                 break
 
 
-def run_pitch_extraction(files, devices, f0_method, threads, progress, updates, force=False):
+def run_pitch_extraction(files, devices, f0_method, threads, progress, updates, force=False, rectified=False):
     if not files:
         return
     if not devices:
@@ -170,6 +171,7 @@ def run_pitch_extraction(files, devices, f0_method, threads, progress, updates, 
                 worker_devices[i],
                 force,
                 updates,
+                rectified,
             )
             for i in range(worker_count)
         ]
@@ -317,7 +319,11 @@ if __name__ == "__main__":
         for stale_path in glob.glob(os.path.join(exp_dir, "*.index")):
             os.remove(stale_path)
         print("Embedder changed; removed stale features and indexes.")
-    force_pitch_extraction = data.get("f0_method") != f0_method
+    f0_model = "rmvpe_rvc" if f0_method == "rmvpe" and not rectified else f0_method
+    force_pitch_extraction = (
+        data.get("f0_method") != f0_method
+        or data.get("f0_model", data.get("f0_method")) != f0_model
+    )
     data.update(metadata)
     with open(file_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4)
@@ -355,8 +361,10 @@ if __name__ == "__main__":
         run_pitch_extraction(
             files, devices, f0_method, num_processes, progress, updates,
             force=force_pitch_extraction,
+            rectified=rectified,
         )
         data["f0_method"] = f0_method
+        data["f0_model"] = f0_model
         with open(file_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4)
 

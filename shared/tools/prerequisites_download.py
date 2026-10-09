@@ -47,7 +47,7 @@ pretraineds_refinegan_list = [
     ),
 ]
 models_list = [
-    ("predictors/", ["rmvpe.pt"]),
+    ("predictors/", ["rmvpe.pt", "rmvpe_rvc.pt"]),
     ("FireRedVAD/AED/", ["model.pth.tar", "cmvn.ark"]),
 ]
 embedders_list = [("embedders/contentvec/", ["pytorch_model.bin", "config.json"])]
@@ -74,6 +74,10 @@ remote_base_mapping = {
     ),
 }
 
+remote_file_mapping = {
+    ("predictors/", "rmvpe_rvc.pt"): "rmvpe.pt",
+}
+
 archive_mapping = {
     ("predictors/", "rmvpe.pt"): (
         "https://github.com/yxlllc/RMVPE/releases/download/230917/rmvpe.zip",
@@ -92,6 +96,9 @@ expected_sha256_mapping = {
     ("predictors/", "rmvpe.pt"): (
         "19dc1809cf4cdb0a18db93441816bc327e14e5644b72eeaae5220560c6736fe2"
     ),
+    ("predictors/", "rmvpe_rvc.pt"): (
+        "6d62215f4306e3ca278246188607209f09af3dc77ed4232efdd069798c4ec193"
+    ),
     ("embedders/contentvec/", "pytorch_model.bin"): CONTENTVEC_SHA256,
     ("embedders/contentvec/", "config.json"): CONTENTVEC_CONFIG_SHA256,
     ("FireRedVAD/AED/", "cmvn.ark"): (
@@ -107,10 +114,11 @@ def get_download_url(remote_folder, file):
     archive = archive_mapping.get((remote_folder, file))
     if archive is not None:
         return archive[0]
+    remote_file = remote_file_mapping.get((remote_folder, file), file)
     remote_base = remote_base_mapping.get(remote_folder)
     if remote_base is not None:
-        return f"{remote_base}{file}"
-    return f"{url_base}/{remote_folder}{file}"
+        return f"{remote_base}{remote_file}"
+    return f"{url_base}/{remote_folder}{remote_file}"
 
 
 def _sha256(file_path):

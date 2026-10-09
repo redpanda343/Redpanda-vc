@@ -2,6 +2,7 @@ import os
 import torch
 
 from shared.predictors.rmvpe import N_CLASS, RMVPE as RMVPEModel, to_local_average_f0
+from shared.predictors.RMVPE import RMVPE0Predictor
 from shared.predictors.swift_dependencies import ensure_swift_f0
 import numpy as np
 
@@ -25,6 +26,20 @@ class RMVPE:
                 raise ValueError("Pitch decoder returned an invalid shape.")
             center = torch.from_numpy(center).clamp(0, N_CLASS - 1).to(hidden.device).view(1, -1, 1)
         return to_local_average_f0(hidden, center=center, thred=filter_radius)
+
+
+class RVCRMVPE:
+    def __init__(self, device, model_name="rmvpe_rvc.pt", sample_rate=16000, hop_size=160):
+        self.device = device
+        self.sample_rate = sample_rate
+        self.hop_size = hop_size
+        self.model = RMVPE0Predictor(
+            os.path.join("models", "predictors", model_name),
+            device=self.device,
+        )
+
+    def get_f0(self, x, filter_radius=0.03, decoder=None):
+        return self.model.infer_from_audio(x, thred=filter_radius, decoder=decoder)
 
 
 class Swift:

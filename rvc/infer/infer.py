@@ -738,11 +738,13 @@ class VoiceConverter:
                 self.vc = VC(self.tgt_sr, self.config)
             if previous_vc is not None:
                 for predictor_name in ("model_rmvpe", "model_swift"):
-                    if hasattr(previous_vc, predictor_name):
-                        setattr(
-                            self.vc,
-                            predictor_name,
-                            getattr(previous_vc, predictor_name),
-                        )
+                    predictor = getattr(previous_vc, predictor_name, None)
+                    if predictor is None:
+                        continue
+                    if predictor_name == "model_rmvpe" and not isinstance(
+                        predictor, self.vc.rmvpe_class
+                    ):
+                        continue
+                    setattr(self.vc, predictor_name, predictor)
             if not isinstance(self.cpt.get("config"), dict):
                 self.n_spk = self.cpt["config"][-3]

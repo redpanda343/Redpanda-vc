@@ -11,7 +11,7 @@ from torch import Tensor
 now_dir = os.getcwd()
 sys.path.append(now_dir)
 
-from shared.predictors.f0 import RMVPE, Swift
+from shared.predictors.f0 import RVCRMVPE, Swift
 from rvc.infer.pm import extract_pm
 from shared.utils import extract_embedding_features
 
@@ -50,6 +50,7 @@ class Pipeline:
     """
 
     high_pass = True
+    rmvpe_class = RVCRMVPE
 
     def __init__(self, tgt_sr, config):
         """
@@ -108,7 +109,7 @@ class Pipeline:
             )
         elif f0_method == "rmvpe":
             if not hasattr(self, "model_rmvpe"):
-                self.model_rmvpe = RMVPE(
+                self.model_rmvpe = self.rmvpe_class(
                     device=self.device,
                     sample_rate=self.sample_rate,
                     hop_size=self.window,
