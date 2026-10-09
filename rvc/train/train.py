@@ -4,9 +4,7 @@ import sys
 os.environ["USE_LIBUV"] = "0" if sys.platform == "win32" else "1"
 import datetime
 import glob
-import hashlib
 import json
-from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from random import randint, shuffle
 from time import time as ttime
@@ -43,13 +41,6 @@ from rvc.train.utils import (
 import shared.zluda
 from rvc.algorithm import commons
 from rvc.train.process.extract_model import extract_model
-from rvc.train.timbre_validation import ECAPATimbreValidator
-from shared.validation_data import (
-    deterministic_validation_scope,
-    infer_validation_audio,
-    prepare_validation_reference,
-    should_run_external_validation,
-)
 
 # Parse command line arguments
 model_name = sys.argv[1]
@@ -60,62 +51,6 @@ pretrainD = sys.argv[5]
 gpus = sys.argv[6]
 batch_size = int(sys.argv[7])
 sample_rate = int(sys.argv[8])
-
-
-def _speaker_id(item):
-    try:
-        return int(item[4])
-    except (TypeError, ValueError):
-        return 0
-
-
-def _validation_sort_key(seed, value):
-    return hashlib.sha256(f"{seed}:{value}".encode("utf-8")).digest()
-
-
-def build_timbre_enrollment(
-    dataset,
-    collate_fn,
-    speaker_ids,
-    seed,
-    max_per_speaker=3,
-):
-    target_speakers = sorted({int(speaker_id) for speaker_id in speaker_ids})
-    groups = defaultdict(list)
-    for index, item in enumerate(dataset.audiopaths_and_text):
-        speaker_id = _speaker_id(item)
-        if speaker_id not in target_speakers:
-            continue
-        audio_path = item[0]
-        if "mute" in os.path.basename(audio_path).lower():
-            continue
-        groups[speaker_id].append((audio_path, index))
-
-    selected = []
-    for speaker_id in target_speakers:
-        candidates = sorted(
-            groups[speaker_id],
-            key=lambda item: _validation_sort_key(
-                seed, f"enrollment:{speaker_id}:{item[0]}"
-            ),
-        )
-        speaker_samples = []
-        for _, index in candidates:
-            try:
-                sample = dataset[index]
-            except Exception:
-                continue
-            if sample[1].abs().mean().item() <= 1e-4:
-                continue
-            speaker_samples.append(sample)
-            if len(speaker_samples) == max_per_speaker:
-                break
-        if not speaker_samples:
-            raise RuntimeError(f"No enrollment audio is available for speaker {speaker_id}")
-        selected.extend(speaker_samples)
-
-    info = collate_fn(selected)
-    return info[6], info[7], info[8]
 
 
 def _strtobool(val):
@@ -330,133 +265,6 @@ class AsyncInferenceExporter:
             self.executor = None
 
 
-def load_saved_validation_model(model_path, device):
-    from rvc.algorithm.synthesizers import Synthesizer
-    from rvc.train.utils import replace_keys_in_dict
-
-    checkpoint = torch.load(model_path, map_location="cpu", weights_only=True)
-    model_config = list(checkpoint["config"])
-    model_config[-3] = checkpoint["weight"]["emb_g.weight"].shape[0]
-    saved_version = checkpoint.get("version", "v1")
-    feature_dim = int(
-        checkpoint.get("feature_dim", 768 if saved_version in {"v2", "v3"} else 256)
-    )
-    with torch.random.fork_rng(devices=[]):
-        model = Synthesizer(
-            *model_config,
-            use_f0=checkpoint.get("f0", 1),
-            text_enc_hidden_dim=feature_dim,
-            vocoder=checkpoint.get("vocoder", "HiFi-GAN"),
-        )
-    del model.enc_q
-    weights = replace_keys_in_dict(
-        replace_keys_in_dict(
-            checkpoint["weight"], ".weight_v", ".parametrizations.weight.original1"
-        ),
-        ".weight_g",
-        ".parametrizations.weight.original0",
-    )
-    model.load_state_dict(weights, strict=True)
-    return model.to(device).float().eval()
-
-
-def evaluate_external_validation(
-    model,
-    config,
-    device,
-    device_id,
-    audio_reference,
-    timbre_reference,
-    timbre_validator,
-    global_step,
-):
-    validation_scalars = {}
-    audio_o = None
-    timbre_o = None
-    if should_run_external_validation(timbre_reference, timbre_validator):
-        inference_model = model.module if hasattr(model, "module") else model
-        was_training = inference_model.training
-        inference_model.eval()
-        rng_devices = [device_id] if device.type == "cuda" else []
-        try:
-            with deterministic_validation_scope(
-                config.train.seed, cuda_devices=rng_devices
-            ):
-                with torch.amp.autocast(
-                    device_type="cuda", enabled=False
-                ):
-                    with torch.inference_mode():
-                        try:
-                            timbre_o = infer_validation_audio(
-                                inference_model,
-                                timbre_reference[0],
-                                config.data.sample_rate,
-                                config.data.hop_length,
-                            )
-                        except Exception as error:
-                            print(
-                                f"External validation generation failed: {error}"
-                            )
-                        if audio_reference is not None:
-                            if timbre_o is not None:
-                                audio_o = timbre_o[:1]
-                            else:
-                                audio_o, *_ = inference_model.infer(
-                                    *audio_reference
-                                )
-        finally:
-            inference_model.train(was_training)
-
-    generated_lengths = None
-    if timbre_o is not None:
-        generated_lengths = (
-            timbre_reference[0][1].detach() * config.data.hop_length
-        )
-
-    if (
-        timbre_validator is not None
-        and timbre_o is not None
-        and generated_lengths is not None
-    ):
-        try:
-            speaker_ids = timbre_reference[3]
-            timbre_scores = timbre_validator.score_batch_accelerated(
-                timbre_o.detach(),
-                generated_lengths,
-                speaker_ids,
-                config.data.sample_rate,
-                device,
-            )
-            if timbre_scores["multi_speaker"]:
-                validation_scalars.update(
-                    {
-                        "validation/voice_similarity": timbre_scores[
-                            "speaker_mean"
-                        ],
-                        "validation/ecapa_margin_mean": timbre_scores[
-                            "margin_mean"
-                        ],
-                        "validation/ecapa_top1_accuracy_percent": timbre_scores[
-                            "top1_accuracy_percent"
-                        ],
-                        "validation/ecapa_eer_percent": timbre_scores[
-                            "eer_percent"
-                        ],
-                        "validation/ecapa_min_dcf": timbre_scores["min_dcf"],
-                    }
-                )
-            else:
-                validation_scalars["validation/voice_similarity"] = (
-                    timbre_scores["speaker_mean"]
-                )
-        except Exception as error:
-            print(f"ECAPA timbre validation failed: {error}")
-    audio_dict = {}
-    if audio_o is not None:
-        audio_dict[f"gen/audio_{global_step:07d}"] = audio_o[0, :, :]
-    return validation_scalars, audio_dict
-
-
 class EpochRecorder:
     """
     Records the time elapsed per epoch.
@@ -633,8 +441,6 @@ def run(
 
     train_dataset = TextAudioLoaderMultiNSFsid(config.data)
     collate_fn = TextAudioCollateMultiNSFsid()
-    timbre_reference = None
-    audio_reference = None
     train_sampler = DistributedBucketSampler(
         train_dataset,
         batch_size,
@@ -675,7 +481,6 @@ def run(
     except Exception as e:
         print(f"Could not load model info file: {e}. Using defaults.")
 
-    dataset_spk_dim = spk_dim
     last_g = latest_checkpoint_path(experiment_dir, "G_*.pth")
     fresh_speaker_embeddings = last_g is None
 
@@ -691,24 +496,6 @@ def run(
     # update config before the model init
     print(f"Initializing the generator with {spk_dim} speakers.")
     config.model.spk_embed_dim = spk_dim
-
-    if rank == 0:
-        try:
-            timbre_reference = prepare_validation_reference(
-                experiment_dir,
-                device,
-                config.train.seed,
-                dataset_spk_dim,
-                config.data.sample_rate,
-                config.data.hop_length,
-                config.model.text_enc_hidden_dim,
-            )
-            if timbre_reference is not None:
-                audio_reference = tuple(value[:1] for value in timbre_reference[0])
-                print("TensorBoard audio validation uses one external validation clip.")
-        except Exception as error:
-            print(f"External validation disabled: {error}")
-            timbre_reference = None
 
     # Initialize models and optimizers
     from rvc.algorithm.discriminators import MultiPeriodDiscriminator
@@ -860,34 +647,6 @@ def run(
 
     cache = []
 
-    timbre_validator = None
-    if rank == 0 and timbre_reference is not None:
-        try:
-            timbre_model_path = os.path.join(
-                "models", "pretraineds", "ecapa_tdnn", "pretrain.model"
-            )
-            timbre_validator = ECAPATimbreValidator(timbre_model_path)
-            enrollment_wave, enrollment_lengths, enrollment_speakers = (
-                build_timbre_enrollment(
-                    train_dataset,
-                    collate_fn,
-                    timbre_reference[3],
-                    config.train.seed,
-                )
-            )
-            timbre_validator.set_references(
-                enrollment_wave,
-                enrollment_lengths,
-                enrollment_speakers,
-                config.data.sample_rate,
-            )
-            print(
-                f"ECAPA timbre validation enabled with {len(timbre_reference[3])} probes and {len(enrollment_speakers)} enrollment clips."
-            )
-        except Exception as error:
-            print(f"ECAPA timbre validation disabled: {error}")
-            timbre_validator = None
-
     inference_exporter = None
     if rank == 0 and save_every_steps > 0:
         export_device = (
@@ -915,9 +674,6 @@ def run(
                 custom_total_epoch,
                 device,
                 device_id,
-                audio_reference,
-                timbre_validator,
-                timbre_reference,
                 fn_mel_loss,
                 scaler,
                 inference_exporter,
@@ -946,9 +702,6 @@ def train_and_evaluate(
     custom_total_epoch,
     device,
     device_id,
-    audio_reference,
-    timbre_validator,
-    timbre_reference,
     fn_mel_loss,
     scaler,
     inference_exporter,
@@ -1211,44 +964,12 @@ def train_and_evaluate(
                         vocoder=vocoder,
                         version=version,
                     )
-                    if should_run_external_validation(timbre_reference, timbre_validator):
-                        inference_exporter.wait_for_completion()
-                        print(f"Validating saved model '{inference_model_path}'")
-                        try:
-                            saved_model = load_saved_validation_model(
-                                inference_model_path, device
-                            )
-                        except Exception as error:
-                            print(f"Saved model validation loading failed: {error}")
-                        else:
-                            try:
-                                validation_scalars, audio_dict = evaluate_external_validation(
-                                    saved_model,
-                                    config,
-                                    device,
-                                    device_id,
-                                    audio_reference,
-                                    timbre_reference,
-                                    timbre_validator,
-                                    global_step,
-                                )
-                            finally:
-                                del saved_model
-                            summarize(
-                                writer=writer,
-                                global_step=global_step,
-                                scalars=validation_scalars,
-                                audios=audio_dict,
-                                audio_sample_rate=config.data.sample_rate,
-                            )
-
             pbar.update(1)
         # end of batch train
     # end of tqdm
 
     if rank == 0:
         if epoch % save_every_epoch == 0:
-            validation_scalars = {}
             mel = spec_to_mel_torch(
                 spec,
                 config.data.filter_length,
@@ -1285,25 +1006,10 @@ def train_and_evaluate(
                 ),
                 "all/mel": plot_spectrogram_to_numpy(mel[0].data.cpu().numpy()),
             }
-            audio_dict = {}
-            if save_every_steps == 0:
-                validation_scalars, audio_dict = evaluate_external_validation(
-                    net_g,
-                    config,
-                    device,
-                    device_id,
-                    audio_reference,
-                    timbre_reference,
-                    timbre_validator,
-                    global_step,
-                )
             summarize(
                 writer=writer,
                 global_step=global_step,
                 images=image_dict,
-                scalars=validation_scalars,
-                audios=audio_dict,
-                audio_sample_rate=config.data.sample_rate,
             )
 
     # Save checkpoint

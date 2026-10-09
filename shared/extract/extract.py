@@ -26,10 +26,6 @@ from shared.utils import (
     load_embedding,
 )
 from shared.extract.preparing_files import generate_config, generate_filelist
-from shared.validation_data import (
-    build_validation_extraction_files,
-    write_validation_manifest,
-)
 
 # Load config
 config = Config()
@@ -349,23 +345,15 @@ if __name__ == "__main__":
         )
         sys.exit(1)
 
-    validation_files, validation_entries = build_validation_extraction_files(exp_dir)
-    extraction_files = files + validation_files
-    if validation_files:
-        print(
-            f"Caching pitch and features for {len(validation_files)} external "
-            "validation source clip(s)."
-        )
-
     devices = ["cpu"] if gpus == "-" else [f"cuda:{idx}" for idx in gpus.split("-")]
 
     with mp.Manager() as manager, tqdm.tqdm(
-        total=2 * len(extraction_files), desc=f"Extracting F0 ({f0_method})", unit="file",
+        total=2 * len(files), desc=f"Extracting F0 ({f0_method})", unit="file",
         dynamic_ncols=True,
     ) as progress:
         updates = manager.Queue()
         run_pitch_extraction(
-            extraction_files, devices, f0_method, num_processes, progress, updates,
+            files, devices, f0_method, num_processes, progress, updates,
             force=force_pitch_extraction,
         )
         data["f0_method"] = f0_method
@@ -373,10 +361,8 @@ if __name__ == "__main__":
             json.dump(data, f, indent=4)
 
         run_embedding_extraction(
-            extraction_files, devices, embedder_model, version, num_processes, progress, updates
+            files, devices, embedder_model, version, num_processes, progress, updates
         )
-
-    write_validation_manifest(exp_dir, validation_entries)
 
     if rectified:
         generate_filelist(exp_dir, sample_rate, 0)
