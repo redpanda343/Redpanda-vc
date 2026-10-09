@@ -53,6 +53,14 @@ def update_and_restart(script_path, app_name):
     try:
         if pull_updates(os.path.dirname(script_path), app_name):
             os.environ["REDPANDA_EXPERIMENTAL_UPDATE_RESTART"] = script_path
-            os.execv(sys.executable, [sys.executable, script_path, *sys.argv[1:]])
+            command = [sys.executable, script_path, *sys.argv[1:]]
+            if os.name != "nt":
+                os.execv(sys.executable, command)
+            process = subprocess.Popen(command)
+            while True:
+                try:
+                    raise SystemExit(process.wait())
+                except KeyboardInterrupt:
+                    continue
     except (OSError, subprocess.SubprocessError, RuntimeError) as error:
         print(f"Automatic update skipped: {error}. Starting the installed version.", file=sys.stderr, flush=True)
