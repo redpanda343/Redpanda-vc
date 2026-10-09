@@ -108,6 +108,11 @@ def stop():
 
 def rectified_train_tab():
     gr.Markdown('### Rectified Flow')
+    gr.Markdown("Trains a voice conversion model with the same architecture as "
+                "[DiffSinger](https://github.com/openvpi/DiffSinger)'s acoustic model, using ContentVec features in "
+                'place of phonemes. It generates 44.1 kHz mel spectrograms from the source voice and its pitch with '
+                'rectified flow, and the selected vocoder turns them into audio. Training from scratch needs a dataset '
+                'of **1 hour or more** for good results; with less audio, check **Pretrained** to fine-tune instead.')
     with gr.Row():
         name = gr.Textbox(label='Model name', value='my-flow')
         device = gr.Textbox(label='Device', value='auto',
