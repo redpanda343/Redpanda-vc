@@ -2,6 +2,8 @@ import argparse
 import json
 import os
 import runpy
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -42,7 +44,7 @@ def link_directory(target, link):
         link.symlink_to(target, target_is_directory=True)
 
 
-def prepare_dataset(experiment, dataset):
+def dataset_speakers(experiment, dataset):
     dataset = Path(dataset).resolve()
     if not dataset.is_dir():
         raise SystemExit(f'The dataset folder does not exist: {dataset}')
@@ -53,6 +55,49 @@ def prepare_dataset(experiment, dataset):
         speakers = [(entry.name, entry) for entry in entries if entry.is_dir()]
     if not speakers:
         raise SystemExit(f'No audio files or speaker folders found in {dataset}.')
+    return speakers
+
+
+def slicing_stamp(speakers, settings):
+    files = [[str(path), stat.st_size, stat.st_mtime_ns] for _, source in speakers
+             for path in sorted(source.rglob('*')) if path.is_file() for stat in (path.stat(),)]
+    return {'speakers': [[speaker, str(source)] for speaker, source in speakers], 'settings': settings, 'files': files}
+
+
+def default_config():
+    return json.loads((TRAINER_ROOT / 'assets' / 'default_config.json').read_text(encoding='utf-8'))
+
+
+def slice_dataset(experiment, speakers, args):
+    sample_rate = str(default_config()['out_sample_rate'])
+    settings = [sample_rate, args.cutting, str(args.chunk_len), str(args.overlap_len), 'none', 'WAV',
+                str(args.truncate_silence), str(args.silence_threshold), str(args.silence_to), str(args.silence_minimum), args.silence_action,
+                str(args.silence_compress)]
+    sliced_root = experiment / 'beatrice_sliced'
+    stamp_path = sliced_root / 'slicing.json'
+    stamp = slicing_stamp(speakers, settings)
+    sliced = [(speaker, sliced_root / speaker / 'sliced_audios') for speaker, _ in speakers]
+    if stamp_path.is_file() and json.loads(stamp_path.read_text(encoding='utf-8')) == stamp:
+        print(f'Using the sliced dataset in {sliced_root}.', flush=True)
+        return sliced
+    if sliced_root.is_dir():
+        shutil.rmtree(sliced_root)
+    workers = str(args.workers or os.cpu_count() or 1)
+    for speaker, source in speakers:
+        print(f'Slicing {speaker} ({args.cutting}, {sample_rate} Hz)...', flush=True)
+        arguments = [str(sliced_root / speaker), str(source), sample_rate, workers, args.cutting, 'False', 'False',
+                     '0.0', *settings[2:]]
+        if subprocess.run([sys.executable, '-u', '-m', 'shared.preprocess.preprocess', *arguments], cwd=ROOT).returncode:
+            raise SystemExit(f'Slicing {speaker} failed.')
+    for speaker, directory in sliced:
+        if not directory.is_dir() or not any(directory.iterdir()):
+            raise SystemExit(f'Slicing produced no audio for {speaker}. Use Skip or check its WAV, FLAC, MP3 and OGG '
+                             'files.')
+    stamp_path.write_text(json.dumps(stamp), encoding='utf-8')
+    return sliced
+
+
+def prepare_dataset(experiment, speakers):
     data_dir = experiment / 'beatrice_data' / experiment.name
     if data_dir.is_dir():
         for entry in data_dir.iterdir():
@@ -72,7 +117,7 @@ def prepare_dataset(experiment, dataset):
 
 
 def write_config(experiment, args):
-    config = json.loads((TRAINER_ROOT / 'assets' / 'default_config.json').read_text(encoding='utf-8'))
+    config = default_config()
     for key, value in (('n_steps', args.steps), ('batch_size', args.batch_size), ('num_workers', args.workers),
                        ('save_interval', args.save_interval), ('evaluation_interval', args.save_interval)):
         if value is not None:
@@ -125,11 +170,23 @@ def main():
     parser.add_argument('--workers', type=int)
     parser.add_argument('--precision', choices=['fp32', 'fp16', 'bf16'], default='fp32')
     parser.add_argument('--device', default='auto')
+    parser.add_argument('--cutting', choices=['Skip', 'Simple', 'Automatic'], default='Skip')
+    parser.add_argument('--chunk-len', type=float, default=3.0)
+    parser.add_argument('--overlap-len', type=float, default=0.3)
+    parser.add_argument('--truncate-silence', action='store_true')
+    parser.add_argument('--silence-action', choices=['truncate', 'compress'], default='truncate')
+    parser.add_argument('--silence-threshold', type=float, default=-45.0)
+    parser.add_argument('--silence-minimum', type=float, default=0.3)
+    parser.add_argument('--silence-to', type=float, default=0.3)
+    parser.add_argument('--silence-compress', type=float, default=50.0)
     args = parser.parse_args()
     select_device(args.device)
     experiment = ROOT / 'logs' / args.model_name
     ensure_trainer()
-    data_dir = prepare_dataset(experiment, args.dataset)
+    speakers = dataset_speakers(experiment, args.dataset)
+    if args.cutting != 'Skip':
+        speakers = slice_dataset(experiment, speakers, args)
+    data_dir = prepare_dataset(experiment, speakers)
     config = write_config(experiment, args)
     out_dir = experiment / 'beatrice'
     arguments = ['-d', str(data_dir), '-o', str(out_dir), '-c', str(config)]

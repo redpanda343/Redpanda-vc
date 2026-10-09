@@ -37,10 +37,10 @@ def cutting_visibility(cutting, truncate_silence, silence_action):
             gr.update(visible=silence and silence_action == 'compress'))
 
 
-def slicing_controls(choices=('Skip', 'Simple', 'Automatic'), value='Automatic'):
+def slicing_controls(choices=('Skip', 'Simple', 'Automatic'), value='Automatic',
+                     note='Audio is always resampled to 44.1 kHz.'):
     cutting = gr.Radio(label='Audio cutting', choices=list(choices), value=value,
-                       info=', '.join(CUTTING_INFO[choice] for choice in choices)
-                            + '. Audio is always resampled to 44.1 kHz.')
+                       info=', '.join(CUTTING_INFO[choice] for choice in choices) + '. ' + note)
     with gr.Row():
         chunk_len = gr.Slider(0.5, 10.0, 3.0, step=0.1, label='Chunk length (sec)',
                               info="Length of the audio slice for 'Simple' method.", visible=False)
