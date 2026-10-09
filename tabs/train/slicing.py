@@ -76,7 +76,8 @@ def slicing_controls(choices=('Skip', 'Simple', 'Automatic'), value='Automatic',
 
 def check_cutting(cutting, chunk_len, choices, chunk_minimum):
     if cutting not in choices:
-        raise gr.Error(f'Choose {", ".join(choices[:-1])} or {choices[-1]} audio cutting.')
+        names = choices[0] if len(choices) == 1 else f'{", ".join(choices[:-1])} or {choices[-1]}'
+        raise gr.Error(f'Choose {names} audio cutting.')
     if cutting == 'Simple' and float(chunk_len) < chunk_minimum:
         raise gr.Error(f'Chunk length must be at least {chunk_minimum:g} seconds.')
 

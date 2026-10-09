@@ -8,7 +8,7 @@ from rectified_flow.resources import VOCODERS
 from tabs.train.jobs import ROOT, JobRunner, device_id, experiment_path, positive_integer
 from tabs.train.slicing import preprocess_step, slicing_controls
 
-SLICERS = ('Automatic', 'Simple')
+SLICERS = ('Simple',)
 SCRATCH = 'scratch'
 DEFAULT_SOURCES = {'pc': 'pc_nsf_hifigan', 'nsf': SCRATCH}
 IDLE_CONTROLS = 3
@@ -150,7 +150,7 @@ def nsf_hifigan_train_tab():
     with gr.Accordion('1. Prepare dataset', open=True):
         dataset = gr.Textbox(label='Dataset folder',
                              info='A validation subfolder, if present, holds the clips used for validation.')
-        slicing = slicing_controls(choices=SLICERS)
+        slicing = slicing_controls(choices=SLICERS, value='Simple')
         with gr.Row():
             pitch_extractor = gr.Radio(label='Pitch extractor', choices=list(PITCH_EXTRACTORS), value='rmvpe',
                                        info='RMVPE matches the F0 Rectified Flow extracts at inference. Parselmouth '
