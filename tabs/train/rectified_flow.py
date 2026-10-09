@@ -129,9 +129,9 @@ def rectified_train_tab():
         gr.Markdown('Training precision follows **Settings → Training → Precision**.')
         with gr.Row():
             batch = gr.Number(label='Max clips per batch (per GPU)', value=0, minimum=0, precision=0,
-                              info='0 uses config, default 64.')
+                              info='0 uses config, default 32.')
             max_frames = gr.Number(label='Max frames per batch (per GPU)', value=0, minimum=0, precision=0,
-                                   info='0 uses config, default 50000 padded frames. Lower to reduce GPU memory use.')
+                                   info='0 uses config, default 80000 padded frames. Lower to reduce GPU memory use.')
             max_updates = gr.Number(label='Max training updates', value=0, minimum=0, precision=0,
                                info='0 uses config, default 100000 Lightning training steps.')
             checkpoint_interval = gr.Number(label='Checkpoint interval (updates)', value=0, minimum=0, precision=0,

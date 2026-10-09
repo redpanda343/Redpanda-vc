@@ -28,8 +28,8 @@ DEFAULT_CONFIG = {
         'weight_decay': 0.1,
         'adamw_weight_decay': 0.0,
         'warmup_steps': 0,
-        'max_batch_frames': 50000,
-        'max_batch_size': 64,
+        'max_batch_frames': 80000,
+        'max_batch_size': 32,
         'grad_clip': 1.0,
         'pitch_extractor': 'parselmouth',
         'hnsep': 'vr',
@@ -118,7 +118,6 @@ FINETUNE_OVERRIDES = {
         'min_learning_rate': 1e-05,
         'decay_step': 2000,
         'eval_interval': 500,
-        'max_batch_size': 32,
         'augmentation_args': {
             'random_pitch_shifting': {'enabled': False},
             'random_time_stretching': {'enabled': False},
