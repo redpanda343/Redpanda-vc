@@ -97,9 +97,9 @@ class VocoderData(pl.LightningDataModule):
         super().__init__()
         index = read_json(paths['index'])
         if index is None:
-            raise ValueError('Vocoder features are missing. Preprocess the dataset first.')
+            raise ValueError('Vocoder features are missing. Extract the features first.')
         if index['data'] != config['data']:
-            raise ValueError('The extracted features use another mel configuration. Preprocess the dataset again.')
+            raise ValueError('The extracted features use another mel configuration. Extract the features again.')
         self.directory, self.config, self.seed = paths['data'], config, seed
         self.pitch_extractor = index['pitch_extractor']
         self.train_dataset = VocoderDataset(self.directory, index['train'], config, True)

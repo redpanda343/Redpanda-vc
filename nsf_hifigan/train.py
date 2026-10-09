@@ -14,8 +14,8 @@ from nsf_hifigan.checkpoints import (
     checkpoint_path, export_vocoder, latest_checkpoint, load_source, prune_checkpoints,
 )
 from nsf_hifigan.config import (
-    FINETUNE, KINDS, PRECISIONS, ROOT, apply_overrides, experiment_paths, new_config, read_json, validate,
-    write_json,
+    FINETUNE, FINETUNE_AUGMENTATION, KINDS, PRECISIONS, ROOT, apply_overrides, experiment_paths, new_config,
+    read_json, validate, write_json,
 )
 from nsf_hifigan.data import VocoderData
 from nsf_hifigan.task import VocoderTask
@@ -97,7 +97,7 @@ def device_count(options):
 def prepare_config(paths, args, resuming):
     index = read_json(paths['index'])
     if index is None:
-        raise ValueError('Vocoder features are missing. Preprocess the dataset first.')
+        raise ValueError('Vocoder features are missing. Extract the features first.')
     source = None
     if resuming:
         config = read_json(paths['config'])
@@ -119,6 +119,8 @@ def prepare_config(paths, args, resuming):
                              learning_rate: args.learning_rate, 'key_aug': args.key_aug,
                              'max_updates': args.max_updates, 'checkpoint_interval': args.checkpoint_interval,
                              'eval_interval': args.checkpoint_interval, 'num_workers': args.workers})
+    if config['pretrained']:
+        config['train'].update(FINETUNE_AUGMENTATION)
     return validate(config), source
 
 

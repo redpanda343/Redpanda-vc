@@ -56,22 +56,28 @@ class RMVPE:
             f0 = to_local_average_f0(hidden, thred=thred)
         return f0
 
-    @torch.no_grad()
-    def infer_hidden(self, audio, sample_rate=16000, network=None):
+    def _resample(self, audio, sample_rate):
         audio = torch.from_numpy(np.asarray(audio)).float().unsqueeze(0).to(self.device)
         if sample_rate == 16000:
-            audio_res = audio
-        else:
-            key_str = str(sample_rate)
-            if key_str not in self.resample_kernel:
-                self.resample_kernel[key_str] = Resample(sample_rate, 16000, lowpass_filter_width=128)
-            self.resample_kernel[key_str] = self.resample_kernel[key_str].to(self.device)
-            audio_res = self.resample_kernel[key_str](audio)
+            return audio
+        key_str = str(sample_rate)
+        if key_str not in self.resample_kernel:
+            self.resample_kernel[key_str] = Resample(sample_rate, 16000, lowpass_filter_width=128)
+        self.resample_kernel[key_str] = self.resample_kernel[key_str].to(self.device)
+        return self.resample_kernel[key_str](audio)
+
+    def _padded_length(self, length):
+        return self.seg_length * ((length + self.hop_length - 1) // self.seg_length + 1) - self.hop_length
+
+    def padded_length(self, num_samples, sample_rate):
+        return self._padded_length(-(-num_samples * 16000 // sample_rate))
+
+    @torch.no_grad()
+    def infer_hidden(self, audio, sample_rate=16000, network=None):
+        audio_res = self._resample(audio, sample_rate)
         B, T = audio_res.shape
         n_frames = T // self.hop_length + 1
-        T1 = T + self.hop_length
-        T_pad = self.seg_length * ((T1 - 1) // self.seg_length + 1) - T1
-        audio_res = F.pad(audio_res, (0, T_pad))
+        audio_res = F.pad(audio_res, (0, self._padded_length(T) - T))
         mel = self.mel_extractor(audio_res, center=True)
         hidden = (self.model if network is None else network)(mel)
         return hidden[:, :n_frames]
@@ -86,6 +92,26 @@ class RMVPE:
             speed=1, interp_uv=False
     ):
         f0 = self.infer_from_audio(waveform, sample_rate=samplerate)
+        return self._align_pitch(f0, samplerate, length, hop_size, speed, interp_uv)
+
+    @torch.no_grad()
+    def get_pitch_batch(self, waveforms, samplerate, lengths, *, hop_size, speed=1, interp_uv=False):
+        resampled = [self._resample(waveform, samplerate)[0] for waveform in waveforms]
+        groups = {}
+        for index, audio in enumerate(resampled):
+            groups.setdefault(self._padded_length(audio.shape[0]), []).append(index)
+        results = [None] * len(resampled)
+        for padded, indices in groups.items():
+            batch = torch.stack([F.pad(resampled[index], (0, padded - resampled[index].shape[0]))
+                                 for index in indices])
+            hidden = self.model(self.mel_extractor(batch, center=True))
+            f0s = self.decode(hidden).reshape(len(indices), -1)
+            for f0, index in zip(f0s, indices):
+                f0 = f0[:resampled[index].shape[0] // self.hop_length + 1]
+                results[index] = self._align_pitch(f0, samplerate, lengths[index], hop_size, speed, interp_uv)
+        return results
+
+    def _align_pitch(self, f0, samplerate, length, hop_size, speed, interp_uv):
         uv = f0 == 0
         f0, uv = interp_f0(f0, uv)
 

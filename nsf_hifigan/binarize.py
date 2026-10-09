@@ -1,7 +1,8 @@
 import argparse
 import random
 import shutil
-from concurrent.futures import ProcessPoolExecutor
+from collections import deque
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +19,8 @@ AUDIO_SUFFIXES = ('.wav', '.flac')
 VALIDATION_SUFFIXES = ('.wav', '.mp3', '.flac', '.ogg')
 _MEL = {}
 PARSELMOUTH_SILENCE_THRESHOLD = 0.01
+RMVPE_BATCH_SAMPLES = 4096 * 160
+RMVPE_PENDING_CLIPS = 512
 
 
 def read_audio(path, sample_rate):
@@ -31,16 +34,22 @@ def read_audio(path, sample_rate):
     return np.asarray(load_audio_ffmpeg(str(path), sample_rate), dtype=np.float32)
 
 
-def clip_features(path, data, extractor, device):
+def load_clip(path, data):
     key = tuple(sorted(data.items()))
     if key not in _MEL:
         _MEL[key] = vocoder_mel(data)
     audio = np.clip(read_audio(path, data['sample_rate']), -1.0, 1.0)
     with torch.no_grad():
         mel = _MEL[key](torch.from_numpy(audio)[None])[0].T.numpy().astype(np.float32)
-    frames = len(mel)
-    if not frames:
+    return (audio, mel) if len(mel) else None
+
+
+def clip_features(path, data, extractor, device):
+    loaded = load_clip(path, data)
+    if loaded is None:
         return None
+    audio, mel = loaded
+    frames = len(mel)
     if extractor == 'parselmouth':
         f0 = interpolate_f0(parselmouth_contour(audio, data['sample_rate'], data['hop_length'], frames,
                                                 silence_threshold=PARSELMOUTH_SILENCE_THRESHOLD))
@@ -59,6 +68,67 @@ def write_clip(job):
     return target.name, len(features['mel'])
 
 
+def save_clip(target, audio, mel, f0):
+    np.savez(target, audio=audio, mel=mel, f0=np.asarray(f0, dtype=np.float32))
+    return target.name, len(mel)
+
+
+def run_rmvpe_jobs(jobs, workers, device):
+    from rectified_flow.pitch import rmvpe_model
+
+    torch.set_num_threads(1)
+    model = rmvpe_model(device)
+    results = {}
+    buckets = {}
+    pending = 0
+    saving = deque()
+    with (ThreadPoolExecutor(workers) as loaders, ThreadPoolExecutor(workers) as savers,
+          tqdm(total=len(jobs), desc='Extracting vocoder features', unit='clip') as progress):
+        def collect(limit):
+            while saving and (len(saving) > limit or saving[0][1].done()):
+                source, future = saving.popleft()
+                results[source] = future.result()
+                progress.update(1)
+
+        def flush(key):
+            nonlocal pending
+            items = buckets.pop(key)
+            pending -= len(items)
+            data = items[0][0][2]
+            pitches = model.get_pitch_batch([audio for _, audio, _ in items], data['sample_rate'],
+                                            [len(mel) for _, _, mel in items], hop_size=data['hop_length'],
+                                            interp_uv=True)
+            for (job, audio, mel), (f0, _) in zip(items, pitches):
+                saving.append((job[0], savers.submit(save_clip, job[1], audio, mel, f0)))
+            collect(8 * workers)
+
+        queued = iter(jobs)
+        loading = deque((job, loaders.submit(load_clip, job[0], job[2])) for _, job in zip(range(4 * workers), queued))
+        while loading:
+            job, future = loading.popleft()
+            following = next(queued, None)
+            if following is not None:
+                loading.append((following, loaders.submit(load_clip, following[0], following[2])))
+            loaded = future.result()
+            if loaded is None:
+                results[job[0]] = None
+                progress.update(1)
+                continue
+            audio, mel = loaded
+            key = model.padded_length(len(audio), job[2]['sample_rate'])
+            buckets.setdefault(key, []).append((job, audio, mel))
+            pending += 1
+            if len(buckets[key]) * key >= RMVPE_BATCH_SAMPLES:
+                flush(key)
+            elif pending > RMVPE_PENDING_CLIPS:
+                flush(max(buckets, key=lambda name: len(buckets[name]) * name))
+            collect(8 * workers)
+        for key in list(buckets):
+            flush(key)
+        collect(0)
+    return [results[job[0]] for job in jobs]
+
+
 def collect_sources(experiment):
     clips = sorted(path for path in (experiment / 'sliced_audios').glob('*')
                    if path.suffix.lower() in AUDIO_SUFFIXES and 'mute' not in path.stem)
@@ -69,6 +139,8 @@ def collect_sources(experiment):
 
 
 def run_jobs(jobs, workers, device):
+    if jobs and jobs[0][3] == 'rmvpe':
+        return run_rmvpe_jobs(jobs, workers, device)
     if device != 'cpu' or workers <= 1:
         return [write_clip(job) for job in tqdm(jobs, desc='Extracting vocoder features', unit='clip')]
     with ProcessPoolExecutor(max_workers=workers) as executor:
@@ -80,7 +152,7 @@ def binarize(experiment, extractor, device, workers, valid_clips, seed=1234):
     paths = experiment_paths(experiment)
     clips, validation = collect_sources(paths['experiment'])
     if not clips:
-        raise SystemExit(f"No sliced audio found in {paths['experiment'] / 'sliced_audios'}. Preprocess the dataset first.")
+        raise SystemExit(f"No sliced audio found in {paths['experiment'] / 'sliced_audios'}. Slice the dataset first.")
     data = default_data()
     if paths['data'].is_dir():
         shutil.rmtree(paths['data'])

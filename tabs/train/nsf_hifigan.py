@@ -11,7 +11,7 @@ from tabs.train.slicing import preprocess_step, slicing_controls
 SLICERS = ('Simple',)
 SCRATCH = 'scratch'
 DEFAULT_SOURCES = {'pc': 'pc_nsf_hifigan', 'nsf': 'nsf_hifigan'}
-IDLE_CONTROLS = 3
+IDLE_CONTROLS = 4
 runner = JobRunner('vocoder')
 
 
@@ -40,22 +40,30 @@ def check_kind(kind):
     return kind
 
 
-def preprocess(name, dataset, workers, pitch_extractor, device, valid_clips, *slicing):
+def slice_dataset(name, dataset, workers, *slicing):
     directory = experiment_path(name)
     dataset = str(dataset).strip().strip('"')
     if not Path(dataset).is_dir():
         raise gr.Error('The dataset folder does not exist.')
+    workers = positive_integer(workers, 'CPU workers')
+    steps = [preprocess_step(directory, dataset, workers, *slicing, choices=SLICERS)]
+    return runner.launch(name, steps, 'Slicing vocoder dataset', IDLE_CONTROLS, 'done. Extract the features next.')
+
+
+def extract_features(name, workers, pitch_extractor, device, valid_clips):
+    directory = experiment_path(name)
     if pitch_extractor not in PITCH_EXTRACTORS:
         raise gr.Error(f'Choose one of these pitch extractors: {", ".join(PITCH_EXTRACTORS)}.')
     if valid_clips is None or float(valid_clips) != int(valid_clips) or int(valid_clips) < 0:
         raise gr.Error('Validation clips must be zero or a positive whole number.')
-    workers = positive_integer(workers, 'CPU workers')
-    steps = [
-        preprocess_step(directory, dataset, workers, *slicing, choices=SLICERS),
-        ('nsf_hifigan.binarize', [str(directory), '--pitch-extractor', pitch_extractor, '--device', device_option(device),
-                                  '--workers', workers, '--valid-clips', str(int(valid_clips))]),
-    ]
-    return runner.launch(name, steps, 'Preprocessing vocoder dataset', IDLE_CONTROLS, 'done. Ready to train.')
+    sliced = directory / 'sliced_audios'
+    if not sliced.is_dir() or not any(sliced.iterdir()):
+        raise gr.Error('This experiment has no sliced audio. Slice the dataset first.')
+    steps = [('nsf_hifigan.binarize', [str(directory), '--pitch-extractor', pitch_extractor,
+                                       '--device', device_option(device),
+                                       '--workers', positive_integer(workers, 'CPU workers'),
+                                       '--valid-clips', str(int(valid_clips))])]
+    return runner.launch(name, steps, 'Extracting vocoder features', IDLE_CONTROLS, 'done. Ready to train.')
 
 
 def device_option(device):
@@ -93,7 +101,7 @@ def start(name, kind, source, discriminator_warmup, precision, batch, crop_frame
     check_kind(kind)
     paths = experiment_paths(directory)
     if not paths['index'].is_file():
-        raise gr.Error('Preprocess the dataset for this vocoder first.')
+        raise gr.Error('Extract the features for this vocoder first.')
     resuming = latest_checkpoint(paths['output']) is not None
     saved = read_json(paths['config']) if resuming else None
     if saved and saved['kind'] != kind:
@@ -147,11 +155,16 @@ def nsf_hifigan_train_tab():
                     info='PC-NSF-HiFiGAN trains with pitch-cycle augmentation so pitch-shifted output stays clean; '
                          'it is the type Rectified Flow ships with. NSF-HiFiGAN is the classic model.')
     workers = gr.Number(label='CPU workers', value=4, minimum=1, precision=0,
-                        info='Processes for slicing, Parselmouth F0 and the training data loader.')
-    with gr.Accordion('1. Prepare dataset', open=True):
+                        info='Processes for slicing, feature extraction and the training data loader.')
+    with gr.Accordion('1. Slice dataset', open=True):
         dataset = gr.Textbox(label='Dataset folder',
                              info='A validation subfolder, if present, holds the clips used for validation.')
         slicing = slicing_controls(choices=SLICERS, value='Simple')
+        slice_button = gr.Button('Slice dataset')
+    with gr.Accordion('2. Extract features', open=True):
+        gr.Markdown('Saves the audio, mel and F0 of every sliced clip to `logs/<model>/vocoder/data` for training. '
+                    'It needs about 1.25 times the space of the sliced audio as 32-bit WAV, and can be deleted '
+                    'after training.')
         with gr.Row():
             pitch_extractor = gr.Radio(label='Pitch extractor', choices=list(PITCH_EXTRACTORS), value='rmvpe',
                                        info='RMVPE matches the F0 Rectified Flow extracts at inference. Parselmouth '
@@ -159,8 +172,8 @@ def nsf_hifigan_train_tab():
             valid_clips = gr.Number(label='Validation clips', value=5, minimum=0, precision=0,
                                     info='Held out when there is no validation subfolder, at most a tenth of the '
                                          'clips.')
-        preprocess_button = gr.Button('Preprocess dataset')
-    with gr.Accordion('2. Train vocoder', open=True):
+        extract_button = gr.Button('Extract features')
+    with gr.Accordion('3. Train vocoder', open=True):
         with gr.Row():
             source = gr.Dropdown(label='Fine-tune from', choices=source_choices(), value=DEFAULT_SOURCES['pc'],
                                  allow_custom_value=True, scale=4,
@@ -193,17 +206,19 @@ def nsf_hifigan_train_tab():
                                            f"{TRAINING['learning_rate']:g} from scratch, or the experiment's saved "
                                            'value.')
         key_aug = gr.Checkbox(label='Speed augmentation', value=False,
-                              info='Resamples random clips 0.9-1.4x faster to cover more pitches. It may lower quality.')
+                              info='Resamples random clips 0.9-1.4x faster to cover more pitches. It may lower quality. '
+                                   'Fine-tuning always trains without augmentation.')
         with gr.Row():
             train_button = gr.Button('Start / resume vocoder training', variant='primary')
             export_button = gr.Button('Export latest checkpoint')
             stop_button = gr.Button('Stop current vocoder job', interactive=False)
     timer = gr.Timer(2)
-    outputs = [preprocess_button, train_button, export_button, stop_button, timer]
+    outputs = [slice_button, extract_button, train_button, export_button, stop_button, timer]
     kind.change(default_source, [kind], [source], queue=False)
     refresh.click(refresh_sources, [kind, source], [source], queue=False)
-    preprocess_button.click(preprocess, [name, dataset, workers, pitch_extractor, device, valid_clips,
-                                         *slicing.inputs], outputs, queue=False)
+    slice_button.click(slice_dataset, [name, dataset, workers, *slicing.inputs], outputs, queue=False)
+    extract_button.click(extract_features, [name, workers, pitch_extractor, device, valid_clips], outputs,
+                         queue=False)
     train_button.click(start, [name, kind, source, discriminator_warmup, precision, batch, crop_frames, max_updates,
                                checkpoint_interval, learning_rate, key_aug, workers, device], outputs, queue=False)
     export_button.click(export, [name], outputs, queue=False)

@@ -55,6 +55,7 @@ FINETUNE = dict(
     eval_interval=2000,
     num_valid_plots=100,
 )
+FINETUNE_AUGMENTATION = dict(volume_aug_prob=0.0, key_aug=False)
 OVERRIDABLE = ('batch_size', 'crop_mel_frames', 'learning_rate', 'finetune_learning_rate', 'key_aug', 'max_updates',
                'checkpoint_interval', 'eval_interval', 'num_workers')
 
