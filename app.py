@@ -31,19 +31,19 @@ def pull_updates():
         return False
     if git("diff", "--name-only", "--diff-filter=U").stdout.strip():
         raise SystemExit("Resolve the existing Git conflicts before starting the WebUI.")
-    if git("branch", "--show-current").stdout.strip() != "experimental":
-        print("Automatic updates apply to experimental checkouts only; starting the current branch.", flush=True)
+    if git("branch", "--show-current").stdout.strip() != "main":
+        print("Automatic updates apply to main checkouts only; starting the current branch.", flush=True)
         return False
     previous = git("rev-parse", "HEAD").stdout.strip()
-    print("Checking origin/experimental for updates...", flush=True)
-    result = git("pull", "--ff-only", "--autostash", "origin", "experimental", check=False)
+    print("Checking origin/main for updates...", flush=True)
+    result = git("pull", "--ff-only", "--autostash", "origin", "main", check=False)
     message = (result.stdout + result.stderr).strip()
     if message:
         print(message, flush=True)
     if git("diff", "--name-only", "--diff-filter=U").stdout.strip():
         raise SystemExit("Git could not reapply local edits cleanly. Resolve the conflicts before starting the WebUI.")
     if result.returncode:
-        raise RuntimeError(f"Experimental update failed with Git exit code {result.returncode}.")
+        raise RuntimeError(f"Update failed with Git exit code {result.returncode}.")
     return git("rev-parse", "HEAD").stdout.strip() != previous
 
 
