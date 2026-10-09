@@ -151,10 +151,6 @@ import shared.zluda
 # Import Tabs
 from tabs.inference.inference import inference_tab
 from tabs.train.train import train_tab
-from tabs.train.one_click_train import one_click_train_tab
-from tabs.download.download import download_tab
-from tabs.voice_blender.voice_blender import voice_blender_tab
-from tabs.checkpoint_exporter.checkpoint_exporter import checkpoint_exporter_tab
 from tabs.settings.settings import settings_tab
 from tabs.tensorboard.tensorboard import tensorboard_tab
 
@@ -540,18 +536,6 @@ with gr.Blocks(
 
         with gr.Tab(i18n("Training")):
             train_tab()
-
-        with gr.Tab(i18n("One-click Training")):
-            one_click_train_tab()
-
-        with gr.Tab(i18n("Voice Blender")):
-            voice_blender_tab()
-
-        with gr.Tab(i18n("Checkpoint Exporter")):
-            checkpoint_exporter_tab()
-
-        with gr.Tab(i18n("Download")):
-            download_tab()
 
         with gr.Tab(i18n("Settings")):
             settings_tab()
