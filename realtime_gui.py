@@ -406,9 +406,12 @@ class AudioEngine:
         self.zc = rate // 100
         self.block_frame = int(np.round(settings["block_time"] * rate / self.zc)) * self.zc
         self.block_frame_16k = 160 * self.block_frame // self.zc
-        self.crossfade_frame = min(
-            int(np.round(settings["crossfade_time"] * rate / self.zc)) * self.zc, 4 * self.zc
-        )
+        if self.rvc is None:
+            self.crossfade_frame = self.zc
+        else:
+            self.crossfade_frame = min(
+                int(np.round(settings["crossfade_time"] * rate / self.zc)) * self.zc, 2 * self.zc
+            )
         self.sola_buffer_frame = self.crossfade_frame
         self.sola_search_frame = self.zc
         self.extra_frame = int(np.round(settings["extra_time"] * rate / self.zc)) * self.zc
@@ -963,13 +966,13 @@ class RealtimeGUI:
         f0_method = value.get("f0_method", "rmvpe")
         self.f0_method = tk.StringVar(value=f0_method if f0_method in PITCH_METHODS.values() else "rmvpe")
         self.block_times = {
-            "rvc": value.get("block_time", 0.25),
+            "rvc": value.get("block_time", 0.3),
             "beatrice": value.get("beatrice_block_time", 0.02),
         }
         self.block_kind = "rvc"
         self.block_time = tk.DoubleVar(value=self.block_times["rvc"])
-        self.crossfade_time = tk.DoubleVar(value=min(value.get("crossfade_time", 0.04), 0.04))
-        self.extra_time = tk.DoubleVar(value=value.get("extra_time", 2.5))
+        self.crossfade_time = tk.DoubleVar(value=min(value.get("crossfade_time", 0.01), 0.02))
+        self.extra_time = tk.DoubleVar(value=value.get("extra_time", 3.0))
         self.passthrough = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="Ready")
         self.stats = tk.StringVar()
@@ -1206,7 +1209,7 @@ class RealtimeGUI:
                 "own value; 0.02-0.05 s works best for them."
             ),
         ))
-        crossfade = self._slider(frame, 1, "Crossfade", self.crossfade_time, 0.01, 0.04, 0.01)
+        crossfade = self._slider(frame, 1, "Crossfade", self.crossfade_time, 0.01, 0.02, 0.01)
         extra = self._slider(
             frame, 2, "Extra context", self.extra_time, 0.05, 5.0, 0.01,
             tooltip="Seconds of past audio the model sees. More is smoother but slower.",
