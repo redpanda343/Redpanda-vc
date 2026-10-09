@@ -12,6 +12,11 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+if __name__ == "__main__":
+    from shared.updater import update_and_restart
+
+    update_and_restart(__file__, "realtime GUI")
+
 try:
     import sv_ttk
 except ImportError:
