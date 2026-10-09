@@ -120,8 +120,11 @@ def rectified_train_tab():
         preprocess_button = gr.Button('Preprocess dataset')
     with gr.Accordion('2. Train rectified flow', open=True):
         use_pretrained = gr.Checkbox(label='Pretrained', value=False)
-        pretrained_path = gr.Textbox(label='Voice checkpoint to fine-tune', value='',
-                                    info='Optional exported flow .pth path, used when Pretrained is checked.')
+        pretrained_path = gr.Textbox(label='Voice checkpoint to fine-tune', value='', visible=False,
+                                    info='Optional exported flow .pth path. Blank uses '
+                                         'models/pretraineds/rectified/pretrained.pth.')
+        use_pretrained.change(lambda enabled: gr.update(visible=enabled), use_pretrained, pretrained_path,
+                              queue=False)
         vocoder = gr.Dropdown(label='Vocoder', choices=list(VOCODERS), value=DEFAULT_VOCODER)
         gr.Markdown('Training precision follows **Settings → Training → Precision**.')
         with gr.Row():
