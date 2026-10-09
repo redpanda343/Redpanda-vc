@@ -1,5 +1,6 @@
 import ctypes
 import json
+import math
 import os
 import queue
 import re
@@ -68,6 +69,17 @@ class BlockTorchGate(TorchGate):
         return y.to(dtype=x.dtype)
 
 
+def release_flow_models():
+    released = False
+    for module_name, cache_name in (("rectified_flow.pitch", "_RMVPE"), ("rectified_flow.variance", "_SEPARATORS")):
+        cache = getattr(sys.modules.get(module_name), cache_name, None)
+        if cache:
+            cache.clear()
+            released = True
+    if released and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def db_to_linear(db):
     return 10.0 ** (float(db) / 20.0)
 
@@ -77,10 +89,19 @@ class AudioFrameFifo:
         self.channels = int(channels)
         self.max_frames = None if max_frames is None else int(max_frames)
         self.prefill = 0
+        self.fade = 0
+        self.trim_threshold = 0
         self._chunks = deque()
         self._frames = 0
         self._starved = True
+        self._levels = None
+        self._largest_read = 0
         self._lock = threading.Lock()
+
+    def drain_after(self, writes, fade, threshold):
+        self._levels = deque(maxlen=max(1, int(writes)))
+        self.fade = int(fade)
+        self.trim_threshold = int(threshold)
 
     def write(self, data):
         array = np.asarray(data, dtype=np.float32)
@@ -89,6 +110,8 @@ class AudioFrameFifo:
         if not array.shape[0]:
             return
         with self._lock:
+            if self._levels is not None:
+                self._levels.append(self._frames)
             if self._starved and self.prefill > 0:
                 self._chunks.append(np.zeros((self.prefill, array.shape[1]), dtype=np.float32))
                 self._frames += self.prefill
@@ -97,9 +120,15 @@ class AudioFrameFifo:
             self._frames += array.shape[0]
             if self.max_frames is not None and self._frames > self.max_frames:
                 self._discard_locked(self._frames - self.max_frames)
+            if self._levels is not None and len(self._levels) == self._levels.maxlen:
+                excess = min(self._levels) - self.prefill - self._largest_read
+                if excess > self.trim_threshold:
+                    self._trim_locked(excess)
+                    self._levels.clear()
 
     def read(self, frames, exact=False):
         with self._lock:
+            self._largest_read = max(self._largest_read, int(frames))
             if exact and self._frames < int(frames):
                 return None
             take = min(int(frames), self._frames)
@@ -120,6 +149,16 @@ class AudioFrameFifo:
                 self._frames -= count
                 remaining -= count
         return parts[0] if len(parts) == 1 else np.concatenate(parts, axis=0)
+
+    def _trim_locked(self, frames):
+        data = np.concatenate(self._chunks, axis=0)
+        kept = data[frames:].copy()
+        fade = min(self.fade, frames, kept.shape[0])
+        if fade > 0:
+            ramp = np.linspace(0.0, 1.0, fade, dtype=np.float32)[:, None]
+            kept[:fade] = data[:fade] * (1.0 - ramp) + kept[:fade] * ramp
+        self._chunks = deque([kept])
+        self._frames = kept.shape[0]
 
     def _discard_locked(self, frames):
         remaining = int(frames)
@@ -202,6 +241,8 @@ class AudioEngine:
 
     def start(self, settings):
         self.stop()
+        self.rvc = None
+        self.beatrice = None
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         self.settings = settings
@@ -211,8 +252,6 @@ class AudioEngine:
                 "This is a Beatrice training checkpoint, not a model. Select the paraphernalia_* model folder "
                 "or its .toml file from the same training run."
             )
-        self.rvc = None
-        self.beatrice = None
         if beatrice_path is None:
             self.rvc = RealTimeRVC(
                 model_path=settings["model_path"],
@@ -227,7 +266,10 @@ class AudioEngine:
             )
             model_rate = self.rvc.sample_rate
             self.device = self.rvc.device
+            if not self.rvc.is_rectified:
+                release_flow_models()
         else:
+            release_flow_models()
             model_rate = OUT_SAMPLE_RATE
             self.device = torch.device("cpu")
         self.input_device = settings["input_device"]
@@ -277,6 +319,7 @@ class AudioEngine:
         self.asio_callback_frames = 0
         self.prefill_margin = max(self.block_frame // 4, self.zc)
         self.output_fifo = AudioFrameFifo(1, max_frames=self.block_frame * 4)
+        self._drain(self.output_fifo)
         if self.output_selectors or self.input_selectors:
             self._resize_asio_fifo(self.output_fifo)
         else:
@@ -477,6 +520,7 @@ class AudioEngine:
             return
         try:
             self.monitor_queue = AudioFrameFifo(1, max_frames=self.block_frame * 4)
+            self._drain(self.monitor_queue)
             if self.input_selectors:
                 self._resize_asio_fifo(self.monitor_queue)
             else:
@@ -500,6 +544,9 @@ class AudioEngine:
             self.error_queue.put_nowait(
                 f"The monitor device could not start; continuing with the main output only. {error}"
             )
+
+    def _drain(self, fifo):
+        fifo.drain_after(math.ceil(5 * self.sample_rate / self.block_frame), self.zc, 5 * self.zc)
 
     def _resize_asio_fifo(self, fifo):
         frames = self.asio_callback_frames
@@ -526,6 +573,7 @@ class AudioEngine:
         self.asio_main_channels = len(output_selectors)
         if self.monitor_selectors:
             self.monitor_queue = AudioFrameFifo(1)
+            self._drain(self.monitor_queue)
             self._resize_asio_fifo(self.monitor_queue)
             output_selectors += self.monitor_selectors
         common = dict(samplerate=self.sample_rate, dtype="float32", blocksize=0)

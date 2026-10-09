@@ -8,7 +8,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from rvc.infer.infer import VoiceConverter, deterministic_torch_scope
+from rvc.infer.infer import VoiceConverter
 from shared.utils import extract_embedding_features
 
 
@@ -523,42 +523,41 @@ class RealTimeRVC:
             raise ValueError("SwiftF0 realtime requires at least 0.2 seconds of extra context.")
         skip_head = int(skip_head) - lookahead
         started = time.perf_counter()
-        with deterministic_torch_scope():
-            with self.lock:
-                torch.manual_seed(self.seed)
-                features = self._extract_features(input_wav)
-                features = self._apply_index(features, skip_head)
-                self._update_pitch(input_wav, block_frame_16k, f0_method)
-                speaker = torch.tensor(
-                    [self.speaker_id], device=self.device, dtype=torch.long
+        with self.lock:
+            torch.manual_seed(self.seed)
+            features = self._extract_features(input_wav)
+            features = self._apply_index(features, skip_head)
+            self._update_pitch(input_wav, block_frame_16k, f0_method)
+            speaker = torch.tensor(
+                [self.speaker_id], device=self.device, dtype=torch.long
+            )
+            if self.is_rectified:
+                audio = self._infer_rectified(
+                    features, input_wav, speaker, skip_head, int(return_length),
+                    f0_method, source_wav, source_rate,
                 )
-                if self.is_rectified:
-                    audio = self._infer_rectified(
-                        features, input_wav, speaker, skip_head, int(return_length),
-                        f0_method, source_wav, source_rate,
-                    )
-                    if torch.device(self.device).type == "cuda":
-                        torch.cuda.synchronize(self.device)
-                    return audio.float(), time.perf_counter() - started
-                p_len = min(input_wav.shape[0] // 160, features.shape[1] * 2)
-                features = F.interpolate(
-                    features.permute(0, 2, 1), scale_factor=2
-                ).permute(0, 2, 1)
-                features = features[:, :p_len]
-                lengths = torch.tensor(
-                    [p_len], device=self.device, dtype=torch.long
-                )
-                coarse = self.cache_pitch[None, -p_len:]
-                continuous = self.cache_pitchf[None, -p_len:]
-                audio = self.model.infer(
-                    features.float(),
-                    lengths,
-                    coarse,
-                    continuous,
-                    speaker,
-                    int(skip_head),
-                    int(return_length),
-                )[0]
                 if torch.device(self.device).type == "cuda":
                     torch.cuda.synchronize(self.device)
+                return audio.float(), time.perf_counter() - started
+            p_len = min(input_wav.shape[0] // 160, features.shape[1] * 2)
+            features = F.interpolate(
+                features.permute(0, 2, 1), scale_factor=2
+            ).permute(0, 2, 1)
+            features = features[:, :p_len]
+            lengths = torch.tensor(
+                [p_len], device=self.device, dtype=torch.long
+            )
+            coarse = self.cache_pitch[None, -p_len:]
+            continuous = self.cache_pitchf[None, -p_len:]
+            audio = self.model.infer(
+                features.float(),
+                lengths,
+                coarse,
+                continuous,
+                speaker,
+                int(skip_head),
+                int(return_length),
+            )[0]
+            if torch.device(self.device).type == "cuda":
+                torch.cuda.synchronize(self.device)
         return audio.squeeze().float(), time.perf_counter() - started
