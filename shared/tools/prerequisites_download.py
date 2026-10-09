@@ -170,7 +170,7 @@ def get_file_size_if_missing(file_list):
     return total_size
 
 
-def download_file(url, destination_path, global_bar, expected_sha256=None, archive_member=None):
+def download_file(url, destination_path, global_bar, expected_sha256=None, archive_member=None, headers=None):
     """
     Download a file from the given URL to the specified destination path,
     updating the global progress bar as data is downloaded.
@@ -185,7 +185,7 @@ def download_file(url, destination_path, global_bar, expected_sha256=None, archi
         with requests.get(
             url,
             stream=True,
-            headers=DOWNLOAD_HEADERS,
+            headers={**DOWNLOAD_HEADERS, **(headers or {})},
             timeout=DOWNLOAD_TIMEOUT,
         ) as response:
             response.raise_for_status()
@@ -360,7 +360,7 @@ def prequisites_download_pipeline(
                 if os.name == "nt":
                     download_mapping_files(executables_list, global_bar)
                 else:
-                    print("No executables needed")
+                    global_bar.write("No executables needed")
             if pretraineds_hifigan:
                 download_mapping_files(pretraineds_hifigan_list, global_bar)
                 download_mapping_files(pretraineds_refinegan_list, global_bar)
