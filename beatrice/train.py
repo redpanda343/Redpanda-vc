@@ -2,7 +2,6 @@ import argparse
 import json
 import os
 import runpy
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -10,6 +9,7 @@ from pathlib import Path
 from beatrice.resources import ROOT, TRAINER_ROOT, ensure_trainer
 
 AUDIO_SUFFIXES = {'.wav', '.aif', '.aiff', '.fla', '.flac', '.oga', '.ogg', '.opus', '.mp3'}
+CHECKPOINT = 'checkpoint_latest.pt.gz'
 REPO_ROOT_SOURCE = '''def repo_root() -> Path:
     d = Path.cwd() / "dummy" if is_notebook() else Path(__file__)
     assert d.is_absolute(), d
@@ -18,10 +18,27 @@ REPO_ROOT_SOURCE = '''def repo_root() -> Path:
             return d
     raise RuntimeError("Repository root is not found.")
 '''
+RUN_FILES_SOURCE = '''    if not resume:
+        with open(out_dir / "config.json", "w", encoding="utf-8") as f:
+            json.dump(dict(h), f, indent=4)
+        if not is_notebook():
+            shutil.copy(__file__, out_dir)
+'''
 LAUNCHER_PATCHES = (
     (REPO_ROOT_SOURCE, 'def repo_root() -> Path:\n    return Path(__file__).resolve().parents[1]\n'),
     ('import torchaudio\n', 'import torchaudio\nfrom beatrice.compat import patch_torchaudio\n\npatch_torchaudio()\n'),
+    (RUN_FILES_SOURCE, ''),
+    ('        writer = SummaryWriter(out_dir)\n',
+     '        writer = SummaryWriter(in_wav_dataset_dir.parent / "events")\n'),
+    ('                shutil.copy(checkpoint_file_save, out_dir / "checkpoint_latest.pt.gz")\n',
+     '                os.replace(checkpoint_file_save, out_dir / "checkpoint_latest.pt.gz")\n'),
+    ('                del paraphernalia_dir\n',
+     '                for old_paraphernalia_dir in out_dir.glob("paraphernalia_*"):\n'
+     '                    if old_paraphernalia_dir != paraphernalia_dir:\n'
+     '                        shutil.rmtree(old_paraphernalia_dir, ignore_errors=True)\n'
+     '                del paraphernalia_dir\n'),
 )
+LEGACY_ENTRIES = ('beatrice_data', 'beatrice_sliced', 'beatrice_config.json')
 
 
 def write_launcher():
@@ -44,10 +61,61 @@ def link_directory(target, link):
         link.symlink_to(target, target_is_directory=True)
 
 
+def remove_path(path):
+    if path.is_symlink() or os.path.isjunction(path):
+        if os.name == 'nt':
+            os.rmdir(path)
+        else:
+            path.unlink()
+    elif path.is_dir():
+        for entry in path.iterdir():
+            remove_path(entry)
+        path.rmdir()
+    elif os.path.lexists(path):
+        path.unlink()
+
+
+def work_directory(experiment):
+    return experiment / 'temp'
+
+
+def remove_work(experiment):
+    if os.path.lexists(work_directory(experiment)):
+        remove_path(work_directory(experiment))
+
+
+def model_folders(directory):
+    return sorted((path for path in directory.glob('paraphernalia_*') if path.is_dir()),
+                  key=lambda path: path.stat().st_mtime)
+
+
+def tidy_experiment(experiment):
+    legacy = experiment / 'beatrice'
+    if legacy.is_dir() and not legacy.is_symlink():
+        if (legacy / CHECKPOINT).is_file() and not (experiment / CHECKPOINT).exists():
+            os.replace(legacy / CHECKPOINT, experiment / CHECKPOINT)
+        exports = model_folders(legacy)
+        if exports and not model_folders(experiment):
+            os.replace(exports[-1], experiment / exports[-1].name)
+        remove_path(legacy)
+    for name in LEGACY_ENTRIES:
+        if os.path.lexists(experiment / name):
+            remove_path(experiment / name)
+    remove_work(experiment)
+    for checkpoint in experiment.glob('checkpoint_*.pt.gz'):
+        if checkpoint.name != CHECKPOINT:
+            checkpoint.unlink()
+    for export in model_folders(experiment)[:-1]:
+        remove_path(export)
+
+
 def dataset_speakers(experiment, dataset):
     dataset = Path(dataset).resolve()
+    work = work_directory(experiment).resolve()
     if not dataset.is_dir():
         raise SystemExit(f'The dataset folder does not exist: {dataset}')
+    if dataset == work or work in dataset.parents or dataset in work.parents:
+        raise SystemExit(f'Choose a dataset folder outside {experiment}.')
     entries = sorted(dataset.iterdir())
     if any(entry.is_file() and entry.suffix.lower() in AUDIO_SUFFIXES for entry in entries):
         speakers = [(experiment.name, dataset)]
@@ -58,61 +126,35 @@ def dataset_speakers(experiment, dataset):
     return speakers
 
 
-def slicing_stamp(speakers, settings):
-    files = [[str(path), stat.st_size, stat.st_mtime_ns] for _, source in speakers
-             for path in sorted(source.rglob('*')) if path.is_file() for stat in (path.stat(),)]
-    return {'speakers': [[speaker, str(source)] for speaker, source in speakers], 'settings': settings, 'files': files}
-
-
 def default_config():
     return json.loads((TRAINER_ROOT / 'assets' / 'default_config.json').read_text(encoding='utf-8'))
 
 
-def slice_dataset(experiment, speakers, args):
+def build_dataset(experiment, speakers, args):
+    work = work_directory(experiment)
+    data_dir = work / experiment.name
+    data_dir.mkdir(parents=True)
+    if args.cutting == 'Skip':
+        for speaker, source in speakers:
+            link_directory(source, data_dir / speaker)
+        return data_dir
     sample_rate = str(default_config()['out_sample_rate'])
-    settings = [sample_rate, args.cutting, str(args.chunk_len), str(args.overlap_len), 'none', 'WAV',
-                str(args.truncate_silence), str(args.silence_threshold), str(args.silence_to), str(args.silence_minimum), args.silence_action,
-                str(args.silence_compress)]
-    sliced_root = experiment / 'beatrice_sliced'
-    stamp_path = sliced_root / 'slicing.json'
-    stamp = slicing_stamp(speakers, settings)
-    sliced = [(speaker, sliced_root / speaker / 'sliced_audios') for speaker, _ in speakers]
-    if stamp_path.is_file() and json.loads(stamp_path.read_text(encoding='utf-8')) == stamp:
-        print(f'Using the sliced dataset in {sliced_root}.', flush=True)
-        return sliced
-    if sliced_root.is_dir():
-        shutil.rmtree(sliced_root)
+    staging = work / 'slicing'
     workers = str(args.workers or os.cpu_count() or 1)
     for speaker, source in speakers:
         print(f'Slicing {speaker} ({args.cutting}, {sample_rate} Hz)...', flush=True)
-        arguments = [str(sliced_root / speaker), str(source), sample_rate, workers, args.cutting, 'False', 'False',
-                     '0.0', *settings[2:]]
+        arguments = [str(staging / speaker), str(source), sample_rate, workers, args.cutting, 'False', 'False', '0.0',
+                     str(args.chunk_len), str(args.overlap_len), 'none', 'WAV', str(args.truncate_silence),
+                     str(args.silence_threshold), str(args.silence_to), str(args.silence_minimum), args.silence_action,
+                     str(args.silence_compress)]
         if subprocess.run([sys.executable, '-u', '-m', 'shared.preprocess.preprocess', *arguments], cwd=ROOT).returncode:
             raise SystemExit(f'Slicing {speaker} failed.')
-    for speaker, directory in sliced:
-        if not directory.is_dir() or not any(directory.iterdir()):
+        sliced = staging / speaker / 'sliced_audios'
+        if not sliced.is_dir() or not any(sliced.iterdir()):
             raise SystemExit(f'Slicing produced no audio for {speaker}. Use Skip or check its WAV, FLAC, MP3 and OGG '
                              'files.')
-    stamp_path.write_text(json.dumps(stamp), encoding='utf-8')
-    return sliced
-
-
-def prepare_dataset(experiment, speakers):
-    data_dir = experiment / 'beatrice_data' / experiment.name
-    if data_dir.is_dir():
-        for entry in data_dir.iterdir():
-            try:
-                if os.name == 'nt':
-                    os.rmdir(entry)
-                elif entry.is_symlink():
-                    entry.unlink()
-                else:
-                    raise OSError
-            except OSError:
-                raise SystemExit(f'{data_dir} holds {entry.name}, which is not a speaker link. Remove it and try again.')
-    data_dir.mkdir(parents=True, exist_ok=True)
-    for speaker, source in speakers:
-        link_directory(source, data_dir / speaker)
+        os.replace(sliced, data_dir / speaker)
+    remove_path(staging)
     return data_dir
 
 
@@ -123,7 +165,7 @@ def write_config(experiment, args):
         if value is not None:
             config[key] = value
     config['use_amp'] = args.precision != 'fp32'
-    path = experiment / 'beatrice_config.json'
+    path = work_directory(experiment) / 'config.json'
     path.write_text(json.dumps(config, indent=4), encoding='utf-8')
     return path
 
@@ -179,22 +221,17 @@ def main():
     parser.add_argument('--silence-minimum', type=float, default=0.3)
     parser.add_argument('--silence-to', type=float, default=0.3)
     parser.add_argument('--silence-compress', type=float, default=50.0)
-    parser.add_argument('--slice-only', action='store_true')
     args = parser.parse_args()
     select_device(args.device)
     experiment = ROOT / 'logs' / args.model_name
     ensure_trainer()
+    tidy_experiment(experiment)
     speakers = dataset_speakers(experiment, args.dataset)
-    if args.cutting != 'Skip':
-        speakers = slice_dataset(experiment, speakers, args)
-    if args.slice_only:
-        return
-    data_dir = prepare_dataset(experiment, speakers)
+    data_dir = build_dataset(experiment, speakers, args)
     config = write_config(experiment, args)
-    out_dir = experiment / 'beatrice'
-    arguments = ['-d', str(data_dir), '-o', str(out_dir), '-c', str(config)]
-    if (out_dir / 'checkpoint_latest.pt.gz').is_file():
-        print(f'Resuming from {out_dir / "checkpoint_latest.pt.gz"}.', flush=True)
+    arguments = ['-d', str(data_dir), '-o', str(experiment), '-c', str(config)]
+    if (experiment / CHECKPOINT).is_file():
+        print(f'Resuming from {experiment / CHECKPOINT}.', flush=True)
         arguments.append('-r')
     launcher = write_launcher()
     sys.argv = [str(launcher), *arguments]

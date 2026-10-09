@@ -30,7 +30,7 @@ from noisereduce.torchgate import TorchGate
 from noisereduce.torchgate.utils import amp_to_db
 from torchaudio.transforms import Resample
 
-from beatrice.inference import OUT_SAMPLE_RATE, find_paraphernalia
+from beatrice.inference import OUT_SAMPLE_RATE, find_paraphernalia, is_beatrice_checkpoint
 from beatrice.realtime import BeatriceRealtime
 from rvc.infer.realtime import RealTimeRVC
 from shared.platform import migrate_models_folder
@@ -218,6 +218,11 @@ class AudioEngine:
             torch.cuda.empty_cache()
         self.settings = settings
         beatrice_path = find_paraphernalia(settings["model_path"])
+        if beatrice_path is None and is_beatrice_checkpoint(settings["model_path"]):
+            raise ValueError(
+                "This is a Beatrice training checkpoint, not a model. Select the paraphernalia_* model folder "
+                "or its .toml file from the same training run."
+            )
         self.rvc = None
         self.beatrice = None
         if beatrice_path is None:

@@ -32,14 +32,27 @@ HISTORY = 2 * IN_HOP + (PITCH_WINDOW - IN_HOP) // 2
 LATENCY_SECONDS = 0.0375
 
 
+def is_beatrice_checkpoint(path):
+    path = Path(path)
+    return path.name.startswith('checkpoint_') and path.name.endswith(('.pt.gz', '.pt'))
+
+
 def find_paraphernalia(path):
     path = Path(path)
     if path.is_file() and path.suffix == '.toml':
         return path
+    if is_beatrice_checkpoint(path):
+        path = path.parent
     if path.is_dir():
         found = sorted(path.glob('beatrice_paraphernalia_*.toml'))
         if len(found) == 1:
             return found[0]
+        folders = sorted((folder for folder in path.glob('paraphernalia_*') if folder.is_dir()),
+                         key=lambda folder: folder.stat().st_mtime, reverse=True)
+        for folder in folders:
+            found = sorted(folder.glob('beatrice_paraphernalia_*.toml'))
+            if len(found) == 1:
+                return found[0]
     return None
 
 
