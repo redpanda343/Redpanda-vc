@@ -179,6 +179,7 @@ def main():
     parser.add_argument('--silence-minimum', type=float, default=0.3)
     parser.add_argument('--silence-to', type=float, default=0.3)
     parser.add_argument('--silence-compress', type=float, default=50.0)
+    parser.add_argument('--slice-only', action='store_true')
     args = parser.parse_args()
     select_device(args.device)
     experiment = ROOT / 'logs' / args.model_name
@@ -186,6 +187,8 @@ def main():
     speakers = dataset_speakers(experiment, args.dataset)
     if args.cutting != 'Skip':
         speakers = slice_dataset(experiment, speakers, args)
+    if args.slice_only:
+        return
     data_dir = prepare_dataset(experiment, speakers)
     config = write_config(experiment, args)
     out_dir = experiment / 'beatrice'

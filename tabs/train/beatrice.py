@@ -27,7 +27,8 @@ def latest_export():
 
 def _status():
     active = _process is not None and _process.poll() is None
-    return gr.update(interactive=not active), gr.update(interactive=active), gr.Timer(active=active)
+    return (gr.update(interactive=not active), gr.update(interactive=not active), gr.update(interactive=active),
+            gr.Timer(active=active))
 
 
 def status():
@@ -35,16 +36,19 @@ def status():
         return _status()
 
 
-def print_job_completion(process, label):
+def print_job_completion(process, label, training):
     code = process.wait()
     if code != 0:
         print(f'{label} stopped with exit code {code}.', flush=True)
+        return
+    if not training:
+        print(f'{label} done. Ready to train.', flush=True)
         return
     export = latest_export()
     print(f'{label} done.' + (f' VST model folder: {export}' if export is not None else ''), flush=True)
 
 
-def launch(name, arguments):
+def launch(name, arguments, description, training=True):
     global _process, _experiment
     directory = experiment_path(name)
     with _lock:
@@ -56,16 +60,16 @@ def launch(name, arguments):
         _process = subprocess.Popen([sys.executable, '-u', '-m', 'beatrice.train', *arguments], cwd=ROOT,
                                     env=environment)
         _experiment = directory
-        label = f'Training Beatrice {name}:'
+        label = f'{description} {name}:'
         print(f'{label} started.', flush=True)
-        threading.Thread(target=print_job_completion, args=(_process, label), daemon=True).start()
-        gr.Info('Beatrice training started. Progress is shown in the console.')
+        threading.Thread(target=print_job_completion, args=(_process, label, training), daemon=True).start()
+        gr.Info(f'{description} started. Progress is shown in the console.')
         return _status()
 
 
-def start(name, dataset, steps, batch, save_interval, workers, device, cutting='Skip', chunk_len=3.0,
-          overlap_len=0.3, truncate_silence=False, silence_action='truncate', silence_threshold=-45.0,
-          silence_minimum=0.3, silence_to=0.3, silence_compress=50.0):
+def dataset_arguments(name, dataset, workers, device, cutting='Skip', chunk_len=3.0, overlap_len=0.3,
+                      truncate_silence=False, silence_action='truncate', silence_threshold=-45.0, silence_minimum=0.3,
+                      silence_to=0.3, silence_compress=50.0):
     experiment_path(name)
     dataset = str(dataset).strip().strip('"')
     if not Path(dataset).is_dir():
@@ -73,25 +77,39 @@ def start(name, dataset, steps, batch, save_interval, workers, device, cutting='
     device = str(device).strip().lower()
     if device not in {'auto', 'cpu'} and not (device.startswith('cuda:') and device[5:].isdigit()):
         raise gr.Error('Device must be auto, cpu or cuda:N.')
-    precision = get_precision() or 'fp32'
-    if precision not in {'fp32', 'fp16', 'bf16'}:
-        raise gr.Error(f'Unsupported training precision: {precision}')
     if cutting not in CUTTING_INFO:
         raise gr.Error('Choose Skip, Simple or Automatic audio cutting.')
     if silence_action not in SILENCE_ACTIONS:
         raise gr.Error('Choose a silence action.')
-    arguments = ['--model-name', str(name).strip(), '--dataset', dataset, '--precision', precision, '--device', device,
-                 '--cutting', cutting, '--chunk-len', str(float(chunk_len)), '--overlap-len', str(float(overlap_len)),
+    arguments = ['--model-name', str(name).strip(), '--dataset', dataset, '--device', device,
+                 '--workers', positive_integer(workers, 'CPU workers'), '--cutting', cutting,
+                 '--chunk-len', str(float(chunk_len)), '--overlap-len', str(float(overlap_len)),
                  '--silence-action', silence_action, '--silence-threshold', str(float(silence_threshold)),
                  '--silence-minimum', str(float(silence_minimum)), '--silence-to', str(float(silence_to)),
                  '--silence-compress', str(float(silence_compress))]
     if truncate_silence:
         arguments.append('--truncate-silence')
+    return arguments
+
+
+def slice_dataset(name, dataset, workers, device, *slicing):
+    arguments = dataset_arguments(name, dataset, workers, device, *slicing)
+    if slicing and slicing[0] == 'Skip':
+        raise gr.Error('Choose Simple or Automatic audio cutting to slice the dataset. Skip trains on the files as '
+                       'they are.')
+    return launch(name, [*arguments, '--slice-only'], 'Slicing Beatrice dataset', training=False)
+
+
+def start(name, dataset, workers, device, steps, batch, save_interval, *slicing):
+    arguments = dataset_arguments(name, dataset, workers, device, *slicing)
+    precision = get_precision() or 'fp32'
+    if precision not in {'fp32', 'fp16', 'bf16'}:
+        raise gr.Error(f'Unsupported training precision: {precision}')
+    arguments.extend(['--precision', precision])
     for flag, value, label in (('--steps', steps, 'Training steps'), ('--batch-size', batch, 'Batch size'),
-                               ('--save-interval', save_interval, 'Save interval'),
-                               ('--workers', workers, 'CPU workers')):
+                               ('--save-interval', save_interval, 'Save interval')):
         arguments.extend([flag, positive_integer(value, label)])
-    return launch(name, arguments)
+    return launch(name, arguments, 'Training Beatrice')
 
 
 def stop():
@@ -128,34 +146,39 @@ def beatrice_train_tab():
     with gr.Row():
         name = gr.Textbox(label='Model name', value='my-beatrice')
         device = gr.Textbox(label='Device', value='auto', info='auto, cpu or cuda:N. Beatrice trains on one GPU.')
-    dataset = gr.Textbox(label='Dataset folder',
-                         info='Audio files directly in this folder train one voice named after the model. A folder '
-                              'holding only subfolders trains one voice per subfolder. With Skip, WAV, FLAC, MP3, OGG, '
-                              'Opus and AIFF are read as they are.')
-    slicing = slicing_controls(value='Skip',
-                               note="Skip trains on the files as they are. Simple and Automatic first write WAV "
-                                    "slices at the Beatrice model's 24 kHz sample rate from the WAV, FLAC, MP3 and OGG "
-                                    'files to logs/<model>/beatrice_sliced and reuse them on resume while the dataset '
-                                    'and settings are unchanged.')
-    with gr.Row():
-        steps = gr.Number(label='Training steps', value=10000, minimum=1, precision=0,
-                          info='Upstream default 10000, about 40 minutes on an RTX 4090. Raise it to continue a '
-                               'finished model.')
-        batch = gr.Number(label='Batch size', value=8, minimum=1, precision=0,
-                          info='4-second clips per step. Lower it to reduce GPU memory use.')
-        save_interval = gr.Number(label='Save interval (steps)', value=2000, minimum=1, precision=0,
-                                  info='Saves a resumable checkpoint, a VST model folder and TensorBoard previews.')
+    with gr.Accordion('1. Prepare dataset', open=True):
+        dataset = gr.Textbox(label='Dataset folder',
+                             info='Audio files directly in this folder train one voice named after the model. A '
+                                  'folder holding only subfolders trains one voice per subfolder. With Skip, WAV, FLAC, '
+                                  'MP3, OGG, Opus and AIFF are read as they are.')
         workers = gr.Number(label='CPU workers', value=min(8, os.cpu_count() or 1), minimum=1, precision=0,
                             info='Processes that slice the dataset and data loader processes that decode and '
                                  'augment audio.')
-    gr.Markdown('Training precision follows **Settings → Training → Precision**: fp32 trains in full precision, '
-                "fp16 or bf16 turn on the trainer's FP16 mixed precision.")
-    with gr.Row():
-        train_button = gr.Button('Start / resume Beatrice training', variant='primary')
-        stop_button = gr.Button('Stop current Beatrice job', interactive=False)
+        slicing = slicing_controls(value='Skip',
+                                   note="Skip trains on the files as they are. Simple and Automatic write WAV slices "
+                                        "at the Beatrice model's 24 kHz sample rate from the WAV, FLAC, MP3 and OGG "
+                                        'files to logs/<model>/beatrice_sliced. Training slices the dataset first if '
+                                        'it has not been sliced with these settings.')
+        slice_button = gr.Button('Slice dataset')
+    with gr.Accordion('2. Train Beatrice', open=True):
+        with gr.Row():
+            steps = gr.Number(label='Training steps', value=10000, minimum=1, precision=0,
+                              info='Upstream default 10000, about 40 minutes on an RTX 4090. Raise it to continue a '
+                                   'finished model.')
+            batch = gr.Number(label='Batch size', value=8, minimum=1, precision=0,
+                              info='4-second clips per step. Lower it to reduce GPU memory use.')
+            save_interval = gr.Number(label='Save interval (steps)', value=2000, minimum=1, precision=0,
+                                      info='Saves a resumable checkpoint, a VST model folder and TensorBoard '
+                                           'previews.')
+        gr.Markdown('Training precision follows **Settings → Training → Precision**: fp32 trains in full precision, '
+                    "fp16 or bf16 turn on the trainer's FP16 mixed precision.")
+        with gr.Row():
+            train_button = gr.Button('Start / resume Beatrice training', variant='primary')
+            stop_button = gr.Button('Stop current Beatrice job', interactive=False)
     timer = gr.Timer(2)
-    outputs = [train_button, stop_button, timer]
-    train_button.click(start, [name, dataset, steps, batch, save_interval, workers, device, *slicing.inputs], outputs,
+    outputs = [slice_button, train_button, stop_button, timer]
+    slice_button.click(slice_dataset, [name, dataset, workers, device, *slicing.inputs], outputs, queue=False)
+    train_button.click(start, [name, dataset, workers, device, steps, batch, save_interval, *slicing.inputs], outputs,
                        queue=False)
     stop_button.click(stop, [], outputs, queue=False)
     timer.tick(status, [], outputs, queue=False, show_progress='hidden')
