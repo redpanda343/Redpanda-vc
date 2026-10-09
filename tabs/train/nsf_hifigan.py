@@ -177,7 +177,8 @@ def nsf_hifigan_train_tab():
             batch = gr.Number(label='Batch size', value=TRAINING['batch_size'], minimum=1, precision=0,
                               info='Clips per step and GPU. Lower it to reduce GPU memory use.')
             crop_frames = gr.Number(label='Crop length (mel frames)', value=TRAINING['crop_mel_frames'], minimum=1,
-                                    precision=0, info='32 frames is about 0.37 s. Lower it to reduce GPU memory use.')
+                                    precision=0, info='32 frames is about 0.37 s. Higher gives better results but uses '
+                                                      'more GPU memory; lower it if training runs out of memory.')
             checkpoint_interval = gr.Number(label='Checkpoint interval (steps)', value=TRAINING['checkpoint_interval'],
                                             minimum=1, precision=0, info='Validation runs at the same interval.')
             max_updates = gr.Number(label='Max training steps', value=0, minimum=0, precision=0,
