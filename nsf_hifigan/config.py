@@ -41,7 +41,6 @@ TRAINING = dict(
     key_aug_max=1.4,
     discriminator_warmup=0,
     max_updates=100000,
-    finetune_max_updates=10000,
     checkpoint_interval=1000,
     eval_interval=1000,
     log_interval=100,
@@ -49,6 +48,13 @@ TRAINING = dict(
     num_valid_plots=10,
     num_workers=4,
     prefetch_factor=2,
+)
+FINETUNE = dict(
+    max_updates=100000,
+    grad_clip=1.0,
+    checkpoint_interval=2000,
+    eval_interval=2000,
+    num_valid_plots=100,
 )
 OVERRIDABLE = ('batch_size', 'crop_mel_frames', 'learning_rate', 'finetune_learning_rate', 'key_aug', 'max_updates',
                'checkpoint_interval', 'eval_interval', 'num_workers')
@@ -96,8 +102,8 @@ def apply_overrides(config, overrides):
 
 def validate(config):
     settings = config['train']
-    for name in ('batch_size', 'crop_mel_frames', 'max_updates', 'finetune_max_updates', 'checkpoint_interval',
-                 'eval_interval', 'log_interval', 'num_ckpt_keep', 'prefetch_factor'):
+    for name in ('batch_size', 'crop_mel_frames', 'max_updates', 'checkpoint_interval', 'eval_interval',
+                 'log_interval', 'num_ckpt_keep', 'prefetch_factor'):
         value = settings[name]
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError(f'{name} must be a positive integer.')

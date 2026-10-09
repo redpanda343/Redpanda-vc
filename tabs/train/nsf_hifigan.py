@@ -3,7 +3,7 @@ from pathlib import Path
 import gradio as gr
 
 from nsf_hifigan.checkpoints import finetune_sources, latest_checkpoint
-from nsf_hifigan.config import KINDS, PITCH_EXTRACTORS, PRECISIONS, TRAINING, experiment_paths, read_json
+from nsf_hifigan.config import FINETUNE, KINDS, PITCH_EXTRACTORS, PRECISIONS, TRAINING, experiment_paths, read_json
 from rectified_flow.resources import VOCODERS
 from tabs.train.jobs import ROOT, JobRunner, device_id, experiment_path, positive_integer
 from tabs.train.slicing import preprocess_step, slicing_controls
@@ -108,10 +108,10 @@ def start(name, kind, source, discriminator_warmup, precision, batch, crop_frame
         arguments.extend(['--pretrained', source, '--discriminator-warmup',
                           str(int(discriminator_warmup or 0))])
     for flag, value, label in (('--batch-size', batch, 'Batch size'),
-                               ('--crop-mel-frames', crop_frames, 'Crop length'),
-                               ('--checkpoint-interval', checkpoint_interval, 'Checkpoint interval')):
+                               ('--crop-mel-frames', crop_frames, 'Crop length')):
         arguments.extend([flag, positive_integer(value, label)])
-    for flag, value in (('--max-updates', optional_number(max_updates, 'Max training steps')),
+    for flag, value in (('--checkpoint-interval', optional_number(checkpoint_interval, 'Checkpoint interval')),
+                        ('--max-updates', optional_number(max_updates, 'Max training steps')),
                         ('--learning-rate', optional_number(learning_rate, 'Learning rate', integer=False))):
         if value is not None:
             arguments.extend([flag, value])
@@ -168,9 +168,10 @@ def nsf_hifigan_train_tab():
                                       'checkpoint yet.')
             refresh = gr.Button('Refresh', scale=1)
         with gr.Row():
-            discriminator_warmup = gr.Number(label='Discriminator warm-up (steps)', value=1000, minimum=0, precision=0,
-                                             info='Released vocoders ship without discriminator weights, so only the '
-                                                  'discriminator trains for these first steps.')
+            discriminator_warmup = gr.Number(label='Discriminator warm-up (steps)', value=0, minimum=0, precision=0,
+                                             info='Released vocoders ship without discriminator weights; only the '
+                                                  'discriminator trains for these first steps. 0 trains both from the '
+                                                  'start, as SingingVocoders fine-tuning does.')
             precision = gr.Radio(label='Precision', choices=list(PRECISIONS), value='fp32',
                                  info='SingingVocoders trains in fp32 and advises against bf16.')
         with gr.Row():
@@ -179,10 +180,12 @@ def nsf_hifigan_train_tab():
             crop_frames = gr.Number(label='Crop length (mel frames)', value=TRAINING['crop_mel_frames'], minimum=1,
                                     precision=0, info='32 frames is about 0.37 s. Higher gives better results but uses '
                                                       'more GPU memory; lower it if training runs out of memory.')
-            checkpoint_interval = gr.Number(label='Checkpoint interval (steps)', value=TRAINING['checkpoint_interval'],
-                                            minimum=1, precision=0, info='Validation runs at the same interval.')
+            checkpoint_interval = gr.Number(label='Checkpoint interval (steps)', value=0, minimum=0, precision=0,
+                                            info=f"0 uses {FINETUNE['checkpoint_interval']} to fine-tune, "
+                                                 f"{TRAINING['checkpoint_interval']} from scratch, or the experiment's "
+                                                 'saved value. Validation runs at the same interval.')
             max_updates = gr.Number(label='Max training steps', value=0, minimum=0, precision=0,
-                                    info=f"0 uses {TRAINING['finetune_max_updates']} to fine-tune, "
+                                    info=f"0 uses {FINETUNE['max_updates']} to fine-tune, "
                                          f"{TRAINING['max_updates']} from scratch, or the experiment's saved value.")
             learning_rate = gr.Number(label='Learning rate', value=0, minimum=0,
                                       info=f"0 uses {TRAINING['finetune_learning_rate']:g} to fine-tune, "

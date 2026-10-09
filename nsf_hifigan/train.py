@@ -1,6 +1,7 @@
 import argparse
 import logging
 import os
+from copy import deepcopy
 from pathlib import Path
 
 import lightning.pytorch as pl
@@ -13,7 +14,8 @@ from nsf_hifigan.checkpoints import (
     checkpoint_path, export_vocoder, latest_checkpoint, load_source, prune_checkpoints,
 )
 from nsf_hifigan.config import (
-    KINDS, PRECISIONS, ROOT, apply_overrides, experiment_paths, new_config, read_json, validate, write_json,
+    FINETUNE, KINDS, PRECISIONS, ROOT, apply_overrides, experiment_paths, new_config, read_json, validate,
+    write_json,
 )
 from nsf_hifigan.data import VocoderData
 from nsf_hifigan.task import VocoderTask
@@ -109,7 +111,7 @@ def prepare_config(paths, args, resuming):
             source = load_source(args.pretrained, index['data'])
         config = new_config(args.kind, index['data'], source['hparams'] if source else None, args.pretrained or None)
         if source:
-            config['train']['max_updates'] = config['train']['finetune_max_updates']
+            config['train'].update(deepcopy(FINETUNE))
             if source['discriminator'] is None:
                 config['train']['discriminator_warmup'] = max(0, args.discriminator_warmup)
     learning_rate = 'finetune_learning_rate' if config['pretrained'] else 'learning_rate'
@@ -169,7 +171,7 @@ def main():
     parser.add_argument('--pretrained', default='',
                         help='Fine-tune source for a new experiment: a Rectified Flow vocoder name or a '
                              '.ckpt/.onnx path. Ignored when resuming.')
-    parser.add_argument('--discriminator-warmup', type=int, default=1000,
+    parser.add_argument('--discriminator-warmup', type=int, default=0,
                         help='Steps that train only the discriminator when the source has no discriminator weights.')
     parser.add_argument('--batch-size', type=int)
     parser.add_argument('--crop-mel-frames', type=int)
