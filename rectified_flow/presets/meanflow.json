@@ -8,6 +8,7 @@
     "lr_final_ratio": 0.05,
     "max_batch_frames": 16000,
     "max_batch_size": 16,
+    "max_updates": 300000,
     "precision": "fp32",
     "model": {
       "mean_flow": true,
