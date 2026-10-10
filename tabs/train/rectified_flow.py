@@ -5,7 +5,7 @@ import gradio as gr
 from tabs.settings.sections.precision import get_precision
 from tabs.train.jobs import ROOT, JobRunner, device_id, experiment_path, positive_integer
 from tabs.train.slicing import preprocess_step, slicing_controls
-from rectified_flow.config import PRESETS, default_config, preset_path
+from rectified_flow.config import default_config, preset_path
 from rectified_flow.resources import (CUSTOM_VOCODER_ROOT, DEFAULT_VOCODER, VOCODERS, custom_vocoder_file,
                                       custom_vocoders, vocoder_path, vocoder_title)
 
@@ -22,12 +22,12 @@ def status():
 
 def preset_value(key):
     try:
-        values = [default_config(preset=preset)['flow'][key] for preset in PRESETS]
+        values = [default_config(preset=preset)['flow'][key] for preset in ('standard', 'meanflow')]
     except (KeyError, ValueError):
         return 'see the preset files'
     if all(value == values[0] for value in values):
         return str(values[0])
-    return ', '.join(f'{preset} {value}' for preset, value in zip(PRESETS, values))
+    return ', '.join(f'{preset} {value}' for preset, value in zip(('standard', 'meanflow'), values))
 
 
 def preset_info(key, unit=''):
@@ -119,7 +119,7 @@ def start(name, batch, max_frames, max_updates, checkpoint_interval, device, use
         raise gr.Error('Extract features for this experiment first.')
     variance_embeds = None if (directory / 'rectified_config.json').is_file() else True
     pretrained = resolve_pretrained(directory, use_pretrained, pretrained_path)
-    preset = 'smaller' if realtime else 'standard'
+    preset = 'meanflow' if realtime else 'standard'
     from rectified_flow.train_flow import experiment_pitch_extractor, load_training_config
 
     pitch_extractor = experiment_pitch_extractor(directory)
@@ -163,6 +163,10 @@ def stop():
     return runner.stop(IDLE_CONTROLS)
 
 
+def realtime_options(enabled):
+    return gr.update(value=False, interactive=False) if enabled else gr.update(interactive=True)
+
+
 def rectified_train_tab():
     gr.Markdown('### Rectified Flow')
     gr.Markdown("Trains a voice conversion model with the same architecture as "
@@ -202,7 +206,7 @@ def rectified_train_tab():
         refresh_vocoder_button.click(refresh_vocoders, vocoder, vocoder, queue=False)
         gr.Markdown('Training precision follows **Settings → Training → Precision**. New experiments copy their '
                     f'training settings from `{preset_path("standard").relative_to(ROOT).as_posix()}`, or '
-                    f'`{preset_path("smaller").relative_to(ROOT).as_posix()}` with **Smaller model**; edit those '
+                    f'`{preset_path("meanflow").relative_to(ROOT).as_posix()}` with **EXPERIMENTAL: Realtime model**; edit those '
                     'files to train with custom settings. A started experiment keeps its own copy in '
                     '`logs/<model>/rectified_config.json`.')
         with gr.Row():
@@ -215,12 +219,13 @@ def rectified_train_tab():
                                info=preset_info('max_updates', ' Lightning training steps'))
             checkpoint_interval = gr.Number(label='Checkpoint interval (updates)', value=0, minimum=0, precision=0,
                                    info=preset_info('checkpoint_interval', ' updates'))
-        realtime = gr.Checkbox(label='Smaller model', value=False,
-                               info='Lower vram usage and faster inference speeds, may decrease the quality of the model')
+        realtime = gr.Checkbox(label='EXPERIMENTAL: Realtime model', value=False,
+                               info='Compact MeanFlow model trained for one or two inference steps.')
         use_fused_kernels = gr.Checkbox(label='Fused Linear + SoftSignGLU kernels', value=False,
                                        info='Set it when starting a new experiment: the experiment then trains with SoftSignGLU so the '
                                             'kernels can run. Experiments and pretrained checkpoints that use ATanGLU cannot enable it. '
                                             'Requires Triton and CUDA FP16 or BF16 for acceleration.')
+        realtime.change(realtime_options, realtime, use_fused_kernels, queue=False)
         with gr.Row():
             train_button = gr.Button('Start / resume rectified training', variant='primary')
             stop_button = gr.Button('Stop current rectified job', interactive=False)

@@ -13,6 +13,7 @@ The realtime GUI (`run-realtime-gui.bat`) supports RVC, Beatrice and Rectified F
 ## Credits
 
 - [DiffSinger](https://github.com/openvpi/DiffSinger)
+- [MeanVC2](https://github.com/ASLP-lab/MeanVC2) by ASLP-lab for the optional MeanFlow training method.
 - [RVC-Realtime-GUI](https://github.com/niel-blue/RVC-Realtime-GUI/)
 - [Retrieval-based-Voice-Conversion-WebUI](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI)
 - [Applio](https://github.com/IAHispano/Applio)

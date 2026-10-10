@@ -5,7 +5,7 @@ from pathlib import Path
 
 PRESET_DIR = Path(__file__).resolve().parent / 'presets'
 
-PRESETS = ('standard', 'smaller')
+PRESETS = ('standard', 'smaller', 'meanflow')
 
 FINETUNE_KEY = 'finetune'
 
@@ -36,6 +36,10 @@ def read_preset(preset):
 def base_config():
     config = read_preset('standard')
     config.pop(FINETUNE_KEY, None)
+    config['flow']['model'].update(mean_flow=False, mean_flow_args=dict(
+        flow_ratio=0.75, time_mu=-0.4, time_sigma=1.0, cfg_ratio=0.2,
+        cfg_scale=2.0, loss_p=0.5, loss_eps=1e-3,
+    ))
     return config
 
 
@@ -74,6 +78,8 @@ def default_config(finetune=False, preset='standard'):
 
 
 def architecture(model):
-    return (model['hidden_channels'], model['encoder_layers'],
-            model['backbone_args']['channels'], model['backbone_args']['layers'],
-            model['aux_decoder']['channels'], model['aux_decoder']['layers'])
+    size = (model.get('mean_flow', False), model['hidden_channels'], model['encoder_layers'],
+            model['backbone_args']['channels'], model['backbone_args']['layers'])
+    return size if model.get('mean_flow', False) else size + (
+        model['aux_decoder']['channels'], model['aux_decoder']['layers'],
+    )

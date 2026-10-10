@@ -60,6 +60,8 @@ def configure_fused_backbone(model, enabled, device, amp_dtype, max_frames):
         layer.use_fused_kernels = False
     if not enabled:
         return 0
+    if getattr(model, 'mean_flow', False):
+        raise ValueError('MeanFlow requires unfused operations for its training derivative. Disable fused kernels.')
     if any(layer.glu_type != 'softsign_glu' for layer in model.backbone.layers):
         raise ValueError('Fused kernels require SoftSignGLU. Existing ATanGLU experiments must keep this option disabled.')
     if device.type != 'cuda' or amp_dtype is None:
@@ -116,16 +118,20 @@ def preview(model, vocoder, reference, data, writer, step, index=None):
         generated = model.sample(content, f0, speaker, mask,
                                  source_mel=normalize_mel(mel.to(device), data) if model.val_gt_start else None,
                                  variances=variances)
-        predicted = model.predict_mel(content, f0, speaker, mask, variances=variances)
-    if not torch.isfinite(generated).all() or not torch.isfinite(predicted).all():
+        predicted = model.predict_mel(content, f0, speaker, mask, variances=variances) if hasattr(model, 'aux') else None
+    if not torch.isfinite(generated).all() or predicted is not None and not torch.isfinite(predicted).all():
         raise FloatingPointError('Non-finite flow preview.')
-    for name, value in (('flow', generated[0]), ('reference', normalize_mel(mel[0], data)), ('predictor', predicted[0])):
+    plots = [('flow', generated[0]), ('reference', normalize_mel(mel[0], data))]
+    if predicted is not None:
+        plots.append(('predictor', predicted[0]))
+    for name, value in plots:
         writer.add_image(f'mel/{name}{suffix}', (value / 6.0 + 0.5).clamp(0, 1).cpu(), step, dataformats='HW')
     if vocoder is None:
         return
     previews = [('flow', vocoder(generated, f0)[0]), ('reference', audio[0]),
-                ('vocoder_on_real_mel', vocoder(normalize_mel(mel.to(device), data), f0)[0]),
-                ('predictor', vocoder(predicted, f0)[0])]
+                ('vocoder_on_real_mel', vocoder(normalize_mel(mel.to(device), data), f0)[0])]
+    if predicted is not None:
+        previews.append(('predictor', vocoder(predicted, f0)[0]))
     for name, value in previews:
         if not torch.isfinite(value).all():
             raise FloatingPointError(f'Non-finite {name} preview.')
@@ -133,6 +139,8 @@ def preview(model, vocoder, reference, data, writer, step, index=None):
 
 
 def require_fused_activation(config, enabled):
+    if enabled and config['flow']['model'].get('mean_flow', False):
+        raise ValueError('MeanFlow requires unfused operations for its training derivative. Disable fused kernels.')
     activation = config['flow']['model']['backbone_args']['glu_type']
     if enabled and activation != 'softsign_glu':
         raise ValueError(f'Fused kernels need SoftSignGLU, but this experiment or pretrained checkpoint uses {activation}. '
@@ -147,6 +155,8 @@ def experiment_pitch_extractor(experiment):
 
 def load_training_config(experiment, pretrained_flow=None, use_fused_kernels=False, preset='standard',
                          pitch_extractor='parselmouth', variance_embeds=None):
+    if preset == 'meanflow' and use_fused_kernels:
+        raise ValueError('MeanFlow requires unfused operations for its training derivative. Disable fused kernels.')
     config_path = experiment / 'rectified_config.json'
     if config_path.exists():
         config = resolve_config(json.loads(config_path.read_text(encoding='utf-8')))
@@ -167,11 +177,15 @@ def load_training_config(experiment, pretrained_flow=None, use_fused_kernels=Fal
                                            use_voicing_embed=bool(variance_embeds))
         if use_fused_kernels and not pretrained_flow:
             config['flow']['model']['backbone_args']['glu_type'] = 'softsign_glu'
+    mean_flow = config['flow']['model'].get('mean_flow', False)
+    if mean_flow != (preset == 'meanflow'):
+        selected = 'EXPERIMENTAL: Realtime model' if mean_flow else 'standard rectified flow'
+        raise ValueError(f'{source} uses {selected}. Select the matching training method or use a new experiment.')
     sizes = {name: architecture(default_config(preset=name)['flow']['model']) for name in PRESETS}
     size = architecture(config['flow']['model'])
     matches = [name for name in PRESETS if sizes[name] == size]
-    if matches and preset not in matches:
-        raise ValueError(f'{source} uses the {matches[0]} model size. Set the Smaller model option to match it, '
+    if matches and preset not in matches and not (preset == 'standard' and matches == ['smaller']):
+        raise ValueError(f'{source} uses the {matches[0]} model size. Set the training model option to match it, '
                          'or start a new experiment.')
     model = config['flow']['model']
     if variance_embeds is not None and (model['use_breathiness_embed'] or model['use_voicing_embed']) != bool(variance_embeds):

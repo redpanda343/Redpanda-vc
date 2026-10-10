@@ -340,6 +340,8 @@ class RectifiedFlow(nn.Module):
 
 
 def validate_model_config(model: dict):
+    if not isinstance(model.get('mean_flow', False), bool):
+        raise ValueError('mean_flow must be a boolean.')
     for name in ('use_rope', 'rope_interleaved', 'use_spk_id', 'key_shift', 'speed', 'dual_timestep',
                  'train_aux_decoder', 'train_diffusion', 'val_gt_start', 'use_breathiness_embed',
                  'use_voicing_embed'):
@@ -354,18 +356,30 @@ def validate_model_config(model: dict):
         raise ValueError('rope_theta must be finite and positive.')
     if model['backbone_args']['glu_type'] not in {'atanglu', 'softsign_glu'}:
         raise ValueError(f"Unsupported flow activation: {model['backbone_args']['glu_type']!r}.")
-    if model['sampling_method'] not in SAMPLERS:
+    if model.get('mean_flow', False):
+        from rectified_flow.mean_flow import validate_mean_flow_config
+
+        validate_mean_flow_config(model)
+    elif model['sampling_method'] not in SAMPLERS:
         raise ValueError(f'Flow sampler must be one of {SAMPLERS}.')
 
 
 def build_flow(config: dict, speaker_count: int) -> RectifiedFlow:
     config = resolve_config(config)
-    model = config["flow"]["model"]
+    model = dict(config["flow"]["model"])
     validate_model_config(model)
-    if (model["sampling_method"], model["sampling_steps"]) == LEGACY_SAMPLER:
+    mean_flow = model.pop('mean_flow')
+    mean_flow_args = model.pop('mean_flow_args')
+    if not mean_flow and (model["sampling_method"], model["sampling_steps"]) == LEGACY_SAMPLER:
         model = dict(model, sampling_method=DEFAULT_SAMPLER[0], sampling_steps=DEFAULT_SAMPLER[1])
     data = config["data"]
-    return RectifiedFlow(
+    model_class = RectifiedFlow
+    if mean_flow:
+        from rectified_flow.mean_flow import MeanFlow
+
+        model_class = MeanFlow
+        model['mean_flow_args'] = mean_flow_args
+    return model_class(
         n_mels=data["n_mels"], speaker_count=speaker_count,
         content_step=data['hop_length'] * 100 / data['sample_rate'],
         mel_mean=float(data['mel_mean']), mel_std=float(data['mel_std']), **model,

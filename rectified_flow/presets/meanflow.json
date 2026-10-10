@@ -1,0 +1,43 @@
+{
+  "flow": {
+    "optimizer": "adamw",
+    "learning_rate": 0.0001,
+    "weight_decay": 0.01,
+    "lr_schedule": "cosine",
+    "warmup_steps": 20000,
+    "lr_final_ratio": 0.05,
+    "max_batch_frames": 16000,
+    "max_batch_size": 16,
+    "precision": "fp32",
+    "model": {
+      "mean_flow": true,
+      "hidden_channels": 256,
+      "encoder_layers": 4,
+      "backbone_args": {
+        "channels": 512,
+        "layers": 6
+      },
+      "dual_timestep": false,
+      "t_start": 0.0,
+      "t_start_infer": 0.0,
+      "sampling_method": "mean",
+      "sampling_steps": 2,
+      "train_aux_decoder": false,
+      "val_gt_start": false
+    }
+  },
+  "finetune": {
+    "flow": {
+      "finetune_learning_rate": 0.00005,
+      "finetune_warmup_steps": 500,
+      "augmentation_args": {
+        "random_pitch_shifting": {
+          "enabled": false
+        },
+        "random_time_stretching": {
+          "enabled": false
+        }
+      }
+    }
+  }
+}

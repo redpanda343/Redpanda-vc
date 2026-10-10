@@ -226,6 +226,8 @@ class RealTimeRVC:
 
             if int(rectified_steps) != rectified_steps or not 0 <= rectified_steps <= 1000:
                 raise ValueError("Flow steps must be an integer between 0 and 1000.")
+            if getattr(self.model, 'mean_flow', False) and rectified_steps not in (0, 1, 2):
+                raise ValueError("This model supports one or two flow steps (0 uses its default).")
             self.rectified_steps = int(rectified_steps) or None
             self.flow_context_frames = None
             if rectified_flow_window:

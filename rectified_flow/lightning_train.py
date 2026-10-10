@@ -488,6 +488,7 @@ def fit(args, config, root):
     has_validation = bool(data.held and settings['eval_interval'])
     trainer = pl.Trainer(
         **options, num_nodes=settings['num_nodes'], strategy=strategy, precision=precision,
+        inference_mode=not settings['model'].get('mean_flow', False),
         callbacks=[FlowCheckpoint(output, args, settings, has_validation), FlowPreview(args), FlowProgress()],
         enable_progress_bar=False, enable_model_summary=False,
         logger=TensorBoardLogger(save_dir=str(output), name='lightning_logs', version='latest'),
