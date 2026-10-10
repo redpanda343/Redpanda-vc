@@ -1,5 +1,6 @@
 import hashlib
 import os
+import shutil
 import sys
 import tempfile
 import soxr
@@ -129,18 +130,14 @@ def _sha256(file_path):
 def _download_file(url, destination_path, expected_sha256=None):
     directory = os.path.dirname(destination_path)
     os.makedirs(directory, exist_ok=True)
-    temporary_path = None
+    temporary_directory = tempfile.mkdtemp(
+        dir=directory, prefix=f".{os.path.basename(destination_path)}.", suffix=".part"
+    )
     try:
-        with tempfile.NamedTemporaryFile(
-            delete=False,
-            dir=directory,
-            prefix=f".{os.path.basename(destination_path)}.",
-            suffix=".part",
-        ) as temporary_file:
-            temporary_path = temporary_file.name
-
         print(f"Downloading {url} to {directory}...")
-        wget.download(url, out=temporary_path)
+        temporary_path = wget.download(
+            url, out=os.path.join(temporary_directory, os.path.basename(destination_path))
+        )
 
         if expected_sha256 is not None and _sha256(temporary_path) != expected_sha256:
             raise RuntimeError(
@@ -149,10 +146,8 @@ def _download_file(url, destination_path, expected_sha256=None):
             )
 
         os.replace(temporary_path, destination_path)
-        temporary_path = None
     finally:
-        if temporary_path is not None and os.path.exists(temporary_path):
-            os.remove(temporary_path)
+        shutil.rmtree(temporary_directory, ignore_errors=True)
 
 
 def extract_embedding_features(model, source, version):
