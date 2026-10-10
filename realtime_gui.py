@@ -1027,7 +1027,7 @@ class RealtimeGUI:
         self.f0_method = tk.StringVar(value=f0_method if f0_method in PITCH_METHODS.values() else "rmvpe")
         self.block_times = {
             "rvc": value.get("block_time", 0.3),
-            "beatrice": min(max(value.get("beatrice_block_time", 0.02), 0.02), 0.05),
+            "beatrice": min(max(value.get("beatrice_block_time", 0.02), 0.02), 0.3),
         }
         self.block_kind = "rvc"
         self.block_time = tk.DoubleVar(value=self.block_times["rvc"])
@@ -1266,7 +1266,7 @@ class RealtimeGUI:
             frame, 0, "Block time", self.block_time, 0.02, 1.5, 0.01,
             tooltip=(
                 "Seconds of audio per step. Lower is less latency but more load. "
-                "Beatrice: 0.02-0.05 s, default 0.02 s."
+                "Beatrice: 0.02-0.30 s, default 0.02 s."
             ),
         )
         self.block_time_slider = block_widgets[-2]
@@ -1313,7 +1313,7 @@ class RealtimeGUI:
             self.block_kind = kind
             self.block_time.set(self.block_times[kind])
         block_time = self.block_time.get()
-        self.block_time_slider.configure(to=0.05 if beatrice else 1.5)
+        self.block_time_slider.configure(to=0.3 if beatrice else 1.5)
         self.block_time_slider.set(block_time)
         running = self.engine.running
         for widget in self.rvc_widgets | self.locked_widgets:
