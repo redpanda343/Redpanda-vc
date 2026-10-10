@@ -1,4 +1,5 @@
 import ctypes
+import gc
 import json
 import math
 import os
@@ -69,15 +70,17 @@ class BlockTorchGate(TorchGate):
         return y.to(dtype=x.dtype)
 
 
+DEVICE_BUFFERS = (
+    "input_wav", "input_wav_denoise", "input_wav_res", "sola_buffer", "sola_den_kernel", "nr_buffer",
+    "output_buffer", "fade_in_window", "fade_out_window", "resampler", "resampler2", "tg",
+)
+
+
 def release_flow_models():
-    released = False
     for module_name, cache_name in (("rectified_flow.pitch", "_RMVPE"), ("rectified_flow.variance", "_SEPARATORS")):
         cache = getattr(sys.modules.get(module_name), cache_name, None)
         if cache:
             cache.clear()
-            released = True
-    if released and torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
 
 def db_to_linear(db):
@@ -241,10 +244,6 @@ class AudioEngine:
 
     def start(self, settings):
         self.stop()
-        self.rvc = None
-        self.beatrice = None
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
         self.settings = settings
         beatrice_path = find_paraphernalia(settings["model_path"])
         if beatrice_path is None and is_beatrice_checkpoint(settings["model_path"]):
@@ -266,10 +265,7 @@ class AudioEngine:
             )
             model_rate = self.rvc.sample_rate
             self.device = self.rvc.device
-            if not self.rvc.is_rectified:
-                release_flow_models()
         else:
-            release_flow_models()
             model_rate = OUT_SAMPLE_RATE
             self.device = torch.device("cpu")
         self.input_device = settings["input_device"]
@@ -677,6 +673,17 @@ class AudioEngine:
         self.output_fifo = None
         self.monitor_queue = None
         self.input_fifo = None
+        self._release_models()
+
+    def _release_models(self):
+        self.rvc = None
+        self.beatrice = None
+        for name in DEVICE_BUFFERS:
+            setattr(self, name, None)
+        release_flow_models()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def update_pitch(self, pitch):
         if self.beatrice is not None:
