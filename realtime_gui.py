@@ -46,6 +46,7 @@ from shared.platform import migrate_models_folder
 ROOT = Path(__file__).resolve().parent
 migrate_models_folder(ROOT)
 CONFIG_PATH = ROOT / "assets" / "realtime_config.json"
+BEATRICE_BLOCK_TIME = 0.02
 MONITOR_DISABLED = "Disabled"
 MAIN_HOST_APIS = ("ASIO", "Windows WASAPI")
 EMBEDDERS = ("contentvec", "spin-v2")
@@ -448,7 +449,8 @@ class AudioEngine:
         rate = self.sample_rate
         device = self.device
         self.zc = rate // 100
-        self.block_frame = int(np.round(settings["block_time"] * rate / self.zc)) * self.zc
+        block_time = BEATRICE_BLOCK_TIME if self.rvc is None else settings["block_time"]
+        self.block_frame = int(np.round(block_time * rate / self.zc)) * self.zc
         self.block_frame_16k = 160 * self.block_frame // self.zc
         if self.rvc is None:
             self.crossfade_frame = self.zc
@@ -1027,7 +1029,7 @@ class RealtimeGUI:
         self.f0_method = tk.StringVar(value=f0_method if f0_method in PITCH_METHODS.values() else "rmvpe")
         self.block_times = {
             "rvc": value.get("block_time", 0.3),
-            "beatrice": min(max(value.get("beatrice_block_time", 0.02), 0.02), 0.3),
+            "beatrice": BEATRICE_BLOCK_TIME,
         }
         self.block_kind = "rvc"
         self.block_time = tk.DoubleVar(value=self.block_times["rvc"])
@@ -1266,10 +1268,12 @@ class RealtimeGUI:
             frame, 0, "Block time", self.block_time, 0.02, 1.5, 0.01,
             tooltip=(
                 "Seconds of audio per step. Lower is less latency but more load. "
-                "Beatrice: 0.02-0.30 s, default 0.02 s."
+                "Beatrice always uses 0.02 s."
             ),
         )
         self.block_time_slider = block_widgets[-2]
+        self.block_time_slider.configure(variable=self.block_time)
+        self.rvc_widgets.update(block_widgets)
         self.locked_widgets.update(block_widgets)
         crossfade = self._slider(frame, 1, "Crossfade", self.crossfade_time, 0.01, 0.02, 0.01)
         extra = self._slider(
@@ -1312,9 +1316,8 @@ class RealtimeGUI:
             self.block_times[self.block_kind] = self.block_time.get()
             self.block_kind = kind
             self.block_time.set(self.block_times[kind])
-        block_time = self.block_time.get()
-        self.block_time_slider.configure(to=0.3 if beatrice else 1.5)
-        self.block_time_slider.set(block_time)
+        if beatrice:
+            self.block_time.set(BEATRICE_BLOCK_TIME)
         running = self.engine.running
         for widget in self.rvc_widgets | self.locked_widgets:
             disabled = (beatrice and widget in self.rvc_widgets) or (running and widget in self.locked_widgets)
@@ -1461,7 +1464,7 @@ class RealtimeGUI:
             "formant_shift": self.formant_shift.get(),
             "vq_neighbors": self.vq_neighbors.get(),
             "f0_method": self.f0_method.get(),
-            "block_time": self.block_time.get(),
+            "block_time": BEATRICE_BLOCK_TIME if self.block_kind == "beatrice" else self.block_time.get(),
             "crossfade_time": self.crossfade_time.get(),
             "extra_time": self.extra_time.get(),
             "passthrough": self.passthrough.get(),
@@ -1476,7 +1479,7 @@ class RealtimeGUI:
             saved.pop(key, None)
         self.block_times[self.block_kind] = self.block_time.get()
         saved["block_time"] = self.block_times["rvc"]
-        saved["beatrice_block_time"] = self.block_times["beatrice"]
+        saved["beatrice_block_time"] = BEATRICE_BLOCK_TIME
         saved["theme"] = self.theme
         saved["show_flow_options"] = self.show_flow_options.get()
         self._write_config(saved)
