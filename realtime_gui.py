@@ -28,14 +28,14 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("OMP_NUM_THREADS", "4")
 os.environ.setdefault("SD_ENABLE_ASIO", "1")
 
+import torch
+import torch.nn.functional as F
+from torchaudio.transforms import Resample
 import librosa
 import numpy as np
 import sounddevice as sd
-import torch
-import torch.nn.functional as F
 from noisereduce.torchgate import TorchGate
 from noisereduce.torchgate.utils import amp_to_db
-from torchaudio.transforms import Resample
 
 from beatrice.inference import OUT_SAMPLE_RATE, find_paraphernalia, is_beatrice_checkpoint
 from beatrice.realtime import BeatriceRealtime
