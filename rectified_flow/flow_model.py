@@ -147,9 +147,11 @@ class LYNXNet2Backbone(nn.Module):
     def prepare_conditioning(self, cond):
         return self.input_cond(cond).transpose(1, 2)
 
-    def forward(self, x, t, cond, prepared=None):
+    def forward(self, x, t, cond, prepared=None, timestep_mask=None):
         time = self.time_mlp(timestep_embedding(t.reshape(-1), self.channels))
         time = time.view(t.shape[0], -1, self.channels)
+        if timestep_mask is not None:
+            time = torch.where(timestep_mask.unsqueeze(-1), time[:, 1:2], time[:, :1])
         h =self.input(x.transpose(1, 2))
         h = h + (self.prepare_conditioning(cond) if prepared is None else prepared) + time
         for layer in self.layers:
@@ -257,9 +259,12 @@ class RectifiedFlow(nn.Module):
     def forward(self, mel, content, f0, speaker, mask, content_mask=None, key_shift=None, speed=None, variances=None):
         cond = self.encoder(content, f0, speaker, mask, content_mask, key_shift, speed, variances)
         t = self._uniform_times(mel.shape[0], mel.device)
+        backbone_times, timestep_mask = t, None
         if self.dual_timestep:
             t2 = self._uniform_times(mel.shape[0], mel.device)
+            backbone_times = torch.stack((t, t2), dim=1)
             alternate = torch.rand(mel.shape[0], mel.shape[-1], device=mel.device) < 0.25
+            timestep_mask = alternate
             t = torch.where(alternate, t2[:, None], t[:, None])
         noise = torch.randn_like(mel)
         predicted = None
@@ -270,7 +275,7 @@ class RectifiedFlow(nn.Module):
             return cond.sum() * 0.0, aux
         mixing = t[:, None, None] if t.ndim == 1 else t[:, None, :]
         x_t = (1.0 - mixing) * noise + mixing * mel
-        prediction = self.backbone(x_t, t, cond)
+        prediction = self.backbone(x_t, backbone_times, cond, timestep_mask=timestep_mask)
         flow = ((prediction.float() - (mel - noise).float()).square() * mask).mean()
         return flow, aux
 
