@@ -1140,9 +1140,7 @@ class RealtimeGUI:
         beatrice = ttk.Frame(frame)
         beatrice.grid(row=5, column=1, columnspan=2, sticky="ew", pady=3)
         beatrice.columnconfigure(1, weight=1)
-        beatrice.columnconfigure(4, weight=1)
         self._slider(beatrice, 0, "Formant", self.formant_shift, -2.0, 2.0, 0.5)
-        self._slider(beatrice, 0, "VQ neighbors", self.vq_neighbors, 0, 8, 1, column=3, padx=(20, 10))
         self.beatrice_rows = [beatrice_label, beatrice]
         return frame
 
