@@ -19,11 +19,14 @@ def discriminator_loss(real, fake):
     loss = 0
     logs = {}
     for name in DISCRIMINATORS:
-        real_loss = sum(torch.mean((1 - output) ** 2) for output in real[name][0])
-        fake_loss = sum(torch.mean(output ** 2) for output in fake[name][0])
-        loss = loss + real_loss + fake_loss
-        logs[f'discriminator/{name}_real'] = real_loss.detach()
-        logs[f'discriminator/{name}_fake'] = fake_loss.detach()
+        if real is not None:
+            real_loss = sum(torch.mean((1 - output) ** 2) for output in real[name][0])
+            loss = loss + real_loss
+            logs[f'discriminator/{name}_real'] = real_loss.detach()
+        if fake is not None:
+            fake_loss = sum(torch.mean(output ** 2) for output in fake[name][0])
+            loss = loss + fake_loss
+            logs[f'discriminator/{name}_fake'] = fake_loss.detach()
     return loss, logs
 
 

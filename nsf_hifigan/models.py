@@ -20,14 +20,49 @@ def _normalized(module):
     _init_normal(module)
 
 
+class TrainingResBlock1(nn.Module):
+    def __init__(self, block):
+        super().__init__()
+        self.convs1, self.convs2 = block.convs1, block.convs2
+
+    def forward(self, x):
+        for first, second in zip(self.convs1, self.convs2):
+            residual = first(F.leaky_relu(x, LRELU_SLOPE))
+            x = x + second(F.leaky_relu(residual, LRELU_SLOPE, inplace=True))
+        return x
+
+
+class TrainingGenerator(NSFHiFiGAN):
+    def forward(self, mel, f0):
+        f0 = f0.float()
+        source = self._fast_sine(f0) if self.mini_nsf else self.m_source(f0, self.upp).transpose(1, 2)
+        x = self.conv_pre(mel)
+        if self.noise_sigma > 0:
+            x = x + self.noise_sigma * torch.randn_like(x)
+        for index, up in enumerate(self.ups):
+            x = up(F.leaky_relu(x, LRELU_SLOPE, inplace=True))
+            if not self.mini_nsf:
+                x = x + self.noise_convs[index](source)
+            elif index == 1:
+                x = x + self.source_conv(source)
+            blocks = self.resblocks[index * self.num_kernels:(index + 1) * self.num_kernels]
+            combined = blocks[0](x)
+            for block in blocks[1:]:
+                combined += block(x)
+            x = combined / self.num_kernels
+        return torch.tanh(self.conv_post(F.leaky_relu(x, inplace=True)))
+
+
 def build_generator(hparams):
-    generator = NSFHiFiGAN(**hparams)
+    generator = TrainingGenerator(**hparams)
     weight_norm(generator.conv_pre)
     for layer in generator.ups:
         _normalized(layer)
-    for block in generator.resblocks:
+    for index, block in enumerate(generator.resblocks):
         for layer in ([*block.convs1, *block.convs2] if isinstance(block, ResBlock1) else block.convs):
             _normalized(layer)
+        if isinstance(block, ResBlock1):
+            generator.resblocks[index] = TrainingResBlock1(block)
     _normalized(generator.conv_post)
     if generator.mini_nsf:
         _init_normal(generator.source_conv)

@@ -1,7 +1,9 @@
 import math
+from contextlib import nullcontext
 
 import lightning.pytorch as pl
 import torch
+from lightning.pytorch.strategies import ParallelStrategy
 from torch.nn import functional as F
 from torchmetrics import MeanMetric
 
@@ -87,15 +89,24 @@ class VocoderTask(pl.LightningModule):
         return outputs, outputs['audio']
 
     def discriminator_step(self, optimizer, real, fake):
-        loss, logs = discriminator_loss(discriminate(self.discriminator, real),
-                                        discriminate(self.discriminator, fake.detach()))
-        optimizer.zero_grad()
-        self.manual_backward(loss)
+        optimizer.zero_grad(set_to_none=True)
+        logs = {}
+        strategy = getattr(self._trainer, 'strategy', None)
+        for is_real, audio in ((True, real), (False, fake.detach())):
+            sync = strategy.block_backward_sync() if is_real and isinstance(strategy, ParallelStrategy) else nullcontext()
+            with sync:
+                outputs = discriminate(self.discriminator, audio)
+                loss, values = discriminator_loss(outputs if is_real else None, None if is_real else outputs)
+                self.manual_backward(loss)
+            logs.update(values)
+            del outputs, loss
         self.clip(optimizer)
         optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
         return logs
 
     def generator_step(self, optimizer, real, outputs, fake):
+        optimizer.zero_grad(set_to_none=True)
         parameters = [parameter for parameter in self.discriminator.parameters() if parameter.requires_grad]
         for parameter in parameters:
             parameter.requires_grad = False
@@ -112,10 +123,10 @@ class VocoderTask(pl.LightningModule):
                 reference = torch.cat((reference, outputs['shift_c']))
             mel_loss = mel_l1(self.loss_mel, generated, reference) * self.settings['mel_loss_weight']
             logs['generator/mel_loss'] = mel_loss.detach()
-            optimizer.zero_grad()
             self.manual_backward(adversarial + mel_loss + pc_loss)
             self.clip(optimizer)
             optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
         finally:
             for parameter in parameters:
                 parameter.requires_grad = True
@@ -127,6 +138,7 @@ class VocoderTask(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         optimizer_g, optimizer_d = self.optimizers()
+        optimizer_g.zero_grad(set_to_none=True)
         warming = self.iteration < self.settings['discriminator_warmup']
         with torch.set_grad_enabled(not warming):
             outputs, fake = self.generate(batch)
