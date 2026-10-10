@@ -11,6 +11,8 @@ from shared.tools.prerequisites_download import _sha256, download_file
 
 ROOT = Path(__file__).resolve().parents[1]
 VOCODER_ROOT = ROOT / 'models' / 'pretraineds' / 'rectified'
+CUSTOM_VOCODER_ROOT = ROOT / 'models' / 'rectified' / 'custom'
+VOCODER_EXTENSIONS = ('.ckpt', '.pth', '.onnx')
 DEFAULT_VOCODER = 'pc_nsf_hifigan'
 VOCODERS = {
     'pc_nsf_hifigan': dict(
@@ -107,9 +109,36 @@ def _install_bundle(destination, url, archive_sha256, archive_size, archive_fold
                 os.replace(temporary / 'files' / name, destination / name)
 
 
+def custom_vocoders():
+    if not CUSTOM_VOCODER_ROOT.is_dir():
+        return []
+    return sorted(path.relative_to(ROOT).as_posix() for path in CUSTOM_VOCODER_ROOT.rglob('*')
+                  if path.is_file() and path.suffix.lower() in VOCODER_EXTENSIONS)
+
+
+def custom_vocoder_file(name):
+    if not isinstance(name, str) or not name.strip():
+        return None
+    path = Path(name.strip().strip('"'))
+    path = (path if path.is_absolute() else ROOT / path).resolve()
+    if path.suffix.lower() in VOCODER_EXTENSIONS and path.is_file() and path.is_relative_to(CUSTOM_VOCODER_ROOT.resolve()):
+        return path
+    return None
+
+
+def vocoder_title(name):
+    if name in VOCODERS:
+        return VOCODERS[name]['title']
+    return Path(name).relative_to(CUSTOM_VOCODER_ROOT.relative_to(ROOT)).as_posix()
+
+
 def vocoder_path(name=DEFAULT_VOCODER):
     if name not in VOCODERS:
-        raise ValueError(f'Unknown flow vocoder {name!r}. Choose one of {", ".join(VOCODERS)}.')
+        custom = custom_vocoder_file(name)
+        if custom is not None:
+            return str(custom)
+        raise ValueError(f'Unknown flow vocoder {name!r}. Choose one of {", ".join(VOCODERS)} or a vocoder file in '
+                         f'{CUSTOM_VOCODER_ROOT.relative_to(ROOT).as_posix()}.')
     spec = VOCODERS[name]
     destination = VOCODER_ROOT / spec['directory']
     _install_bundle(destination, spec['url'], spec['archive_sha256'], spec['archive_size'], spec['archive_folder'],
@@ -117,9 +146,20 @@ def vocoder_path(name=DEFAULT_VOCODER):
     return str(destination / spec['filename'])
 
 
+def recorded_name(name):
+    if name in VOCODERS:
+        return name
+    custom = custom_vocoder_file(name)
+    return custom.relative_to(ROOT).as_posix() if custom is not None else None
+
+
 def recorded_vocoder(checkpoint):
-    name = checkpoint.get('vocoder')
-    return name if name in VOCODERS else DEFAULT_VOCODER
+    recorded = checkpoint.get('vocoder')
+    name = recorded_name(recorded)
+    if name is None and recorded:
+        print(f'The recorded flow vocoder {recorded} was not found; using the {VOCODERS[DEFAULT_VOCODER]["title"]}.',
+              flush=True)
+    return name or DEFAULT_VOCODER
 
 
 def hnsep_model():

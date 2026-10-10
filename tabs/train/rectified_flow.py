@@ -6,7 +6,8 @@ from tabs.settings.sections.precision import get_precision
 from tabs.train.jobs import ROOT, JobRunner, device_id, experiment_path, positive_integer
 from tabs.train.slicing import preprocess_step, slicing_controls
 from rectified_flow.config import PRESETS, default_config, preset_path
-from rectified_flow.resources import DEFAULT_VOCODER, VOCODERS, vocoder_path
+from rectified_flow.resources import (CUSTOM_VOCODER_ROOT, DEFAULT_VOCODER, VOCODERS, custom_vocoder_file,
+                                      custom_vocoders, vocoder_path, vocoder_title)
 
 IDLE_CONTROLS = 2
 SLICERS = ('Skip', 'Simple')
@@ -63,6 +64,26 @@ def resolve_vocoder(name=DEFAULT_VOCODER):
         raise gr.Error(f'Could not download the {name} vocoder: {error}') from error
 
 
+def vocoder_choices():
+    return ([(spec['title'], name) for name, spec in VOCODERS.items()] +
+            [(f'Custom: {vocoder_title(path)}', path) for path in custom_vocoders()])
+
+
+def refresh_vocoders(current):
+    choices = vocoder_choices()
+    values = {value for _, value in choices}
+    return gr.update(choices=choices, value=current if current in values else DEFAULT_VOCODER)
+
+
+def check_custom_vocoder(vocoder, data):
+    from rectified_flow.vocoder import load_vocoder
+
+    try:
+        load_vocoder(str(custom_vocoder_file(vocoder)), data)
+    except Exception as error:
+        raise gr.Error(f'The custom vocoder {vocoder_title(vocoder)} cannot be used with this experiment: {error}') from error
+
+
 def pretrained_choices():
     if not PRETRAINED_ROOT.is_dir():
         return []
@@ -111,10 +132,14 @@ def start(name, batch, max_frames, max_updates, checkpoint_interval, device, use
     precision = get_precision() or selected['flow']['precision']
     if precision not in {'fp32', 'fp16', 'bf16'}:
         raise gr.Error(f'Unsupported training precision: {precision}')
-    if vocoder not in VOCODERS:
-        raise gr.Error(f'Choose one of these vocoders: {", ".join(VOCODERS)}.')
-    if selected['flow']['val_with_vocoder']:
-        resolve_vocoder(vocoder)
+    if vocoder in VOCODERS:
+        if selected['flow']['val_with_vocoder']:
+            resolve_vocoder(vocoder)
+    elif custom_vocoder_file(vocoder) is not None:
+        check_custom_vocoder(vocoder, selected['data'])
+    else:
+        raise gr.Error(f'Choose a listed vocoder, or put a custom vocoder in '
+                       f'{CUSTOM_VOCODER_ROOT.relative_to(ROOT).as_posix()} and press Refresh.')
     arguments = ['--model-name', str(name).strip(), '--vocoder', vocoder,
                  '--precision', precision, '--preset', preset, '--pitch-extractor', pitch_extractor]
     for flag, value, label in (('--batch-size', batch, 'Max clips per batch'),
@@ -167,8 +192,14 @@ def rectified_train_tab():
         use_pretrained.change(lambda enabled: gr.update(visible=enabled), use_pretrained, pretrained_row,
                               queue=False)
         refresh_pretrained_button.click(refresh_pretrained, pretrained_path, pretrained_path, queue=False)
-        vocoder = gr.Dropdown(label='Vocoder', choices=[(spec['title'], name) for name, spec in VOCODERS.items()],
-                              value=DEFAULT_VOCODER)
+        with gr.Row():
+            vocoder = gr.Dropdown(label='Vocoder', choices=vocoder_choices(), value=DEFAULT_VOCODER, scale=4,
+                                  info='Renders the training previews and becomes the default vocoder of exported '
+                                       'models. Custom NSF-HiFiGAN vocoders (.ckpt, .pth or .onnx, with any '
+                                       'config.json or vocoder.yaml beside them) are listed from '
+                                       f'{CUSTOM_VOCODER_ROOT.relative_to(ROOT).as_posix()}.')
+            refresh_vocoder_button = gr.Button('Refresh', scale=1)
+        refresh_vocoder_button.click(refresh_vocoders, vocoder, vocoder, queue=False)
         gr.Markdown('Training precision follows **Settings → Training → Precision**. New experiments copy their '
                     f'training settings from `{preset_path("standard").relative_to(ROOT).as_posix()}`, or '
                     f'`{preset_path("smaller").relative_to(ROOT).as_posix()}` with **Smaller model**; edit those '

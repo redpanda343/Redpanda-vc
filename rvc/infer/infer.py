@@ -687,7 +687,7 @@ class VoiceConverter:
                 from rectified_flow.config import resolve_config
                 from rectified_flow.flow_model import build_flow
                 from rectified_flow.infer import is_rectified
-                from rectified_flow.resources import VOCODERS, recorded_vocoder
+                from rectified_flow.resources import recorded_vocoder, vocoder_title
 
                 if not is_rectified(self.cpt):
                     raise ValueError('Select an RVC model or Rectified Flow voice checkpoint, not a vocoder checkpoint.')
@@ -697,7 +697,7 @@ class VoiceConverter:
                 self.tgt_sr = int(self.cpt['config']['data']['sample_rate'])
                 self.version, self.use_f0 = 'v2', 1
                 self.text_enc_hidden_dim = int(self.cpt['config']['flow']['model']['content_channels'])
-                self.vocoder = VOCODERS[recorded_vocoder(self.cpt)]['title']
+                self.vocoder = vocoder_title(recorded_vocoder(self.cpt))
                 self.net_g = build_flow(self.cpt['config'], self.n_spk)
                 self.net_g.load_state_dict(weights, strict=True)
                 self.net_g = self.net_g.to(self.config.device).float().eval().requires_grad_(False)

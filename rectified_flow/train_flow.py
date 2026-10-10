@@ -269,8 +269,9 @@ def main():
     parser = argparse.ArgumentParser(description='Train Multispeaker Rectified Flow with an optional frozen NSF-HiFiGAN preview vocoder.')
     parser.add_argument('--model-name', required=True)
     parser.add_argument('--vocoder', default='',
-                        help=f'Preview vocoder: {", ".join(VOCODERS)} (recorded in exported checkpoints as their default '
-                             'inference vocoder) or a .ckpt/.pth/.onnx path.')
+                        help=f'Preview vocoder: {", ".join(VOCODERS)} or a vocoder file in models/rectified/custom '
+                             '(recorded in exported checkpoints as their default inference vocoder), or another '
+                             '.ckpt/.pth/.onnx path.')
     parser.add_argument('--batch-size', type=int, help='Maximum clips per batch and GPU (default: max_batch_size in the config).')
     parser.add_argument('--max-batch-frames', type=int, help='Maximum padded frames per batch and GPU (default: max_batch_frames in the config).')
     parser.add_argument('--epochs', type=int, help='Optional epoch limit instead of the configured update limit.')

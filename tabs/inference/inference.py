@@ -381,9 +381,13 @@ def get_speakers_id(model):
 
 
 def get_vocoders():
-    root = os.path.join(now_dir, "models", "pretraineds", "rectified")
+    roots = (
+        os.path.join(now_dir, "models", "pretraineds", "rectified"),
+        os.path.join(now_dir, "models", "rectified", "custom"),
+    )
     return sorted(
         os.path.relpath(os.path.join(folder, name), now_dir)
+        for root in roots
         for folder, _, files in os.walk(root)
         for name in files
         if name.lower().endswith((".pth", ".ckpt", ".onnx"))
