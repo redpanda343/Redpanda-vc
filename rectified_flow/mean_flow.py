@@ -90,7 +90,7 @@ class MeanFlow(nn.Module):
     def variance_names(self):
         return self.encoder.variance_names
 
-    def sample_t_r(self, batch_size, device):
+    def sample_t_r(self, batch_size, device, return_mean_indices=False):
         settings = self.mean_flow_args
         normal = np.random.randn(batch_size, 2).astype(np.float32) * settings['time_sigma'] + settings['time_mu']
         samples = 1.0 / (1.0 + np.exp(-normal))
@@ -98,32 +98,53 @@ class MeanFlow(nn.Module):
         r = np.minimum(samples[:, 0], samples[:, 1])
         indices = np.random.permutation(batch_size)[:int(settings['flow_ratio'] * batch_size)]
         r[indices] = t[indices]
-        return torch.tensor(t, device=device), torch.tensor(r, device=device)
+        times = torch.tensor(t, device=device), torch.tensor(r, device=device)
+        if return_mean_indices:
+            return (*times, torch.tensor(np.flatnonzero(t != r), device=device))
+        return times
+
+    def velocity_jvp(self, z, t, r, direction, cond, mask, cfg_mask):
+        with torch.autocast(device_type=z.device.type, enabled=False):
+            return torch.func.jvp(
+                lambda value, time, end: self.backbone(value, time, end, cond.float(), mask, cfg_mask=cfg_mask),
+                (z, t, r), (direction, torch.ones_like(t), torch.zeros_like(r)),
+            )
 
     def loss(self, mel, cond, mask):
         settings = self.mean_flow_args
-        t, r = self.sample_t_r(mel.shape[0], mel.device)
+        t, r, mean_indices = self.sample_t_r(mel.shape[0], mel.device, return_mean_indices=True)
         noise = torch.randn_like(mel)
         z = (1.0 - t[:, None, None]) * mel + t[:, None, None] * noise
         velocity = noise - mel
         with torch.no_grad():
-            unconditional = self.backbone(z, t, t, cond, mask, unconditional=True)
-            direction = settings['cfg_scale'] * velocity + (1.0 - settings['cfg_scale']) * unconditional
+            if settings['cfg_scale'] == 1.0:
+                direction = velocity
+            else:
+                unconditional = self.backbone(z, t, t, cond, mask, unconditional=True)
+                direction = settings['cfg_scale'] * velocity + (1.0 - settings['cfg_scale']) * unconditional.float()
         cfg_mask = torch.rand(mel.shape[0], device=mel.device) < settings['cfg_ratio']
-        prediction, derivative = torch.autograd.functional.jvp(
-            lambda value, time, end: self.backbone(value, time, end, cond, mask, cfg_mask=cfg_mask),
-            (z, t, r), (direction, torch.ones_like(t), torch.zeros_like(r)), create_graph=True,
-        )
-        target = direction - (t - r)[:, None, None] * derivative
-        error = prediction - target.detach()
-        squared = error.square().mean(dim=1)[mask[:, 0].bool()]
+        if any(layer.dropout.p for layer in self.backbone.layers):
+            prediction, derivative = self.velocity_jvp(z, t, r, direction, cond, mask, cfg_mask)
+            target = direction - (t - r)[:, None, None] * derivative.detach()
+        else:
+            prediction = self.backbone(z, t, r, cond, mask, cfg_mask=cfg_mask)
+            target = direction.clone()
+            if mean_indices.numel():
+                with torch.no_grad():
+                    _, derivative = self.velocity_jvp(
+                        z[mean_indices], t[mean_indices], r[mean_indices], direction[mean_indices],
+                        cond[mean_indices], mask[mean_indices], cfg_mask[mean_indices],
+                    )
+                    target[mean_indices] -= (t - r)[mean_indices, None, None] * derivative
+        error = prediction.float() - target.detach()
+        squared = error.square().mean(dim=1)
         weight = (squared + settings['loss_eps']).pow(-settings['loss_p']).detach()
-        return (weight * squared).mean()
+        valid = mask[:, 0].bool()
+        return torch.where(valid, weight * squared, 0.0).sum() / valid.sum()
 
     def forward(self, mel, content, f0, speaker, mask, content_mask=None, key_shift=None, speed=None, variances=None):
-        with torch.autocast(device_type=mel.device.type, enabled=False):
-            cond = self.encoder(content.float(), f0.float(), speaker, mask, content_mask, key_shift, speed, variances)
-            return self.loss(mel.float(), cond.float(), mask), None
+        cond = self.encoder(content.float(), f0.float(), speaker, mask, content_mask, key_shift, speed, variances)
+        return self.loss(mel.float(), cond, mask), None
 
     @torch.no_grad()
     def sample(self, content, f0, speaker, mask, content_mask=None, key_shift=None, speed=None,
