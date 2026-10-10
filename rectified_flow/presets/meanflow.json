@@ -4,7 +4,7 @@
     "max_updates": 300000,
     "augmentation_args": {
       "random_time_stretching": {
-        "enabled": false
+        "enabled": true
       }
     },
     "model": {
