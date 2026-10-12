@@ -107,7 +107,8 @@ def embedder_train_tab():
                                       info='Peak learning rate after warmup. It then gradually decreases.')
             save_interval = gr.Number(label='Save interval (steps)', value=defaults['save_interval'], minimum=1,
                                       precision=0)
-        gr.Markdown('New experiments start from Beatrice’s pretrained embedder and use **Settings → Training → '
+        gr.Markdown('New experiments start from Beatrice’s pretrained embedder, fit the ContentVec projection '
+                    'before the first step, and use **Settings → Training → '
                     f'Precision**. The first {defaults["warmup_steps"]} steps warm up the learning rate, then it '
                     f'decays to {defaults["minimum_learning_rate_ratio"]:.0%} of its peak. Resume keeps the saved '
                     'precision and training recipe. Validation feature losses '

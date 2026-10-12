@@ -306,20 +306,64 @@ def weighted_mean(values, mask):
     return (values * weights).sum() / weights.sum().clamp_min(1)
 
 
-def distillation_loss(phone, projected, batch, geometry_settings, delay, offset=0, config=None, check_valid=True):
+def aligned_frames(values, batch, geometry_settings, delay, offset=0):
     targets = batch['teacher'].float()
-    positions = student_positions(targets.shape[1], geometry_settings, phone.device)
-    left = positions.floor().long().clamp(0, phone.shape[1] - 1)
-    right = (left + 1).clamp_max(phone.shape[1] - 1)
+    positions = student_positions(targets.shape[1], geometry_settings, values.device)
+    left = positions.floor().long().clamp(0, values.shape[1] - 1)
+    right = (left + 1).clamp_max(values.shape[1] - 1)
     fraction = (positions - left).clamp(0, 1)[None, :, None]
-    predicted = torch.lerp(projected[:, left].float(), projected[:, right].float(), fraction)
-    predicted = F.layer_norm(predicted, (predicted.shape[-1],))
+    aligned = torch.lerp(values[:, left].float(), values[:, right].float(), fraction)
     targets = F.layer_norm(targets, (targets.shape[-1],))
     lengths = batch['valid_samples']
     max_phone = (lengths - 200 - offset).div(160, rounding_mode='floor') - delay
-    teacher_end = torch.arange(targets.shape[1], device=phone.device) * geometry_settings['hop']
+    teacher_end = torch.arange(targets.shape[1], device=values.device) * geometry_settings['hop']
     teacher_end = teacher_end + geometry_settings['receptive_field']
     valid = (right[None] <= max_phone[:, None]) & (teacher_end[None] <= lengths[:, None])
+    return aligned, targets, valid, max_phone
+
+
+def initialize_projection(model, dataset, geometry_settings, delay, offset, device, clips, batch_size):
+    generator = torch.Generator().manual_seed(SEED + 3)
+    indices = torch.randperm(len(dataset), generator=generator)[:clips].tolist()
+    loader = DataLoader(Subset(dataset, indices), batch_size=batch_size, generator=torch.Generator())
+    channels = model.projection.in_features
+    gram = torch.zeros(channels + 1, channels + 1, dtype=torch.float64, device=device)
+    cross = torch.zeros(channels + 1, model.projection.out_features, dtype=torch.float64, device=device)
+    target_energy, count = torch.zeros((), dtype=torch.float64, device=device), 0
+    training = model.training
+    model.eval()
+    try:
+        with torch.inference_mode():
+            for batch in loader:
+                batch = move_batch(batch, device)
+                phone, _ = model(batch['audio'])
+                inputs, targets, valid, _ = aligned_frames(phone, batch, geometry_settings, delay, offset)
+                inputs = F.pad(inputs[valid].double(), (0, 1), value=1.0)
+                targets = targets[valid].double()
+                gram += inputs.T @ inputs
+                cross += inputs.T @ targets
+                target_energy += targets.square().sum()
+                count += len(targets)
+    finally:
+        model.train(training)
+    if not count:
+        raise ValueError('No valid aligned frames to fit the teacher projection. Use longer audio clips.')
+    ridge = 1e-3 * gram.diagonal()[:channels].mean() * torch.eye(channels + 1, dtype=torch.float64, device=device)
+    solution = torch.linalg.solve(gram + ridge, cross)
+    residual = (target_energy - 2 * (solution * cross).sum() + (solution * (gram @ solution)).sum()) / (
+        count * model.projection.out_features)
+    if not torch.isfinite(solution).all() or not torch.isfinite(residual):
+        raise FloatingPointError('Fitting the teacher projection produced nonfinite values.')
+    with torch.no_grad():
+        model.projection.weight.copy_(solution[:channels].T.float())
+        model.projection.bias.copy_(solution[channels].float())
+    print(f'Fitted the ContentVec projection on {count} frames from {len(indices)} clips '
+          f'(feature loss {residual.item():.4f}).', flush=True)
+
+
+def distillation_loss(phone, projected, batch, geometry_settings, delay, offset=0, config=None, check_valid=True):
+    predicted, targets, valid, max_phone = aligned_frames(projected, batch, geometry_settings, delay, offset)
+    predicted = F.layer_norm(predicted, (predicted.shape[-1],))
     if check_valid and not valid.any():
         raise ValueError('No valid aligned frames in the batch. Use longer audio clips.')
     feature = weighted_mean((predicted - targets).square().mean(-1), valid)
@@ -402,7 +446,8 @@ def train(directory, name, index, args, device):
     config_path = directory / 'config.json'
     defaults = default_config()
     saved_parameters = ('warmup_steps', 'minimum_learning_rate_ratio', 'adam_betas', 'weight_decay', 'max_grad_norm',
-                        'transition_weight', 'anchor_weight', 'gain_range', 'noise_relative_std')
+                        'transition_weight', 'anchor_weight', 'gain_range', 'noise_relative_std',
+                        'projection_learning_rate_ratio', 'projection_init_clips')
     config = dict(format=FORMAT, architecture=ARCHITECTURE, **lookahead_settings(args.lookahead_ms),
                   recipe=index['recipe'], learning_rate=args.learning_rate, precision=args.precision,
                   lr_schedule='warmup_cosine', schedule_steps=args.steps,
@@ -432,7 +477,11 @@ def train(directory, name, index, args, device):
         del original
     else:
         model.load_state_dict(checkpoint['model'], strict=True)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config['learning_rate'],
+    projection_ratio = config.get('projection_learning_rate_ratio')
+    parameter_groups = ([dict(params=model.phone_extractor.parameters()), dict(params=model.projection.parameters())]
+                        if projection_ratio else model.parameters())
+    learning_rate_scales = (1.0, projection_ratio) if projection_ratio else (1.0,)
+    optimizer = torch.optim.AdamW(parameter_groups, lr=config['learning_rate'],
                                   betas=tuple(config.get('adam_betas', (0.9, 0.99))),
                                   weight_decay=config.get('weight_decay', 0.01), fused=device.type == 'cuda')
     scaler = torch.amp.GradScaler('cuda', enabled=device.type == 'cuda' and precision == 'fp16', init_scale=1024)
@@ -452,6 +501,9 @@ def train(directory, name, index, args, device):
     valid_set = FeatureDataset(directory / 'data', index['clips'], 'validation')
     if not len(valid_set):
         raise ValueError('Training needs separate usable validation clips.')
+    if checkpoint is None and config.get('projection_init_clips'):
+        initialize_projection(model, train_set, index['recipe']['geometry'], delay, offset, device,
+                              config['projection_init_clips'], args.batch_size)
     sampler = TrainingBatchSampler(len(train_set), args.batch_size,
                                    checkpoint.get('data_sampler') if checkpoint is not None else None)
     loader_generator = torch.Generator().manual_seed(SEED + 1)
@@ -489,8 +541,8 @@ def train(directory, name, index, args, device):
                          * config.get('noise_relative_std', 0.005))
                 audio = audio * gain + noise
                 current_lr = learning_rate_for_step(config, step)
-                for group in optimizer.param_groups:
-                    group['lr'] = current_lr
+                for group, scale in zip(optimizer.param_groups, learning_rate_scales, strict=True):
+                    group['lr'] = current_lr * scale
                 optimizer.zero_grad(set_to_none=True)
                 with precision_context(device, precision):
                     phone, projected = model(audio)

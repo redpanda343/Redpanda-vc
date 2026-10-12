@@ -14,6 +14,8 @@
   "max_grad_norm": 1.0,
   "transition_weight": 0.25,
   "anchor_weight": 0.1,
+  "projection_learning_rate_ratio": 10.0,
+  "projection_init_clips": 256,
   "gain_range": [0.8, 1.2],
   "noise_relative_std": 0.005,
   "precision": "fp16"
