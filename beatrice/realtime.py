@@ -2,7 +2,7 @@ import math
 
 import numpy as np
 
-from beatrice.inference import IN_SAMPLE_RATE, LATENCY_SECONDS, OUT_SAMPLE_RATE, BeatriceModel
+from beatrice.inference import IN_SAMPLE_RATE, OUT_SAMPLE_RATE, BeatriceModel
 
 
 class StreamResampler:
@@ -68,7 +68,7 @@ class BeatriceRealtime:
 
     @property
     def latency_seconds(self):
-        return (LATENCY_SECONDS + self.input_resampler.delay_seconds + self.output_resampler.delay_seconds
+        return (self.model.latency_seconds + self.input_resampler.delay_seconds + self.output_resampler.delay_seconds
                 + self.margin / self.stream_rate)
 
     def reset(self):

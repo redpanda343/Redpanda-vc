@@ -1,6 +1,7 @@
 import gradio as gr
 
 from tabs.train.beatrice import beatrice_train_tab
+from tabs.train.embedder import embedder_train_tab
 from tabs.train.nsf_hifigan import nsf_hifigan_train_tab
 from tabs.train.rectified_flow import rectified_train_tab
 from tabs.train.rvc import rvc_train_tab
@@ -15,3 +16,5 @@ def train_tab():
         nsf_hifigan_train_tab()
     with gr.Tab("Beatrice"):
         beatrice_train_tab()
+    with gr.Tab("Embedder"):
+        embedder_train_tab()

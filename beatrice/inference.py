@@ -7,6 +7,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from beatrice.embedder_model import CUSTOM_VERSION, read_voice_metadata
+
 VERSION = '2.0.0-rc.0'
 IN_SAMPLE_RATE = 16000
 OUT_SAMPLE_RATE = 24000
@@ -63,7 +65,7 @@ def read_paraphernalia(path):
     with toml.open('rb') as handle:
         config = tomllib.load(handle)
     version = config.get('model', {}).get('version')
-    if version != VERSION:
+    if version not in (VERSION, CUSTOM_VERSION):
         raise ValueError(f'This Beatrice model has format {version}; only {VERSION} models are supported.')
     voices = config.get('voice', {})
     voices = [voices[key] for key in sorted(voices, key=int)]
@@ -224,6 +226,12 @@ class BeatriceModel:
     def __init__(self, path, device='cpu', prepend=PHONE_LOOKAHEAD):
         self.device = torch.device(device)
         self.directory, self.name, self.voices = read_paraphernalia(path)
+        with find_paraphernalia(path).open('rb') as handle:
+            version = tomllib.load(handle)['model']['version']
+        self.phone_delay, self.phone_offset = read_voice_metadata(self.directory, version)
+        extra_samples = self.phone_delay * IN_HOP + self.phone_offset
+        self.phone_lookahead = PHONE_LOOKAHEAD + extra_samples
+        self.latency_seconds = LATENCY_SECONDS + extra_samples / IN_SAMPLE_RATE
         self.prepend = prepend
         self._load_phone_extractor()
         self._load_pitch_estimator()
@@ -324,6 +332,7 @@ class BeatriceModel:
             module.reset()
         self.audio = torch.zeros(HISTORY + self.prepend, device=self.device)
         self.frame = 0
+        self.phone_frame = 0
         self.phase = torch.rand((), device=self.device, dtype=torch.float64)
         self.last_ir = torch.zeros(1, IR_LENGTH, device=self.device)
         self.periodic_tail = torch.zeros(IR_LENGTH, device=self.device)
@@ -335,6 +344,11 @@ class BeatriceModel:
         x = audio[:, None]
         for conv in self.feature_convs:
             x = F.gelu(conv(x), approximate='tanh')
+        count = len(x)
+        if self.phone_frame == 0 and self.phone_delay:
+            self.phone_backbone.embed(F.layer_norm(x[:self.phone_delay], (x.shape[1],)))
+            x = x[self.phone_delay:]
+        self.phone_frame += count
         phone = self.phone_head(F.gelu(self.phone_backbone(F.layer_norm(x, (x.shape[1],))), approximate='tanh'))
         if self.vq_neighbors:
             codes = self.codebooks[self.speaker]
@@ -428,11 +442,12 @@ class BeatriceModel:
         audio = torch.as_tensor(audio, dtype=torch.float32, device=self.device).reshape(-1)
         self.audio = torch.cat([self.audio, audio])
         start = self.frame * IN_HOP - HISTORY
-        frames = (start + self.audio.shape[0] - PHONE_LOOKAHEAD - IN_HOP) // IN_HOP - self.frame + 1
+        frames = (start + self.audio.shape[0] - self.phone_lookahead - IN_HOP) // IN_HOP - self.frame + 1
         if frames <= 0:
             return torch.zeros(0, device=self.device)
-        offset = HISTORY - PHONE_LOOKAHEAD
-        phones = self._phones(self.audio[offset:offset + IN_HOP * (frames - 1) + 240])
+        offset = HISTORY - PHONE_LOOKAHEAD + self.phone_offset + (self.phone_frame - self.frame) * IN_HOP
+        phone_frames = self.frame + frames + self.phone_delay - self.phone_frame
+        phones = self._phones(self.audio[offset:offset + IN_HOP * (phone_frames - 1) + 240])
         instfreq, difference, loudness = self._pitch_inputs(self.audio, frames)
         quantized, pitch_features = self._pitch(instfreq, difference)
         quantized = (quantized + round(self.pitch_shift * BINS_PER_OCTAVE / 12)).clamp(1, PITCH_BINS - 1)
