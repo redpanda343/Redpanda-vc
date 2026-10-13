@@ -100,12 +100,15 @@ def dataset_arguments(name, dataset, workers, device, pause_threshold=-42.0, pau
     return arguments
 
 
-def start(name, dataset, workers, device, steps, batch, save_interval, pause_threshold, pause_minimum, *slicing):
+def start(name, dataset, workers, device, steps, warmup, batch, save_interval, pause_threshold, pause_minimum,
+          *slicing):
     arguments = dataset_arguments(name, dataset, workers, device, pause_threshold, pause_minimum, *slicing)
     precision = get_precision() or 'fp32'
     if precision not in {'fp32', 'fp16', 'bf16'}:
         raise gr.Error(f'Unsupported training precision: {precision}')
-    arguments.extend(['--precision', precision])
+    if warmup is None or float(warmup) != int(warmup) or int(warmup) < 0:
+        raise gr.Error('Warmup steps must be a whole number of 0 or more.')
+    arguments.extend(['--precision', precision, '--warmup-steps', str(int(warmup))])
     for flag, value, label in (('--steps', steps, 'Training steps'), ('--batch-size', batch, 'Batch size'),
                                ('--save-interval', save_interval, 'Save interval')):
         arguments.extend([flag, positive_integer(value, label)])
@@ -175,6 +178,9 @@ def beatrice_train_tab():
             steps = gr.Number(label='Training steps', value=10000, minimum=1, precision=0,
                               info='Upstream default 10000, about 40 minutes on an RTX 4090. Raise it to continue a '
                                    'finished model.')
+            warmup = gr.Number(label='Warmup steps', value=5000, minimum=0, precision=0,
+                               info='Steps over which the learning rate rises from 0 to full. Upstream default '
+                                    '5000. 0 starts at full rate.')
             batch = gr.Number(label='Batch size', value=8, minimum=1, precision=0,
                               info='4-second clips per step. Lower it to reduce GPU memory use.')
             save_interval = gr.Number(label='Save interval (steps)', value=2000, minimum=1, precision=0,
@@ -187,7 +193,7 @@ def beatrice_train_tab():
             stop_button = gr.Button('Stop current Beatrice job', interactive=False)
     timer = gr.Timer(2)
     outputs = [train_button, stop_button, timer]
-    train_button.click(start, [name, dataset, workers, device, steps, batch, save_interval, pause_threshold,
+    train_button.click(start, [name, dataset, workers, device, steps, warmup, batch, save_interval, pause_threshold,
                                pause_minimum, *slicing.inputs], outputs, queue=False)
     stop_button.click(stop, [], outputs, queue=False)
     timer.tick(status, [], outputs, queue=False, show_progress='hidden')

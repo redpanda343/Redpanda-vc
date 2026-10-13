@@ -163,8 +163,9 @@ def build_dataset(experiment, speakers, args):
 
 def write_config(experiment, args):
     config = default_config()
-    for key, value in (('n_steps', args.steps), ('batch_size', args.batch_size), ('num_workers', args.workers),
-                       ('save_interval', args.save_interval), ('evaluation_interval', args.save_interval)):
+    for key, value in (('n_steps', args.steps), ('warmup_steps', args.warmup_steps), ('batch_size', args.batch_size),
+                       ('num_workers', args.workers), ('save_interval', args.save_interval),
+                       ('evaluation_interval', args.save_interval)):
         if value is not None:
             config[key] = value
     config['use_amp'] = args.precision != 'fp32'
@@ -210,6 +211,7 @@ def main():
     parser.add_argument('--model-name', required=True)
     parser.add_argument('--dataset', required=True)
     parser.add_argument('--steps', type=int)
+    parser.add_argument('--warmup-steps', type=int)
     parser.add_argument('--batch-size', type=int)
     parser.add_argument('--save-interval', type=int)
     parser.add_argument('--workers', type=int)
