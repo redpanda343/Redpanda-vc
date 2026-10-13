@@ -171,6 +171,7 @@ def prepare_data(directory, dataset, clip_samples, device, extraction_batch_size
     recipe_hash = hashlib.sha256(json.dumps(recipe, sort_keys=True).encode()).hexdigest()[:16]
     clips = []
     pending = []
+    short_files = 0
     benchmark = torch.backends.cudnn.benchmark
     if device.type == 'cuda':
         torch.backends.cudnn.benchmark = True
@@ -195,7 +196,7 @@ def prepare_data(directory, dataset, clip_samples, device, extraction_batch_size
                 if not np.isfinite(audio).all():
                     raise ValueError(f'Audio contains nonfinite samples: {entry["path"]}')
                 if len(audio) < 16000:
-                    print(f'Skipping audio shorter than one second: {entry["path"]}', flush=True)
+                    short_files += 1
                     continue
                 for offset in range(0, len(audio), clip_samples):
                     piece = audio[offset:offset + clip_samples]
@@ -217,6 +218,8 @@ def prepare_data(directory, dataset, clip_samples, device, extraction_batch_size
         gc.collect()
         if device.type == 'cuda':
             torch.cuda.empty_cache()
+    if short_files:
+        print(f'Skipped {short_files} audio file(s) shorter than one second.', flush=True)
     if not all(any(row['split'] == split for row in clips) for split in ('train', 'validation')):
         raise ValueError('No usable clips in one split. Training and validation each need audio at least one second long.')
     index = dict(recipe=recipe, clips=clips)
