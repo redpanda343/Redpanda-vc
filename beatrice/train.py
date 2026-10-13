@@ -35,7 +35,7 @@ LAUNCHER_PATCHES = (
      '        if key not in dict_default_hparams and key not in '
      '{"phone_delay_frames", "phone_offset_samples", "embedder_sha256"}:\n'),
     ('        writer = SummaryWriter(out_dir)\n',
-     '        writer = SummaryWriter(in_wav_dataset_dir.parent / "events")\n'),
+     '        writer = SummaryWriter(out_dir / "events")\n'),
     ('                shutil.copy(checkpoint_file_save, out_dir / "checkpoint_latest.pt.gz")\n',
      '                os.replace(checkpoint_file_save, out_dir / "checkpoint_latest.pt.gz")\n'),
     ('                del paraphernalia_dir\n',
