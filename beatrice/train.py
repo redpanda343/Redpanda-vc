@@ -169,6 +169,8 @@ def write_config(experiment, args):
         if value is not None:
             config[key] = value
     config['use_amp'] = args.precision != 'fp32'
+    if args.training_vq is not None:
+        config['training_time_vq'] = args.training_vq
     path = work_directory(experiment) / 'config.json'
     path.write_text(json.dumps(config, indent=4), encoding='utf-8')
     return path
@@ -216,6 +218,7 @@ def main():
     parser.add_argument('--save-interval', type=int)
     parser.add_argument('--workers', type=int)
     parser.add_argument('--precision', choices=['fp32', 'fp16', 'bf16'], default='fp32')
+    parser.add_argument('--training-vq', choices=['none', 'self', 'random'])
     parser.add_argument('--device', default='auto')
     parser.add_argument('--cutting', choices=['Skip', 'Silence', 'Simple'], default='Skip')
     parser.add_argument('--pause-threshold', type=float, default=-42.0)

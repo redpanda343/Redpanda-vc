@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 BEATRICE_WARNINGS = 'ignore:wav_length % 160 != 0,ignore:Some clusters have no assigned data points'
 SLICERS = ('Skip', 'Silence', 'Simple')
 MINIMUM_CHUNK = 5.0
+TRAINING_VQ_MODES = ('none', 'self', 'random')
 _lock = threading.Lock()
 _process = None
 _experiment = None
@@ -100,15 +101,17 @@ def dataset_arguments(name, dataset, workers, device, pause_threshold=-42.0, pau
     return arguments
 
 
-def start(name, dataset, workers, device, steps, warmup, batch, save_interval, pause_threshold, pause_minimum,
-          *slicing):
+def start(name, dataset, workers, device, steps, warmup, batch, save_interval, training_vq, pause_threshold,
+          pause_minimum, *slicing):
     arguments = dataset_arguments(name, dataset, workers, device, pause_threshold, pause_minimum, *slicing)
     precision = get_precision() or 'fp32'
     if precision not in {'fp32', 'fp16', 'bf16'}:
         raise gr.Error(f'Unsupported training precision: {precision}')
     if warmup is None or float(warmup) != int(warmup) or int(warmup) < 0:
         raise gr.Error('Warmup steps must be a whole number of 0 or more.')
-    arguments.extend(['--precision', precision, '--warmup-steps', str(int(warmup))])
+    if training_vq not in TRAINING_VQ_MODES:
+        raise gr.Error('Choose a training-time VQ mode.')
+    arguments.extend(['--precision', precision, '--warmup-steps', str(int(warmup)), '--training-vq', training_vq])
     for flag, value, label in (('--steps', steps, 'Training steps'), ('--batch-size', batch, 'Batch size'),
                                ('--save-interval', save_interval, 'Save interval')):
         arguments.extend([flag, positive_integer(value, label)])
@@ -186,6 +189,14 @@ def beatrice_train_tab():
             save_interval = gr.Number(label='Save interval (steps)', value=2000, minimum=1, precision=0,
                                       info='Replaces checkpoint_latest.pt.gz and the model folder with the '
                                            'current step.')
+        training_vq = gr.Radio(label='Training-time VQ', value='none',
+                               choices=[('Off (upstream default)', 'none'), ('Own voice codebook', 'self'),
+                                        ('Random voice codebook', 'random')],
+                               info="Replaces the phone features with the average of their 4 nearest codebook entries "
+                                    'during training, as VQ Neighbor Count does at inference, so the generator learns '
+                                    'from the same kind of features. Set VQ Neighbor Count to 4 when using a model '
+                                    "trained this way. Random uses a random voice's codebook and matches Own voice "
+                                    'when training one voice.')
         gr.Markdown('Training precision follows **Settings → Training → Precision**: fp32 trains in full precision, '
                     "fp16 or bf16 turn on the trainer's FP16 mixed precision.")
         with gr.Row():
@@ -193,7 +204,7 @@ def beatrice_train_tab():
             stop_button = gr.Button('Stop current Beatrice job', interactive=False)
     timer = gr.Timer(2)
     outputs = [train_button, stop_button, timer]
-    train_button.click(start, [name, dataset, workers, device, steps, warmup, batch, save_interval, pause_threshold,
-                               pause_minimum, *slicing.inputs], outputs, queue=False)
+    train_button.click(start, [name, dataset, workers, device, steps, warmup, batch, save_interval, training_vq,
+                               pause_threshold, pause_minimum, *slicing.inputs], outputs, queue=False)
     stop_button.click(stop, [], outputs, queue=False)
     timer.tick(status, [], outputs, queue=False, show_progress='hidden')
