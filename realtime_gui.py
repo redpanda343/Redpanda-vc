@@ -47,6 +47,7 @@ ROOT = Path(__file__).resolve().parent
 migrate_models_folder(ROOT)
 CONFIG_PATH = ROOT / "assets" / "realtime_config.json"
 BEATRICE_BLOCK_TIME = 0.02
+BEATRICE_THREADS = 1
 MONITOR_DISABLED = "Disabled"
 MAIN_HOST_APIS = ("ASIO", "Windows WASAPI")
 EMBEDDERS = ("contentvec", "spin-v2")
@@ -616,6 +617,8 @@ class AudioEngine:
         self.worker.start()
 
     def _worker(self, fifo, wakeup, stop):
+        if self.beatrice is not None:
+            torch.set_num_threads(BEATRICE_THREADS)
         while not stop.is_set():
             wakeup.wait(0.05)
             wakeup.clear()
