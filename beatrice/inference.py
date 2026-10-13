@@ -1,4 +1,6 @@
 import functools
+import hashlib
+import json
 import math
 import tomllib
 from pathlib import Path
@@ -7,9 +9,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from beatrice.embedder_model import CUSTOM_VERSION, read_voice_metadata
-
 VERSION = '2.0.0-rc.0'
+CUSTOM_VERSION = '2.0.0-rc.0-redpanda-embedder'
+EMBEDDER_METADATA_FILE = 'redpanda_embedder.json'
+EMBEDDER_ARCHITECTURE = dict(phone_channels=128, hidden_channels=128, n_blocks=20)
+EMBEDDER_LOOKAHEADS = ((0, 0), (1, 0), (2, 0), (2, 80))
 IN_SAMPLE_RATE = 16000
 OUT_SAMPLE_RATE = 24000
 IN_HOP = 160
@@ -32,6 +36,33 @@ FILTER_FFT = 768
 PHONE_LOOKAHEAD = 40
 HISTORY = 2 * IN_HOP + (PITCH_WINDOW - IN_HOP) // 2
 LATENCY_SECONDS = 0.0375
+
+
+def file_hash(path):
+    digest = hashlib.sha256()
+    with Path(path).open('rb') as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def read_voice_metadata(directory, version):
+    path = Path(directory) / EMBEDDER_METADATA_FILE
+    if not path.is_file():
+        if version == CUSTOM_VERSION:
+            raise ValueError(f'This model needs its {EMBEDDER_METADATA_FILE} lookahead metadata.')
+        return 0, 0
+    metadata = json.loads(path.read_text(encoding='utf-8'))
+    delay, offset = metadata.get('phone_delay_frames'), metadata.get('phone_offset_samples', 0)
+    if (metadata.get('format') not in (1, 2) or metadata.get('architecture') != EMBEDDER_ARCHITECTURE
+            or any(isinstance(value, bool) or not isinstance(value, int) for value in (delay, offset))
+            or (delay, offset) not in EMBEDDER_LOOKAHEADS or (offset and metadata['format'] != 2)):
+        raise ValueError(f'{path.name} does not describe a supported Beatrice embedder.')
+    if file_hash(Path(directory) / 'phone_extractor.bin') != metadata.get('phone_extractor_sha256'):
+        raise ValueError('The phone extractor does not match this model\'s lookahead metadata.')
+    if bool(delay) != (version == CUSTOM_VERSION):
+        raise ValueError('The Beatrice model version does not match its embedder lookahead.')
+    return delay, offset
 
 
 def is_beatrice_checkpoint(path):

@@ -49,8 +49,8 @@ def guard_loss_stats(source):
 
 def optimize_trainer_source(source):
     patches = (
-        ('from beatrice.embedder_model import make_phone_extractor, write_voice_metadata\n',
-         'from beatrice.embedder_model import make_phone_extractor, write_voice_metadata\n'
+        ('from beatrice.compat import patch_torchaudio\n',
+         'from beatrice.compat import patch_torchaudio\n'
          'from beatrice.training_optimizations import compressed_optimizer_state_dict, optimizer_state_for_load\n'),
         ('        enable_loss_ap: bool = False,\n    ) -> tuple[',
          '        enable_loss_ap: bool = False,\n        record_stats: bool = True,\n    ) -> tuple['),

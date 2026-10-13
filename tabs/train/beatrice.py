@@ -97,39 +97,8 @@ def dataset_arguments(name, dataset, workers, device, cutting='Skip', chunk_len=
     return arguments
 
 
-def embedder_choices(finetune_embedder=False):
-    from beatrice.embedder_model import export_choices
-
-    if finetune_embedder:
-        return export_choices(lookahead_ms=25)
-    return [('Default Beatrice embedder', 'default'), *export_choices()]
-
-
-def refresh_embedders(value, finetune_embedder=False):
-    choices = embedder_choices(finetune_embedder)
-    if finetune_embedder and value not in {path for _, path in choices}:
-        known = {path for _, path in embedder_choices()}
-        if not value or value in known or not Path(str(value)).is_file():
-            value = max(choices, key=lambda choice: Path(choice[1]).stat().st_mtime)[1] if choices else None
-    return gr.update(choices=choices, value=value if finetune_embedder else value or 'default')
-
-
-def change_embedder_mode(value, finetune_embedder):
-    return refresh_embedders(value if finetune_embedder else 'default', finetune_embedder)
-
-
-def start(name, dataset, workers, device, steps, batch, save_interval, embedder='default', *slicing,
-          lookahead_ms=None):
+def start(name, dataset, workers, device, steps, batch, save_interval, *slicing):
     arguments = dataset_arguments(name, dataset, workers, device, *slicing)
-    if embedder and embedder != 'default':
-        path = Path(str(embedder).strip().strip('"'))
-        if not path.is_file():
-            raise gr.Error('The selected embedder checkpoint does not exist.')
-        arguments.extend(['--embedder', str(path.resolve())])
-    elif lookahead_ms is not None and not (experiment_path(name) / 'checkpoint_latest.pt.gz').is_file():
-        raise gr.Error('Train and export a 25 ms embedder in the Embedder tab, then refresh and select it here.')
-    if lookahead_ms is not None:
-        arguments.extend(['--embedder-lookahead-ms', str(lookahead_ms)])
     precision = get_precision() or 'fp32'
     if precision not in {'fp32', 'fp16', 'bf16'}:
         raise gr.Error(f'Unsupported training precision: {precision}')
@@ -138,12 +107,6 @@ def start(name, dataset, workers, device, steps, batch, save_interval, embedder=
                                ('--save-interval', save_interval, 'Save interval')):
         arguments.extend([flag, positive_integer(value, label)])
     return launch(name, arguments)
-
-
-def start_with_mode(name, dataset, workers, device, steps, batch, save_interval, embedder, finetune_embedder,
-                    *slicing):
-    return start(name, dataset, workers, device, steps, batch, save_interval, embedder, *slicing,
-                 lookahead_ms=25 if finetune_embedder else None)
 
 
 def stop():
@@ -175,8 +138,7 @@ def beatrice_train_tab():
     gr.Markdown('Fine-tunes a [Beatrice 2](https://prj-beatrice.com) low-latency voice conversion model with '
                 '[Beatrice Trainer](https://huggingface.co/fierce-cats/beatrice-trainer) 2.0.0-rc.0 (MIT). '
                 '`logs/<model>` keeps only the latest `paraphernalia_*` model folder, which loads in the realtime GUI, '
-                'and `checkpoint_latest.pt.gz` to resume training. Default models also load in the Beatrice VST, '
-                'VCClient or beatrice-client. Embedders with extra lookahead require the RedPanda realtime GUI. The '
+                'the Beatrice VST, VCClient or beatrice-client, and `checkpoint_latest.pt.gz` to resume training. The '
                 'app downloads the trainer with its pretrained models, noise and impulse-response sets (about 440 MB) '
                 'at startup, and training retries an interrupted download.')
     with gr.Row():
@@ -196,18 +158,6 @@ def beatrice_train_tab():
                                         "files into 5-10 second chunks at the Beatrice model's 24 kHz sample rate, in "
                                         'a temporary folder that is deleted when training ends.')
     with gr.Accordion('2. Train Beatrice', open=True):
-        finetune_embedder = gr.Checkbox(label='Fine-tune pretrained with a 25 ms embedder', value=False,
-                                       info='Use the embedder trained in the Embedder tab. Matching 25 ms exports '
-                                            'are listed below, with the newest selected automatically.')
-        with gr.Row():
-            embedder = gr.Dropdown(label='Embedder', choices=embedder_choices(), value='default',
-                                   allow_custom_value=True, scale=4,
-                                   info='Choose an export from the Embedder tab, or enter its phone_extractor.pt '
-                                        'path. Resume keeps the embedder saved with the voice experiment.')
-            refresh = gr.Button('Refresh embedders', scale=1)
-        gr.Markdown('New voice experiments start from Beatrice’s bundled pretrained model. The selected embedder '
-                    'stays fixed while the voice generator learns to use its features. Use a new model name when '
-                    'changing embedders; 25 ms lookahead is read from the embedder export and preserved on resume.')
         with gr.Row():
             steps = gr.Number(label='Training steps', value=10000, minimum=1, precision=0,
                               info='Upstream default 10000, about 40 minutes on an RTX 4090. Raise it to continue a '
@@ -224,10 +174,7 @@ def beatrice_train_tab():
             stop_button = gr.Button('Stop current Beatrice job', interactive=False)
     timer = gr.Timer(2)
     outputs = [train_button, stop_button, timer]
-    finetune_embedder.change(change_embedder_mode, [embedder, finetune_embedder], [embedder], queue=False)
-    refresh.click(refresh_embedders, [embedder, finetune_embedder], [embedder], queue=False)
-    train_button.click(start_with_mode,
-                       [name, dataset, workers, device, steps, batch, save_interval, embedder, finetune_embedder,
-                        *slicing.inputs], outputs, queue=False)
+    train_button.click(start, [name, dataset, workers, device, steps, batch, save_interval, *slicing.inputs], outputs,
+                       queue=False)
     stop_button.click(stop, [], outputs, queue=False)
     timer.tick(status, [], outputs, queue=False, show_progress='hidden')

@@ -6,7 +6,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-from beatrice.embedder_config import LOOKAHEAD_CHOICES
 from beatrice.resources import ROOT, TRAINER_ROOT, ensure_trainer
 
 AUDIO_SUFFIXES = {'.wav', '.aif', '.aiff', '.fla', '.flac', '.oga', '.ogg', '.opus', '.mp3'}
@@ -27,13 +26,8 @@ RUN_FILES_SOURCE = '''    if not resume:
 '''
 LAUNCHER_PATCHES = (
     (REPO_ROOT_SOURCE, 'def repo_root() -> Path:\n    return Path(__file__).resolve().parents[1]\n'),
-    ('import torchaudio\n', 'import torchaudio\nfrom beatrice.compat import patch_torchaudio\n'
-     'from beatrice.embedder_model import make_phone_extractor, write_voice_metadata\n\npatch_torchaudio()\n'),
+    ('import torchaudio\n', 'import torchaudio\nfrom beatrice.compat import patch_torchaudio\n\npatch_torchaudio()\n'),
     (RUN_FILES_SOURCE, ''),
-    ('    for key in list(h.keys()):\n        if key not in dict_default_hparams:\n',
-     '    for key in list(h.keys()):\n'
-     '        if key not in dict_default_hparams and key not in '
-     '{"phone_delay_frames", "phone_offset_samples", "embedder_sha256"}:\n'),
     ('        writer = SummaryWriter(out_dir)\n',
      '        writer = SummaryWriter(out_dir / "events")\n'),
     ('                shutil.copy(checkpoint_file_save, out_dir / "checkpoint_latest.pt.gz")\n',
@@ -42,17 +36,6 @@ LAUNCHER_PATCHES = (
      '                for old_paraphernalia_dir in out_dir.glob("paraphernalia_*"):\n'
      '                    if old_paraphernalia_dir != paraphernalia_dir:\n'
      '                        shutil.rmtree(old_paraphernalia_dir, ignore_errors=True)\n'
-     '                del paraphernalia_dir\n'),
-    ('    phone_extractor = PhoneExtractor().to(device).eval().requires_grad_(False)\n',
-     '    phone_extractor = make_phone_extractor(PhoneExtractor, h.get("phone_delay_frames", 0), '
-     'h.get("phone_offset_samples", 0))'
-     '.to(device).eval().requires_grad_(False)\n'),
-    ('                phone_extractor_fp16 = PhoneExtractor()\n',
-     '                phone_extractor_fp16 = make_phone_extractor(PhoneExtractor, h.get("phone_delay_frames", 0), '
-     'h.get("phone_offset_samples", 0))\n'),
-    ('                del paraphernalia_dir\n',
-     '                write_voice_metadata(paraphernalia_dir, h.get("phone_delay_frames", 0), '
-     'h.get("embedder_sha256"), h.get("phone_offset_samples", 0))\n'
      '                del paraphernalia_dir\n'),
 )
 LEGACY_ENTRIES = ('beatrice_data', 'beatrice_sliced', 'beatrice_config.json')
@@ -178,17 +161,13 @@ def build_dataset(experiment, speakers, args):
     return data_dir
 
 
-def write_config(experiment, args, embedder_config=None):
+def write_config(experiment, args):
     config = default_config()
-    if (getattr(args, 'embedder_lookahead_ms', None) is not None
-            and not (experiment / CHECKPOINT).is_file() and not config.get('pretrained_file')):
-        raise ValueError('Fine-tuning with the new embedder requires a pretrained Beatrice voice model.')
     for key, value in (('n_steps', args.steps), ('batch_size', args.batch_size), ('num_workers', args.workers),
                        ('save_interval', args.save_interval), ('evaluation_interval', args.save_interval)):
         if value is not None:
             config[key] = value
     config['use_amp'] = args.precision != 'fp32'
-    config.update(embedder_config or {})
     path = work_directory(experiment) / 'config.json'
     path.write_text(json.dumps(config, indent=4), encoding='utf-8')
     return path
@@ -236,9 +215,6 @@ def main():
     parser.add_argument('--workers', type=int)
     parser.add_argument('--precision', choices=['fp32', 'fp16', 'bf16'], default='fp32')
     parser.add_argument('--device', default='auto')
-    parser.add_argument('--embedder')
-    parser.add_argument('--embedder-lookahead-ms', type=int, choices=LOOKAHEAD_CHOICES,
-                        help='Require the selected or saved fine-tuned embedder to use this extra lookahead.')
     parser.add_argument('--cutting', choices=['Skip', 'Simple'], default='Skip')
     parser.add_argument('--chunk-len', type=float, default=5.0)
     parser.add_argument('--overlap-len', type=float, default=0.3)
@@ -252,15 +228,13 @@ def main():
     select_device(args.device)
     experiment = ROOT / 'logs' / args.model_name
     ensure_trainer()
-    from beatrice.embedder_model import prepare_voice_embedder
-
-    embedder_config = prepare_voice_embedder(experiment, args.embedder, args.embedder_lookahead_ms)
+    if (experiment / CHECKPOINT).is_file() and (experiment / 'beatrice_embedder.json').is_file():
+        raise SystemExit(f'{experiment.name} was trained with a custom embedder, which is no longer supported. '
+                         'Use a new model name.')
     tidy_experiment(experiment)
     speakers = dataset_speakers(experiment, args.dataset)
     data_dir = build_dataset(experiment, speakers, args)
-    config = write_config(experiment, args, embedder_config)
-    if args.embedder_lookahead_ms is not None:
-        print(f'Training Beatrice with the fine-tuned {args.embedder_lookahead_ms} ms embedder.', flush=True)
+    config = write_config(experiment, args)
     arguments = ['-d', str(data_dir), '-o', str(experiment), '-c', str(config)]
     if (experiment / CHECKPOINT).is_file():
         print(f'Resuming from {experiment / CHECKPOINT}.', flush=True)
