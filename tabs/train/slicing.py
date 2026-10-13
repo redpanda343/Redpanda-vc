@@ -6,6 +6,7 @@ CUTTING_INFO = {
     'Skip': "'Skip' keeps full clips",
     'Simple': "'Simple' cuts fixed-length slices",
     'Automatic': "'Automatic' slices at silences",
+    'Silence': "'Silence' cuts only at long pauses and keeps each utterance whole",
 }
 SILENCE_ACTIONS = ('truncate', 'compress')
 

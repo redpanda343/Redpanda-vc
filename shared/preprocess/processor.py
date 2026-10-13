@@ -21,6 +21,10 @@ from shared.preprocess.constants import (
     MINIMUM_AUTOMATIC_SOURCE_AUDIO_SECONDS,
     MINIMUM_OUTPUT_AUDIO_SECONDS,
     OVERLAP,
+    PAUSE_HOP_MS,
+    PAUSE_KEPT_MS,
+    PAUSE_MIN_SILENCE_SECONDS,
+    PAUSE_THRESHOLD_DB,
     PERCENTAGE,
     POST_NORMALIZATION_MAX_GAIN,
     SIMPLE_MIN_SILENCE_SECONDS,
@@ -416,6 +420,54 @@ class PreProcess:
                     start += step_samples
         return duration_s, writer.skipped_short
 
+    def _process_pauses(
+        self,
+        path: str,
+        idx0: int,
+        sid: int,
+        process_effects: bool,
+        noise_reduction: bool,
+        reduction_strength: float,
+        normalization_mode: str,
+        threshold_db: float,
+        minimum_seconds: float,
+    ):
+        audio = load_audio_ffmpeg(path, self.sr)
+        duration_s = len(audio) / self.sr
+        audio = self._prepare_audio(
+            audio,
+            process_effects,
+            noise_reduction,
+            reduction_strength,
+            normalization_mode,
+        )
+        if audio is None:
+            return duration_s, 0
+        normalization_gain = 1.0
+        if normalization_mode == "post":
+            normalization_gain = self._detect_post_normalization_gain(audio)
+        minimum_ms = max(round(minimum_seconds * 1000), PAUSE_HOP_MS)
+        slicer = AutomaticSlicer(
+            sr=self.sr,
+            threshold=threshold_db,
+            min_length=minimum_ms,
+            min_interval=minimum_ms,
+            hop_size=PAUSE_HOP_MS,
+            max_sil_kept=max(PAUSE_HOP_MS, min(PAUSE_KEPT_MS, minimum_ms)),
+        )
+        with BoundedAudioWriter(self.audio_write_workers) as writer:
+            for idx1, segment in enumerate(slicer.slice(audio)):
+                self.process_audio_segment(
+                    segment,
+                    sid,
+                    idx0,
+                    idx1,
+                    normalization_mode,
+                    normalization_gain,
+                    writer,
+                )
+        return duration_s, writer.skipped_short
+
     def process_audio(
         self,
         path: str,
@@ -428,10 +480,24 @@ class PreProcess:
         chunk_len: float,
         overlap_len: float,
         normalization_mode: str,
+        pause_threshold_db: float = PAUSE_THRESHOLD_DB,
+        pause_minimum_seconds: float = PAUSE_MIN_SILENCE_SECONDS,
     ):
         audio_length = 0
         skipped_short = 0
         try:
+            if cut_preprocess == "Silence":
+                return self._process_pauses(
+                    path,
+                    idx0,
+                    sid,
+                    process_effects,
+                    noise_reduction,
+                    reduction_strength,
+                    normalization_mode,
+                    pause_threshold_db,
+                    pause_minimum_seconds,
+                )
             if cut_preprocess == "Automatic":
                 return self._process_automatic(
                     path,
@@ -478,7 +544,7 @@ class PreProcess:
                 )
         except Exception as error:
             print(f"Error processing audio: {error}")
-            if cut_preprocess == "Automatic" or self.dataset_format in {
+            if cut_preprocess in {"Automatic", "Silence"} or self.dataset_format in {
                 "flac",
                 "wav_float32",
             }:

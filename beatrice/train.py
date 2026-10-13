@@ -149,7 +149,7 @@ def build_dataset(experiment, speakers, args):
         arguments = [str(staging / speaker), str(source), sample_rate, workers, args.cutting, 'False', 'False', '0.0',
                      str(args.chunk_len), str(args.overlap_len), 'none', 'WAV', str(args.truncate_silence),
                      str(args.silence_threshold), str(args.silence_to), str(args.silence_minimum), args.silence_action,
-                     str(args.silence_compress)]
+                     str(args.silence_compress), 'v2', str(args.pause_threshold), str(args.pause_minimum)]
         if subprocess.run([sys.executable, '-u', '-m', 'shared.preprocess.preprocess', *arguments], cwd=ROOT).returncode:
             raise SystemExit(f'Slicing {speaker} failed.')
         sliced = staging / speaker / 'sliced_audios'
@@ -215,7 +215,9 @@ def main():
     parser.add_argument('--workers', type=int)
     parser.add_argument('--precision', choices=['fp32', 'fp16', 'bf16'], default='fp32')
     parser.add_argument('--device', default='auto')
-    parser.add_argument('--cutting', choices=['Skip', 'Simple'], default='Skip')
+    parser.add_argument('--cutting', choices=['Skip', 'Silence', 'Simple'], default='Skip')
+    parser.add_argument('--pause-threshold', type=float, default=-42.0)
+    parser.add_argument('--pause-minimum', type=float, default=1.0)
     parser.add_argument('--chunk-len', type=float, default=5.0)
     parser.add_argument('--overlap-len', type=float, default=0.3)
     parser.add_argument('--truncate-silence', action='store_true')

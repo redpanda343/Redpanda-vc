@@ -13,7 +13,7 @@ from tabs.train.slicing import SILENCE_ACTIONS, check_cutting, slicing_controls
 
 ROOT = Path(__file__).resolve().parents[2]
 BEATRICE_WARNINGS = 'ignore:wav_length % 160 != 0,ignore:Some clusters have no assigned data points'
-SLICERS = ('Skip', 'Simple')
+SLICERS = ('Skip', 'Silence', 'Simple')
 MINIMUM_CHUNK = 5.0
 _lock = threading.Lock()
 _process = None
@@ -73,9 +73,9 @@ def launch(name, arguments):
         return _status()
 
 
-def dataset_arguments(name, dataset, workers, device, cutting='Skip', chunk_len=MINIMUM_CHUNK, overlap_len=0.3,
-                      truncate_silence=False, silence_action='truncate', silence_threshold=-45.0, silence_minimum=0.3,
-                      silence_to=0.3, silence_compress=50.0):
+def dataset_arguments(name, dataset, workers, device, pause_threshold=-42.0, pause_minimum=1.0, cutting='Skip',
+                      chunk_len=MINIMUM_CHUNK, overlap_len=0.3, truncate_silence=False, silence_action='truncate',
+                      silence_threshold=-45.0, silence_minimum=0.3, silence_to=0.3, silence_compress=50.0):
     experiment_path(name)
     dataset = str(dataset).strip().strip('"')
     if not Path(dataset).is_dir():
@@ -86,19 +86,22 @@ def dataset_arguments(name, dataset, workers, device, cutting='Skip', chunk_len=
     check_cutting(cutting, chunk_len, SLICERS, MINIMUM_CHUNK)
     if silence_action not in SILENCE_ACTIONS:
         raise gr.Error('Choose a silence action.')
+    if not 0.1 <= float(pause_minimum) <= 10.0:
+        raise gr.Error('Minimum pause must be between 0.1 and 10 seconds.')
     arguments = ['--model-name', str(name).strip(), '--dataset', dataset, '--device', device,
                  '--workers', positive_integer(workers, 'CPU workers'), '--cutting', cutting,
                  '--chunk-len', str(float(chunk_len)), '--overlap-len', str(float(overlap_len)),
                  '--silence-action', silence_action, '--silence-threshold', str(float(silence_threshold)),
                  '--silence-minimum', str(float(silence_minimum)), '--silence-to', str(float(silence_to)),
-                 '--silence-compress', str(float(silence_compress))]
+                 '--silence-compress', str(float(silence_compress)), '--pause-threshold', str(float(pause_threshold)),
+                 '--pause-minimum', str(float(pause_minimum))]
     if truncate_silence:
         arguments.append('--truncate-silence')
     return arguments
 
 
-def start(name, dataset, workers, device, steps, batch, save_interval, *slicing):
-    arguments = dataset_arguments(name, dataset, workers, device, *slicing)
+def start(name, dataset, workers, device, steps, batch, save_interval, pause_threshold, pause_minimum, *slicing):
+    arguments = dataset_arguments(name, dataset, workers, device, pause_threshold, pause_minimum, *slicing)
     precision = get_precision() or 'fp32'
     if precision not in {'fp32', 'fp16', 'bf16'}:
         raise gr.Error(f'Unsupported training precision: {precision}')
@@ -154,9 +157,19 @@ def beatrice_train_tab():
                                  'augment audio.')
         slicing = slicing_controls(choices=SLICERS, value='Skip', chunk_minimum=MINIMUM_CHUNK,
                                    chunk_value=MINIMUM_CHUNK,
-                                   note="Skip trains on the files as they are. Simple cuts the WAV, FLAC, MP3 and OGG "
-                                        "files into 5-10 second chunks at the Beatrice model's 24 kHz sample rate, in "
-                                        'a temporary folder that is deleted when training ends.')
+                                   note="Skip trains on the files as they are. Silence splits the WAV, FLAC, MP3 and "
+                                        'OGG files only where a pause lasts at least the minimum pause, with no length '
+                                        'limit. Simple cuts them into 5-10 second chunks. Both slice at the Beatrice '
+                                        "model's 24 kHz sample rate, in a temporary folder that is deleted when "
+                                        'training ends.')
+        with gr.Row(visible=False) as pause_row:
+            pause_threshold = gr.Slider(-80, -20, -42, step=1, label='Pause threshold (dB)',
+                                        info='Audio quieter than this counts as a pause.')
+            pause_minimum = gr.Slider(0.1, 10.0, 1.0, step=0.1, label='Minimum pause (sec)',
+                                      info='Splits only at pauses at least this long. Shorter pauses stay inside the '
+                                           'slice, and up to 0.3 s of each pause is kept at the slice edges.')
+        slicing.cutting.change(lambda cutting: gr.update(visible=cutting == 'Silence'), slicing.cutting, pause_row,
+                               queue=False)
     with gr.Accordion('2. Train Beatrice', open=True):
         with gr.Row():
             steps = gr.Number(label='Training steps', value=10000, minimum=1, precision=0,
@@ -174,7 +187,7 @@ def beatrice_train_tab():
             stop_button = gr.Button('Stop current Beatrice job', interactive=False)
     timer = gr.Timer(2)
     outputs = [train_button, stop_button, timer]
-    train_button.click(start, [name, dataset, workers, device, steps, batch, save_interval, *slicing.inputs], outputs,
-                       queue=False)
+    train_button.click(start, [name, dataset, workers, device, steps, batch, save_interval, pause_threshold,
+                               pause_minimum, *slicing.inputs], outputs, queue=False)
     stop_button.click(stop, [], outputs, queue=False)
     timer.tick(status, [], outputs, queue=False, show_progress='hidden')

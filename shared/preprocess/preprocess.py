@@ -19,6 +19,8 @@ from shared.preprocess.constants import (
     GPU_PREPROCESS_MAX_WORKERS,
     MINIMUM_AUTOMATIC_SOURCE_AUDIO_SECONDS,
     MINIMUM_OUTPUT_AUDIO_SECONDS,
+    PAUSE_MIN_SILENCE_SECONDS,
+    PAUSE_THRESHOLD_DB,
     PROCESS_PENDING_MULTIPLIER,
     SIMPLE_MIN_SILENCE_SECONDS,
     SIMPLE_SILENCE_COMPRESS_PERCENT,
@@ -87,6 +89,8 @@ def process_audio_wrapper(args):
         chunk_len,
         overlap_len,
         normalization_mode,
+        pause_threshold_db,
+        pause_minimum_seconds,
     ) = args
     if pp is None:
         pp = _PROCESS_PREPROCESSOR
@@ -104,6 +108,8 @@ def process_audio_wrapper(args):
         chunk_len,
         overlap_len,
         normalization_mode,
+        pause_threshold_db,
+        pause_minimum_seconds,
     )
 
 
@@ -169,6 +175,8 @@ def preprocess_training_set(
     truncate_silence_action: str = "truncate",
     truncate_silence_compress_percent: float = SIMPLE_SILENCE_COMPRESS_PERCENT,
     version: str = "v2",
+    pause_threshold_db: float = PAUSE_THRESHOLD_DB,
+    pause_minimum_seconds: float = PAUSE_MIN_SILENCE_SECONDS,
 ):
     if not os.path.exists(input_root):
         print(f"The dataset path does not exist: '{input_root}'.")
@@ -280,6 +288,8 @@ def preprocess_training_set(
                 chunk_len,
                 overlap_len,
                 normalization_mode,
+                pause_threshold_db,
+                pause_minimum_seconds,
             )
             for file in files
         ]
@@ -391,6 +401,10 @@ if __name__ == "__main__":
         else SIMPLE_SILENCE_COMPRESS_PERCENT
     )
     version = str(sys.argv[19]) if len(sys.argv) > 19 else "v2"
+    pause_threshold_db = float(sys.argv[20]) if len(sys.argv) > 20 else PAUSE_THRESHOLD_DB
+    pause_minimum_seconds = (
+        float(sys.argv[21]) if len(sys.argv) > 21 else PAUSE_MIN_SILENCE_SECONDS
+    )
     preprocess_training_set(
         input_root,
         sample_rate,
@@ -411,4 +425,6 @@ if __name__ == "__main__":
         truncate_silence_action,
         truncate_silence_compress_percent,
         version,
+        pause_threshold_db,
+        pause_minimum_seconds,
     )
