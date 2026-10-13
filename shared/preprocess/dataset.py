@@ -233,7 +233,7 @@ def format_duration(seconds):
     return f"{hours:02}:{minutes:02}:{seconds:02}"
 
 
-def save_dataset_duration(file_path, dataset_duration, dataset_format="wav"):
+def save_dataset_duration(file_path, dataset_duration, dataset_format="wav", speakers=None):
     normalized_format = normalize_dataset_format(dataset_format)
     try:
         with open(file_path, "r", encoding="utf-8") as f:
@@ -253,6 +253,10 @@ def save_dataset_duration(file_path, dataset_duration, dataset_format="wav"):
         }[normalized_format],
     }
     data.update(new_data)
+    if speakers:
+        data["speakers"] = speakers
+    else:
+        data.pop("speakers", None)
 
     with open(file_path, "w") as f:
         json.dump(data, f, indent=4)

@@ -48,6 +48,19 @@ def strtobool(val):
     return val.lower() in ("yes", "true", "t", "y", "1")
 
 
+def speaker_ids(speakers):
+    names = sorted((name for name in speakers if name), key=lambda name: (name.casefold(), name))
+    if all(name.isdecimal() for name in names):
+        mapping = {name: int(name) for name in names}
+        start = 0
+    else:
+        start = 1 if "" in speakers else 0
+        mapping = {name: start + index for index, name in enumerate(names)}
+    if "" in speakers:
+        mapping[""] = 0
+    return mapping
+
+
 def initialize_preprocess_worker(
     sr, exp_dir, dataset_format, audio_write_workers, torch_threads, version
 ):
@@ -173,9 +186,7 @@ def preprocess_training_set(
             f"{os.path.join(exp_dir, 'validation', 'audio')}."
         )
 
-    files = []
-    idx = 0
-
+    sources = []
     for root, directories, filenames in os.walk(input_root):
         if root == input_root:
             directories[:] = [
@@ -184,17 +195,23 @@ def preprocess_training_set(
                 if directory.lower() != "validation"
             ]
         directories.sort()
-        try:
-            sid = 0 if root == input_root else int(os.path.basename(root))
-            for f in sorted(filenames):
-                if f.lower().endswith((".wav", ".mp3", ".flac", ".ogg")):
-                    files.append((os.path.join(root, f), idx, sid))
-                    idx += 1
-        except ValueError:
-            print(
-                f'Speaker ID folder is expected to be integer, got "{os.path.basename(root)}" instead.'
-            )
+        relative_root = os.path.relpath(root, input_root)
+        speaker = "" if relative_root == "." else relative_root.split(os.sep)[0]
+        for f in sorted(filenames):
+            if f.lower().endswith((".wav", ".mp3", ".flac", ".ogg")):
+                sources.append((os.path.join(root, f), speaker))
 
+    speakers = speaker_ids({speaker for _, speaker in sources})
+    files = [
+        (file_path, idx, speakers[speaker])
+        for idx, (file_path, speaker) in enumerate(sources)
+    ]
+    named_speakers = {name: sid for name, sid in speakers.items() if name}
+    if named_speakers:
+        print(
+            "Speaker IDs: "
+            + ", ".join(f"{name}={sid}" for name, sid in named_speakers.items())
+        )
 
     if len(files) == 0:
         print(
@@ -321,6 +338,7 @@ def preprocess_training_set(
         os.path.join(exp_dir, "model_info.json"),
         dataset_duration=audio_length,
         dataset_format=dataset_format,
+        speakers=named_speakers,
     )
     elapsed_time = time.time() - start_time
     automatic_filter = (
