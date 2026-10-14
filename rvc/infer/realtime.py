@@ -356,6 +356,16 @@ class RealTimeRVC:
         if getattr(self, "variance_stream", None) is not None:
             self.variance_stream.reset()
 
+    def skip_block(self, block_frame_16k):
+        with self.lock:
+            shift = max(1, block_frame_16k // 160)
+            self.cache_pitch[:-shift] = self.cache_pitch[shift:].clone()
+            self.cache_pitchf[:-shift] = self.cache_pitchf[shift:].clone()
+            self.cache_pitch[-shift:] = 1
+            self.cache_pitchf[-shift:] = 0.0
+            self.rmvpe_viterbi.reset()
+            self.pitch_sample_count += int(block_frame_16k)
+
     def _extract_features(self, input_wav):
         source = input_wav.float().view(1, -1)
         if getattr(self.embedder, "audio_requires_normalization", False):

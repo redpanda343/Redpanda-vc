@@ -507,7 +507,7 @@ class AudioEngine:
         try:
             silence = np.zeros((self.block_frame, self.channels), dtype=np.float32)
             for _ in range(2 if self.beatrice is None else 3):
-                self._process(silence)
+                self._process(silence, skip_silence=False)
         finally:
             self._reset_buffers()
 
@@ -752,7 +752,7 @@ class AudioEngine:
         self.sola_buffer[:] = converted[self.block_frame : self.block_frame + self.sola_buffer_frame]
         return converted[: self.block_frame]
 
-    def _process(self, indata):
+    def _process(self, indata, skip_silence=True):
         started = time.perf_counter()
         settings = self.settings
         indata = librosa.to_mono(indata.T).astype(np.float32)
@@ -782,6 +782,7 @@ class AudioEngine:
         source = self.input_wav_denoise if denoise else self.input_wav
         passthrough = settings["passthrough"]
         infer_seconds = 0.0
+        silent = False
         if self.beatrice is not None:
             block = source[-self.block_frame :]
             if passthrough:
@@ -796,9 +797,15 @@ class AudioEngine:
                 infer_wav = self.tg(infer_wav.unsqueeze(0), self.output_buffer.unsqueeze(0)).squeeze(0)
             output_block = infer_wav[: self.block_frame]
         else:
-            if passthrough:
-                self.rvc.pitch_sample_count += self.block_frame_16k
+            lookahead = self.rvc.pitch_lookahead_frames(settings["f0_method"])
+            silent = skip_silence and not passthrough and not bool(
+                self.input_wav[max(0, self.extra_frame - lookahead * self.zc) :].any()
+            )
+            if passthrough or silent:
+                self.rvc.skip_block(self.block_frame_16k)
                 infer_wav = source[self.extra_frame :].clone()
+                if silent:
+                    infer_wav.zero_()
             else:
                 infer_wav, infer_seconds = self.rvc.infer(
                     self.input_wav_res,
@@ -813,18 +820,19 @@ class AudioEngine:
                     infer_wav = self.resampler2(infer_wav)
                 else:
                     infer_wav = infer_wav.clone()
-            if settings["output_noise_reduce"] and not passthrough:
+            if settings["output_noise_reduce"] and not (passthrough or silent):
                 self.output_buffer[: -self.block_frame] = self.output_buffer[self.block_frame :].clone()
                 self.output_buffer[-self.block_frame :] = infer_wav[-self.block_frame :]
                 infer_wav = self.tg(infer_wav.unsqueeze(0), self.output_buffer.unsqueeze(0)).squeeze(0)
-            if settings["rms_mix_rate"] < 1 and not passthrough:
+            if settings["rms_mix_rate"] < 1 and not (passthrough or silent):
                 infer_wav = self._mix_volume(infer_wav, source)
             output_block = self._apply_sola(infer_wav)
         gain = db_to_linear(settings["output_gain_db"])
         output = torch.clamp(output_block * gain, -1.0, 1.0).cpu().numpy().astype(np.float32)
         self.output_level = float(np.abs(output).max(initial=0.0))
-        self.last_infer_ms = round(infer_seconds * 1000)
-        self.last_block_ms = round((time.perf_counter() - started) * 1000)
+        if not silent:
+            self.last_infer_ms = round(infer_seconds * 1000)
+            self.last_block_ms = round((time.perf_counter() - started) * 1000)
         self._refresh_latency()
         return output
 
