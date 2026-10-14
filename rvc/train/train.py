@@ -219,11 +219,32 @@ def parse_arguments(argv=None):
     parser.add_argument("--cache-data-in-gpu", action="store_true")
     parser.add_argument("--cleanup", action="store_true")
     parser.add_argument("--checkpointing", action="store_true")
+    parser.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=0,
+        help="Ramp the learning rate up over this many steps.",
+    )
+    parser.add_argument(
+        "--lr-decay-steps",
+        type=int,
+        default=0,
+        help="Apply lr_decay every this many steps instead of once per epoch (0).",
+    )
+    parser.add_argument(
+        "--max-batch-seconds",
+        type=float,
+        default=0.0,
+        help="Limit clips per batch times the longest clip to this much audio (0 disables it).",
+    )
     args = parser.parse_args(argv)
 
     for name in ("total_epoch", "save_every_epoch", "batch_size"):
         if getattr(args, name) < 1:
             parser.error(f"--{name.replace('_', '-')} must be at least 1.")
+    for name in ("warmup_steps", "lr_decay_steps", "max_batch_seconds"):
+        if not getattr(args, name) >= 0:
+            parser.error(f"--{name.replace('_', '-')} cannot be negative.")
     args.save_every_steps = max(0, args.save_every_steps)
     if args.version == "v1" and (args.sample_rate != 40000 or args.vocoder != "HiFi-GAN"):
         parser.error("RVC v1 training requires HiFi-GAN at 40000 Hz.")
@@ -428,6 +449,9 @@ class Trainer:
         last_g, last_d = latest_checkpoint_pair(self.args.experiment_dir)
         self.build_models(last_g)
         epoch_str = self.restore(last_g, last_d)
+        for optimizer in (self.optim_g, self.optim_d):
+            for group in optimizer.param_groups:
+                group.setdefault("initial_lr", group["lr"])
 
         if self.rank == 0:
             self.writer = SummaryWriter(
@@ -438,12 +462,6 @@ class Trainer:
             if self.args.save_every_steps > 0:
                 self.exporter = AsyncInferenceExporter(self.device)
 
-        schedulers = [
-            torch.optim.lr_scheduler.ExponentialLR(
-                optimizer, gamma=self.config.train.lr_decay, last_epoch=epoch_str - 2
-            )
-            for optimizer in (self.optim_g, self.optim_d)
-        ]
         if epoch_str > self.args.total_epoch and self.rank == 0:
             print(
                 f"{self.args.model_name} already reached epoch {self.args.total_epoch}. "
@@ -454,8 +472,6 @@ class Trainer:
                 self.train_epoch(epoch)
                 if self.finish_epoch(epoch):
                     break
-                for scheduler in schedulers:
-                    scheduler.step()
         finally:
             if self.exporter is not None:
                 self.exporter.close()
@@ -469,7 +485,9 @@ class Trainer:
             TextAudioLoaderMultiNSFsid,
         )
 
-        self.dataset = TextAudioLoaderMultiNSFsid(self.config.data)
+        data = self.config.data
+        max_frames = int(self.args.max_batch_seconds * data.sample_rate / data.hop_length)
+        self.dataset = TextAudioLoaderMultiNSFsid(data)
         self.collate = TextAudioCollateMultiNSFsid()
         self.sampler = DistributedBucketSampler(
             self.dataset,
@@ -478,7 +496,14 @@ class Trainer:
             num_replicas=self.world_size,
             rank=self.rank,
             shuffle=True,
+            max_frames=max_frames or None,
         )
+        if max_frames and self.rank == 0:
+            sizes = self.sampler.bucket_batch_sizes
+            print(
+                f"Limiting batches to {self.args.max_batch_seconds:g} s of audio: "
+                f"{min(sizes)} to {max(sizes)} clips per batch, {len(self.sampler)} steps per epoch."
+            )
         if len(self.sampler) < 3:
             print(
                 "Not enough data present in the training set. Perhaps you forgot to slice the audio files in preprocess?"
@@ -556,6 +581,11 @@ class Trainer:
             eps=config.train.eps,
             **options,
         )
+        if args.warmup_steps or args.lr_decay_steps:
+            decay = f"every {args.lr_decay_steps} steps" if args.lr_decay_steps else "every epoch"
+            print(
+                f"Learning rate: {args.warmup_steps} warmup steps, lr_decay {config.train.lr_decay} {decay}."
+            )
         if args.multiscale_mel_loss:
             self.fn_mel_loss = MultiScaleMelSpectrogramLoss(
                 sample_rate=config.data.sample_rate
@@ -659,9 +689,23 @@ class Trainer:
         self.epoch_recorder = EpochRecorder()
         with tqdm(total=len(self.sampler), leave=False) as pbar:
             for batch in self.batches():
+                self.set_learning_rate(epoch)
                 self.train_step(batch)
                 self.export_step_weights(epoch)
                 pbar.update(1)
+
+    def set_learning_rate(self, epoch):
+        args, step = self.args, self.global_step
+        decay = self.config.train.lr_decay
+        if args.lr_decay_steps:
+            factor = decay ** (max(0, step - args.warmup_steps) / args.lr_decay_steps)
+        else:
+            factor = decay ** (epoch - 1)
+        if step < args.warmup_steps:
+            factor *= (step + 1) / args.warmup_steps
+        for optimizer in (self.optim_g, self.optim_d):
+            for group in optimizer.param_groups:
+                group["lr"] = group["initial_lr"] * factor
 
     def optimizer_step(self, optimizer, net, loss, log_grad_norm, update_scaler, before_step=None):
         optimizer.zero_grad()

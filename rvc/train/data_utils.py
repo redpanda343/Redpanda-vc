@@ -231,6 +231,7 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
         num_replicas (int, optional): Number of processes participating in distributed training. Defaults to None.
         rank (int, optional): Rank of the current process. Defaults to None.
         shuffle (bool, optional): Whether to shuffle the data. Defaults to True.
+        max_frames (int, optional): Maximum batch size times the longest clip of a bucket, in frames. Defaults to None.
     """
 
     def __init__(
@@ -241,11 +242,13 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
         num_replicas=None,
         rank=None,
         shuffle=True,
+        max_frames=None,
     ):
         super().__init__(dataset, num_replicas=num_replicas, rank=rank, shuffle=shuffle)
         self.lengths = dataset.lengths
         self.batch_size = batch_size
         self.boundaries = boundaries
+        self.max_frames = max_frames
 
         self.buckets, self.num_samples_per_bucket = self._create_buckets()
         self.total_size = sum(self.num_samples_per_bucket)
@@ -267,10 +270,22 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
                 buckets.pop(i)
                 self.boundaries.pop(i + 1)
 
+        self.bucket_batch_sizes = [
+            max(
+                1,
+                min(
+                    self.batch_size,
+                    self.max_frames // max(self.lengths[i] for i in bucket),
+                ),
+            )
+            if self.max_frames
+            else self.batch_size
+            for bucket in buckets
+        ]
         num_samples_per_bucket = []
         for i in range(len(buckets)):
             len_bucket = len(buckets[i])
-            total_batch_size = self.num_replicas * self.batch_size
+            total_batch_size = self.num_replicas * self.bucket_batch_sizes[i]
             rem = (
                 total_batch_size - (len_bucket % total_batch_size)
             ) % total_batch_size
@@ -309,12 +324,11 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
             ids_bucket = ids_bucket[self.rank :: self.num_replicas]
 
             # batching
-            for j in range(len(ids_bucket) // self.batch_size):
+            batch_size = self.bucket_batch_sizes[i]
+            for j in range(len(ids_bucket) // batch_size):
                 batch = [
                     bucket[idx]
-                    for idx in ids_bucket[
-                        j * self.batch_size : (j + 1) * self.batch_size
-                    ]
+                    for idx in ids_bucket[j * batch_size : (j + 1) * batch_size]
                 ]
                 batches.append(batch)
 
@@ -323,7 +337,7 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
             batches = [batches[i] for i in batch_ids]
         self.batches = batches
 
-        assert len(self.batches) * self.batch_size == self.num_samples
+        assert sum(len(batch) for batch in self.batches) == self.num_samples
         return iter(self.batches)
 
     def _bisect(self, x, lo=0, hi=None):
@@ -353,4 +367,9 @@ class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
         """
         Returns the length of the sampler.
         """
-        return self.num_samples // self.batch_size
+        return sum(
+            num_samples // (self.num_replicas * batch_size)
+            for num_samples, batch_size in zip(
+                self.num_samples_per_bucket, self.bucket_batch_sizes
+            )
+        )

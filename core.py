@@ -655,6 +655,9 @@ def _build_train_command(
     checkpointing: bool = False,
     save_every_steps: int = 0,
     version: str = "v2",
+    warmup_steps: int = 0,
+    lr_decay_steps: int = 0,
+    max_batch_seconds: float = 0.0,
 ):
     if version not in {"v1", "v2"}:
         raise ValueError(f"Unsupported RVC version: {version}")
@@ -712,6 +715,12 @@ def _build_train_command(
         vocoder,
         "--version",
         version,
+        "--warmup-steps",
+        str(int(warmup_steps)),
+        "--lr-decay-steps",
+        str(int(lr_decay_steps)),
+        "--max-batch-seconds",
+        str(float(max_batch_seconds)),
     ]
     if pg:
         command += ["--pretrained-g", pg]
@@ -751,6 +760,9 @@ def run_train_script(
     shutdown_check: bool = False,
     save_every_steps: int = 0,
     version: str = "v2",
+    warmup_steps: int = 0,
+    lr_decay_steps: int = 0,
+    max_batch_seconds: float = 0.0,
 ):
     command = _build_train_command(
         model_name,
@@ -772,6 +784,9 @@ def run_train_script(
         checkpointing,
         save_every_steps,
         version,
+        warmup_steps,
+        lr_decay_steps,
+        max_batch_seconds,
     )
     result = subprocess.run(command)
     if result.returncode != 0:
@@ -820,6 +835,9 @@ def start_train_script(
     save_every_steps: int = 0,
     version: str = "v2",
     generate_index: bool = False,
+    warmup_steps: int = 0,
+    lr_decay_steps: int = 0,
+    max_batch_seconds: float = 0.0,
 ):
     command = _build_train_command(
         model_name,
@@ -841,6 +859,9 @@ def start_train_script(
         checkpointing,
         save_every_steps,
         version,
+        warmup_steps,
+        lr_decay_steps,
+        max_batch_seconds,
     )
 
     on_success = None
@@ -1498,6 +1519,24 @@ def extract(**kwargs):
     default="Auto",
     help="Index file generation algorithm.",
 )
+@click.option(
+    "--warmup-steps",
+    type=click.IntRange(min=0),
+    default=0,
+    help="Ramp the learning rate up over this many steps.",
+)
+@click.option(
+    "--lr-decay-steps",
+    type=click.IntRange(min=0),
+    default=0,
+    help="Apply lr_decay every N steps instead of once per epoch (0).",
+)
+@click.option(
+    "--max-batch-seconds",
+    type=click.FloatRange(min=0),
+    default=0.0,
+    help="Limit clips per batch times the longest clip to this much audio (0 disables it).",
+)
 def train(**kwargs):
     """Train an RVC model."""
     result = run_train_script(
@@ -1520,6 +1559,9 @@ def train(**kwargs):
         checkpointing=kwargs["checkpointing"],
         save_every_steps=kwargs["save_every_steps"],
         version=kwargs["version"],
+        warmup_steps=kwargs["warmup_steps"],
+        lr_decay_steps=kwargs["lr_decay_steps"],
+        max_batch_seconds=kwargs["max_batch_seconds"],
     )
     click.echo(result)
 

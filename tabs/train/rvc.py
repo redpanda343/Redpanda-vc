@@ -793,6 +793,40 @@ def rvc_train_tab():
                         interactive=True,
                     )
             with gr.Row():
+                warmup_steps = gr.Slider(
+                    0,
+                    10000,
+                    0,
+                    step=1,
+                    label=i18n("Warmup Steps"),
+                    info=i18n(
+                        "Ramps the learning rate up linearly over the first X steps. 0 disables warmup."
+                    ),
+                    interactive=True,
+                )
+                lr_decay_steps = gr.Slider(
+                    0,
+                    10000,
+                    0,
+                    step=1,
+                    label=i18n("Learning Rate Decay Every X Steps"),
+                    info=i18n(
+                        "Applies the learning rate decay every X steps, so it no longer depends on the dataset size. 0 decays once per epoch."
+                    ),
+                    interactive=True,
+                )
+                max_batch_seconds = gr.Slider(
+                    0,
+                    600,
+                    0,
+                    step=1,
+                    label=i18n("Max Audio per Batch (sec)"),
+                    info=i18n(
+                        "Uses fewer clips per batch for long clips, so the batch size times the longest clip stays under this length. 0 keeps the batch size fixed."
+                    ),
+                    interactive=True,
+                )
+            with gr.Row():
                 custom_pretrained = gr.Checkbox(
                     label=i18n("Custom Pretrained"),
                     info=i18n(
@@ -842,7 +876,13 @@ def rvc_train_tab():
             )
 
         def start_training(*args):
-            message = start_train_script(*args)
+            *arguments, warmup, decay_steps, batch_seconds = args
+            message = start_train_script(
+                *arguments,
+                warmup_steps=warmup,
+                lr_decay_steps=decay_steps,
+                max_batch_seconds=batch_seconds,
+            )
             gr.Info(message)
             return training_ui_state(args[0])
 
@@ -1188,6 +1228,9 @@ def rvc_train_tab():
                     shutdown_check,
                     save_every_steps,
                     model_version,
+                    warmup_steps,
+                    lr_decay_steps,
+                    max_batch_seconds,
                 ],
                 outputs=training_outputs,
             ).then(**wake_training_timer)
