@@ -177,49 +177,35 @@ class TextAudioCollateMultiNSFsid:
         _, ids_sorted_decreasing = torch.sort(
             torch.LongTensor([x[0].size(1) for x in batch]), dim=0, descending=True
         )
+        rows = [batch[i] for i in ids_sorted_decreasing.tolist()]
+        device = rows[0][0].device
 
-        max_spec_len = max([x[0].size(1) for x in batch])
-        max_wave_len = max([x[1].size(1) for x in batch])
-        spec_lengths = torch.LongTensor(len(batch))
-        wave_lengths = torch.LongTensor(len(batch))
-        spec_padded = torch.FloatTensor(len(batch), batch[0][0].size(0), max_spec_len)
-        wave_padded = torch.FloatTensor(len(batch), 1, max_wave_len)
-        spec_padded.zero_()
-        wave_padded.zero_()
-
-        max_phone_len = max([x[2].size(0) for x in batch])
-        phone_lengths = torch.LongTensor(len(batch))
-        phone_padded = torch.FloatTensor(
-            len(batch), max_phone_len, batch[0][2].shape[1]
+        max_spec_len = max([x[0].size(1) for x in rows])
+        max_wave_len = max([x[1].size(1) for x in rows])
+        spec_lengths = torch.LongTensor([x[0].size(1) for x in rows])
+        wave_lengths = torch.LongTensor([x[1].size(1) for x in rows])
+        spec_padded = torch.zeros(
+            len(rows), rows[0][0].size(0), max_spec_len, device=device
         )
-        pitch_padded = torch.LongTensor(len(batch), max_phone_len)
-        pitchf_padded = torch.FloatTensor(len(batch), max_phone_len)
-        phone_padded.zero_()
-        pitch_padded.zero_()
-        pitchf_padded.zero_()
-        sid = torch.LongTensor(len(batch))
+        wave_padded = torch.zeros(len(rows), 1, max_wave_len, device=device)
 
-        for i in range(len(ids_sorted_decreasing)):
-            row = batch[ids_sorted_decreasing[i]]
+        max_phone_len = max([x[2].size(0) for x in rows])
+        phone_lengths = torch.LongTensor([x[2].size(0) for x in rows])
+        phone_padded = torch.zeros(
+            len(rows), max_phone_len, rows[0][2].shape[1], device=device
+        )
+        pitch_padded = torch.zeros(
+            len(rows), max_phone_len, dtype=torch.long, device=device
+        )
+        pitchf_padded = torch.zeros(len(rows), max_phone_len, device=device)
+        sid = torch.cat([row[5] for row in rows])
 
-            spec = row[0]
+        for i, (spec, wave, phone, pitch, pitchf, _) in enumerate(rows):
             spec_padded[i, :, : spec.size(1)] = spec
-            spec_lengths[i] = spec.size(1)
-
-            wave = row[1]
             wave_padded[i, :, : wave.size(1)] = wave
-            wave_lengths[i] = wave.size(1)
-
-            phone = row[2]
             phone_padded[i, : phone.size(0), :] = phone
-            phone_lengths[i] = phone.size(0)
-
-            pitch = row[3]
             pitch_padded[i, : pitch.size(0)] = pitch
-            pitchf = row[4]
             pitchf_padded[i, : pitchf.size(0)] = pitchf
-
-            sid[i] = row[5]
 
         return (
             phone_padded,

@@ -2,17 +2,18 @@ import os
 import sys
 
 os.environ["USE_LIBUV"] = "0" if sys.platform == "win32" else "1"
+import argparse
 import datetime
 import glob
 import json
+import logging
 from concurrent.futures import Future, ThreadPoolExecutor
-from random import randint, shuffle
+from random import randint
 from time import time as ttime
 
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
@@ -29,7 +30,6 @@ from rvc.train.mel_processing import (
 )
 from rvc.train.utils import (
     HParams,
-    latest_checkpoint_path,
     load_checkpoint,
     load_wav_to_torch,
     plot_spectrogram_to_numpy,
@@ -42,98 +42,19 @@ import shared.zluda
 from rvc.algorithm import commons
 from rvc.train.process.extract_model import extract_model
 
-# Parse command line arguments
-model_name = sys.argv[1]
-save_every_epoch = int(sys.argv[2])
-total_epoch = int(sys.argv[3])
-pretrainG = sys.argv[4]
-pretrainD = sys.argv[5]
-gpus = sys.argv[6]
-batch_size = int(sys.argv[7])
-sample_rate = int(sys.argv[8])
+VOCODERS = ("HiFi-GAN", "MRF HiFi-GAN", "RefineGAN")
+BUCKET_BOUNDARIES = (
+    50, 100, 200, 300, 400, 500, 600, 700, 800, 900,
+    1000, 1100, 1200, 1300, 1400, 1500,
+)
+LATEST_CHECKPOINT_SUFFIX = 2333333
 
-
-def _strtobool(val):
-    return val.lower() in ("yes", "true", "t", "y", "1")
-
-
-save_only_latest = _strtobool(sys.argv[9])
-save_every_weights = _strtobool(sys.argv[10])
-cache_data_in_gpu = _strtobool(sys.argv[11])
-cleanup = _strtobool(sys.argv[12])
-vocoder = sys.argv[13]
-checkpointing = _strtobool(sys.argv[14])
-save_every_steps = max(0, int(sys.argv[15])) if len(sys.argv) > 15 else 0
-version = sys.argv[16] if len(sys.argv) > 16 else "v2"
-if version not in {"v1", "v2"}:
-    raise ValueError(f"Unsupported RVC version: {version}")
-if version == "v1" and (sample_rate != 40000 or vocoder != "HiFi-GAN"):
-    raise ValueError("RVC v1 training requires HiFi-GAN at 40000 Hz.")
-expected_feature_dim = 256 if version == "v1" else 768
 # experimental settings
 randomized = True
 d_lr_coeff = 1.0
 g_lr_coeff = 1.0
 d_step_per_g_step = 1
-multiscale_mel_loss = False
 bf16_adamw = False
-disc_version = version
-
-if vocoder == "RefineGAN":
-    if version == "v1":
-        raise ValueError("RVC v1 training does not support RefineGAN.")
-    disc_version = "v3"
-    multiscale_mel_loss = True
-
-current_dir = os.getcwd()
-
-try:
-    with open(
-        os.path.join(current_dir, "assets", "config.json"),
-        "r",
-        encoding="utf-8",
-    ) as f:
-        config = json.load(f)
-        precision = config["precision"]
-        if (
-            precision == "bf16"
-            and torch.cuda.is_available()
-            and torch.cuda.is_bf16_supported()
-        ):
-            train_dtype = torch.bfloat16
-        elif precision == "fp16" and torch.cuda.is_available():
-            train_dtype = torch.float16
-        else:
-            train_dtype = torch.float32
-except (FileNotFoundError, json.JSONDecodeError, KeyError):
-    train_dtype = torch.float32
-
-inference_export_dtype = (
-    torch.float32 if train_dtype == torch.float32 else torch.float16
-)
-
-experiment_dir = os.path.join(current_dir, "logs", model_name)
-config_save_path = os.path.join(experiment_dir, "config.json")
-dataset_path = os.path.join(experiment_dir, "sliced_audios")
-model_info_path = os.path.join(experiment_dir, "model_info.json")
-
-try:
-    with open(config_save_path, "r", encoding="utf-8") as f:
-        config = json.load(f)
-    config = HParams(**config)
-except FileNotFoundError:
-    print(
-        f"Config file not found at {config_save_path}. Did you run preprocessing and feature extraction steps?"
-    )
-    sys.exit(1)
-
-config.data.training_files = os.path.join(experiment_dir, "filelist.txt")
-configured_feature_dim = int(getattr(config.model, "text_enc_hidden_dim", 768))
-if configured_feature_dim != expected_feature_dim:
-    raise ValueError(
-        f"RVC {version} training requires {expected_feature_dim}-channel features, "
-        f"but the experiment config uses {configured_feature_dim}."
-    )
 
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = os.name == "nt"
@@ -142,12 +63,6 @@ try:
     torch.backends.cudnn.fp32_precision = "ieee"
 except Exception as e:
     print(f'Torch tf32: {e}')
-
-global_step = 0
-last_loss_gen_all = 0
-training_file_path = os.path.join(experiment_dir, "training_data.json")
-
-import logging
 
 logging.getLogger("torch").setLevel(logging.ERROR)
 
@@ -286,822 +201,716 @@ class EpochRecorder:
         return f"time={current_time} | training_speed={elapsed_time_str}"
 
 
-def main():
-    """
-    Main function to start the training process.
-    """
-    global training_file_path, last_loss_gen_all, gpus
+def parse_arguments(argv=None):
+    parser = argparse.ArgumentParser(description="Train an RVC voice model.")
+    parser.add_argument("--model-name", required=True)
+    parser.add_argument("--sample-rate", type=int, required=True)
+    parser.add_argument("--total-epoch", type=int, required=True)
+    parser.add_argument("--save-every-epoch", type=int, required=True)
+    parser.add_argument("--save-every-steps", type=int, default=0)
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--gpus", default="0", help="CUDA device indices joined by -, such as 0-1.")
+    parser.add_argument("--pretrained-g", default="")
+    parser.add_argument("--pretrained-d", default="")
+    parser.add_argument("--vocoder", choices=VOCODERS, default="HiFi-GAN")
+    parser.add_argument("--version", choices=("v1", "v2"), default="v2")
+    parser.add_argument("--save-only-latest", action="store_true")
+    parser.add_argument("--save-every-weights", action="store_true")
+    parser.add_argument("--cache-data-in-gpu", action="store_true")
+    parser.add_argument("--cleanup", action="store_true")
+    parser.add_argument("--checkpointing", action="store_true")
+    args = parser.parse_args(argv)
 
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = str(randint(20000, 55555))
-    # Check sample rate
-    dataset_format = "wav"
+    for name in ("total_epoch", "save_every_epoch", "batch_size"):
+        if getattr(args, name) < 1:
+            parser.error(f"--{name.replace('_', '-')} must be at least 1.")
+    args.save_every_steps = max(0, args.save_every_steps)
+    if args.version == "v1" and (args.sample_rate != 40000 or args.vocoder != "HiFi-GAN"):
+        parser.error("RVC v1 training requires HiFi-GAN at 40000 Hz.")
+
+    args.experiment_dir = os.path.join(now_dir, "logs", args.model_name)
+    args.train_dtype = configured_train_dtype()
+    args.export_dtype = (
+        torch.float32 if args.train_dtype == torch.float32 else torch.float16
+    )
+    args.disc_version = "v3" if args.vocoder == "RefineGAN" else args.version
+    args.multiscale_mel_loss = args.vocoder == "RefineGAN"
+    return args
+
+
+def configured_train_dtype():
     try:
-        with open(model_info_path, "r", encoding="utf-8") as f:
-            dataset_format = str(json.load(f).get("dataset_format", "wav")).lower()
+        with open(
+            os.path.join(now_dir, "assets", "config.json"), "r", encoding="utf-8"
+        ) as f:
+            precision = json.load(f)["precision"]
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        return torch.float32
+    if precision == "bf16" and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    if precision == "fp16" and torch.cuda.is_available():
+        return torch.float16
+    return torch.float32
+
+
+def load_experiment_config(args):
+    config_save_path = os.path.join(args.experiment_dir, "config.json")
+    try:
+        with open(config_save_path, "r", encoding="utf-8") as f:
+            config = HParams(**json.load(f))
+    except FileNotFoundError:
+        print(
+            f"Config file not found at {config_save_path}. Did you run preprocessing and feature extraction steps?"
+        )
+        sys.exit(1)
+
+    config.data.training_files = os.path.join(args.experiment_dir, "filelist.txt")
+    expected_feature_dim = 256 if args.version == "v1" else 768
+    configured_feature_dim = int(getattr(config.model, "text_enc_hidden_dim", 768))
+    if configured_feature_dim != expected_feature_dim:
+        raise ValueError(
+            f"RVC {args.version} training requires {expected_feature_dim}-channel features, "
+            f"but the experiment config uses {configured_feature_dim}."
+        )
+    return config
+
+
+def read_model_info(args):
+    try:
+        with open(
+            os.path.join(args.experiment_dir, "model_info.json"), "r", encoding="utf-8"
+        ) as f:
+            return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        pass
+        return {}
+
+
+def check_dataset_sample_rate(args, config):
+    dataset_format = str(read_model_info(args).get("dataset_format", "wav")).lower()
     if dataset_format not in {"wav", "flac"}:
         dataset_format = "wav"
     wavs = glob.glob(
-        os.path.join(
-            os.path.join(experiment_dir, "sliced_audios"),
-            f"*.{dataset_format}",
-        )
+        os.path.join(args.experiment_dir, "sliced_audios", f"*.{dataset_format}")
     )
-    if wavs:
-        _, sr = load_wav_to_torch(wavs[0])
-        if sr != config.data.sample_rate:
-            print(
-                f"Error: Pretrained model sample rate ({config.data.sample_rate} Hz) does not match dataset audio sample rate ({sr} Hz)."
-            )
-            os._exit(1)
-    else:
+    if not wavs:
         print(f"No {dataset_format} file found.")
+        return
+    _, sr = load_wav_to_torch(wavs[0])
+    if sr != config.data.sample_rate:
+        print(
+            f"Error: Pretrained model sample rate ({config.data.sample_rate} Hz) does not match dataset audio sample rate ({sr} Hz)."
+        )
+        sys.exit(1)
+
+
+def remove_previous_attempt(experiment_dir):
+    print("Removing files from the prior training attempt...")
+    for root, dirs, files in os.walk(experiment_dir, topdown=False):
+        for name in files:
+            file_name, file_extension = os.path.splitext(name)
+            if (
+                file_extension in (".0", ".pth")
+                or name.endswith(".spec.pt")
+                or (file_name.startswith("added") and file_extension == ".index")
+            ):
+                os.remove(os.path.join(root, name))
+        for name in dirs:
+            if name == "eval":
+                folder_path = os.path.join(root, name)
+                for item in os.listdir(folder_path):
+                    item_path = os.path.join(folder_path, item)
+                    if os.path.isfile(item_path):
+                        os.remove(item_path)
+                os.rmdir(folder_path)
+    print("Cleanup done!")
+
+
+def latest_checkpoint_pair(experiment_dir):
+    generators = sorted(
+        glob.glob(os.path.join(experiment_dir, "G_*.pth")),
+        key=os.path.getmtime,
+        reverse=True,
+    )
+    for generator in generators:
+        discriminator = os.path.join(
+            experiment_dir, "D_" + os.path.basename(generator)[2:]
+        )
+        if os.path.isfile(discriminator):
+            return generator, discriminator
+    if generators:
+        return generators[0], None
+    discriminators = glob.glob(os.path.join(experiment_dir, "D_*.pth"))
+    return None, discriminators[0] if discriminators else None
+
+
+def main():
+    args = parse_arguments()
+    config = load_experiment_config(args)
+    check_dataset_sample_rate(args, config)
 
     if torch.cuda.is_available():
-        device = torch.device("cuda")
-        gpus = [int(item) for item in gpus.split("-")]
-        n_gpus = len(gpus)
+        device_type = "cuda"
+        device_ids = [int(item) for item in args.gpus.split("-")]
     elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-        gpus = [0]
-        n_gpus = 1
+        device_type = "mps"
+        device_ids = [0]
     else:
-        device = torch.device("cpu")
-        gpus = [0]
-        n_gpus = 1
+        device_type = "cpu"
+        device_ids = [0]
         print("Training with CPU, this will take a long time.")
 
-    def start():
-        """
-        Starts the training process with multi-GPU support or CPU.
-        """
-        children = []
-        for rank, device_id in enumerate(gpus):
-            subproc = mp.Process(
-                target=run,
-                args=(
-                    rank,
-                    n_gpus,
-                    experiment_dir,
-                    pretrainG,
-                    pretrainD,
-                    total_epoch,
-                    save_every_weights,
-                    config,
-                    device,
-                    device_id,
-                ),
-            )
-            children.append(subproc)
-            subproc.start()
+    if args.cleanup:
+        remove_previous_attempt(args.experiment_dir)
 
-        for i in range(n_gpus):
-            children[i].join()
-
-    if cleanup:
-        print("Removing files from the prior training attempt...")
-
-        # Clean up unnecessary files
-        for root, dirs, files in os.walk(
-            os.path.join(now_dir, "logs", model_name), topdown=False
-        ):
-            for name in files:
-                file_path = os.path.join(root, name)
-                file_name, file_extension = os.path.splitext(name)
-                if (
-                    file_extension == ".0"
-                    or file_extension == ".pth"
-                    or name.endswith(".spec.pt")
-                    or (file_name.startswith("added") and file_extension == ".index")
-                ):
-                    os.remove(file_path)
-            for name in dirs:
-                if name == "eval":
-                    folder_path = os.path.join(root, name)
-                    for item in os.listdir(folder_path):
-                        item_path = os.path.join(folder_path, item)
-                        if os.path.isfile(item_path):
-                            os.remove(item_path)
-                    os.rmdir(folder_path)
-
-        print("Cleanup done!")
-
-    start()
-
-
-def run(
-    rank,
-    n_gpus,
-    experiment_dir,
-    pretrainG,
-    pretrainD,
-    custom_total_epoch,
-    custom_save_every_weights,
-    config,
-    device,
-    device_id,
-):
-    """
-    Runs the training loop on a specific GPU or CPU.
-
-    Args:
-        rank (int): The rank of the current process within the distributed training setup.
-        n_gpus (int): The total number of GPUs available for training.
-        experiment_dir (str): The directory where experiment logs and checkpoints will be saved.
-        pretrainG (str): Path to the pre-trained generator model.
-        pretrainD (str): Path to the pre-trained discriminator model.
-        custom_total_epoch (int): The total number of epochs for training.
-        custom_save_every_weights (int): The interval (in epochs) at which to save model weights.
-        config (object): Configuration object containing training parameters.
-        device (torch.device): The device to use for training (CPU or GPU).
-    """
-    global global_step
-    writer_eval = None
-
-    dist.init_process_group(
-        backend="gloo" if sys.platform == "win32" or device.type != "cuda" else "nccl",
-        init_method="env://",
-        world_size=n_gpus if device.type == "cuda" else 1,
-        rank=rank if device.type == "cuda" else 0,
-    )
-
-    torch.manual_seed(config.train.seed)
-
-    if torch.cuda.is_available():
-        torch.cuda.set_device(device_id)
-
-    # Create datasets and dataloaders
-    from rvc.train.data_utils import (
-        DistributedBucketSampler,
-        TextAudioCollateMultiNSFsid,
-        TextAudioLoaderMultiNSFsid,
-    )
-
-    train_dataset = TextAudioLoaderMultiNSFsid(config.data)
-    collate_fn = TextAudioCollateMultiNSFsid()
-    train_sampler = DistributedBucketSampler(
-        train_dataset,
-        batch_size,
-        [
-            50, 100, 200, 300, 400, 500, 600, 700, 800, 900,
-            1000, 1100, 1200, 1300, 1400, 1500,
-        ],
-        num_replicas=n_gpus,
-        rank=rank,
-        shuffle=True,
-    )
-
-    train_loader = DataLoader(
-        train_dataset,
-        num_workers=4,
-        shuffle=False,
-        pin_memory=True,
-        collate_fn=collate_fn,
-        batch_sampler=train_sampler,
-        persistent_workers=True,
-        prefetch_factor=8,
-    )
-
-    # Validations
-    if len(train_loader) < 3:
-        print(
-            "Not enough data present in the training set. Perhaps you forgot to slice the audio files in preprocess?"
+    world_size = len(device_ids)
+    if world_size > 1:
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = str(randint(20000, 55555))
+        mp.spawn(
+            run,
+            args=(world_size, args, config, device_type, device_ids),
+            nprocs=world_size,
+            join=True,
         )
-        os._exit(2333333)
-
-    # defaults
-    spk_dim = config.model.spk_embed_dim  # 109 default speakers
-
-    try:
-        with open(model_info_path, "r", encoding="utf-8") as f:
-            model_info = json.load(f)
-            spk_dim = model_info["speakers_id"]
-    except Exception as e:
-        print(f"Could not load model info file: {e}. Using defaults.")
-
-    last_g = latest_checkpoint_path(experiment_dir, "G_*.pth")
-    fresh_speaker_embeddings = last_g is None
-
-    try:
-        chk_path = last_g
-        if chk_path:
-            ckpt = torch.load(chk_path, map_location="cpu", weights_only=True)
-            spk_dim = ckpt["model"]["emb_g.weight"].shape[0]
-            del ckpt
-    except Exception as e:
-        print(f"Failed to load checkpoint: {e}. Using default number of speakers.")
-
-    # update config before the model init
-    print(f"Initializing the generator with {spk_dim} speakers.")
-    config.model.spk_embed_dim = spk_dim
-
-    # Initialize models and optimizers
-    from rvc.algorithm.discriminators import MultiPeriodDiscriminator
-    from rvc.algorithm.synthesizers import Synthesizer
-
-    net_g = Synthesizer(
-        config.data.filter_length // 2 + 1,
-        config.train.segment_size // config.data.hop_length,
-        **config.model,
-        use_f0=True,
-        sr=config.data.sample_rate,
-        vocoder=vocoder,
-        checkpointing=checkpointing,
-        randomized=randomized,
-    )
-
-    net_d = MultiPeriodDiscriminator(
-        config.model.use_spectral_norm,
-        checkpointing=checkpointing,
-        version=disc_version,
-    )
-
-    if torch.cuda.is_available():
-        net_g = net_g.cuda(device_id)
-        net_d = net_d.cuda(device_id)
     else:
-        net_g = net_g.to(device)
-        net_d = net_d.to(device)
+        run(0, 1, args, config, device_type, device_ids)
 
-    if bf16_adamw == True and train_dtype == torch.bfloat16:
-        print("Using BFload16 AdamW optimizer")
-        from rvc.train.anyprecision_optimizer import AnyPrecisionAdamW
 
-        optimizer = AnyPrecisionAdamW
-    else:
-        print("Using AdamW optimizer")
-        optimizer = torch.optim.AdamW
-
-    optim_g = optimizer(
-        net_g.parameters(),
-        config.train.learning_rate * g_lr_coeff,
-        betas=config.train.betas,
-        eps=config.train.eps,
-    )
-    optim_d = optimizer(
-        net_d.parameters(),
-        config.train.learning_rate * d_lr_coeff,
-        betas=config.train.betas,
-        eps=config.train.eps,
-    )
-    if multiscale_mel_loss:
-        fn_mel_loss = MultiScaleMelSpectrogramLoss(sample_rate=config.data.sample_rate)
-        print("Using Multi-Scale Mel loss function")
-    else:
-        fn_mel_loss = torch.nn.L1Loss()
-        print("Using Single-Scale Mel loss function")
-
-    # Wrap models with DDP for multi-gpu processing
-    if n_gpus > 1 and device.type == "cuda":
-        net_g = DDP(net_g, device_ids=[device_id])
-        net_d = DDP(net_d, device_ids=[device_id])
-
-    if rank == 0 and train_dtype == torch.bfloat16:
-        print("Using BFloat16 for training.")
-    elif rank == 0 and train_dtype == torch.float16:
-        print("Using Float16 for training.")
-
-    # Load checkpoint if available
-    scaler_dict = {}
-    print("Starting training...")
-    last_d = latest_checkpoint_path(experiment_dir, "D_*.pth")
-    if last_g or last_d:
-        try:
-            if not (last_g and last_d):
-                raise FileNotFoundError("resuming needs both a G_*.pth and a D_*.pth checkpoint")
-            _, _, _, epoch_str, scaler_dict = load_checkpoint(last_d, net_d, optim_d)
-            _, _, _, epoch_str, _ = load_checkpoint(last_g, net_g, optim_g)
-        except Exception as e:
-            print(f"Could not resume from the checkpoints in {experiment_dir}: {e}")
-            print("Fix or remove them, or enable cleanup to start over from the pretrained models.")
-            sys.exit(1)
-        epoch_str += 1
-        global_step = (epoch_str - 1) * len(train_loader)
-    else:
-        epoch_str = 1
-        global_step = 0
-
-        if pretrainG not in ("", "None"):
-            if rank == 0:
-                print(f"Loaded pretrained (G) '{pretrainG}'")
-            try:
-                ckpt = torch.load(pretrainG, map_location="cpu", weights_only=True)[
-                    "model"
-                ]
-                target_net_g = net_g.module if hasattr(net_g, "module") else net_g
-                if fresh_speaker_embeddings:
-                    if "emb_g.weight" not in ckpt:
-                        raise KeyError(
-                            "The pretrained generator has no speaker embedding."
-                        )
-                    ckpt["emb_g.weight"] = (
-                        target_net_g.emb_g.weight.detach().cpu().clone()
-                    )
-                target_net_g.load_state_dict(ckpt)
-                del ckpt
-            except Exception as e:
-                print(
-                    "The parameters of the pretrain model such as the sample rate or architecture do not match the selected model."
-                )
-                print(e)
-                sys.exit(1)
-
-        if pretrainD not in ("", "None"):
-            if rank == 0:
-                print(f"Loaded pretrained (D) '{pretrainD}'")
-            try:
-                ckpt = torch.load(pretrainD, map_location="cpu", weights_only=True)[
-                    "model"
-                ]
-                if hasattr(net_d, "module"):
-                    net_d.module.load_state_dict(ckpt)
-                else:
-                    net_d.load_state_dict(ckpt)
-                del ckpt
-            except Exception as e:
-                print(
-                    "The parameters of the pretrain model such as the sample rate or architecture do not match the selected model."
-                )
-                print(e)
-                sys.exit(1)
-
-    if rank == 0:
-        purge_step = global_step + 1 if global_step else 0
-        writer_eval = SummaryWriter(
-            log_dir=os.path.join(experiment_dir, "eval"),
-            purge_step=purge_step,
-            max_queue=1000,
+def run(rank, world_size, args, config, device_type, device_ids):
+    device_id = device_ids[rank]
+    if world_size > 1:
+        dist.init_process_group(
+            backend="gloo" if sys.platform == "win32" else "nccl",
+            init_method="env://",
+            world_size=world_size,
+            rank=rank,
         )
-
-    # Initialize schedulers
-    scheduler_g = torch.optim.lr_scheduler.ExponentialLR(
-        optim_g, gamma=config.train.lr_decay, last_epoch=epoch_str - 2
-    )
-    scheduler_d = torch.optim.lr_scheduler.ExponentialLR(
-        optim_d, gamma=config.train.lr_decay, last_epoch=epoch_str - 2
-    )
-
-    use_scaler = device.type == "cuda" and train_dtype == torch.float16
-    scaler = torch.amp.GradScaler(enabled=use_scaler)
-    if len(scaler_dict) > 0:
-        scaler.load_state_dict(scaler_dict)
-
-    cache = []
-
-    inference_exporter = None
-    if rank == 0 and save_every_steps > 0:
-        export_device = (
-            torch.device("cuda", device_id) if device.type == "cuda" else device
-        )
-        inference_exporter = AsyncInferenceExporter(export_device)
-
-    scalar_log_state = {
-        "loss_sums": torch.zeros(6, device=device, dtype=torch.float32),
-        "batch_count": 0,
-    }
     try:
-        for epoch in range(epoch_str, total_epoch + 1):
-            train_and_evaluate(
-                rank,
-                epoch,
-                config,
-                [net_g, net_d],
-                [optim_g, optim_d],
-                [train_loader, None],
-                [writer_eval],
-                scalar_log_state,
-                cache,
-                custom_save_every_weights,
-                custom_total_epoch,
-                device,
-                device_id,
-                fn_mel_loss,
-                scaler,
-                inference_exporter,
-            )
-
-            scheduler_g.step()
-            scheduler_d.step()
-    finally:
-        if inference_exporter is not None:
-            inference_exporter.close()
-        if writer_eval is not None:
-            writer_eval.close()
-
-
-def train_and_evaluate(
-    rank,
-    epoch,
-    hps,
-    nets,
-    optims,
-    loaders,
-    writers,
-    scalar_log_state,
-    cache,
-    custom_save_every_weights,
-    custom_total_epoch,
-    device,
-    device_id,
-    fn_mel_loss,
-    scaler,
-    inference_exporter,
-):
-    """
-    Trains and evaluates the model for one epoch.
-
-    Args:
-        rank (int): Rank of the current process.
-        epoch (int): Current epoch number.
-        hps (Namespace): Hyperparameters.
-        nets (list): List of models [net_g, net_d].
-        optims (list): List of optimizers [optim_g, optim_d].
-        loaders (list): List of dataloaders [train_loader, eval_loader].
-        writers (list): List of TensorBoard writers [writer_eval].
-        cache (list): List to cache data in GPU memory.
-        use_cpu (bool): Whether to use CPU for training.
-    """
-    global global_step, loss_disc
-
-    net_g, net_d = nets
-    optim_g, optim_d = optims
-    train_loader = loaders[0] if loaders is not None else None
-    if writers is not None:
-        writer = writers[0]
-
-    log_interval = int(hps.train.log_interval)
-    if log_interval < 1:
-        raise ValueError("train.log_interval must be at least 1")
-
-    train_loader.batch_sampler.set_epoch(epoch)
-
-    net_g.train()
-    net_d.train()
-    freeze_discriminator_for_generator = device.type == "cuda"
-    net_d_for_generator = (
-        net_d.module
-        if freeze_discriminator_for_generator and hasattr(net_d, "module")
-        else net_d
-    )
-
-    use_amp = device.type == "cuda" and (
-        train_dtype == torch.bfloat16 or train_dtype == torch.float16
-    )
-
-    # Data caching
-    if device.type == "cuda" and cache_data_in_gpu:
-        data_iterator = cache
-        if cache == []:
-            for batch_idx, info in enumerate(train_loader):
-                # phone, phone_lengths, pitch, pitchf, spec, spec_lengths, wave, wave_lengths, sid
-                info = [tensor.cuda(device_id, non_blocking=True) for tensor in info]
-                cache.append((batch_idx, info))
+        torch.manual_seed(config.train.seed)
+        if device_type == "cuda":
+            torch.cuda.set_device(device_id)
+            device = torch.device("cuda", device_id)
         else:
-            shuffle(cache)
-    else:
-        data_iterator = enumerate(train_loader)
+            device = torch.device(device_type)
+        Trainer(rank, world_size, args, config, device).fit()
+    finally:
+        if world_size > 1:
+            dist.destroy_process_group()
 
-    epoch_recorder = EpochRecorder()
-    with tqdm(total=len(train_loader), leave=False) as pbar:
-        for batch_idx, info in data_iterator:
-            if device.type == "cuda" and not cache_data_in_gpu:
-                info = [tensor.cuda(device_id, non_blocking=True) for tensor in info]
-            elif device.type != "cuda":
-                info = [tensor.to(device) for tensor in info]
-            # else iterator is going thru a cached list with a device already assigned
 
-            (
-                phone,
-                phone_lengths,
-                pitch,
-                pitchf,
-                spec,
-                spec_lengths,
-                wave,
-                wave_lengths,
-                sid,
-            ) = info
+class Trainer:
+    def __init__(self, rank, world_size, args, config, device):
+        self.rank = rank
+        self.world_size = world_size
+        self.args = args
+        self.config = config
+        self.device = device
+        self.segment_frames = config.train.segment_size // config.data.hop_length
+        self.log_interval = int(config.train.log_interval)
+        if self.log_interval < 1:
+            raise ValueError("train.log_interval must be at least 1")
+        self.use_amp = device.type == "cuda" and args.train_dtype in (
+            torch.bfloat16,
+            torch.float16,
+        )
+        self.cache_in_gpu = device.type == "cuda" and args.cache_data_in_gpu
+        self.global_step = 0
+        self.loss_sums = torch.zeros(6, device=device, dtype=torch.float32)
+        self.batch_count = 0
+        self.cache = None
+        self.loader = None
+        self.last_batch = None
+        self.writer = None
+        self.exporter = None
 
-            log_grad_norms = rank == 0 and (global_step + 1) % log_interval == 0
+    def fit(self):
+        self.build_data()
+        last_g, last_d = latest_checkpoint_pair(self.args.experiment_dir)
+        self.build_models(last_g)
+        epoch_str = self.restore(last_g, last_d)
 
-            with torch.amp.autocast(
-                device_type="cuda", enabled=use_amp, dtype=train_dtype
-            ):
-                # Forward pass
-                model_output = net_g(
-                    phone, phone_lengths, pitch, pitchf, spec, spec_lengths, sid
-                )
-                y_hat, ids_slice, x_mask, z_mask, (z, z_p, m_p, logs_p, m_q, logs_q) = (
-                    model_output
-                )
-                # slice of the original waveform to match a generate slice
-                if randomized:
-                    wave = commons.slice_segments(
-                        wave,
-                        ids_slice * config.data.hop_length,
-                        config.train.segment_size,
-                        dim=3,
-                    )
-            for discriminator_step in range(d_step_per_g_step):
-                with torch.amp.autocast(
-                    device_type="cuda", enabled=use_amp, dtype=train_dtype
-                ):
-                    y_d_hat_r, y_d_hat_g, _, _ = net_d(wave, y_hat.detach())
-                loss_disc, _, _ = discriminator_loss(y_d_hat_r, y_d_hat_g)
-                # Discriminator backward and update
-                optim_d.zero_grad()
-                if train_dtype == torch.float16:
-                    scaler.scale(loss_disc).backward()
-                    if log_grad_norms and discriminator_step + 1 == d_step_per_g_step:
-                        scaler.unscale_(optim_d)
-                        grad_norm_d = commons.grad_norm(net_d.parameters())
-                    scaler.step(optim_d)
-                    if discriminator_step + 1 < d_step_per_g_step:
-                        scaler.update()
-                else:
-                    loss_disc.backward()
-                    if log_grad_norms and discriminator_step + 1 == d_step_per_g_step:
-                        grad_norm_d = commons.grad_norm(net_d.parameters())
-                    optim_d.step()
-
-            if freeze_discriminator_for_generator:
-                optim_d.zero_grad(set_to_none=True)
-                net_d.requires_grad_(False)
-
-            with torch.amp.autocast(
-                device_type="cuda", enabled=use_amp, dtype=train_dtype
-            ):
-                # Generator backward and update
-                _, y_d_hat_g, fmap_r, fmap_g = net_d_for_generator(wave, y_hat)
-
-            if multiscale_mel_loss:
-                loss_mel = fn_mel_loss(wave, y_hat) * config.train.c_mel / 3.0
-                loss_kl = (
-                    kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * config.train.c_kl
-                )
-                loss_fm = feature_loss(fmap_r, fmap_g)
-            else:
-                wave_mel = spec_to_mel_torch(
-                    spec,
-                    config.data.filter_length,
-                    config.data.n_mel_channels,
-                    config.data.sample_rate,
-                    config.data.mel_fmin,
-                    config.data.mel_fmax,
-                )
-                wave_mel = commons.slice_segments(
-                    wave_mel,
-                    ids_slice,
-                    config.train.segment_size // config.data.hop_length,
-                    dim=3,
-                )
-                y_hat_mel = mel_spectrogram_torch(
-                    y_hat.float().squeeze(1),
-                    config.data.filter_length,
-                    config.data.n_mel_channels,
-                    config.data.sample_rate,
-                    config.data.hop_length,
-                    config.data.win_length,
-                    config.data.mel_fmin,
-                    config.data.mel_fmax,
-                )
-                loss_mel = fn_mel_loss(wave_mel, y_hat_mel) * config.train.c_mel
-                loss_kl = (
-                    kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * config.train.c_kl
-                )
-                loss_fm = feature_loss(fmap_r, fmap_g)
-            loss_gen, _ = generator_loss(y_d_hat_g)
-            loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl
-            optim_g.zero_grad()
-            if train_dtype == torch.float16:
-                scaler.scale(loss_gen_all).backward()
-                if log_grad_norms:
-                    scaler.unscale_(optim_g)
-                    grad_norm_g = commons.grad_norm(net_g.parameters())
-                if inference_exporter is not None:
-                    inference_exporter.wait_for_staging()
-                scaler.step(optim_g)
-                scaler.update()
-            else:
-                loss_gen_all.backward()
-                if log_grad_norms:
-                    grad_norm_g = commons.grad_norm(net_g.parameters())
-                if inference_exporter is not None:
-                    inference_exporter.wait_for_staging()
-                optim_g.step()
-
-            if freeze_discriminator_for_generator:
-                net_d.requires_grad_(True)
-
-            global_step += 1
-
-            scalar_log_state["loss_sums"].add_(
-                torch.stack(
-                    (
-                        loss_gen_all.detach(),
-                        loss_disc.detach(),
-                        loss_gen.detach(),
-                        loss_fm.detach(),
-                        loss_mel.detach(),
-                        loss_kl.detach(),
-                    )
-                ).float()
+        if self.rank == 0:
+            self.writer = SummaryWriter(
+                log_dir=os.path.join(self.args.experiment_dir, "eval"),
+                purge_step=self.global_step + 1 if self.global_step else 0,
+                max_queue=1000,
             )
-            scalar_log_state["batch_count"] += 1
+            if self.args.save_every_steps > 0:
+                self.exporter = AsyncInferenceExporter(self.device)
 
-            if global_step % log_interval == 0:
-                scalar_log_totals = torch.cat(
-                    (
-                        scalar_log_state["loss_sums"],
-                        scalar_log_state["loss_sums"].new_tensor(
-                            [scalar_log_state["batch_count"]]
-                        ),
-                    )
-                )
-                if dist.get_world_size() > 1:
-                    if dist.get_backend() == "gloo" and scalar_log_totals.is_cuda:
-                        scalar_log_totals = scalar_log_totals.cpu()
-                    dist.reduce(scalar_log_totals, dst=0, op=dist.ReduceOp.SUM)
-                if rank == 0:
-                    scalar_values = (
-                        scalar_log_totals[:-1] / scalar_log_totals[-1]
-                    ).cpu().tolist()
-                    gradient_values = (
-                        torch.stack((grad_norm_d, grad_norm_g)).float().cpu().tolist()
-                    )
-                    summarize(
-                        writer=writer,
-                        global_step=global_step,
-                        scalars={
-                            "loss/g/total": scalar_values[0],
-                            "loss/d/adv": scalar_values[1],
-                            "learning_rate": optim_g.param_groups[0]["lr"],
-                            "loss/g/adv": scalar_values[2],
-                            "loss/g/fm": scalar_values[3],
-                            "loss/g/mel": scalar_values[4],
-                            "loss/g/kl": scalar_values[5],
-                            "grad/norm_d": gradient_values[0],
-                            "grad/norm_g": gradient_values[1],
-                        },
-                    )
-                scalar_log_state["loss_sums"].zero_()
-                scalar_log_state["batch_count"] = 0
-            if (
-                inference_exporter is not None
-                and save_every_steps > 0
-                and global_step % save_every_steps == 0
-            ):
-                inference_model_path = os.path.join(
-                    experiment_dir, f"{model_name}_{epoch}e_{global_step}s.pth"
-                )
-                if not os.path.exists(inference_model_path):
-                    inference_model = (
-                        net_g.module if hasattr(net_g, "module") else net_g
-                    )
-                    inference_exporter.submit(
-                        model=inference_model,
-                        export_dtype=inference_export_dtype,
-                        sr=config.data.sample_rate,
-                        name=model_name,
-                        model_path=inference_model_path,
-                        epoch=epoch,
-                        step=global_step,
-                        hps=hps,
-                        vocoder=vocoder,
-                        version=version,
-                    )
-            pbar.update(1)
-        # end of batch train
-    # end of tqdm
+        schedulers = [
+            torch.optim.lr_scheduler.ExponentialLR(
+                optimizer, gamma=self.config.train.lr_decay, last_epoch=epoch_str - 2
+            )
+            for optimizer in (self.optim_g, self.optim_d)
+        ]
+        if epoch_str > self.args.total_epoch and self.rank == 0:
+            print(
+                f"{self.args.model_name} already reached epoch {self.args.total_epoch}. "
+                "Raise the total epochs to continue training."
+            )
+        try:
+            for epoch in range(epoch_str, self.args.total_epoch + 1):
+                self.train_epoch(epoch)
+                if self.finish_epoch(epoch):
+                    break
+                for scheduler in schedulers:
+                    scheduler.step()
+        finally:
+            if self.exporter is not None:
+                self.exporter.close()
+            if self.writer is not None:
+                self.writer.close()
 
-    if rank == 0:
-        if epoch % save_every_epoch == 0:
-            mel = spec_to_mel_torch(
-                spec,
-                config.data.filter_length,
-                config.data.n_mel_channels,
-                config.data.sample_rate,
-                config.data.mel_fmin,
-                config.data.mel_fmax,
+    def build_data(self):
+        from rvc.train.data_utils import (
+            DistributedBucketSampler,
+            TextAudioCollateMultiNSFsid,
+            TextAudioLoaderMultiNSFsid,
+        )
+
+        self.dataset = TextAudioLoaderMultiNSFsid(self.config.data)
+        self.collate = TextAudioCollateMultiNSFsid()
+        self.sampler = DistributedBucketSampler(
+            self.dataset,
+            self.args.batch_size,
+            list(BUCKET_BOUNDARIES),
+            num_replicas=self.world_size,
+            rank=self.rank,
+            shuffle=True,
+        )
+        if len(self.sampler) < 3:
+            print(
+                "Not enough data present in the training set. Perhaps you forgot to slice the audio files in preprocess?"
+            )
+            sys.exit(1)
+        if not self.cache_in_gpu:
+            self.loader = DataLoader(
+                self.dataset,
+                num_workers=4,
+                shuffle=False,
+                pin_memory=True,
+                collate_fn=self.collate,
+                batch_sampler=self.sampler,
+                persistent_workers=True,
+                prefetch_factor=8,
+            )
+
+    def build_models(self, last_g):
+        from rvc.algorithm.discriminators import MultiPeriodDiscriminator
+        from rvc.algorithm.synthesizers import Synthesizer
+
+        config, args = self.config, self.args
+        spk_dim = config.model.spk_embed_dim
+        try:
+            spk_dim = read_model_info(args)["speakers_id"]
+        except Exception as e:
+            print(f"Could not load model info file: {e}. Using defaults.")
+        if last_g:
+            try:
+                ckpt = torch.load(last_g, map_location="cpu", weights_only=True)
+                spk_dim = ckpt["model"]["emb_g.weight"].shape[0]
+                del ckpt
+            except Exception as e:
+                print(f"Failed to load checkpoint: {e}. Using default number of speakers.")
+        print(f"Initializing the generator with {spk_dim} speakers.")
+        config.model.spk_embed_dim = spk_dim
+
+        net_g = Synthesizer(
+            config.data.filter_length // 2 + 1,
+            self.segment_frames,
+            **config.model,
+            use_f0=True,
+            sr=config.data.sample_rate,
+            vocoder=args.vocoder,
+            checkpointing=args.checkpointing,
+            randomized=randomized,
+        ).to(self.device)
+        net_d = MultiPeriodDiscriminator(
+            config.model.use_spectral_norm,
+            checkpointing=args.checkpointing,
+            version=args.disc_version,
+        ).to(self.device)
+
+        if bf16_adamw and args.train_dtype == torch.bfloat16:
+            print("Using BFload16 AdamW optimizer")
+            from rvc.train.anyprecision_optimizer import AnyPrecisionAdamW
+
+            optimizer = AnyPrecisionAdamW
+            options = {}
+        else:
+            print("Using AdamW optimizer")
+            optimizer = torch.optim.AdamW
+            options = {"fused": self.device.type == "cuda"}
+        self.optim_g = optimizer(
+            net_g.parameters(),
+            config.train.learning_rate * g_lr_coeff,
+            betas=config.train.betas,
+            eps=config.train.eps,
+            **options,
+        )
+        self.optim_d = optimizer(
+            net_d.parameters(),
+            config.train.learning_rate * d_lr_coeff,
+            betas=config.train.betas,
+            eps=config.train.eps,
+            **options,
+        )
+        if args.multiscale_mel_loss:
+            self.fn_mel_loss = MultiScaleMelSpectrogramLoss(
+                sample_rate=config.data.sample_rate
+            )
+            print("Using Multi-Scale Mel loss function")
+        else:
+            self.fn_mel_loss = torch.nn.L1Loss()
+            print("Using Single-Scale Mel loss function")
+
+        if self.world_size > 1 and self.device.type == "cuda":
+            net_g = DDP(net_g, device_ids=[self.device.index])
+            net_d = DDP(net_d, device_ids=[self.device.index])
+        self.net_g, self.net_d = net_g, net_d
+        self.freeze_discriminator = self.device.type == "cuda"
+        self.net_d_for_generator = (
+            net_d.module if self.freeze_discriminator and hasattr(net_d, "module") else net_d
+        )
+
+        if self.rank == 0 and args.train_dtype == torch.bfloat16:
+            print("Using BFloat16 for training.")
+        elif self.rank == 0 and args.train_dtype == torch.float16:
+            print("Using Float16 for training.")
+        self.scaler = torch.amp.GradScaler(
+            enabled=self.device.type == "cuda" and args.train_dtype == torch.float16
+        )
+
+    def restore(self, last_g, last_d):
+        print("Starting training...")
+        if last_g or last_d:
+            try:
+                if not (last_g and last_d):
+                    raise FileNotFoundError(
+                        "resuming needs a G_*.pth and a D_*.pth checkpoint with the same suffix"
+                    )
+                _, _, _, epoch_str, scaler_dict = load_checkpoint(
+                    last_d, self.net_d, self.optim_d
+                )
+                _, _, _, epoch_str, _ = load_checkpoint(last_g, self.net_g, self.optim_g)
+            except Exception as e:
+                print(f"Could not resume from the checkpoints in {self.args.experiment_dir}: {e}")
+                print("Fix or remove them, or enable cleanup to start over from the pretrained models.")
+                sys.exit(1)
+            if scaler_dict:
+                self.scaler.load_state_dict(scaler_dict)
+            epoch_str += 1
+            self.global_step = (epoch_str - 1) * len(self.sampler)
+            return epoch_str
+
+        self.load_pretrained(self.net_g, self.args.pretrained_g, "G", fresh_speakers=True)
+        self.load_pretrained(self.net_d, self.args.pretrained_d, "D")
+        return 1
+
+    def load_pretrained(self, net, path, label, fresh_speakers=False):
+        if path in ("", "None"):
+            return
+        if self.rank == 0:
+            print(f"Loaded pretrained ({label}) '{path}'")
+        target = net.module if hasattr(net, "module") else net
+        try:
+            ckpt = torch.load(path, map_location="cpu", weights_only=True)["model"]
+            if fresh_speakers:
+                if "emb_g.weight" not in ckpt:
+                    raise KeyError("The pretrained generator has no speaker embedding.")
+                ckpt["emb_g.weight"] = target.emb_g.weight.detach().cpu().clone()
+            target.load_state_dict(ckpt)
+            del ckpt
+        except Exception as e:
+            print(
+                "The parameters of the pretrain model such as the sample rate or architecture do not match the selected model."
+            )
+            print(e)
+            sys.exit(1)
+
+    def autocast(self):
+        return torch.amp.autocast(
+            device_type="cuda", enabled=self.use_amp, dtype=self.args.train_dtype
+        )
+
+    def batches(self):
+        if not self.cache_in_gpu:
+            for batch in self.loader:
+                if self.device.type == "cuda":
+                    yield [tensor.to(self.device, non_blocking=True) for tensor in batch]
+                else:
+                    yield [tensor.to(self.device) for tensor in batch]
+            return
+        if self.cache is None:
+            loader = DataLoader(self.dataset, batch_size=None, num_workers=4, pin_memory=True)
+            self.cache = [
+                tuple(tensor.to(self.device, non_blocking=True) for tensor in item)
+                for item in loader
+            ]
+        for indices in self.sampler:
+            batch = self.collate([self.cache[index] for index in indices])
+            yield [tensor.to(self.device, non_blocking=True) for tensor in batch]
+
+    def train_epoch(self, epoch):
+        self.sampler.set_epoch(epoch)
+        self.net_g.train()
+        self.net_d.train()
+        self.epoch_recorder = EpochRecorder()
+        with tqdm(total=len(self.sampler), leave=False) as pbar:
+            for batch in self.batches():
+                self.train_step(batch)
+                self.export_step_weights(epoch)
+                pbar.update(1)
+
+    def optimizer_step(self, optimizer, net, loss, log_grad_norm, update_scaler, before_step=None):
+        optimizer.zero_grad()
+        self.scaler.scale(loss).backward()
+        norm = None
+        if log_grad_norm:
+            self.scaler.unscale_(optimizer)
+            norm = commons.grad_norm(net.parameters())
+        if before_step is not None:
+            before_step()
+        self.scaler.step(optimizer)
+        if update_scaler:
+            self.scaler.update()
+        return norm
+
+    def mel_loss(self, wave, y_hat, spec, ids_slice):
+        config = self.config
+        if self.args.multiscale_mel_loss:
+            return self.fn_mel_loss(wave, y_hat) * config.train.c_mel / 3.0
+        wave_mel = spec_to_mel_torch(
+            commons.slice_segments(spec, ids_slice, self.segment_frames, dim=3),
+            config.data.filter_length,
+            config.data.n_mel_channels,
+            config.data.sample_rate,
+            config.data.mel_fmin,
+            config.data.mel_fmax,
+        )
+        y_hat_mel = mel_spectrogram_torch(
+            y_hat.float().squeeze(1),
+            config.data.filter_length,
+            config.data.n_mel_channels,
+            config.data.sample_rate,
+            config.data.hop_length,
+            config.data.win_length,
+            config.data.mel_fmin,
+            config.data.mel_fmax,
+        )
+        return self.fn_mel_loss(wave_mel, y_hat_mel) * config.train.c_mel
+
+    def train_step(self, batch):
+        config = self.config
+        self.last_batch = None
+        phone, phone_lengths, pitch, pitchf, spec, spec_lengths, wave, _, sid = batch
+        log_grad_norms = self.rank == 0 and (self.global_step + 1) % self.log_interval == 0
+
+        with self.autocast():
+            y_hat, ids_slice, _, z_mask, (_, z_p, m_p, logs_p, _, logs_q) = self.net_g(
+                phone, phone_lengths, pitch, pitchf, spec, spec_lengths, sid
             )
             if randomized:
-                y_mel = commons.slice_segments(
-                    mel,
-                    ids_slice,
-                    config.train.segment_size // config.data.hop_length,
+                wave = commons.slice_segments(
+                    wave,
+                    ids_slice * config.data.hop_length,
+                    config.train.segment_size,
                     dim=3,
                 )
-            else:
-                y_mel = mel
-            y_hat_mel = mel_spectrogram_torch(
-                y_hat.float().squeeze(1),
-                config.data.filter_length,
-                config.data.n_mel_channels,
-                config.data.sample_rate,
-                config.data.hop_length,
-                config.data.win_length,
-                config.data.mel_fmin,
-                config.data.mel_fmax,
+
+        for discriminator_step in range(d_step_per_g_step):
+            last_discriminator_step = discriminator_step + 1 == d_step_per_g_step
+            with self.autocast():
+                y_d_hat_r, y_d_hat_g, _, _ = self.net_d(wave, y_hat.detach())
+            loss_disc, _, _ = discriminator_loss(y_d_hat_r, y_d_hat_g)
+            grad_norm_d = self.optimizer_step(
+                self.optim_d,
+                self.net_d,
+                loss_disc,
+                log_grad_norms and last_discriminator_step,
+                update_scaler=not last_discriminator_step,
             )
-            image_dict = {
-                "slice/mel_org": plot_spectrogram_to_numpy(
-                    y_mel[0].data.cpu().numpy()
-                ),
-                "slice/mel_gen": plot_spectrogram_to_numpy(
-                    y_hat_mel[0].data.cpu().numpy()
-                ),
-                "all/mel": plot_spectrogram_to_numpy(mel[0].data.cpu().numpy()),
-            }
+
+        if self.freeze_discriminator:
+            self.optim_d.zero_grad(set_to_none=True)
+            self.net_d.requires_grad_(False)
+
+        with self.autocast():
+            _, y_d_hat_g, fmap_r, fmap_g = self.net_d_for_generator(wave, y_hat)
+
+        loss_mel = self.mel_loss(wave, y_hat, spec, ids_slice)
+        loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * config.train.c_kl
+        loss_fm = feature_loss(fmap_r, fmap_g)
+        loss_gen, _ = generator_loss(y_d_hat_g)
+        loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl
+        grad_norm_g = self.optimizer_step(
+            self.optim_g,
+            self.net_g,
+            loss_gen_all,
+            log_grad_norms,
+            update_scaler=True,
+            before_step=self.exporter.wait_for_staging if self.exporter else None,
+        )
+
+        if self.freeze_discriminator:
+            self.net_d.requires_grad_(True)
+
+        self.global_step += 1
+        self.record_losses(
+            (loss_gen_all, loss_disc, loss_gen, loss_fm, loss_mel, loss_kl),
+            (grad_norm_d, grad_norm_g),
+        )
+        self.last_batch = (spec, ids_slice, y_hat, loss_gen_all)
+
+    def record_losses(self, losses, grad_norms):
+        self.loss_sums.add_(torch.stack([loss.detach() for loss in losses]).float())
+        self.batch_count += 1
+        if self.global_step % self.log_interval != 0:
+            return
+        totals = torch.cat((self.loss_sums, self.loss_sums.new_tensor([self.batch_count])))
+        if self.world_size > 1:
+            if dist.get_backend() == "gloo" and totals.is_cuda:
+                totals = totals.cpu()
+            dist.reduce(totals, dst=0, op=dist.ReduceOp.SUM)
+        if self.rank == 0:
+            loss_values = (totals[:-1] / totals[-1]).cpu().tolist()
+            gradient_values = torch.stack(grad_norms).float().cpu().tolist()
             summarize(
-                writer=writer,
-                global_step=global_step,
-                images=image_dict,
+                writer=self.writer,
+                global_step=self.global_step,
+                scalars={
+                    "loss/g/total": loss_values[0],
+                    "loss/d/adv": loss_values[1],
+                    "learning_rate": self.optim_g.param_groups[0]["lr"],
+                    "loss/g/adv": loss_values[2],
+                    "loss/g/fm": loss_values[3],
+                    "loss/g/mel": loss_values[4],
+                    "loss/g/kl": loss_values[5],
+                    "grad/norm_d": gradient_values[0],
+                    "grad/norm_g": gradient_values[1],
+                },
+            )
+        self.loss_sums.zero_()
+        self.batch_count = 0
+
+    def generator(self):
+        return self.net_g.module if hasattr(self.net_g, "module") else self.net_g
+
+    def weights_path(self, epoch):
+        return os.path.join(
+            self.args.experiment_dir,
+            f"{self.args.model_name}_{epoch}e_{self.global_step}s.pth",
+        )
+
+    def export_arguments(self, epoch):
+        return dict(
+            sr=self.config.data.sample_rate,
+            name=self.args.model_name,
+            epoch=epoch,
+            step=self.global_step,
+            hps=self.config,
+            vocoder=self.args.vocoder,
+            version=self.args.version,
+        )
+
+    def export_step_weights(self, epoch):
+        if self.exporter is None or self.global_step % self.args.save_every_steps != 0:
+            return
+        path = self.weights_path(epoch)
+        if not os.path.exists(path):
+            self.exporter.submit(
+                model=self.generator(),
+                export_dtype=self.args.export_dtype,
+                model_path=path,
+                **self.export_arguments(epoch),
             )
 
-    # Save checkpoint
-    model_add = []
-    model_del = []
-    done = False
+    def summarize_epoch(self, spec, ids_slice, y_hat):
+        config = self.config
+        mel = spec_to_mel_torch(
+            spec,
+            config.data.filter_length,
+            config.data.n_mel_channels,
+            config.data.sample_rate,
+            config.data.mel_fmin,
+            config.data.mel_fmax,
+        )
+        y_mel = (
+            commons.slice_segments(mel, ids_slice, self.segment_frames, dim=3)
+            if randomized
+            else mel
+        )
+        y_hat_mel = mel_spectrogram_torch(
+            y_hat.float().squeeze(1),
+            config.data.filter_length,
+            config.data.n_mel_channels,
+            config.data.sample_rate,
+            config.data.hop_length,
+            config.data.win_length,
+            config.data.mel_fmin,
+            config.data.mel_fmax,
+        )
+        summarize(
+            writer=self.writer,
+            global_step=self.global_step,
+            images={
+                "slice/mel_org": plot_spectrogram_to_numpy(y_mel[0].data.cpu().numpy()),
+                "slice/mel_gen": plot_spectrogram_to_numpy(y_hat_mel[0].data.cpu().numpy()),
+                "all/mel": plot_spectrogram_to_numpy(mel[0].data.cpu().numpy()),
+            },
+        )
 
-    if rank == 0:
-        # Print training progress
-        record = f"{model_name} | epoch={epoch} | step={global_step} | {epoch_recorder.record()}"
-        print(record)
+    def finish_epoch(self, epoch):
+        if self.rank != 0:
+            return False
+        args = self.args
+        spec, ids_slice, y_hat, loss_gen_all = self.last_batch
+        save_epoch = epoch % args.save_every_epoch == 0
+        done = epoch >= args.total_epoch
+        if save_epoch:
+            self.summarize_epoch(spec, ids_slice, y_hat)
 
-        # Save weights every N epochs and at the end of training
-        if epoch % save_every_epoch == 0 or epoch >= custom_total_epoch:
-            checkpoint_suffix = f"{2333333 if save_only_latest else global_step}.pth"
-            save_checkpoint(
-                net_g,
-                optim_g,
-                config.train.learning_rate,
-                epoch,
-                os.path.join(experiment_dir, "G_" + checkpoint_suffix),
-                scaler,
-            )
-            save_checkpoint(
-                net_d,
-                optim_d,
-                config.train.learning_rate,
-                epoch,
-                os.path.join(experiment_dir, "D_" + checkpoint_suffix),
-                scaler,
-            )
-            if custom_save_every_weights and save_every_steps == 0:
-                model_add.append(
-                    os.path.join(
-                        experiment_dir, f"{model_name}_{epoch}e_{global_step}s.pth"
-                    )
+        print(
+            f"{args.model_name} | epoch={epoch} | step={self.global_step} | {self.epoch_recorder.record()}"
+        )
+
+        weights = []
+        if save_epoch or done:
+            suffix = LATEST_CHECKPOINT_SUFFIX if args.save_only_latest else self.global_step
+            for prefix, net, optimizer in (
+                ("G", self.net_g, self.optim_g),
+                ("D", self.net_d, self.optim_d),
+            ):
+                save_checkpoint(
+                    net,
+                    optimizer,
+                    self.config.train.learning_rate,
+                    epoch,
+                    os.path.join(args.experiment_dir, f"{prefix}_{suffix}.pth"),
+                    self.scaler,
                 )
-
-        # Check completion
-        if epoch >= custom_total_epoch:
-            print(
-                f"Training has been successfully completed with {epoch} epoch, {global_step} steps and {round(loss_gen_all.item(), 3)} loss gen."
-            )
-            # Final model
-            model_add.append(
-                os.path.join(
-                    experiment_dir, f"{model_name}_{epoch}e_{global_step}s.pth"
-                )
-            )
-            done = True
-
-        if done and inference_exporter is not None:
-            inference_exporter.wait_for_completion()
-
-        # Clean-up old best epochs
-        for m in model_del:
-            os.remove(m)
-
-        if model_add:
-            ckpt = (
-                net_g.module.state_dict()
-                if hasattr(net_g, "module")
-                else net_g.state_dict()
-            )
-            for m in model_add:
-                if not os.path.exists(m):
-                    extract_model(
-                        ckpt=ckpt,
-                        sr=config.data.sample_rate,
-                        name=model_name,
-                        model_path=m,
-                        epoch=epoch,
-                        step=global_step,
-                        hps=hps,
-                        vocoder=vocoder,
-                        version=version,
-                        export_dtype=inference_export_dtype,
-                    )
+            if args.save_every_weights and args.save_every_steps == 0:
+                weights.append(self.weights_path(epoch))
 
         if done:
-            if inference_exporter is not None:
-                inference_exporter.close()
-            writer.close()
-            os._exit(2333333)
+            print(
+                f"Training has been successfully completed with {epoch} epoch, {self.global_step} steps and {round(loss_gen_all.item(), 3)} loss gen."
+            )
+            weights.append(self.weights_path(epoch))
+            if self.exporter is not None:
+                self.exporter.wait_for_completion()
+
+        state_dict = self.generator().state_dict() if weights else None
+        for path in weights:
+            if not os.path.exists(path):
+                extract_model(
+                    ckpt=state_dict,
+                    model_path=path,
+                    export_dtype=args.export_dtype,
+                    **self.export_arguments(epoch),
+                )
+        return done
 
 
 if __name__ == "__main__":

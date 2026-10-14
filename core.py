@@ -694,28 +694,38 @@ def _build_train_command(
     command = [
         python,
         train_script_path,
-        *map(
-            str,
-            [
-                model_name,
-                save_every_epoch,
-                total_epoch,
-                pg,
-                pd,
-                gpu,
-                batch_size,
-                sample_rate,
-                save_only_latest,
-                save_every_weights,
-                cache_data_in_gpu,
-                cleanup,
-                vocoder,
-                checkpointing,
-                save_every_steps,
-                version,
-            ],
-        ),
+        "--model-name",
+        model_name,
+        "--sample-rate",
+        str(sample_rate),
+        "--total-epoch",
+        str(total_epoch),
+        "--save-every-epoch",
+        str(save_every_epoch),
+        "--save-every-steps",
+        str(save_every_steps),
+        "--batch-size",
+        str(batch_size),
+        "--gpus",
+        str(gpu),
+        "--vocoder",
+        vocoder,
+        "--version",
+        version,
     ]
+    if pg:
+        command += ["--pretrained-g", pg]
+    if pd:
+        command += ["--pretrained-d", pd]
+    for flag, enabled in (
+        ("--save-only-latest", save_only_latest),
+        ("--save-every-weights", save_every_weights),
+        ("--cache-data-in-gpu", cache_data_in_gpu),
+        ("--cleanup", cleanup),
+        ("--checkpointing", checkpointing),
+    ):
+        if enabled:
+            command.append(flag)
     return command
 
 

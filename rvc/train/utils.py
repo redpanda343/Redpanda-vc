@@ -54,22 +54,35 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, load_opt=1):
         ".parametrizations.weight.original0",
     )
 
-    # Update model state_dict
-    model_state_dict = (
-        model.module.state_dict() if hasattr(model, "module") else model.state_dict()
-    )
-    new_state_dict = {
-        k: checkpoint_dict["model"].get(k, v) for k, v in model_state_dict.items()
-    }
-
-    # Load state_dict into model
-    if hasattr(model, "module"):
-        model.module.load_state_dict(new_state_dict, strict=False)
-    else:
-        model.load_state_dict(new_state_dict, strict=False)
+    target = model.module if hasattr(model, "module") else model
+    saved_state_dict = checkpoint_dict["model"]
+    model_keys = target.state_dict().keys()
+    missing = [key for key in model_keys if key not in saved_state_dict]
+    unexpected = [key for key in saved_state_dict if key not in model_keys]
+    if missing or unexpected:
+        raise ValueError(
+            f"'{checkpoint_path}' does not match the model "
+            f"(missing: {', '.join(missing[:5]) or 'none'}; "
+            f"unexpected: {', '.join(unexpected[:5]) or 'none'})."
+        )
+    target.load_state_dict(saved_state_dict)
 
     if optimizer and load_opt == 1:
-        optimizer.load_state_dict(checkpoint_dict.get("optimizer", {}))
+        optimizer_state = checkpoint_dict["optimizer"]
+        overrides = {
+            key: optimizer.defaults[key]
+            for key in ("fused", "foreach")
+            if key in optimizer.defaults
+        }
+        optimizer.load_state_dict(
+            dict(
+                optimizer_state,
+                param_groups=[
+                    dict(group, **overrides)
+                    for group in optimizer_state["param_groups"]
+                ],
+            )
+        )
 
     print(
         f"Loaded checkpoint '{checkpoint_path}' (epoch {checkpoint_dict['iteration']})"
@@ -108,6 +121,7 @@ def save_checkpoint(
     }
 
     # Create a backwards-compatible checkpoint
+    temporary_path = f"{checkpoint_path}.tmp"
     torch.save(
         replace_keys_in_dict(
             replace_keys_in_dict(
@@ -116,8 +130,9 @@ def save_checkpoint(
             ".parametrizations.weight.original0",
             ".weight_g",
         ),
-        checkpoint_path,
+        temporary_path,
     )
+    os.replace(temporary_path, checkpoint_path)
 
     print(f"Saved model '{checkpoint_path}' (epoch {iteration})")
 

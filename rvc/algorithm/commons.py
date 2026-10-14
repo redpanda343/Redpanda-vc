@@ -49,20 +49,11 @@ def slice_segments(
         segment_size (int, optional): The size of each segment. Defaults to 4.
         dim (int, optional): The dimension to slice across (2D or 3D tensors). Defaults to 3.
     """
+    offsets = torch.arange(segment_size, device=x.device)
     if dim == 2:
-        ret = torch.zeros_like(x[:, :segment_size])
-    elif dim == 3:
-        ret = torch.zeros_like(x[:, :, :segment_size])
-
-    for i in range(x.size(0)):
-        idx_str = ids_str[i]
-        idx_end = idx_str + segment_size
-        if dim == 2:
-            ret[i] = x[i, idx_str:idx_end]
-        else:
-            ret[i] = x[i, :, idx_str:idx_end]
-
-    return ret
+        return x.gather(1, ids_str.view(-1, 1) + offsets)
+    index = ids_str.view(-1, 1, 1) + offsets
+    return x.gather(2, index.expand(x.size(0), x.size(1), segment_size))
 
 
 def rand_slice_segments(x, x_lengths=None, segment_size=4):
@@ -78,7 +69,9 @@ def rand_slice_segments(x, x_lengths=None, segment_size=4):
     if x_lengths is None:
         x_lengths = t
     ids_str_max = x_lengths - segment_size + 1
-    ids_str = (torch.rand([b]).to(device=x.device) * ids_str_max).to(dtype=torch.long)
+    ids_str = (
+        torch.rand([b]).to(device=x.device, non_blocking=True) * ids_str_max
+    ).to(dtype=torch.long)
     ret = slice_segments(x, ids_str, segment_size, dim=3)
     return ret, ids_str
 
