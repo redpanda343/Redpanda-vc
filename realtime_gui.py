@@ -378,9 +378,7 @@ class AudioEngine:
         return latency[index] if isinstance(latency, tuple) else latency
 
     def _routing_samplerate(self, model_rate):
-        exclusive = self.settings.get("wasapi_exclusive", False)
-
-        def check(checker, device, channels, rate, selectors=None):
+        def check(checker, device, channels, rate, selectors=None, exclusive=False):
             if selectors:
                 settings = sd.AsioSettings(channel_selectors=selectors)
                 checker(device=device, channels=channels, dtype="float32",
@@ -416,11 +414,12 @@ class AudioEngine:
         for rate in candidates:
             try:
                 self.input_extra, input_shared = check(
-                    sd.check_input_settings, self.input_device, self.channels, rate, self.input_selectors
+                    sd.check_input_settings, self.input_device, self.channels, rate, self.input_selectors,
+                    self.settings.get("exclusive_input", False),
                 )
                 self.output_extra, output_shared = check(
                     sd.check_output_settings, self.output_device, self.output_channels, rate,
-                    self.output_selectors,
+                    self.output_selectors, self.settings.get("exclusive_output", False),
                 )
                 self.monitor_extra, monitor_shared = None, False
                 if self.monitor_device is not None:
@@ -1015,7 +1014,9 @@ class RealtimeGUI:
         self.output_device = tk.StringVar(value=value.get("output_device", ""))
         self.monitor_device = tk.StringVar(value=value.get("monitor_device", MONITOR_DISABLED))
         self.show_legacy_devices = tk.BooleanVar(value=value.get("show_legacy_devices", False))
-        self.wasapi_exclusive = tk.BooleanVar(value=value.get("wasapi_exclusive", False))
+        legacy_exclusive = value.get("wasapi_exclusive", False)
+        self.exclusive_input = tk.BooleanVar(value=value.get("exclusive_input", legacy_exclusive))
+        self.exclusive_output = tk.BooleanVar(value=value.get("exclusive_output", legacy_exclusive))
         self.pitch = tk.IntVar(value=value.get("pitch", 0))
         self.speaker_id = tk.IntVar(value=value.get("speaker_id", 0))
         self.index_rate = tk.DoubleVar(value=value.get("index_rate", 0.0))
@@ -1229,15 +1230,21 @@ class RealtimeGUI:
         options.grid(row=4, column=0, columnspan=5, sticky="ew", pady=(8, 0))
         reload_button = ttk.Button(options, text="Reload devices", command=self._load_devices)
         reload_button.pack(side="left")
-        exclusive = ttk.Checkbutton(options, text="WASAPI exclusive", variable=self.wasapi_exclusive)
-        exclusive.pack(side="left", padx=(16, 0))
+        exclusive_input = ttk.Checkbutton(options, text="Exclusive input", variable=self.exclusive_input)
+        exclusive_input.pack(side="left", padx=(16, 0))
+        Tooltip(exclusive_input, "WASAPI exclusive mode for the input. Lower delay, but other apps "
+                                 "cannot record from this device while running.")
+        exclusive_output = ttk.Checkbutton(options, text="Exclusive output", variable=self.exclusive_output)
+        exclusive_output.pack(side="left", padx=(16, 0))
+        Tooltip(exclusive_output, "WASAPI exclusive mode for the output. Lower delay, but other apps "
+                                  "cannot play to this device while running. The monitor always stays shared.")
         legacy = ttk.Checkbutton(
             options, text="Legacy drivers", variable=self.show_legacy_devices, command=self._load_devices
         )
         legacy.pack(side="left", padx=(16, 0))
         Tooltip(legacy, "Also list MME, DirectSound and WDM-KS devices.")
         ttk.Label(options, textvariable=self.sample_rate_text, style="Muted.TLabel").pack(side="right")
-        self.locked_widgets.update((*combos, reload_button, exclusive, legacy))
+        self.locked_widgets.update((*combos, reload_button, exclusive_input, exclusive_output, legacy))
         return frame
 
     def _build_voice(self, parent):
@@ -1451,7 +1458,8 @@ class RealtimeGUI:
             "output_device_label": self.output_device.get(),
             "monitor_device_label": monitor,
             "show_legacy_devices": self.show_legacy_devices.get(),
-            "wasapi_exclusive": self.wasapi_exclusive.get(),
+            "exclusive_input": self.exclusive_input.get(),
+            "exclusive_output": self.exclusive_output.get(),
             "pitch": self.pitch.get(),
             "speaker_id": self.speaker_id.get(),
             "index_rate": self.index_rate.get(),
