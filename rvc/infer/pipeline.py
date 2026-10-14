@@ -11,7 +11,7 @@ from torch import Tensor
 now_dir = os.getcwd()
 sys.path.append(now_dir)
 
-from shared.predictors.f0 import RVCRMVPE, Swift
+from shared.predictors.f0 import BeatricePitch, RVCRMVPE, Swift
 from rvc.infer.pm import extract_pm
 from shared.utils import extract_embedding_features
 
@@ -125,9 +125,20 @@ class Pipeline:
                     hop_size=self.window,
                 )
             f0 = self.model_swift.get_f0(x, p_len)
+        elif f0_method == "beatrice":
+            if not hasattr(self, "model_beatrice"):
+                self.model_beatrice = BeatricePitch(
+                    device=self.device,
+                    sample_rate=self.sample_rate,
+                    hop_size=self.window,
+                )
+            f0 = self.model_beatrice.get_f0(x, p_len)
         else:
             raise ValueError(f"Unsupported pitch extraction method: {f0_method}")
 
+        return self.quantize_f0(f0, pitch)
+
+    def quantize_f0(self, f0, pitch):
         # Preserve zero F0 frames so the existing pitch inputs carry an explicit
         # unvoiced state: coarse bin 1 for the encoder and zero F0 for the vocoder.
         f0 = np.asarray(f0).copy()

@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from rvc.infer.infer import VoiceConverter
+from shared.predictors.f0 import BeatricePitch
 from shared.utils import extract_embedding_features
 
 
@@ -190,6 +191,7 @@ class RealTimeRVC:
         self.seed = int(seed) % (2**63 - 1)
         self.last_f0_method = None
         self.pitch_sample_count = 0
+        self.beatrice_sample_count = None
         self.prepared_f0_methods = set()
         self.rmvpe_viterbi = RMVPEViterbi()
         self.cache_pitch = torch.zeros(4096, device=self.device, dtype=torch.long)
@@ -277,6 +279,8 @@ class RealTimeRVC:
 
     @staticmethod
     def pitch_lookahead_frames(method):
+        if method == "beatrice":
+            return BeatricePitch.lookahead_frames
         return 20 if method == "swift" else 0
 
     @property
@@ -314,6 +318,7 @@ class RealTimeRVC:
         self.rmvpe_viterbi.reset()
         self.last_f0_method = None
         self.pitch_sample_count = 0
+        self.beatrice_sample_count = None
         if getattr(self, "variance_stream", None) is not None:
             self.variance_stream.reset()
 
@@ -370,6 +375,9 @@ class RealTimeRVC:
                 spin=False,
             )
             self.pipeline.model_swift = predictor
+        if predictor is None and method == "beatrice":
+            predictor = BeatricePitch(device=self.device, sample_rate=16000, hop_size=160)
+            self.pipeline.model_beatrice = predictor
         if predictor is None:
             return
         current = predictor
@@ -394,6 +402,9 @@ class RealTimeRVC:
         if method not in self.prepared_f0_methods:
             self._prepare_pitch_predictor(method)
         self.pitch_sample_count += int(block_frame_16k)
+        if method == "beatrice":
+            self._update_beatrice_pitch(input_wav, block_frame_16k)
+            return
         extractor_frame = block_frame_16k + 800
         if method == "swift":
             extractor_frame = min(block_frame_16k + 19200, input_wav.shape[0])
@@ -436,6 +447,29 @@ class RealTimeRVC:
         if count:
             self.cache_pitch[-count:] = usable_pitch[-count:]
             self.cache_pitchf[-count:] = usable_pitchf[-count:]
+
+    def _update_beatrice_pitch(self, input_wav, block_frame_16k):
+        predictor = self.pipeline.model_beatrice
+        source = input_wav[-int(block_frame_16k):]
+        if self.beatrice_sample_count != self.pitch_sample_count - block_frame_16k:
+            predictor.reset()
+            source = input_wav
+        self.beatrice_sample_count = self.pitch_sample_count
+        f0 = predictor.push(source)
+        if not f0.numel():
+            return
+        pitch, pitchf = self.pipeline.quantize_f0(f0.cpu().numpy(), self.pitch)
+        pitch = torch.as_tensor(pitch, device=self.device, dtype=torch.long)
+        pitchf = torch.as_tensor(pitchf, device=self.device, dtype=torch.float32)
+        shift = max(1, block_frame_16k // 160)
+        self.cache_pitch[:-shift] = self.cache_pitch[shift:].clone()
+        self.cache_pitchf[:-shift] = self.cache_pitchf[shift:].clone()
+        end = predictor.frames - predictor.samples // 160
+        count = min(pitch.numel(), self.cache_pitch.numel() + end)
+        self.cache_pitch[end - count:end] = pitch[-count:]
+        self.cache_pitchf[end - count:end] = pitchf[-count:]
+        self.cache_pitch[end:] = pitch[-1]
+        self.cache_pitchf[end:] = pitchf[-1]
 
     def _full_rate_source(self, source_wav, source_rate, length):
         source = source_wav.float().view(-1)

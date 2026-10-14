@@ -937,6 +937,7 @@ def inference_tab():
                     choices=[
                         "rmvpe",
                         "swift",
+                        "beatrice",
                         ("parselmouth", "pm"),
                     ],
                     value="rmvpe",
@@ -1417,6 +1418,7 @@ def inference_tab():
                     choices=[
                         "rmvpe",
                         "swift",
+                        "beatrice",
                         ("parselmouth", "pm"),
                     ],
                     value="rmvpe",
@@ -1588,7 +1590,7 @@ def inference_tab():
             multi_f0_method = gr.Radio(
                 label=i18n("Pitch extraction algorithm"),
                 info=i18n("Pitch extraction algorithm used by every model."),
-                choices=["rmvpe", "swift", ("parselmouth", "pm")],
+                choices=["rmvpe", "swift", "beatrice", ("parselmouth", "pm")],
                 value="rmvpe",
                 interactive=True,
             )
@@ -1773,7 +1775,7 @@ def inference_tab():
             batch_multi_f0_method = gr.Radio(
                 label=i18n("Pitch extraction algorithm"),
                 info=i18n("Pitch extraction algorithm used by every model."),
-                choices=["rmvpe", "swift", ("parselmouth", "pm")],
+                choices=["rmvpe", "swift", "beatrice", ("parselmouth", "pm")],
                 value="rmvpe",
                 interactive=True,
             )

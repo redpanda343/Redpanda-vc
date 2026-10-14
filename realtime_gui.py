@@ -51,7 +51,7 @@ BEATRICE_THREADS = 1
 MONITOR_DISABLED = "Disabled"
 MAIN_HOST_APIS = ("ASIO", "Windows WASAPI")
 EMBEDDERS = ("contentvec", "spin-v2")
-PITCH_METHODS = {"rmvpe": "rmvpe", "swift": "swift", "parselmouth": "pm"}
+PITCH_METHODS = {"rmvpe": "rmvpe", "swift": "swift", "beatrice": "beatrice", "parselmouth": "pm"}
 METER_FLOOR_DB = -60.0
 
 

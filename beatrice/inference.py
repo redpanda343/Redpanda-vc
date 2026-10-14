@@ -14,6 +14,8 @@ IN_HOP = 160
 OUT_HOP = 240
 PITCH_BINS = 448
 BINS_PER_OCTAVE = 96
+PITCH_BAND = 4
+PITCH_BASE_HZ = 55.0
 PHONE_CHANNELS = 128
 HIDDEN_CHANNELS = 256
 CODEBOOK_SIZE = 512
@@ -71,12 +73,13 @@ def read_paraphernalia(path):
 
 
 class Weights:
-    def __init__(self, path, device):
+    def __init__(self, path, device, values=None):
         self.path = Path(path)
-        if not self.path.is_file():
-            raise FileNotFoundError(f'Beatrice model file not found: {self.path}')
-        values = np.fromfile(self.path, dtype=np.float16).astype(np.float32)
-        self.values = torch.from_numpy(values).to(device)
+        if values is None:
+            if not self.path.is_file():
+                raise FileNotFoundError(f'Beatrice model file not found: {self.path}')
+            values = np.fromfile(self.path, dtype=np.float16)
+        self.values = torch.from_numpy(values.astype(np.float32)).to(device)
         self.offset = 0
 
     def take(self, *shape):
@@ -90,6 +93,30 @@ class Weights:
     def finish(self):
         if self.offset != self.values.numel():
             raise ValueError(f'{self.path.name} does not match the Beatrice {VERSION} layout.')
+
+
+def checkpoint_pitch_values(path):
+    state = torch.load(path, map_location='cpu', weights_only=True)['pitch_estimator']
+    tensors = []
+    for name in ('instfreq_embed_0', 'instfreq_embed_1', 'corr_embed_0', 'corr_embed_1', 'backbone.embed',
+                 'backbone.norm'):
+        tensors += [state[f'{name}.weight'], state[f'{name}.bias']]
+    block = 0
+    while f'backbone.convnext.{block}.gamma' in state:
+        prefix = f'backbone.convnext.{block}.'
+        scale = state[prefix + 'post_scale'] * state[prefix + 'post_scale_weight']
+        tensors += [
+            state[prefix + 'dwconv.weight'] * state[prefix + 'pre_scale'],
+            state[prefix + 'dwconv.bias'],
+            state[prefix + 'pwconv1.weight'] * state[prefix + 'norm.weight'][None],
+            state[prefix + 'pwconv1.bias'] + torch.mv(state[prefix + 'pwconv1.weight'], state[prefix + 'norm.bias']),
+            state[prefix + 'pwconv2.weight'] * state[prefix + 'gamma'][:, None] * scale,
+            state[prefix + 'pwconv2.bias'] * state[prefix + 'gamma'] * scale,
+        ]
+        block += 1
+    for name in ('backbone.final_layer_norm', 'head'):
+        tensors += [state[f'{name}.weight'], state[f'{name}.bias']]
+    return torch.cat([tensor.reshape(-1) for tensor in tensors]).half().numpy()
 
 
 @functools.lru_cache(maxsize=64)
@@ -220,6 +247,60 @@ class Stack:
         return x
 
 
+class PitchEstimator:
+    def __init__(self, weights, device):
+        self.instfreq_embed = (Conv(weights, 192, 192, 1), Conv(weights, 192, 192, 1))
+        self.correlation_embed = (Conv(weights, 256, 192, 1), Conv(weights, 192, 192, 1))
+        self.backbone = Stack(weights, 192, 192, 384, 9, 3, 33)
+        self.head = Conv(weights, 192, PITCH_BINS, 1)
+        weights.finish()
+        self.cosine = torch.signal.windows.cosine(PITCH_WINDOW, device=device)
+        self.bins = torch.arange(PITCH_BINS, device=device)
+
+    def reset(self):
+        for module in (*self.instfreq_embed, *self.correlation_embed, self.backbone, self.head):
+            module.reset()
+
+    def inputs(self, audio, frames):
+        windows = audio.unfold(0, PITCH_WINDOW, IN_HOP)[:frames + 1]
+        spectrum = torch.fft.rfft(windows, n=PITCH_WINDOW)[:, :INSTFREQ_BINS]
+        delta = spectrum[1:] * spectrum[:-1].conj()
+        delta = delta / delta.abs().add(1e-5)
+        instfreq = torch.cat([spectrum[1:].abs().add(1e-5).log10(), delta.real, delta.imag], 1)
+        windows = windows[1:]
+        flipped = windows.flip(-1)
+        correlation = torch.fft.irfft(
+            torch.fft.rfft(flipped, n=PITCH_WINDOW) * torch.fft.rfft(windows[:, -CORRELATION_WINDOW:], n=PITCH_WINDOW),
+            n=PITCH_WINDOW,
+        )[:, CORRELATION_WINDOW:]
+        energy = flipped.square().cumsum(-1)
+        difference = (energy[:, CORRELATION_WINDOW - 1:CORRELATION_WINDOW] + energy[:, CORRELATION_WINDOW:]
+                      - energy[:, :-CORRELATION_WINDOW] - 2.0 * correlation)
+        difference = (difference.clamp(min=0.0) * (2.0 / CORRELATION_WINDOW)).sqrt()
+        loudness = (windows * self.cosine).square().sum(-1).clamp(min=1e-3).log10() * 0.5
+        return instfreq, difference, loudness
+
+    def probabilities(self, instfreq, difference):
+        instfreq = self.instfreq_embed[1](F.gelu(self.instfreq_embed[0](instfreq), approximate='tanh'))
+        difference = self.correlation_embed[1](F.gelu(self.correlation_embed[0](difference), approximate='tanh'))
+        return self.head(self.backbone(F.gelu(instfreq + difference, approximate='tanh'))).softmax(-1)
+
+    def __call__(self, instfreq, difference):
+        probabilities = self.probabilities(instfreq, difference)
+        unvoiced = probabilities[:, 0].clone()
+        probabilities[:, 0] = -100.0
+        band = probabilities.unfold(1, PITCH_BAND, 1).sum(-1)
+        top = band.argmax(1)
+        top_probability = band.gather(1, top[:, None])[:, 0] + 1e-6
+        half = band.gather(1, (top - BINS_PER_OCTAVE).clamp(min=1)[:, None])[:, 0]
+        half = torch.where(top <= BINS_PER_OCTAVE, 0.0, half)
+        double = band.gather(1, (top + BINS_PER_OCTAVE).clamp(max=PITCH_BINS - PITCH_BAND)[:, None])[:, 0]
+        double = torch.where(top > PITCH_BINS - PITCH_BAND - BINS_PER_OCTAVE, 0.0, double)
+        mask = (top[:, None] <= self.bins) & (self.bins < top[:, None] + PITCH_BAND)
+        quantized = (probabilities * mask).argmax(1)
+        return quantized, torch.stack([unvoiced, half / top_probability, double / top_probability])
+
+
 class BeatriceModel:
     def __init__(self, path, device='cpu', prepend=PHONE_LOOKAHEAD):
         self.device = torch.device(device)
@@ -229,9 +310,7 @@ class BeatriceModel:
         self._load_pitch_estimator()
         self._load_waveform_generator()
         self._load_speakers()
-        self.cosine = torch.signal.windows.cosine(PITCH_WINDOW, device=self.device)
         self.hann = torch.hann_window(2 * OUT_HOP, device=self.device)
-        self.bins = torch.arange(PITCH_BINS, device=self.device)
         self.ir_bins = torch.arange(IR_LENGTH // 2 + 1, device=self.device) * (-2.0 * math.pi / IR_LENGTH)
         self.ir_offsets = torch.arange(IR_LENGTH, device=self.device)
         self.pitch_shift = 0.0
@@ -253,12 +332,7 @@ class BeatriceModel:
         weights.finish()
 
     def _load_pitch_estimator(self):
-        weights = Weights(self.directory / 'pitch_estimator.bin', self.device)
-        self.instfreq_embed = (Conv(weights, 192, 192, 1), Conv(weights, 192, 192, 1))
-        self.correlation_embed = (Conv(weights, 256, 192, 1), Conv(weights, 192, 192, 1))
-        self.pitch_backbone = Stack(weights, 192, 192, 384, 9, 3, 33)
-        self.pitch_head = Conv(weights, 192, PITCH_BINS, 1)
-        weights.finish()
+        self.pitch_estimator = PitchEstimator(Weights(self.directory / 'pitch_estimator.bin', self.device), self.device)
 
     def _load_waveform_generator(self):
         weights = Weights(self.directory / 'waveform_generator.bin', self.device)
@@ -317,10 +391,9 @@ class BeatriceModel:
         self.vq_neighbors = min(max(int(count), 0), 8)
 
     def reset(self):
-        for module in (self.phone_backbone, self.phone_head, *self.instfreq_embed, *self.correlation_embed,
-                       self.pitch_backbone, self.pitch_head, self.embed_phone, self.embed_pitch_features, self.prenet,
-                       self.ir_generator, self.ir_post, self.aperiodicity_generator, self.aperiodicity_post,
-                       self.filter_generator, self.filter_post):
+        for module in (self.phone_backbone, self.phone_head, self.pitch_estimator, self.embed_phone,
+                       self.embed_pitch_features, self.prenet, self.ir_generator, self.ir_post,
+                       self.aperiodicity_generator, self.aperiodicity_post, self.filter_generator, self.filter_post):
             module.reset()
         self.audio = torch.zeros(HISTORY + self.prepend, device=self.device)
         self.frame = 0
@@ -341,43 +414,6 @@ class BeatriceModel:
             nearest = (F.normalize(phone, dim=1, eps=1e-6) @ codes.T).topk(self.vq_neighbors, dim=1).indices
             phone = codes[nearest].mean(1)
         return phone * torch.rsqrt(phone.square().mean(1, keepdim=True) + torch.finfo(torch.float32).eps)
-
-    def _pitch_inputs(self, audio, frames):
-        windows = audio.unfold(0, PITCH_WINDOW, IN_HOP)[:frames + 1]
-        spectrum = torch.fft.rfft(windows, n=PITCH_WINDOW)[:, :INSTFREQ_BINS]
-        delta = spectrum[1:] * spectrum[:-1].conj()
-        delta = delta / delta.abs().add(1e-5)
-        instfreq = torch.cat([spectrum[1:].abs().add(1e-5).log10(), delta.real, delta.imag], 1)
-        windows = windows[1:]
-        flipped = windows.flip(-1)
-        correlation = torch.fft.irfft(
-            torch.fft.rfft(flipped, n=PITCH_WINDOW) * torch.fft.rfft(windows[:, -CORRELATION_WINDOW:], n=PITCH_WINDOW),
-            n=PITCH_WINDOW,
-        )[:, CORRELATION_WINDOW:]
-        energy = flipped.square().cumsum(-1)
-        difference = (energy[:, CORRELATION_WINDOW - 1:CORRELATION_WINDOW] + energy[:, CORRELATION_WINDOW:]
-                      - energy[:, :-CORRELATION_WINDOW] - 2.0 * correlation)
-        difference = (difference.clamp(min=0.0) * (2.0 / CORRELATION_WINDOW)).sqrt()
-        loudness = (windows * self.cosine).square().sum(-1).clamp(min=1e-3).log10() * 0.5
-        return instfreq, difference, loudness
-
-    def _pitch(self, instfreq, difference):
-        instfreq = self.instfreq_embed[1](F.gelu(self.instfreq_embed[0](instfreq), approximate='tanh'))
-        difference = self.correlation_embed[1](F.gelu(self.correlation_embed[0](difference), approximate='tanh'))
-        logits = self.pitch_head(self.pitch_backbone(F.gelu(instfreq + difference, approximate='tanh')))
-        probabilities = logits.softmax(-1)
-        unvoiced = probabilities[:, 0].clone()
-        probabilities[:, 0] = -100.0
-        band = probabilities.unfold(1, 4, 1).sum(-1)
-        top = band.argmax(1)
-        top_probability = band.gather(1, top[:, None])[:, 0] + 1e-6
-        half = band.gather(1, (top - BINS_PER_OCTAVE).clamp(min=1)[:, None])[:, 0]
-        half = torch.where(top <= BINS_PER_OCTAVE, 0.0, half)
-        double = band.gather(1, (top + BINS_PER_OCTAVE).clamp(max=PITCH_BINS - 4)[:, None])[:, 0]
-        double = torch.where(top > PITCH_BINS - 4 - BINS_PER_OCTAVE, 0.0, double)
-        mask = (top[:, None] <= self.bins) & (self.bins < top[:, None] + 4)
-        quantized = (probabilities * mask).argmax(1)
-        return quantized, torch.stack([unvoiced, half / top_probability, double / top_probability])
 
     def _synthesize(self, hertz, ir, aperiodicity, post_filter):
         frames = hertz.shape[0]
@@ -433,8 +469,8 @@ class BeatriceModel:
             return torch.zeros(0, device=self.device)
         offset = HISTORY - PHONE_LOOKAHEAD
         phones = self._phones(self.audio[offset:offset + IN_HOP * (frames - 1) + 240])
-        instfreq, difference, loudness = self._pitch_inputs(self.audio, frames)
-        quantized, pitch_features = self._pitch(instfreq, difference)
+        instfreq, difference, loudness = self.pitch_estimator.inputs(self.audio, frames)
+        quantized, pitch_features = self.pitch_estimator(instfreq, difference)
         quantized = (quantized + round(self.pitch_shift * BINS_PER_OCTAVE / 12)).clamp(1, PITCH_BINS - 1)
         features = torch.cat([loudness[None], pitch_features]).T
         x = (self.embed_phone(phones) + self.embed_pitch[quantized] + self.embed_pitch_features(features)
@@ -444,7 +480,7 @@ class BeatriceModel:
         aperiodicity = self.aperiodicity_post(F.silu(self.aperiodicity_generator(x)))
         post_filter = self.filter_post(F.silu(self.filter_generator(x)))
         post_filter[:, 0] += 1.0
-        hertz = 55.0 * 2.0 ** (quantized.float() / BINS_PER_OCTAVE)
+        hertz = PITCH_BASE_HZ * 2.0 ** (quantized.float() / BINS_PER_OCTAVE)
         self.frame += frames
         self.audio = self.audio[frames * IN_HOP:]
         return self._synthesize(hertz, ir, aperiodicity, post_filter)

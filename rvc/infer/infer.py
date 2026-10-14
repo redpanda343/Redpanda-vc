@@ -737,7 +737,7 @@ class VoiceConverter:
             else:
                 self.vc = VC(self.tgt_sr, self.config)
             if previous_vc is not None:
-                for predictor_name in ("model_rmvpe", "model_swift"):
+                for predictor_name in ("model_rmvpe", "model_swift", "model_beatrice"):
                     predictor = getattr(previous_vc, predictor_name, None)
                     if predictor is None:
                         continue

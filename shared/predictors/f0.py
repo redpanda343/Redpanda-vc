@@ -1,6 +1,19 @@
+import math
 import os
 import torch
 
+from beatrice.inference import (
+    BINS_PER_OCTAVE,
+    IN_HOP,
+    IN_SAMPLE_RATE,
+    PITCH_BAND,
+    PITCH_BASE_HZ,
+    PITCH_WINDOW,
+    PitchEstimator,
+    Weights,
+    checkpoint_pitch_values,
+)
+from beatrice.resources import ensure_pitch_estimator
 from shared.predictors.rmvpe import N_CLASS, RMVPE as RMVPEModel, to_local_average_f0
 from shared.predictors.RMVPE import RMVPE0Predictor
 from shared.predictors.swift_dependencies import ensure_swift_f0
@@ -124,3 +137,61 @@ class Swift:
         f0 = np.exp2(np.interp(t_tgt, t_src[voiced], np.log2(pitch[voiced])))
         f0[np.interp(t_tgt, t_src, confidence) < threshold] = 0.0
         return f0
+
+
+class BeatricePitch:
+    padding = PITCH_WINDOW // 2
+    latency = PITCH_WINDOW + IN_HOP - padding
+    lookahead_frames = math.ceil((latency - IN_HOP) / IN_HOP)
+    chunk_samples = 10 * IN_SAMPLE_RATE
+
+    def __init__(self, device, sample_rate=16000, hop_size=160, threshold=0.7):
+        if sample_rate != IN_SAMPLE_RATE or hop_size != IN_HOP:
+            raise ValueError("The Beatrice pitch estimator requires 16 kHz audio with a 160-sample hop.")
+        self.device = torch.device(device)
+        self.sample_rate = sample_rate
+        self.hop_size = hop_size
+        self.threshold = threshold
+        path = ensure_pitch_estimator()
+        self.model = PitchEstimator(Weights(path, self.device, checkpoint_pitch_values(path)), self.device)
+        self.offsets = torch.arange(1, PITCH_BAND + 1, device=self.device)
+        self.reset()
+
+    def reset(self):
+        self.model.reset()
+        self.audio = torch.zeros(self.padding, device=self.device)
+        self.samples = 0
+        self.frames = 0
+
+    def _decode(self, probabilities):
+        band = probabilities[:, 1:].unfold(1, PITCH_BAND, 1)
+        confidence, top = band.sum(-1).max(1)
+        weights = band[torch.arange(band.shape[0], device=self.device), top]
+        position = (weights * (top[:, None] + self.offsets)).sum(1) / weights.sum(1)
+        f0 = PITCH_BASE_HZ * 2.0 ** (position / BINS_PER_OCTAVE)
+        return torch.where(confidence > self.threshold, f0, 0.0)
+
+    @torch.inference_mode()
+    def push(self, audio):
+        audio = torch.as_tensor(audio, dtype=torch.float32, device=self.device).reshape(-1)
+        self.audio = torch.cat([self.audio, audio])
+        self.samples += audio.shape[0]
+        frames = (self.audio.shape[0] - PITCH_WINDOW) // IN_HOP
+        if frames <= 0:
+            return torch.zeros(0, device=self.device)
+        instfreq, difference, _ = self.model.inputs(self.audio, frames)
+        probabilities = self.model.probabilities(instfreq, difference)
+        self.audio = self.audio[frames * IN_HOP:]
+        self.frames += frames
+        return self._decode(probabilities)
+
+    def get_f0(self, x, p_len=None):
+        x = np.asarray(x, dtype=np.float32).reshape(-1)
+        if p_len is None:
+            p_len = x.shape[0] // self.hop_size
+        self.reset()
+        x = np.pad(x, (0, self.latency))
+        f0 = torch.cat([self.push(x[start:start + self.chunk_samples])
+                        for start in range(0, x.shape[0], self.chunk_samples)])
+        f0 = f0[:p_len].cpu().numpy()
+        return np.pad(f0, (0, p_len - f0.shape[0]))

@@ -8,16 +8,20 @@ ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY = 'fierce-cats/beatrice-trainer'
 REVISION = 'f34836de014b86956096878aecb8d3b17feaaa0b'
 TRAINER_ROOT = ROOT / 'models' / 'beatrice' / 'beatrice-trainer'
+PITCH_ESTIMATOR_FILE = 'assets/pretrained/104_3_checkpoint_00300000.pt'
+PITCH_ESTIMATOR_SHA256 = '174e5411009e0e4f6ee8a8c97c4cd2f646791eae1b9aa2b425acb797e0353ef4'
+PITCH_ESTIMATOR_SIZE = 7061178
 REQUIRED_FILES = (
     'beatrice_trainer/__main__.py',
     'assets/default_config.json',
     'assets/images/noimage.png',
-    'assets/pretrained/104_3_checkpoint_00300000.pt',
+    PITCH_ESTIMATOR_FILE,
     'assets/pretrained/122_checkpoint_03000000.pt',
     'assets/pretrained/151_checkpoint_libritts_r_200_02750000.pt.gz',
 )
 DOWNLOAD_ATTEMPTS = 5
 _rate_limit_lock = threading.Lock()
+_pitch_estimator_lock = threading.Lock()
 _resume_at = 0.0
 
 
@@ -85,6 +89,19 @@ def download_entry(entry, progress, headers):
             if error.response is None or error.response.status_code != 429 or attempt == DOWNLOAD_ATTEMPTS - 1:
                 raise
             wait_for_rate_limit(error.response, progress)
+
+
+def ensure_pitch_estimator():
+    path = TRAINER_ROOT / PITCH_ESTIMATOR_FILE
+    with _pitch_estimator_lock:
+        if not path.is_file():
+            from tqdm import tqdm
+
+            print(f'Downloading the Beatrice pitch estimator from {REPOSITORY}...', flush=True)
+            with tqdm(total=PITCH_ESTIMATOR_SIZE, unit='B', unit_scale=True, desc='Beatrice pitch estimator') as progress:
+                download_entry({'path': PITCH_ESTIMATOR_FILE, 'lfs': {'oid': PITCH_ESTIMATOR_SHA256}}, progress,
+                               hub_headers())
+    return path
 
 
 def ensure_trainer():

@@ -1001,6 +1001,7 @@ def _infer_opts(func):
                 [
                     "rmvpe",
                     "swift",
+                    "beatrice",
                     "pm",
                 ]
             ),
