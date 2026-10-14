@@ -26,7 +26,27 @@ except ImportError:
 
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("OMP_NUM_THREADS", "4")
+os.environ.setdefault("KMP_BLOCKTIME", "1")
 os.environ.setdefault("SD_ENABLE_ASIO", "1")
+
+CU_CTX_SCHED_BLOCKING_SYNC = 4
+
+
+def use_blocking_cuda_sync():
+    try:
+        driver = ctypes.WinDLL("nvcuda.dll") if sys.platform == "win32" else ctypes.CDLL("libcuda.so.1")
+        count = ctypes.c_int()
+        if driver.cuInit(0) or driver.cuDeviceGetCount(ctypes.byref(count)):
+            return
+        for index in range(count.value):
+            device = ctypes.c_int()
+            if not driver.cuDeviceGet(ctypes.byref(device), index):
+                driver.cuDevicePrimaryCtxSetFlags_v2(device, CU_CTX_SCHED_BLOCKING_SYNC)
+    except (AttributeError, OSError):
+        pass
+
+
+use_blocking_cuda_sync()
 
 import torch
 import torch.nn.functional as F
@@ -53,6 +73,7 @@ MAIN_HOST_APIS = ("ASIO", "Windows WASAPI")
 EMBEDDERS = ("contentvec", "spin-v2")
 PITCH_METHODS = {"rmvpe": "rmvpe", "swift": "swift", "beatrice": "beatrice", "parselmouth": "pm"}
 METER_FLOOR_DB = -60.0
+AUTOTUNE_HEADROOM = 1 << 30
 
 
 class BlockTorchGate(TorchGate):
@@ -503,11 +524,35 @@ class AudioEngine:
         if self.beatrice is not None:
             self.beatrice.reset()
 
+    def _warm_up(self):
+        silence = np.zeros((self.block_frame, self.channels), dtype=np.float32)
+        for _ in range(2 if self.beatrice is None else 3):
+            self._process(silence, skip_silence=False)
+
+    def _budgeted_warm_up(self):
+        device = torch.device(self.device)
+        if self.rvc is None or device.type != "cuda" or not torch.backends.cudnn.benchmark:
+            return False
+        limit = torch.cuda.memory_reserved(device) + AUTOTUNE_HEADROOM
+        total = torch.cuda.get_device_properties(device).total_memory
+        torch.cuda.set_per_process_memory_fraction(min(1.0, limit / total), device)
+        try:
+            self._warm_up()
+            succeeded = not self.rvc.graphs_failed
+        except torch.OutOfMemoryError:
+            succeeded = False
+        finally:
+            torch.cuda.set_per_process_memory_fraction(1.0, device)
+        if not succeeded:
+            self._reset_buffers()
+            self.rvc.reset_graphs()
+            torch.cuda.empty_cache()
+        return succeeded
+
     def _prewarm(self):
         try:
-            silence = np.zeros((self.block_frame, self.channels), dtype=np.float32)
-            for _ in range(2 if self.beatrice is None else 3):
-                self._process(silence, skip_silence=False)
+            if not self._budgeted_warm_up():
+                self._warm_up()
         finally:
             self._reset_buffers()
 

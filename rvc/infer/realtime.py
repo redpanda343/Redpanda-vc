@@ -8,14 +8,16 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from rectified_flow.pitch import release_rmvpe_model
 from rectified_flow.realtime import RealtimeGraph
 from rvc.infer.infer import VoiceConverter
 from shared.predictors.f0 import BeatricePitch
-from shared.utils import extract_embedding_features
+from shared.utils import V1_FEATURE_LAYER, extract_embedding_features
 
 
 SUPPORTED_VOCODERS = {"HiFi-GAN", "RefineGAN"}
 SUPPORTED_EMBEDDERS = {"contentvec", "spin-v2"}
+PITCH_PREDICTORS = ("rmvpe", "swift", "beatrice")
 FLOW_WINDOW_CONTEXT = 0.5
 
 
@@ -209,6 +211,8 @@ class RealTimeRVC:
         self.model = self.converter.net_g.to(
             device=self.device, dtype=torch.float32
         )
+        for key in ("weight", "model"):
+            self.converter.cpt.pop(key, None)
         self.pipeline = self.converter.vc
         self.sample_rate = self.converter.tgt_sr
         self.version = self.converter.version
@@ -216,7 +220,6 @@ class RealTimeRVC:
         self.pitch = pitch
         self.index_rate = float(index_rate)
         self.index = None
-        self.big_npy = None
         self.lock = threading.RLock()
         self.seed = int(seed) % (2**63 - 1)
         self.last_f0_method = None
@@ -248,6 +251,8 @@ class RealTimeRVC:
         positional = getattr(getattr(self.embedder, "encoder", None), "pos_conv_embed", None)
         if positional is not None and isinstance(positional.conv, torch.nn.Conv1d):
             positional.conv = MatmulGroupedConv1d(positional.conv)
+        if self.version == "v1" and not self.embedder.config.do_stable_layer_norm:
+            self.embedder.encoder.layers = self.embedder.encoder.layers[:V1_FEATURE_LAYER]
         self.expected_feature_dim = (
             self.pipeline.content_channels
             if self.is_rectified
@@ -332,8 +337,12 @@ class RealTimeRVC:
             )
         if index.ntotal < 1:
             raise ValueError("The selected feature index is empty.")
+        try:
+            faiss.extract_index_ivf(index).make_direct_map()
+        except RuntimeError:
+            pass
+        index.reconstruct(0)
         self.index = index
-        self.big_npy = index.reconstruct_n(0, index.ntotal)
 
     def change_pitch(self, pitch):
         with self.lock:
@@ -393,9 +402,8 @@ class RealTimeRVC:
         score = np.maximum(score, 1e-6)
         weight = np.where(valid, np.square(1.0 / score), 0.0)
         weight /= weight.sum(axis=1, keepdims=True)
-        retrieved = np.sum(
-            self.big_npy[indices] * np.expand_dims(weight, axis=2), axis=1
-        )
+        neighbors = self.index.reconstruct_batch(indices.ravel()).reshape(*indices.shape, -1)
+        retrieved = np.sum(neighbors * np.expand_dims(weight, axis=2), axis=1)
         replacement = torch.from_numpy(retrieved).unsqueeze(0).to(self.device)
         features[0, start:] = (
             replacement * self.index_rate
@@ -433,6 +441,35 @@ class RealTimeRVC:
                 break
         self.prepared_f0_methods.add(method)
 
+    def _release_pitch_predictors(self, method):
+        released = False
+        for name in PITCH_PREDICTORS:
+            if name != method and hasattr(self.pipeline, f"model_{name}"):
+                delattr(self.pipeline, f"model_{name}")
+                self.prepared_f0_methods.discard(name)
+                released = True
+        if method != "rmvpe":
+            released = released or self.rmvpe_graph is not None
+            self.rmvpe_graph = None
+            if self.is_rectified:
+                released = release_rmvpe_model(self.device) or released
+        if released and torch.device(self.device).type == "cuda":
+            torch.cuda.empty_cache()
+
+    def _graphs(self):
+        graphs = [self.feature_graph, self.rmvpe_graph, *self.synthesizer_graphs.values()]
+        if self.is_rectified:
+            graphs += [self.flow_sampler, self.vocoder_graph]
+        return [graph for graph in graphs if graph is not None]
+
+    @property
+    def graphs_failed(self):
+        return any(graph.failed for graph in self._graphs())
+
+    def reset_graphs(self):
+        for graph in self._graphs():
+            graph.reset()
+
     def _rmvpe_network(self, model):
         if self.rmvpe_graph is None or self.rmvpe_graph.function is not model:
             self.rmvpe_graph = RealtimeGraph(model, "RMVPE", self.cuda_graph)
@@ -450,6 +487,7 @@ class RealTimeRVC:
     def _update_pitch(self, input_wav, block_frame_16k, method):
         if method != self.last_f0_method:
             self.rmvpe_viterbi.reset()
+            self._release_pitch_predictors(method)
             self.last_f0_method = method
         if self.is_rectified and method in ("pm", "rmvpe"):
             self.pitch_sample_count += int(block_frame_16k)

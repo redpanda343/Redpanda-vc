@@ -46,6 +46,10 @@ class RealtimeGraph:
         self.entries = OrderedDict()
         self.failed = False
 
+    def reset(self):
+        self.failed = False
+        self.entries.clear()
+
     def _fail(self, message, error=None):
         self.failed = True
         self.entries.clear()
@@ -120,6 +124,9 @@ class RealtimeFlowSampler:
     def __init__(self, model, enabled=True):
         self.model = model
         self.enabled = bool(enabled)
+        self.reset()
+
+    def reset(self):
         self.failed = False
         self.entry = None
         self.signature = None

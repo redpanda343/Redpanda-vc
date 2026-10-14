@@ -67,6 +67,10 @@ def rmvpe_model(device):
     return _RMVPE[key]
 
 
+def release_rmvpe_model(device):
+    return _RMVPE.pop(str(device), None) is not None
+
+
 def rmvpe_pitch(model, waveform, sample_rate, hop, frames, network=None):
     from shared.predictors.rmvpe import interp_f0, resample_align_curve
 

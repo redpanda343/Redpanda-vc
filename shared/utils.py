@@ -1,3 +1,4 @@
+import functools
 import hashlib
 import os
 import shutil
@@ -117,6 +118,7 @@ def format_title(title):
 
 CONTENTVEC_SHA256 = "d8dd400e054ddf4e6be75dab5a2549db748cc99e756a097c496c099f65a4854e"
 CONTENTVEC_CONFIG_SHA256 = "2ddde063b795d38d9051a7215a092fecf4cfe148b54251e38de51d88d356898b"
+V1_FEATURE_LAYER = 9
 
 
 def _sha256(file_path):
@@ -125,6 +127,16 @@ def _sha256(file_path):
         for block in iter(lambda: file.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+@functools.lru_cache(maxsize=None)
+def _cached_sha256(file_path, size, modified):
+    return _sha256(file_path)
+
+
+def _file_sha256(file_path):
+    stat = os.stat(file_path)
+    return _cached_sha256(os.path.abspath(file_path), stat.st_size, stat.st_mtime_ns)
 
 
 def _download_file(url, destination_path, expected_sha256=None):
@@ -157,7 +169,7 @@ def extract_embedding_features(model, source, version):
             output_hidden_states=True,
             return_dict=True,
         )
-        return model.final_proj(output.hidden_states[9])
+        return model.final_proj(output.hidden_states[V1_FEATURE_LAYER])
     if version == "v2":
         return model(
             source,
@@ -203,7 +215,7 @@ def load_embedding(embedder_model, version="v2"):
         checkpoint_is_valid = (
             os.path.isfile(bin_file)
             and os.path.getsize(bin_file) > 0
-            and _sha256(bin_file) == CONTENTVEC_SHA256
+            and _file_sha256(bin_file) == CONTENTVEC_SHA256
         )
         if not checkpoint_is_valid:
             if os.path.exists(bin_file):
@@ -217,7 +229,7 @@ def load_embedding(embedder_model, version="v2"):
         config_is_valid = (
             os.path.isfile(json_file)
             and os.path.getsize(json_file) > 0
-            and _sha256(json_file) == CONTENTVEC_CONFIG_SHA256
+            and _file_sha256(json_file) == CONTENTVEC_CONFIG_SHA256
         )
         if not config_is_valid:
             if os.path.exists(json_file):
