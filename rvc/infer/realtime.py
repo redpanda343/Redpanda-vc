@@ -144,6 +144,33 @@ class RMVPEViterbi:
         return centers
 
 
+class MatmulGroupedConv1d(torch.nn.Module):
+    def __init__(self, conv):
+        super().__init__()
+        self.groups = conv.groups
+        self.kernel_size = conv.kernel_size[0]
+        self.padding = conv.padding[0]
+        weight = conv.weight.detach()
+        out_channels, group_channels, _ = weight.shape
+        self.register_buffer(
+            "weight",
+            weight.reshape(self.groups, out_channels // self.groups, group_channels * self.kernel_size)
+            .transpose(1, 2)
+            .contiguous(),
+        )
+        self.register_buffer("bias", conv.bias.detach().clone())
+
+    def forward(self, x):
+        batch, channels, _ = x.shape
+        group_channels = channels // self.groups
+        windows = F.pad(x, (self.padding, self.padding)).unfold(2, self.kernel_size, 1)
+        windows = windows.reshape(batch, self.groups, group_channels, -1, self.kernel_size).permute(0, 1, 3, 2, 4)
+        windows = windows.reshape(batch * self.groups, -1, group_channels * self.kernel_size)
+        output = torch.bmm(windows, self.weight.repeat(batch, 1, 1))
+        output = output.reshape(batch, self.groups, -1, self.weight.shape[2]).permute(0, 1, 3, 2)
+        return output.reshape(batch, -1, output.shape[-1]) + self.bias[:, None]
+
+
 class RealTimeRVC:
     def __init__(
         self,
@@ -218,6 +245,9 @@ class RealTimeRVC:
         self.embedder = self.converter.hubert_model.to(
             device=self.device, dtype=torch.float32
         )
+        positional = getattr(getattr(self.embedder, "encoder", None), "pos_conv_embed", None)
+        if positional is not None and isinstance(positional.conv, torch.nn.Conv1d):
+            positional.conv = MatmulGroupedConv1d(positional.conv)
         self.expected_feature_dim = (
             self.pipeline.content_channels
             if self.is_rectified
