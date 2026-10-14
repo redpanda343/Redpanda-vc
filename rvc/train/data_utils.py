@@ -106,7 +106,7 @@ class TextAudioLoaderMultiNSFsid(torch.utils.data.Dataset):
         phone = np.repeat(phone, 2, axis=0)
         pitch = np.load(pitch)
         pitchf = np.load(pitchf)
-        n_num = min(phone.shape[0], self.max_sample_frames)
+        n_num = min(phone.shape[0], pitch.shape[0], pitchf.shape[0], self.max_sample_frames)
         phone = phone[:n_num, :]
         pitch = pitch[:n_num]
         pitchf = pitchf[:n_num]

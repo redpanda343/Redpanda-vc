@@ -565,18 +565,21 @@ def run(
 
     # Load checkpoint if available
     scaler_dict = {}
-    try:
-        print("Starting training...")
-        _, _, _, epoch_str, scaler_dict = load_checkpoint(
-            latest_checkpoint_path(experiment_dir, "D_*.pth"), net_d, optim_d
-        )
-        _, _, _, epoch_str, _ = load_checkpoint(
-            latest_checkpoint_path(experiment_dir, "G_*.pth"), net_g, optim_g
-        )
+    print("Starting training...")
+    last_d = latest_checkpoint_path(experiment_dir, "D_*.pth")
+    if last_g or last_d:
+        try:
+            if not (last_g and last_d):
+                raise FileNotFoundError("resuming needs both a G_*.pth and a D_*.pth checkpoint")
+            _, _, _, epoch_str, scaler_dict = load_checkpoint(last_d, net_d, optim_d)
+            _, _, _, epoch_str, _ = load_checkpoint(last_g, net_g, optim_g)
+        except Exception as e:
+            print(f"Could not resume from the checkpoints in {experiment_dir}: {e}")
+            print("Fix or remove them, or enable cleanup to start over from the pretrained models.")
+            sys.exit(1)
         epoch_str += 1
         global_step = (epoch_str - 1) * len(train_loader)
-
-    except Exception as e:
+    else:
         epoch_str = 1
         global_step = 0
 
@@ -737,6 +740,11 @@ def train_and_evaluate(
     net_g.train()
     net_d.train()
     freeze_discriminator_for_generator = device.type == "cuda"
+    net_d_for_generator = (
+        net_d.module
+        if freeze_discriminator_for_generator and hasattr(net_d, "module")
+        else net_d
+    )
 
     use_amp = device.type == "cuda" and (
         train_dtype == torch.bfloat16 or train_dtype == torch.float16
@@ -826,7 +834,7 @@ def train_and_evaluate(
                 device_type="cuda", enabled=use_amp, dtype=train_dtype
             ):
                 # Generator backward and update
-                _, y_d_hat_g, fmap_r, fmap_g = net_d(wave, y_hat)
+                _, y_d_hat_g, fmap_r, fmap_g = net_d_for_generator(wave, y_hat)
 
             if multiscale_mel_loss:
                 loss_mel = fn_mel_loss(wave, y_hat) * config.train.c_mel / 3.0
@@ -1022,8 +1030,8 @@ def train_and_evaluate(
         record = f"{model_name} | epoch={epoch} | step={global_step} | {epoch_recorder.record()}"
         print(record)
 
-        # Save weights every N epochs
-        if epoch % save_every_epoch == 0:
+        # Save weights every N epochs and at the end of training
+        if epoch % save_every_epoch == 0 or epoch >= custom_total_epoch:
             checkpoint_suffix = f"{2333333 if save_only_latest else global_step}.pth"
             save_checkpoint(
                 net_g,

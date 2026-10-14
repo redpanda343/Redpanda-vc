@@ -161,11 +161,8 @@ def latest_checkpoint_path(dir_path, regex="G_*.pth"):
         dir_path (str): The directory to search for checkpoints.
         regex (str, optional): The regular expression to match checkpoint files.
     """
-    checkpoints = sorted(
-        glob.glob(os.path.join(dir_path, regex)),
-        key=lambda f: int("".join(filter(str.isdigit, f))),
-    )
-    return checkpoints[-1] if checkpoints else None
+    checkpoints = glob.glob(os.path.join(dir_path, regex))
+    return max(checkpoints, key=os.path.getmtime) if checkpoints else None
 
 
 def plot_spectrogram_to_numpy(spectrogram):

@@ -126,6 +126,9 @@ def kl_loss(z_p, logs_q, m_p, logs_p, z_mask):
         logs_p (torch.Tensor): Log variance of p [b, h, t_t].
         z_mask (torch.Tensor): Mask for the latent variables [b, h, t_t].
     """
+    z_p, logs_q, m_p, logs_p, z_mask = (
+        z_p.float(), logs_q.float(), m_p.float(), logs_p.float(), z_mask.float()
+    )
     kl = logs_p - logs_q - 0.5 + 0.5 * ((z_p - m_p) ** 2) * torch.exp(-2 * logs_p)
     kl = (kl * z_mask).sum()
     loss = kl / z_mask.sum()
