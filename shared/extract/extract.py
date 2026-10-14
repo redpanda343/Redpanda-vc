@@ -17,7 +17,8 @@ sys.path.append(os.path.join(now_dir))
 # Zluda hijack
 import shared.zluda
 from rvc.configs.config import Config
-from shared.predictors.f0 import RMVPE, RVCRMVPE, Swift
+from beatrice.resources import ensure_pitch_estimator
+from shared.predictors.f0 import RMVPE, RVCRMVPE, BeatricePitch, Swift
 from shared.predictors.swift_dependencies import ensure_swift_f0
 from shared.utils import (
     extract_embedding_features,
@@ -51,6 +52,10 @@ class FeatureInput:
             self.model = Swift(
                 device=self.device, sample_rate=self.sample_rate, hop_size=self.hop_size
             )
+        elif f0_method == "beatrice":
+            self.model = BeatricePitch(
+                device=self.device, sample_rate=self.sample_rate, hop_size=self.hop_size
+            )
         elif f0_method != "pm":
             raise ValueError(f"Unsupported F0 method: {f0_method}")
         self.f0_method = f0_method
@@ -66,6 +71,8 @@ class FeatureInput:
             f0 = self.model.get_f0(
                 x, p_len=p_len, f0_min=self.f0_min, f0_max=self.f0_max
             )
+        elif self.f0_method == "beatrice":
+            f0 = self.model.get_f0(x, p_len)
         return np.asarray(f0).copy()
 
     def get_pm(self, x, p_len):
@@ -153,6 +160,8 @@ def run_pitch_extraction(files, devices, f0_method, threads, progress, updates, 
         raise RuntimeError("SwiftF0 training extraction requires a CUDA GPU. Select a GPU or use RMVPE.")
     if f0_method == "swift":
         ensure_swift_f0()
+    if f0_method == "beatrice":
+        ensure_pitch_estimator()
     threads = max(1, int(threads))
     if f0_method == "pm":
         worker_count = min(threads, len(files))

@@ -637,6 +637,7 @@ def rvc_train_tab():
                 choices=[
                     "swift",
                     "rmvpe",
+                    "beatrice",
                 ],
                 value="rmvpe",
                 interactive=True,

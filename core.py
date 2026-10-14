@@ -1370,7 +1370,7 @@ def preprocess(**kwargs):
 @click.option("--model-name", required=True, help="Name of the model.")
 @click.option(
     "--f0-method",
-    type=click.Choice(["rmvpe", "swift"]),
+    type=click.Choice(["rmvpe", "swift", "beatrice"]),
     default="rmvpe",
     help="Pitch extraction method.",
 )
