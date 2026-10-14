@@ -37,6 +37,7 @@ def extract_model(
     pitch_guidance=True,
     version=None,
     export_dtype=torch.float16,
+    verbose=True,
 ):
     temporary_model_path = None
     try:
@@ -175,7 +176,8 @@ def extract_model(
         os.replace(temporary_model_path, model_path)
         temporary_model_path = None
 
-        print(f"Saved model '{model_path}' (epoch {epoch} and step {step})")
+        if verbose:
+            print(f"Saved model '{model_path}' (epoch {epoch} and step {step})")
 
     except Exception as error:
         if temporary_model_path and os.path.exists(temporary_model_path):

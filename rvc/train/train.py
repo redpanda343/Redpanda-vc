@@ -3,13 +3,11 @@ import sys
 
 os.environ["USE_LIBUV"] = "0" if sys.platform == "win32" else "1"
 import argparse
-import datetime
 import glob
 import json
 import logging
 from concurrent.futures import Future, ThreadPoolExecutor
 from random import randint
-from time import time as ttime
 
 import torch
 import torch.distributed as dist
@@ -180,27 +178,6 @@ class AsyncInferenceExporter:
             self.executor = None
 
 
-class EpochRecorder:
-    """
-    Records the time elapsed per epoch.
-    """
-
-    def __init__(self):
-        self.last_time = ttime()
-
-    def record(self):
-        """
-        Records the elapsed time and returns a formatted string.
-        """
-        now_time = ttime()
-        elapsed_time = now_time - self.last_time
-        self.last_time = now_time
-        elapsed_time = round(elapsed_time, 1)
-        elapsed_time_str = str(datetime.timedelta(seconds=int(elapsed_time)))
-        current_time = datetime.datetime.now().strftime("%H:%M:%S")
-        return f"time={current_time} | training_speed={elapsed_time_str}"
-
-
 def parse_arguments(argv=None):
     parser = argparse.ArgumentParser(description="Train an RVC voice model.")
     parser.add_argument("--model-name", required=True)
@@ -325,7 +302,6 @@ def check_dataset_sample_rate(args, config):
 
 
 def remove_previous_attempt(experiment_dir):
-    print("Removing files from the prior training attempt...")
     for root, dirs, files in os.walk(experiment_dir, topdown=False):
         for name in files:
             file_name, file_extension = os.path.splitext(name)
@@ -343,7 +319,6 @@ def remove_previous_attempt(experiment_dir):
                     if os.path.isfile(item_path):
                         os.remove(item_path)
                 os.rmdir(folder_path)
-    print("Cleanup done!")
 
 
 def latest_checkpoint_pair(experiment_dir):
@@ -378,7 +353,6 @@ def main():
     else:
         device_type = "cpu"
         device_ids = [0]
-        print("Training with CPU, this will take a long time.")
 
     if args.cleanup:
         remove_previous_attempt(args.experiment_dir)
@@ -443,6 +417,9 @@ class Trainer:
         self.last_batch = None
         self.writer = None
         self.exporter = None
+        self.progress = None
+        self.epoch = 0
+        self.logged_losses = None
 
     def fit(self):
         self.build_data()
@@ -462,21 +439,91 @@ class Trainer:
             if self.args.save_every_steps > 0:
                 self.exporter = AsyncInferenceExporter(self.device)
 
+        if self.rank == 0:
+            print(self.summary(epoch_str, last_g))
         if epoch_str > self.args.total_epoch and self.rank == 0:
             print(
                 f"{self.args.model_name} already reached epoch {self.args.total_epoch}. "
                 "Raise the total epochs to continue training."
             )
+        total_steps = self.args.total_epoch * len(self.sampler)
+        self.progress = tqdm(
+            total=max(total_steps, self.global_step),
+            initial=self.global_step,
+            desc="Training",
+            unit="step",
+            dynamic_ncols=True,
+            disable=self.rank != 0 or epoch_str > self.args.total_epoch,
+        )
+        completed = None
         try:
             for epoch in range(epoch_str, self.args.total_epoch + 1):
                 self.train_epoch(epoch)
                 if self.finish_epoch(epoch):
+                    completed = epoch
                     break
         finally:
+            self.progress.close()
             if self.exporter is not None:
                 self.exporter.close()
             if self.writer is not None:
                 self.writer.close()
+        if completed is not None:
+            print(
+                f"{self.args.model_name} | training completed at epoch {completed}, step {self.global_step}"
+            )
+
+    def summary(self, epoch_str, last_g):
+        args, data = self.args, self.config.data
+        precision = (
+            {torch.float16: "FP16", torch.bfloat16: "BF16"}[args.train_dtype]
+            if self.use_amp
+            else "FP32"
+        )
+        device = f"GPU {args.gpus}" if self.device.type == "cuda" else self.device.type.upper()
+        speakers = self.config.model.spk_embed_dim
+        parts = [
+            args.model_name,
+            f"{args.vocoder} {data.sample_rate} Hz {args.version}",
+            f"{speakers} speaker{'' if speakers == 1 else 's'}",
+            f"{device} {precision}",
+            f"batch {args.batch_size}, {len(self.sampler)} steps per epoch",
+        ]
+        options = []
+        if args.max_batch_seconds:
+            sizes = self.sampler.bucket_batch_sizes
+            options.append(
+                f"max {args.max_batch_seconds:g} s audio per batch ({min(sizes)}-{max(sizes)} clips)"
+            )
+        if args.warmup_steps:
+            options.append(f"{args.warmup_steps} warmup steps")
+        if args.lr_decay_steps:
+            options.append(f"lr_decay every {args.lr_decay_steps} steps")
+        if self.cache_in_gpu:
+            options.append("dataset cached in GPU")
+        if args.checkpointing:
+            options.append("checkpointing")
+        if options:
+            parts.append(", ".join(options))
+        pretrained = [
+            os.path.basename(path)
+            for path in (args.pretrained_g, args.pretrained_d)
+            if path not in ("", "None")
+        ]
+        if last_g:
+            parts.append(f"resuming at epoch {epoch_str}, step {self.global_step}")
+        elif pretrained:
+            parts.append(f"from {' and '.join(pretrained)}")
+        else:
+            parts.append("from scratch")
+        return " | ".join(parts)
+
+    def update_postfix(self):
+        text = f"epoch {self.epoch}/{self.args.total_epoch}"
+        if self.logged_losses is not None:
+            total, disc, mel = self.logged_losses
+            text += f", g {total:.2f}, d {disc:.2f}, mel {mel:.2f}"
+        self.progress.set_postfix_str(text, refresh=False)
 
     def build_data(self):
         from rvc.train.data_utils import (
@@ -498,12 +545,6 @@ class Trainer:
             shuffle=True,
             max_frames=max_frames or None,
         )
-        if max_frames and self.rank == 0:
-            sizes = self.sampler.bucket_batch_sizes
-            print(
-                f"Limiting batches to {self.args.max_batch_seconds:g} s of audio: "
-                f"{min(sizes)} to {max(sizes)} clips per batch, {len(self.sampler)} steps per epoch."
-            )
         if len(self.sampler) < 3:
             print(
                 "Not enough data present in the training set. Perhaps you forgot to slice the audio files in preprocess?"
@@ -514,7 +555,7 @@ class Trainer:
                 self.dataset,
                 num_workers=4,
                 shuffle=False,
-                pin_memory=True,
+                pin_memory=self.device.type == "cuda",
                 collate_fn=self.collate,
                 batch_sampler=self.sampler,
                 persistent_workers=True,
@@ -538,7 +579,6 @@ class Trainer:
                 del ckpt
             except Exception as e:
                 print(f"Failed to load checkpoint: {e}. Using default number of speakers.")
-        print(f"Initializing the generator with {spk_dim} speakers.")
         config.model.spk_embed_dim = spk_dim
 
         net_g = Synthesizer(
@@ -558,13 +598,11 @@ class Trainer:
         ).to(self.device)
 
         if bf16_adamw and args.train_dtype == torch.bfloat16:
-            print("Using BFload16 AdamW optimizer")
             from rvc.train.anyprecision_optimizer import AnyPrecisionAdamW
 
             optimizer = AnyPrecisionAdamW
             options = {}
         else:
-            print("Using AdamW optimizer")
             optimizer = torch.optim.AdamW
             options = {"fused": self.device.type == "cuda"}
         self.optim_g = optimizer(
@@ -581,19 +619,12 @@ class Trainer:
             eps=config.train.eps,
             **options,
         )
-        if args.warmup_steps or args.lr_decay_steps:
-            decay = f"every {args.lr_decay_steps} steps" if args.lr_decay_steps else "every epoch"
-            print(
-                f"Learning rate: {args.warmup_steps} warmup steps, lr_decay {config.train.lr_decay} {decay}."
-            )
         if args.multiscale_mel_loss:
             self.fn_mel_loss = MultiScaleMelSpectrogramLoss(
                 sample_rate=config.data.sample_rate
             )
-            print("Using Multi-Scale Mel loss function")
         else:
             self.fn_mel_loss = torch.nn.L1Loss()
-            print("Using Single-Scale Mel loss function")
 
         if self.world_size > 1 and self.device.type == "cuda":
             net_g = DDP(net_g, device_ids=[self.device.index])
@@ -604,16 +635,11 @@ class Trainer:
             net_d.module if self.freeze_discriminator and hasattr(net_d, "module") else net_d
         )
 
-        if self.rank == 0 and args.train_dtype == torch.bfloat16:
-            print("Using BFloat16 for training.")
-        elif self.rank == 0 and args.train_dtype == torch.float16:
-            print("Using Float16 for training.")
         self.scaler = torch.amp.GradScaler(
             enabled=self.device.type == "cuda" and args.train_dtype == torch.float16
         )
 
     def restore(self, last_g, last_d):
-        print("Starting training...")
         if last_g or last_d:
             try:
                 if not (last_g and last_d):
@@ -641,8 +667,6 @@ class Trainer:
     def load_pretrained(self, net, path, label, fresh_speakers=False):
         if path in ("", "None"):
             return
-        if self.rank == 0:
-            print(f"Loaded pretrained ({label}) '{path}'")
         target = net.module if hasattr(net, "module") else net
         try:
             ckpt = torch.load(path, map_location="cpu", weights_only=True)["model"]
@@ -673,7 +697,9 @@ class Trainer:
                     yield [tensor.to(self.device) for tensor in batch]
             return
         if self.cache is None:
-            loader = DataLoader(self.dataset, batch_size=None, num_workers=4, pin_memory=True)
+            loader = DataLoader(
+                self.dataset, batch_size=None, num_workers=4, pin_memory=True
+            )
             self.cache = [
                 tuple(tensor.to(self.device, non_blocking=True) for tensor in item)
                 for item in loader
@@ -686,13 +712,13 @@ class Trainer:
         self.sampler.set_epoch(epoch)
         self.net_g.train()
         self.net_d.train()
-        self.epoch_recorder = EpochRecorder()
-        with tqdm(total=len(self.sampler), leave=False) as pbar:
-            for batch in self.batches():
-                self.set_learning_rate(epoch)
-                self.train_step(batch)
-                self.export_step_weights(epoch)
-                pbar.update(1)
+        self.epoch = epoch
+        self.update_postfix()
+        for batch in self.batches():
+            self.set_learning_rate(epoch)
+            self.train_step(batch)
+            self.export_step_weights(epoch)
+            self.progress.update(1)
 
     def set_learning_rate(self, epoch):
         args, step = self.args, self.global_step
@@ -805,7 +831,7 @@ class Trainer:
             (loss_gen_all, loss_disc, loss_gen, loss_fm, loss_mel, loss_kl),
             (grad_norm_d, grad_norm_g),
         )
-        self.last_batch = (spec, ids_slice, y_hat, loss_gen_all)
+        self.last_batch = (spec, ids_slice, y_hat)
 
     def record_losses(self, losses, grad_norms):
         self.loss_sums.add_(torch.stack([loss.detach() for loss in losses]).float())
@@ -819,6 +845,8 @@ class Trainer:
             dist.reduce(totals, dst=0, op=dist.ReduceOp.SUM)
         if self.rank == 0:
             loss_values = (totals[:-1] / totals[-1]).cpu().tolist()
+            self.logged_losses = (loss_values[0], loss_values[1], loss_values[4])
+            self.update_postfix()
             gradient_values = torch.stack(grad_norms).float().cpu().tolist()
             summarize(
                 writer=self.writer,
@@ -856,6 +884,7 @@ class Trainer:
             hps=self.config,
             vocoder=self.args.vocoder,
             version=self.args.version,
+            verbose=False,
         )
 
     def export_step_weights(self, epoch):
@@ -909,15 +938,11 @@ class Trainer:
         if self.rank != 0:
             return False
         args = self.args
-        spec, ids_slice, y_hat, loss_gen_all = self.last_batch
+        spec, ids_slice, y_hat = self.last_batch
         save_epoch = epoch % args.save_every_epoch == 0
         done = epoch >= args.total_epoch
         if save_epoch:
             self.summarize_epoch(spec, ids_slice, y_hat)
-
-        print(
-            f"{args.model_name} | epoch={epoch} | step={self.global_step} | {self.epoch_recorder.record()}"
-        )
 
         weights = []
         if save_epoch or done:
@@ -938,9 +963,6 @@ class Trainer:
                 weights.append(self.weights_path(epoch))
 
         if done:
-            print(
-                f"Training has been successfully completed with {epoch} epoch, {self.global_step} steps and {round(loss_gen_all.item(), 3)} loss gen."
-            )
             weights.append(self.weights_path(epoch))
             if self.exporter is not None:
                 self.exporter.wait_for_completion()

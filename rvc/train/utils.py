@@ -84,9 +84,6 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, load_opt=1):
             )
         )
 
-    print(
-        f"Loaded checkpoint '{checkpoint_path}' (epoch {checkpoint_dict['iteration']})"
-    )
     return (
         model,
         optimizer,
@@ -133,8 +130,6 @@ def save_checkpoint(
         temporary_path,
     )
     os.replace(temporary_path, checkpoint_path)
-
-    print(f"Saved model '{checkpoint_path}' (epoch {iteration})")
 
 
 def summarize(
