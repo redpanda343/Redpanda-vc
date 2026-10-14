@@ -30,8 +30,8 @@ class RMVPE:
             device=self.device,
         )
 
-    def get_f0(self, x, filter_radius=0.03, decoder=None):
-        hidden = self.model.infer_hidden(x, self.sample_rate)
+    def get_f0(self, x, filter_radius=0.03, decoder=None, network=None):
+        hidden = self.model.infer_hidden(x, self.sample_rate, network)
         center = None
         if decoder is not None:
             center = np.asarray(decoder(hidden[0].cpu().numpy(), filter_radius), dtype=np.int64)
@@ -51,8 +51,8 @@ class RVCRMVPE:
             device=self.device,
         )
 
-    def get_f0(self, x, filter_radius=0.03, decoder=None):
-        return self.model.infer_from_audio(x, thred=filter_radius, decoder=decoder)
+    def get_f0(self, x, filter_radius=0.03, decoder=None, network=None):
+        return self.model.infer_from_audio(x, thred=filter_radius, decoder=decoder, network=network)
 
 
 class Swift:

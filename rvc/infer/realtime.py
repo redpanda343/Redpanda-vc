@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from rectified_flow.realtime import RealtimeGraph
 from rvc.infer.infer import VoiceConverter
 from shared.predictors.f0 import BeatricePitch
 from shared.utils import extract_embedding_features
@@ -155,7 +156,7 @@ class RealTimeRVC:
         seed=0,
         rectified_vocoder_path="",
         rectified_steps=0,
-        rectified_cuda_graph=True,
+        cuda_graph=True,
         rectified_flow_window=True,
     ):
         self.converter = VoiceConverter()
@@ -176,6 +177,8 @@ class RealTimeRVC:
                 f"Speaker ID must be between 0 and {self.converter.n_spk - 1}."
             )
         self.device = self.converter.config.device
+        if torch.device(self.device).type == "cuda":
+            torch.backends.cudnn.benchmark = True
         self.model = self.converter.net_g.to(
             device=self.device, dtype=torch.float32
         )
@@ -220,10 +223,17 @@ class RealTimeRVC:
             if self.is_rectified
             else int(self.model.enc_p.emb_phone.in_features)
         )
+        self.cuda_graph = bool(cuda_graph)
+        self.feature_graph = RealtimeGraph(
+            lambda source: extract_embedding_features(self.embedder, source, self.version),
+            "content feature", self.cuda_graph,
+        )
+        self.rmvpe_graph = None
+        self.synthesizer_graphs = {}
         if self.is_rectified:
             from torchaudio.transforms import Resample
             from rectified_flow.vocoder import load_vocoder
-            from rectified_flow.realtime import RealtimeFlowSampler, RealtimeGraph
+            from rectified_flow.realtime import RealtimeFlowSampler
             from rectified_flow.variance import StreamingVariances
 
             if int(rectified_steps) != rectified_steps or not 0 <= rectified_steps <= 1000:
@@ -236,19 +246,13 @@ class RealTimeRVC:
                 self.flow_context_frames = math.ceil(
                     FLOW_WINDOW_CONTEXT * self.sample_rate / int(self.pipeline.data["hop_length"])
                 )
-            self.flow_sampler = RealtimeFlowSampler(self.model, enabled=rectified_cuda_graph)
-            self.feature_graph = RealtimeGraph(
-                lambda source: extract_embedding_features(self.embedder, source, self.version),
-                "content feature", rectified_cuda_graph,
-            )
-            self.rmvpe_graph = None
-            self.rectified_cuda_graph = bool(rectified_cuda_graph)
+            self.flow_sampler = RealtimeFlowSampler(self.model, enabled=self.cuda_graph)
             self.pipeline.set_vocoder(rectified_vocoder_path)
             vocoder, _ = load_vocoder(self.pipeline.resolved_vocoder_path(), self.pipeline.data)
             if self.pipeline.vocoder_path:
                 self.vocoder = os.path.basename(self.pipeline.vocoder_path)
             self.pipeline.vocoder_model = vocoder.to(self.device).float()
-            self.vocoder_graph = RealtimeGraph(self.pipeline.vocoder_model, "vocoder", rectified_cuda_graph)
+            self.vocoder_graph = RealtimeGraph(self.pipeline.vocoder_model, "vocoder", self.cuda_graph)
             self.flow_resampler = Resample(16000, self.sample_rate).to(self.device)
             self.source_resampler = None
             self.variance_stream = None
@@ -326,10 +330,7 @@ class RealTimeRVC:
         source = input_wav.float().view(1, -1)
         if getattr(self.embedder, "audio_requires_normalization", False):
             source = F.layer_norm(source, source.shape)
-        if self.is_rectified:
-            features = self.feature_graph(source)
-        else:
-            features = extract_embedding_features(self.embedder, source, self.version)
+        features = self.feature_graph(source)
         if features.shape[-1] != self.expected_feature_dim:
             raise RuntimeError(
                 f"{self.embedder_name} outputs {features.shape[-1]} channels, but "
@@ -392,6 +393,20 @@ class RealTimeRVC:
                 break
         self.prepared_f0_methods.add(method)
 
+    def _rmvpe_network(self, model):
+        if self.rmvpe_graph is None or self.rmvpe_graph.function is not model:
+            self.rmvpe_graph = RealtimeGraph(model, "RMVPE", self.cuda_graph)
+        return self.rmvpe_graph
+
+    def _synthesizer_graph(self, skip_head, return_length):
+        key = (skip_head, return_length)
+        if key not in self.synthesizer_graphs:
+            self.synthesizer_graphs[key] = RealtimeGraph(
+                lambda *inputs: self.model.infer(*inputs, skip_head, return_length)[0],
+                "synthesizer", self.cuda_graph,
+            )
+        return self.synthesizer_graphs[key]
+
     def _update_pitch(self, input_wav, block_frame_16k, method):
         if method != self.last_f0_method:
             self.rmvpe_viterbi.reset()
@@ -418,16 +433,21 @@ class RealTimeRVC:
         source = input_wav[-extractor_frame:].detach().cpu().numpy()
         shift = max(1, block_frame_16k // 160)
         decoder = None
+        network = None
         if method == "rmvpe":
             decoder = lambda salience, threshold: self.rmvpe_viterbi.decode(
                 salience, threshold, shift
             )
+            predictor = getattr(self.pipeline, "model_rmvpe", None)
+            if predictor is not None:
+                network = self._rmvpe_network(predictor.model.model)
         pitch, pitchf = self.pipeline.get_f0(
             source,
             source.shape[0] // 160,
             f0_method=method,
             pitch=self.pitch,
             f0_decoder=decoder,
+            f0_network=network,
         )
         if method not in self.prepared_f0_methods:
             self._prepare_pitch_predictor(method)
@@ -499,11 +519,7 @@ class RealTimeRVC:
             else:
                 predictor = getattr(self.pipeline, "model_rmvpe", None)
                 model = predictor.model if predictor is not None else rmvpe_model(self.device)
-                if self.rmvpe_graph is None or self.rmvpe_graph.function is not model.model:
-                    from rectified_flow.realtime import RealtimeGraph
-
-                    self.rmvpe_graph = RealtimeGraph(model.model, "RMVPE", self.rectified_cuda_graph)
-                f0, uv = rmvpe_pitch(model, audio, rate, hop, frames, self.rmvpe_graph)
+                f0, uv = rmvpe_pitch(model, audio, rate, hop, frames, self._rmvpe_network(model.model))
             return f0, uv, source
         p_len = input_wav.shape[0] // 160
         pitchf = self.cache_pitchf[-p_len:].cpu().numpy()
@@ -585,15 +601,9 @@ class RealTimeRVC:
             )
             coarse = self.cache_pitch[None, -p_len:]
             continuous = self.cache_pitchf[None, -p_len:]
-            audio = self.model.infer(
-                features.float(),
-                lengths,
-                coarse,
-                continuous,
-                speaker,
-                int(skip_head),
-                int(return_length),
-            )[0]
+            audio = self._synthesizer_graph(int(skip_head), int(return_length))(
+                features.float(), lengths, coarse, continuous, speaker
+            )
             if torch.device(self.device).type == "cuda":
                 torch.cuda.synchronize(self.device)
         return audio.squeeze().float(), time.perf_counter() - started

@@ -442,7 +442,7 @@ class RMVPE0Predictor:
         cents_mapping = 20 * np.arange(N_CLASS) + 1997.3794084376191
         self.cents_mapping = np.pad(cents_mapping, (4, 4))
 
-    def mel2hidden(self, mel, chunk_size=32000):
+    def mel2hidden(self, mel, chunk_size=32000, network=None):
         """
         Converts Mel-spectrogram features to hidden representation.
 
@@ -471,7 +471,7 @@ class RMVPE0Predictor:
                 # mel_chunk = F.pad(mel_chunk, (320, 320), mode="reflect")
                 # print(' after padding', mel_chunk.shape)
 
-                out_chunk = self.model(mel_chunk)
+                out_chunk = (self.model if network is None else network)(mel_chunk)
                 # print(' result chunk', out_chunk.shape)
                 # out_chunk = out_chunk[:, 320:-320, :]
                 # print(' trimmed chunk', out_chunk.shape)
@@ -494,7 +494,7 @@ class RMVPE0Predictor:
         f0[f0 == 10] = 0
         return f0
 
-    def infer_from_audio(self, audio, thred=0.03, decoder=None):
+    def infer_from_audio(self, audio, thred=0.03, decoder=None, network=None):
         """
         Infers F0 from audio.
 
@@ -504,7 +504,7 @@ class RMVPE0Predictor:
         """
         audio = torch.from_numpy(audio).float().to(self.device).unsqueeze(0)
         mel = self.mel_extractor(audio, center=True)
-        hidden = self.mel2hidden(mel)
+        hidden = self.mel2hidden(mel, network=network)
         hidden = hidden.squeeze(0).cpu().numpy()
         center = decoder(hidden, thred) if decoder is not None else None
         f0 = self.decode(hidden, thred=thred, center=center)
