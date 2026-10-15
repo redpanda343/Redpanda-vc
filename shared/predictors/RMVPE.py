@@ -454,7 +454,7 @@ class RMVPE0Predictor:
             # print('n_frames', n_frames)
             # print('mel shape before padding', mel.shape)
             mel = F.pad(
-                mel, (0, 32 * ((n_frames - 1) // 32 + 1) - n_frames), mode="constant"
+                mel, (0, 32 * ((n_frames - 1) // 32 + 1) - n_frames), mode="reflect"
             )
             # print('mel shape after padding', mel.shape)
 

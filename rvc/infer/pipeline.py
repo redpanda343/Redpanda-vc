@@ -137,12 +137,6 @@ class Pipeline:
         else:
             raise ValueError(f"Unsupported pitch extraction method: {f0_method}")
 
-        f0 = np.asarray(f0).copy()
-        voiced = f0 > 0
-        if voiced.any():
-            f0[~voiced] = np.interp(
-                np.flatnonzero(~voiced), np.flatnonzero(voiced), f0[voiced]
-            )
         return self.quantize_f0(f0, pitch)
 
     def quantize_f0(self, f0, pitch):

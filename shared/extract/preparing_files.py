@@ -90,8 +90,6 @@ def generate_filelist(model_path: str, sample_rate: int, include_mutes: int = 2)
                 os.path.join(f0nsf_dir, f0_file),
             )
             missing_paths = [path for path in required_paths if not os.path.isfile(path)]
-            if missing_paths == list(required_paths[1:]):
-                continue
             if missing_paths:
                 raise RuntimeError(
                     "Missing FLAC extraction artifacts: " + ", ".join(missing_paths)
