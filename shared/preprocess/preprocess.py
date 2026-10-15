@@ -17,7 +17,6 @@ from shared.preprocess.slicer import (
 from shared.preprocess.constants import (
     AUDIO_WRITE_MAX_WORKERS,
     GPU_PREPROCESS_MAX_WORKERS,
-    MINIMUM_AUTOMATIC_SOURCE_AUDIO_SECONDS,
     MINIMUM_OUTPUT_AUDIO_SECONDS,
     PAUSE_MIN_SILENCE_SECONDS,
     PAUSE_THRESHOLD_DB,
@@ -83,7 +82,6 @@ def process_audio_wrapper(args):
         pp,
         file,
         cut_preprocess,
-        process_effects,
         noise_reduction,
         reduction_strength,
         chunk_len,
@@ -102,7 +100,6 @@ def process_audio_wrapper(args):
         idx0,
         sid,
         cut_preprocess,
-        process_effects,
         noise_reduction,
         reduction_strength,
         chunk_len,
@@ -119,7 +116,6 @@ def process_simple_audio_wrapper(args):
         path,
         idx0,
         sid,
-        process_effects,
         noise_reduction,
         reduction_strength,
         chunk_len,
@@ -140,7 +136,6 @@ def process_simple_audio_wrapper(args):
         path,
         idx0,
         sid,
-        process_effects,
         noise_reduction,
         reduction_strength,
         chunk_len,
@@ -161,13 +156,12 @@ def preprocess_training_set(
     num_processes: int,
     exp_dir: str,
     cut_preprocess: str,
-    process_effects: bool,
     noise_reduction: bool,
     reduction_strength: float,
     chunk_len: float,
     overlap_len: float,
     normalization_mode: str,
-    dataset_format: str = "wav",
+    dataset_format: str = "wav_float32",
     truncate_silence_enabled: bool = False,
     truncate_silence_threshold_db: float = SIMPLE_SILENCE_THRESHOLD_DB,
     truncate_silence_to_seconds: float = SIMPLE_TRUNCATE_TO_SECONDS,
@@ -260,7 +254,6 @@ def preprocess_training_set(
                 file_path,
                 idx0,
                 sid,
-                process_effects,
                 noise_reduction,
                 reduction_strength,
                 chunk_len,
@@ -282,7 +275,6 @@ def preprocess_training_set(
                 work_pp,
                 file,
                 cut_preprocess,
-                process_effects,
                 noise_reduction,
                 reduction_strength,
                 chunk_len,
@@ -351,15 +343,10 @@ def preprocess_training_set(
         speakers=named_speakers,
     )
     elapsed_time = time.time() - start_time
-    automatic_filter = (
-        f"Automatic sources under {MINIMUM_AUTOMATIC_SOURCE_AUDIO_SECONDS:.1f}s skipped; "
-        if cut_preprocess == "Automatic"
-        else ""
-    )
     print(
         f"Preprocess completed in {elapsed_time:.2f} seconds on "
         f"{format_duration(audio_length)} seconds of audio. Short-audio filter: "
-        f"{automatic_filter}{skipped_short_outputs} output slice(s) under "
+        f"{skipped_short_outputs} output slice(s) under "
         f"{MINIMUM_OUTPUT_AUDIO_SECONDS:.1f}s skipped before writing.",
         flush=True,
     )
@@ -375,35 +362,34 @@ if __name__ == "__main__":
     else:
         num_processes = int(num_processes)
     cut_preprocess = str(sys.argv[5])
-    process_effects = strtobool(sys.argv[6])
-    noise_reduction = strtobool(sys.argv[7])
-    reduction_strength = float(sys.argv[8])
-    chunk_len = float(sys.argv[9])
-    overlap_len = float(sys.argv[10])
-    normalization_mode = str(sys.argv[11])
-    dataset_format = str(sys.argv[12]) if len(sys.argv) > 12 else "WAV"
-    truncate_silence_enabled = strtobool(sys.argv[13]) if len(sys.argv) > 13 else False
+    noise_reduction = strtobool(sys.argv[6])
+    reduction_strength = float(sys.argv[7])
+    chunk_len = float(sys.argv[8])
+    overlap_len = float(sys.argv[9])
+    normalization_mode = str(sys.argv[10])
+    dataset_format = str(sys.argv[11]) if len(sys.argv) > 11 else "WAV 32-bit float"
+    truncate_silence_enabled = strtobool(sys.argv[12]) if len(sys.argv) > 12 else False
     truncate_silence_threshold_db = (
-        float(sys.argv[14]) if len(sys.argv) > 14 else SIMPLE_SILENCE_THRESHOLD_DB
+        float(sys.argv[13]) if len(sys.argv) > 13 else SIMPLE_SILENCE_THRESHOLD_DB
     )
     truncate_silence_to_seconds = (
-        float(sys.argv[15]) if len(sys.argv) > 15 else SIMPLE_TRUNCATE_TO_SECONDS
+        float(sys.argv[14]) if len(sys.argv) > 14 else SIMPLE_TRUNCATE_TO_SECONDS
     )
     truncate_silence_minimum_seconds = (
-        float(sys.argv[16]) if len(sys.argv) > 16 else SIMPLE_MIN_SILENCE_SECONDS
+        float(sys.argv[15]) if len(sys.argv) > 15 else SIMPLE_MIN_SILENCE_SECONDS
     )
     truncate_silence_action = (
-        str(sys.argv[17]) if len(sys.argv) > 17 else "truncate"
+        str(sys.argv[16]) if len(sys.argv) > 16 else "truncate"
     )
     truncate_silence_compress_percent = (
-        float(sys.argv[18])
-        if len(sys.argv) > 18
+        float(sys.argv[17])
+        if len(sys.argv) > 17
         else SIMPLE_SILENCE_COMPRESS_PERCENT
     )
-    version = str(sys.argv[19]) if len(sys.argv) > 19 else "v2"
-    pause_threshold_db = float(sys.argv[20]) if len(sys.argv) > 20 else PAUSE_THRESHOLD_DB
+    version = str(sys.argv[18]) if len(sys.argv) > 18 else "v2"
+    pause_threshold_db = float(sys.argv[19]) if len(sys.argv) > 19 else PAUSE_THRESHOLD_DB
     pause_minimum_seconds = (
-        float(sys.argv[21]) if len(sys.argv) > 21 else PAUSE_MIN_SILENCE_SECONDS
+        float(sys.argv[20]) if len(sys.argv) > 20 else PAUSE_MIN_SILENCE_SECONDS
     )
     preprocess_training_set(
         input_root,
@@ -411,7 +397,6 @@ if __name__ == "__main__":
         num_processes,
         experiment_directory,
         cut_preprocess,
-        process_effects,
         noise_reduction,
         reduction_strength,
         chunk_len,

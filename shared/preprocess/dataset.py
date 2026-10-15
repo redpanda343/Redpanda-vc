@@ -105,7 +105,7 @@ def write_training_audio(
     if dataset_format == "wav_float32":
         sf.write(
             os.path.join(directory, f"{stem}.wav"),
-            np.clip(audio, -1.0, 1.0),
+            audio,
             sample_rate,
             format="WAV",
             subtype="FLOAT",

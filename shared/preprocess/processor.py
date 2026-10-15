@@ -18,7 +18,6 @@ from shared.preprocess.constants import (
     ALPHA,
     HIGH_PASS_CUTOFF,
     MAX_AMPLITUDE,
-    MINIMUM_AUTOMATIC_SOURCE_AUDIO_SECONDS,
     MINIMUM_OUTPUT_AUDIO_SECONDS,
     OVERLAP,
     PAUSE_HOP_MS,
@@ -70,9 +69,8 @@ class PreProcess:
         if version not in {"v1", "v2"}:
             raise ValueError(f"Unsupported RVC version: {version}")
         self.version = version
-        high_pass_cutoff = 48 if version == "v1" else HIGH_PASS_CUTOFF
         self.b_high, self.a_high = signal.butter(
-            N=5, Wn=high_pass_cutoff, btype="high", fs=self.sr
+            N=5, Wn=HIGH_PASS_CUTOFF, btype="high", fs=self.sr
         )
         self.exp_dir = exp_dir
         self.dataset_format = normalize_dataset_format(dataset_format)
@@ -81,8 +79,8 @@ class PreProcess:
         os.makedirs(self.gt_wavs_dir, exist_ok=True)
 
     def _normalize_audio(self, audio: np.ndarray):
-        tmp_max = np.abs(audio).max()
-        if tmp_max > 2.5:
+        tmp_max = np.abs(audio).max() if audio.size else 0.0
+        if not np.isfinite(tmp_max) or tmp_max <= 0 or tmp_max > 2.5:
             return None
         return (audio / tmp_max * (MAX_AMPLITUDE * ALPHA)) + (1 - ALPHA) * audio
 
@@ -120,9 +118,11 @@ class PreProcess:
         normalization_gain: float = 1.0,
         writer: BoundedAudioWriter | None = None,
     ):
+        if normalized_audio is not None and normalization_mode == "chunk":
+            normalized_audio = self._normalize_audio(normalized_audio)
         if normalized_audio is None:
             print(f"{sid}-{idx0}-{idx1}-filtered")
-            return
+            return 0
         if normalization_mode == "post":
             normalized_audio = self._peak_normalize_audio(
                 normalized_audio, normalization_gain
@@ -159,15 +159,18 @@ class PreProcess:
             i = 0
             while i < len(audio):
                 chunk = audio[i : i + chunk_length]
-                if normalization_mode == "post":
+                if normalization_mode == "chunk":
+                    chunk = self._normalize_audio(chunk)
+                elif normalization_mode == "post":
                     chunk = self._peak_normalize_audio(chunk, normalization_gain)
-                writer.submit(
-                    self.gt_wavs_dir,
-                    f"{sid}_{idx0}_{i // (chunk_length - overlap_length)}",
-                    self.sr,
-                    chunk,
-                    self.dataset_format,
-                )
+                if chunk is not None:
+                    writer.submit(
+                        self.gt_wavs_dir,
+                        f"{sid}_{idx0}_{i // (chunk_length - overlap_length)}",
+                        self.sr,
+                        chunk,
+                        self.dataset_format,
+                    )
                 i += chunk_length - overlap_length
         return writer.skipped_short
 
@@ -243,7 +246,6 @@ class PreProcess:
         path: str,
         idx0: int,
         sid: int,
-        process_effects: bool,
         chunk_len: float,
         overlap_len: float,
         truncate_silence_threshold_db: float,
@@ -266,8 +268,7 @@ class PreProcess:
             cuts,
             total_frames,
         )
-        if process_effects or self.version == "v1":
-            blocks = iter_high_pass_audio(blocks, self.b_high, self.a_high)
+        blocks = iter_high_pass_audio(blocks, self.b_high, self.a_high)
         skipped_short = self.simple_cut_stream(
             blocks,
             sid,
@@ -282,7 +283,6 @@ class PreProcess:
         path: str,
         idx0: int,
         sid: int,
-        process_effects: bool,
         noise_reduction: bool,
         reduction_strength: float,
         chunk_len: float,
@@ -304,7 +304,6 @@ class PreProcess:
                 path,
                 idx0,
                 sid,
-                process_effects,
                 chunk_len,
                 overlap_len,
                 truncate_silence_threshold_db,
@@ -327,7 +326,6 @@ class PreProcess:
             )
         audio = self._prepare_audio(
             audio,
-            process_effects,
             noise_reduction,
             reduction_strength,
             normalization_mode,
@@ -349,13 +347,11 @@ class PreProcess:
     def _prepare_audio(
         self,
         audio: np.ndarray,
-        process_effects: bool,
         noise_reduction: bool,
         reduction_strength: float,
         normalization_mode: str,
     ):
-        if process_effects or self.version == "v1":
-            audio = signal.lfilter(self.b_high, self.a_high, audio)
+        audio = signal.lfilter(self.b_high, self.a_high, audio)
         if normalization_mode == "pre":
             audio = self._normalize_audio(audio)
         if noise_reduction and audio is not None and audio.size:
@@ -369,18 +365,14 @@ class PreProcess:
         path: str,
         idx0: int,
         sid: int,
-        process_effects: bool,
         noise_reduction: bool,
         reduction_strength: float,
         normalization_mode: str,
     ):
         audio = load_audio_ffmpeg(path, self.sr)
         duration_s = librosa.get_duration(y=audio, sr=self.sr)
-        if duration_s < MINIMUM_AUTOMATIC_SOURCE_AUDIO_SECONDS:
-            return 0.0, 0
         audio = self._prepare_audio(
             audio,
-            process_effects,
             noise_reduction,
             reduction_strength,
             normalization_mode,
@@ -393,7 +385,7 @@ class PreProcess:
 
         segments = self.automatic_slicer.slice(audio)
         idx1 = 0
-        chunk_seconds = 3.7 if self.version == "v1" else PERCENTAGE
+        chunk_seconds = PERCENTAGE
         step_samples = int(self.sr * (chunk_seconds - OVERLAP))
         chunk_samples = int(self.sr * chunk_seconds)
         long_tail_samples = int(self.sr * (chunk_seconds + OVERLAP))
@@ -425,7 +417,6 @@ class PreProcess:
         path: str,
         idx0: int,
         sid: int,
-        process_effects: bool,
         noise_reduction: bool,
         reduction_strength: float,
         normalization_mode: str,
@@ -436,7 +427,6 @@ class PreProcess:
         duration_s = len(audio) / self.sr
         audio = self._prepare_audio(
             audio,
-            process_effects,
             noise_reduction,
             reduction_strength,
             normalization_mode,
@@ -474,7 +464,6 @@ class PreProcess:
         idx0: int,
         sid: int,
         cut_preprocess: str,
-        process_effects: bool,
         noise_reduction: bool,
         reduction_strength: float,
         chunk_len: float,
@@ -491,7 +480,6 @@ class PreProcess:
                     path,
                     idx0,
                     sid,
-                    process_effects,
                     noise_reduction,
                     reduction_strength,
                     normalization_mode,
@@ -503,7 +491,6 @@ class PreProcess:
                     path,
                     idx0,
                     sid,
-                    process_effects,
                     noise_reduction,
                     reduction_strength,
                     normalization_mode,
@@ -513,7 +500,6 @@ class PreProcess:
             audio_length = librosa.get_duration(y=audio, sr=self.sr)
             audio = self._prepare_audio(
                 audio,
-                process_effects,
                 noise_reduction,
                 reduction_strength,
                 normalization_mode,

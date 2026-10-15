@@ -486,13 +486,12 @@ def run_preprocess_script(
     sample_rate: int,
     cpu_cores: int,
     cut_preprocess: str,
-    process_effects: bool,
     noise_reduction: bool,
     clean_strength: float,
     chunk_len: float,
     overlap_len: float,
-    normalization_mode: str = "none",
-    dataset_format: str = "WAV",
+    normalization_mode: str = "chunk",
+    dataset_format: str = "WAV 32-bit float",
     truncate_silence_enabled: bool = False,
     truncate_silence_threshold_db: float = -45.0,
     truncate_silence_to_seconds: float = 0.3,
@@ -517,7 +516,6 @@ def run_preprocess_script(
                 sample_rate,
                 cpu_cores,
                 cut_preprocess,
-                process_effects,
                 noise_reduction,
                 clean_strength,
                 chunk_len,
@@ -1239,12 +1237,6 @@ def batch_infer(**kwargs):
     help="Dataset cutting method.",
 )
 @click.option(
-    "--process-effects",
-    is_flag=True,
-    default=False,
-    help="Disable filters during preprocessing.",
-)
-@click.option(
     "--noise-reduction",
     is_flag=True,
     default=False,
@@ -1270,14 +1262,14 @@ def batch_infer(**kwargs):
 )
 @click.option(
     "--normalization-mode",
-    type=click.Choice(["none", "pre", "post"]),
-    default="none",
+    type=click.Choice(["chunk", "none", "pre", "post"]),
+    default="chunk",
     help="Normalization mode.",
 )
 @click.option(
     "--dataset-format",
     type=click.Choice(["WAV", "WAV 32-bit float", "FLAC"], case_sensitive=False),
-    default="WAV",
+    default="WAV 32-bit float",
     show_default=True,
     help="Format and encoding used for processed training slices.",
 )
@@ -1344,7 +1336,6 @@ def preprocess(**kwargs):
         sample_rate=kwargs["sample_rate"],
         cpu_cores=kwargs["cpu_cores"],
         cut_preprocess=kwargs["cut_preprocess"],
-        process_effects=kwargs["process_effects"],
         noise_reduction=kwargs["noise_reduction"],
         clean_strength=kwargs["noise_reduction_strength"],
         chunk_len=kwargs["chunk_len"],

@@ -267,7 +267,6 @@ def rvc_train_tab():
         sample_rate,
         cpu_cores,
         cut_preprocess,
-        process_effects,
         noise_reduction,
         clean_strength,
         chunk_len,
@@ -289,7 +288,6 @@ def rvc_train_tab():
             sample_rate=sample_rate,
             cpu_cores=cpu_cores,
             cut_preprocess=cut_preprocess,
-            process_effects=process_effects,
             noise_reduction=noise_reduction,
             clean_strength=clean_strength,
             chunk_len=chunk_len,
@@ -439,7 +437,7 @@ def rvc_train_tab():
                     "Format used for processed training slices."
                 ),
                 choices=["WAV 16-bit", "WAV 32-bit float", "FLAC"],
-                value="WAV 16-bit",
+                value="WAV 32-bit float",
                 interactive=True,
             )
             cut_preprocess = gr.Radio(
@@ -549,23 +547,13 @@ def rvc_train_tab():
                 )
 
             with gr.Row():
-                process_effects = gr.Checkbox(
-                    label=i18n("DC-offset removal"),
-                    info=i18n(
-                        "Removes DC-offset from the dataset. Disable this if your dataset has no DC-offset or has already been passed through a high-pass filter."
-                    ),
-                    value=True,
-                    interactive=True,
-                    visible=False,
-                )
-
                 normalization_mode = gr.Radio(
                     label=i18n("Normalization mode"),
                     info=i18n(
-                        "Audio normalization: Select 'none' if the files are already normalized, 'pre' to normalize the entire input file at once, or 'post' to normalize each slice individually."
+                        "Audio normalization: Select 'chunk' to normalize each slice the way RVC WebUI does, 'none' if the files are already normalized, 'pre' to normalize the entire input file at once, or 'post' to normalize each slice to the peak of the voiced audio."
                     ),
-                    choices=["none", "pre", "post"],
-                    value="none",
+                    choices=["chunk", "none", "pre", "post"],
+                    value="chunk",
                     interactive=True,
                     visible=True,
                 )
@@ -608,7 +596,6 @@ def rvc_train_tab():
                     sampling_rate,
                     cpu_cores,
                     cut_preprocess,
-                    process_effects,
                     noise_reduction,
                     clean_strength,
                     chunk_len,
