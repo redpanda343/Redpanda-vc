@@ -74,6 +74,12 @@ EMBEDDERS = ("contentvec", "spin-v2")
 PITCH_METHODS = {"rmvpe": "rmvpe", "swift": "swift", "beatrice": "beatrice", "parselmouth": "pm"}
 METER_FLOOR_DB = -60.0
 AUTOTUNE_HEADROOM = 1 << 30
+RESAMPLE_FILTER = dict(
+    lowpass_filter_width=64,
+    rolloff=0.9475937167399596,
+    resampling_method="sinc_interp_kaiser",
+    beta=14.769656459379492,
+)
 
 
 class BlockTorchGate(TorchGate):
@@ -506,11 +512,13 @@ class AudioEngine:
             ** 2
         )
         self.fade_out_window = 1 - self.fade_in_window
-        self.resampler = Resample(orig_freq=rate, new_freq=16000, dtype=torch.float32).to(device)
+        self.resampler = Resample(
+            orig_freq=rate, new_freq=16000, dtype=torch.float32, **RESAMPLE_FILTER
+        ).to(device)
         self.resampler2 = None
         if self.rvc is not None and self.rvc.sample_rate != rate:
             self.resampler2 = Resample(
-                orig_freq=self.rvc.sample_rate, new_freq=rate, dtype=torch.float32
+                orig_freq=self.rvc.sample_rate, new_freq=rate, dtype=torch.float32, **RESAMPLE_FILTER
             ).to(device)
         self.tg = BlockTorchGate(sr=rate, n_fft=4 * self.zc, prop_decrease=0.9).to(device)
 
