@@ -90,7 +90,7 @@ class DiscriminatorS(torch.nn.Module):
             ]
         )
         self.conv_post = norm_f(torch.nn.Conv1d(1024, 1, 3, 1, padding=1))
-        self.lrelu = torch.nn.LeakyReLU(LRELU_SLOPE)
+        self.lrelu = torch.nn.LeakyReLU(LRELU_SLOPE, inplace=True)
 
     def forward(self, x):
         fmap = []
@@ -150,7 +150,7 @@ class DiscriminatorP(torch.nn.Module):
         )
 
         self.conv_post = norm_f(torch.nn.Conv2d(1024, 1, (3, 1), 1, padding=(1, 0)))
-        self.lrelu = torch.nn.LeakyReLU(LRELU_SLOPE)
+        self.lrelu = torch.nn.LeakyReLU(LRELU_SLOPE, inplace=True)
 
     def forward(self, x):
         fmap = []
@@ -232,7 +232,7 @@ class DiscriminatorR(torch.nn.Module):
         x = self.spectrogram(x).unsqueeze(1)
 
         for layer in self.convs:
-            x = F.leaky_relu(layer(x), self.lrelu_slope)
+            x = F.leaky_relu(layer(x), self.lrelu_slope, inplace=True)
             fmap.append(x)
         x = self.conv_post(x)
         fmap.append(x)

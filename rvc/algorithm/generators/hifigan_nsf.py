@@ -182,31 +182,18 @@ class HiFiGANNSFGenerator(torch.nn.Module):
             x = x + self.cond(g)
 
         for i, (ups, noise_convs) in enumerate(zip(self.ups, self.noise_convs)):
-            x = torch.nn.functional.leaky_relu(x, self.lrelu_slope)
+            x = torch.nn.functional.leaky_relu(x, self.lrelu_slope, inplace=True)
             # Apply upsampling layer
-            if self.training and self.checkpointing:
-                x = checkpoint(ups, x, use_reentrant=False)
-                x = x + noise_convs(har_source)
-                xs = sum(
-                    [
-                        checkpoint(resblock, x, use_reentrant=False)
-                        for j, resblock in enumerate(self.resblocks)
-                        if j in range(i * self.num_kernels, (i + 1) * self.num_kernels)
-                    ]
-                )
-            else:
-                x = ups(x)
-                x = x + noise_convs(har_source)
-                xs = sum(
-                    [
-                        resblock(x)
-                        for j, resblock in enumerate(self.resblocks)
-                        if j in range(i * self.num_kernels, (i + 1) * self.num_kernels)
-                    ]
-                )
+            checkpointed = self.training and self.checkpointing
+            x = checkpoint(ups, x, use_reentrant=False) if checkpointed else ups(x)
+            x = x + noise_convs(har_source)
+            xs = None
+            for resblock in self.resblocks[i * self.num_kernels : (i + 1) * self.num_kernels]:
+                y = checkpoint(resblock, x, use_reentrant=False) if checkpointed else resblock(x)
+                xs = y if xs is None else xs + y
             x = xs / self.num_kernels
 
-        x = torch.nn.functional.leaky_relu(x)
+        x = torch.nn.functional.leaky_relu(x, inplace=True)
         x = torch.tanh(self.conv_post(x))
 
         return x

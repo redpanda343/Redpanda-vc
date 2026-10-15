@@ -7,7 +7,7 @@ from torch.nn.utils.parametrizations import weight_norm
 from torch.nn.utils import remove_weight_norm
 from torch.utils.checkpoint import checkpoint
 
-from rvc.algorithm.commons import init_weights, get_padding
+from rvc.algorithm.commons import init_weights, get_padding, leaky_relu
 
 
 class ResBlock(nn.Module):
@@ -72,9 +72,9 @@ class ResBlock(nn.Module):
 
     def forward(self, x: torch.Tensor):
         for c1, c2 in zip(self.convs1, self.convs2):
-            xt = F.leaky_relu(x, self.leaky_relu_slope)
+            xt = leaky_relu(x, self.leaky_relu_slope)
             xt = c1(xt)
-            xt = F.leaky_relu(xt, self.leaky_relu_slope)
+            xt = F.leaky_relu(xt, self.leaky_relu_slope, inplace=True)
             xt = c2(xt)
             x = xt + x
 
@@ -107,7 +107,7 @@ class AdaIN(nn.Module):
 
         self.weight = nn.Parameter(torch.ones(channels) * 1e-4)
         # safe to use in-place as it is used on a new x+gaussian tensor
-        self.activation = nn.LeakyReLU(leaky_relu_slope)
+        self.activation = nn.LeakyReLU(leaky_relu_slope, inplace=True)
 
     def forward(self, x: torch.Tensor):
         gaussian = torch.randn_like(x) * self.weight[None, :, None]
@@ -395,7 +395,7 @@ class RefineGANGenerator(nn.Module):
         # downsampled/upchanneled versions for each upscale
         downs = []
         for block, (old_size, new_size) in zip(self.downsample_blocks, self.df0):
-            x = F.leaky_relu(x, self.leaky_relu_slope)
+            x = F.leaky_relu(x, self.leaky_relu_slope, inplace=True)
             downs.append(x)
             # attempt to cancel spectral aliasing
             x = torchaudio.functional.resample(
@@ -422,7 +422,7 @@ class RefineGANGenerator(nn.Module):
             self.upsample_conv_blocks,
             reversed(downs),
         ):
-            x = F.leaky_relu(x, self.leaky_relu_slope)
+            x = F.leaky_relu(x, self.leaky_relu_slope, inplace=True)
 
             if self.training and self.checkpointing:
                 x = checkpoint(ups, x, use_reentrant=False)
@@ -433,7 +433,7 @@ class RefineGANGenerator(nn.Module):
                 x = torch.cat([x, down], dim=1)
                 x = res(x)
 
-        x = F.leaky_relu(x, self.leaky_relu_slope)
+        x = F.leaky_relu(x, self.leaky_relu_slope, inplace=True)
         x = self.conv_post(x)
         x = torch.tanh(x)
 

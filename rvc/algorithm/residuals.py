@@ -5,7 +5,7 @@ from torch.nn.utils import remove_weight_norm
 from torch.nn.utils.parametrizations import weight_norm
 
 from rvc.algorithm.modules import WaveNet
-from rvc.algorithm.commons import get_padding, init_weights
+from rvc.algorithm.commons import get_padding, init_weights, leaky_relu
 
 LRELU_SLOPE = 0.1
 
@@ -71,9 +71,9 @@ class ResBlock(torch.nn.Module):
     def forward(self, x: torch.Tensor, x_mask: torch.Tensor = None):
         for conv1, conv2 in zip(self.convs1, self.convs2):
             x_residual = x
-            x = torch.nn.functional.leaky_relu(x, LRELU_SLOPE)
+            x = leaky_relu(x, LRELU_SLOPE)
             x = apply_mask(x, x_mask)
-            x = torch.nn.functional.leaky_relu(conv1(x), LRELU_SLOPE)
+            x = torch.nn.functional.leaky_relu(conv1(x), LRELU_SLOPE, inplace=True)
             x = apply_mask(x, x_mask)
             x = conv2(x)
             x = x + x_residual
@@ -241,12 +241,13 @@ class ResidualCouplingLayer(torch.nn.Module):
         h = self.pre(x0) * x_mask
         h = self.enc(h, x_mask, g=g)
         stats = self.post(h) * x_mask
-        if not self.mean_only:
-            m, logs = torch.split(stats, [self.half_channels] * 2, 1)
-        else:
-            m = stats
-            logs = torch.zeros_like(m)
+        if self.mean_only:
+            if not reverse:
+                x = torch.cat([x0, stats + x1 * x_mask], 1)
+                return x, torch.zeros(x.size(0), dtype=x.dtype, device=x.device)
+            return torch.cat([x0, (x1 - stats) * x_mask], 1)
 
+        m, logs = torch.split(stats, [self.half_channels] * 2, 1)
         if not reverse:
             x1 = m + x1 * torch.exp(logs) * x_mask
             x = torch.cat([x0, x1], 1)

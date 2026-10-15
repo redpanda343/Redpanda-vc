@@ -16,6 +16,29 @@ def init_weights(m, mean=0.0, std=0.01):
         m.weight.data.normal_(mean, std)
 
 
+class _LeakyReLU(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, negative_slope):
+        y = torch.nn.functional.leaky_relu(x, negative_slope)
+        ctx.negative_slope = negative_slope
+        ctx.save_for_backward(y)
+        return y
+
+    @staticmethod
+    def backward(ctx, grad):
+        (y,) = ctx.saved_tensors
+        return (
+            torch.ops.aten.leaky_relu_backward(grad, y, ctx.negative_slope, True),
+            None,
+        )
+
+
+def leaky_relu(x: torch.Tensor, negative_slope: float):
+    if torch.is_grad_enabled() and x.requires_grad:
+        return _LeakyReLU.apply(x, negative_slope)
+    return torch.nn.functional.leaky_relu(x, negative_slope)
+
+
 def get_padding(kernel_size, dilation=1):
     """
     Calculate the padding needed for a convolution.

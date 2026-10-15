@@ -7,6 +7,8 @@ from torch.nn.utils import remove_weight_norm
 from torch.nn.utils.parametrizations import weight_norm
 from torch.utils.checkpoint import checkpoint
 
+from rvc.algorithm.commons import leaky_relu
+
 LRELU_SLOPE = 0.1
 
 
@@ -43,9 +45,9 @@ class MRFLayer(torch.nn.Module):
         )
 
     def forward(self, x: torch.Tensor):
-        y = torch.nn.functional.leaky_relu(x, LRELU_SLOPE)
+        y = leaky_relu(x, LRELU_SLOPE)
         y = self.conv1(y)
-        y = torch.nn.functional.leaky_relu(y, LRELU_SLOPE)
+        y = torch.nn.functional.leaky_relu(y, LRELU_SLOPE, inplace=True)
         y = self.conv2(y)
         return x + y
 
@@ -348,19 +350,18 @@ class HiFiGANMRFGenerator(torch.nn.Module):
             x = x + self.cond(g)
 
         for ups, mrf, noise_conv in zip(self.upsamples, self.mrfs, self.noise_convs):
-            x = torch.nn.functional.leaky_relu(x, LRELU_SLOPE)
+            x = torch.nn.functional.leaky_relu(x, LRELU_SLOPE, inplace=True)
 
-            if self.training and self.checkpointing:
-                x = checkpoint(ups, x, use_reentrant=False)
-                x = x + noise_conv(har_source)
-                xs = sum([checkpoint(layer, x, use_reentrant=False) for layer in mrf])
-            else:
-                x = ups(x)
-                x = x + noise_conv(har_source)
-                xs = sum([layer(x) for layer in mrf])
+            checkpointed = self.training and self.checkpointing
+            x = checkpoint(ups, x, use_reentrant=False) if checkpointed else ups(x)
+            x = x + noise_conv(har_source)
+            xs = None
+            for layer in mrf:
+                y = checkpoint(layer, x, use_reentrant=False) if checkpointed else layer(x)
+                xs = y if xs is None else xs + y
             x = xs / self.num_kernels
 
-        x = torch.nn.functional.leaky_relu(x)
+        x = torch.nn.functional.leaky_relu(x, inplace=True)
         x = torch.tanh(self.conv_post(x))
 
         return x

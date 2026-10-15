@@ -95,11 +95,16 @@ class MultiHeadAttention(torch.nn.Module):
         key = key.view(b, self.n_heads, self.k_channels, t_s).transpose(2, 3)
         value = value.view(b, self.n_heads, self.k_channels, t_s).transpose(2, 3)
 
-        scores = torch.matmul(query / math.sqrt(self.k_channels), key.transpose(-2, -1))
+        query = query / math.sqrt(self.k_channels)
+        scores = torch.matmul(query, key.transpose(-2, -1))
 
         if self.window_size is not None:
             assert t_s == t_t, "Relative attention only supports self-attention."
-            scores += self._compute_relative_scores(query, t_s)
+            window = min(self.window_size, t_s - 1)
+            rel_keys = self._relative_embeddings(self.emb_rel_k, window)
+            scores += self._band_to_absolute(
+                torch.matmul(query, rel_keys.transpose(-2, -1)), window
+            )
 
         if self.proximal_bias:
             assert t_s == t_t, "Proximal bias only supports self-attention."
@@ -122,66 +127,34 @@ class MultiHeadAttention(torch.nn.Module):
         output = torch.matmul(p_attn, value)
 
         if self.window_size is not None:
-            output += self._apply_relative_values(p_attn, t_s)
+            rel_values = self._relative_embeddings(self.emb_rel_v, window)
+            output += torch.matmul(self._absolute_to_band(p_attn, window), rel_values)
 
         return output.transpose(2, 3).contiguous().view(b, d, t_t), p_attn
 
-    def _compute_relative_scores(self, query, length):
-        rel_emb = self._get_relative_embeddings(self.emb_rel_k, length)
-        rel_logits = self._matmul_with_relative_keys(
-            query / math.sqrt(self.k_channels), rel_emb
-        )
-        return self._relative_position_to_absolute_position(rel_logits)
+    def _relative_embeddings(self, embeddings, window):
+        start = self.window_size - window
+        return embeddings[:, start : start + 2 * window + 1].unsqueeze(0)
 
-    def _apply_relative_values(self, p_attn, length):
-        rel_weights = self._absolute_position_to_relative_position(p_attn)
-        rel_emb = self._get_relative_embeddings(self.emb_rel_v, length)
-        return self._matmul_with_relative_values(rel_weights, rel_emb)
+    @staticmethod
+    def _band_to_absolute(x, window):
+        batch, heads, length, width = x.size()
+        span = length + 2 * window
+        x = torch.nn.functional.pad(x, (0, span + 1 - width))
+        x = x.reshape(batch, heads, length * (span + 1))[:, :, : length * span]
+        return x.reshape(batch, heads, length, span)[:, :, :, window : window + length]
 
-    # Helper methods
-    def _matmul_with_relative_values(self, x, y):
-        return torch.matmul(x, y.unsqueeze(0))
-
-    def _matmul_with_relative_keys(self, x, y):
-        return torch.matmul(x, y.unsqueeze(0).transpose(-2, -1))
-
-    def _get_relative_embeddings(self, embeddings, length):
-        if embeddings.size(0) == 1:
-            embeddings = embeddings.squeeze(0).unsqueeze(0)
-        pad_length = max(length - (self.window_size + 1), 0)
-        start = max((self.window_size + 1) - length, 0)
-        end = start + 2 * length - 1
-
-        if pad_length > 0:
-            embeddings = torch.nn.functional.pad(
-                embeddings,
-                convert_pad_shape([[0, 0], [pad_length, pad_length], [0, 0]]),
-            )
-        return embeddings[:, start:end]
-
-    def _relative_position_to_absolute_position(self, x):
+    @staticmethod
+    def _absolute_to_band(x, window):
         batch, heads, length, _ = x.size()
-        x = torch.nn.functional.pad(
-            x, convert_pad_shape([[0, 0], [0, 0], [0, 0], [0, 1]])
+        span = length + 2 * window
+        x = torch.nn.functional.pad(x, (window, window)).reshape(
+            batch, heads, length * span
         )
-        x_flat = x.view(batch, heads, length * 2 * length)
-        x_flat = torch.nn.functional.pad(
-            x_flat, convert_pad_shape([[0, 0], [0, 0], [0, length - 1]])
-        )
-        return x_flat.view(batch, heads, length + 1, 2 * length - 1)[
-            :, :, :length, length - 1 :
-        ]
-
-    def _absolute_position_to_relative_position(self, x):
-        batch, heads, length, _ = x.size()
-        x = torch.nn.functional.pad(
-            x, convert_pad_shape([[0, 0], [0, 0], [0, 0], [0, length - 1]])
-        )
-        x_flat = x.view(batch, heads, length**2 + length * (length - 1))
-        x_flat = torch.nn.functional.pad(
-            x_flat, convert_pad_shape([[0, 0], [0, 0], [length, 0]])
-        )
-        return x_flat.view(batch, heads, length, 2 * length)[:, :, :, 1:]
+        x = torch.nn.functional.pad(x, (0, length))
+        return x.reshape(batch, heads, length, span + 1)[
+            :, :, :, : 2 * window + 1
+        ].contiguous()
 
     def _attention_bias_proximal(self, length):
         r = torch.arange(length, dtype=torch.float32)
