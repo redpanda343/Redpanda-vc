@@ -389,16 +389,13 @@ class PreProcess:
         step_samples = int(self.sr * (chunk_seconds - OVERLAP))
         chunk_samples = int(self.sr * chunk_seconds)
         long_tail_samples = int(self.sr * (chunk_seconds + OVERLAP))
+        tail = None
         with BoundedAudioWriter(self.audio_write_workers) as writer:
             for segment in segments:
                 start = 0
-                while start < len(segment):
-                    if len(segment) - start > long_tail_samples:
-                        chunk = segment[start : start + chunk_samples]
-                    else:
-                        chunk = segment[start:]
+                while len(segment) - start > long_tail_samples:
                     self.process_audio_segment(
-                        chunk,
+                        segment[start : start + chunk_samples],
                         sid,
                         idx0,
                         idx1,
@@ -407,9 +404,19 @@ class PreProcess:
                         writer,
                     )
                     idx1 += 1
-                    if len(segment) - start <= long_tail_samples:
-                        break
                     start += step_samples
+                tail = segment[start:]
+                idx1 += 1
+            if tail is not None:
+                self.process_audio_segment(
+                    tail,
+                    sid,
+                    idx0,
+                    idx1,
+                    normalization_mode,
+                    normalization_gain,
+                    writer,
+                )
         return duration_s, writer.skipped_short
 
     def _process_pauses(
