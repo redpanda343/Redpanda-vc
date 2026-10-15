@@ -137,6 +137,12 @@ class Pipeline:
         else:
             raise ValueError(f"Unsupported pitch extraction method: {f0_method}")
 
+        f0 = np.asarray(f0).copy()
+        voiced = f0 > 0
+        if voiced.any():
+            f0[~voiced] = np.interp(
+                np.flatnonzero(~voiced), np.flatnonzero(voiced), f0[voiced]
+            )
         return self.quantize_f0(f0, pitch)
 
     def quantize_f0(self, f0, pitch):
@@ -325,14 +331,14 @@ class Pipeline:
         if audio_pad.shape[0] > self.t_max:
             audio_sum = np.zeros_like(audio)
             for i in range(self.window):
-                audio_sum += audio_pad[i : i - self.window]
+                audio_sum += np.abs(audio_pad[i : i - self.window])
             for t in range(self.t_center, audio.shape[0], self.t_center):
                 opt_ts.append(
                     t
                     - self.t_query
                     + np.where(
-                        np.abs(audio_sum[t - self.t_query : t + self.t_query])
-                        == np.abs(audio_sum[t - self.t_query : t + self.t_query]).min()
+                        audio_sum[t - self.t_query : t + self.t_query]
+                        == audio_sum[t - self.t_query : t + self.t_query].min()
                     )[0][0]
                 )
         s = 0

@@ -41,10 +41,7 @@ from rvc.algorithm import commons
 from rvc.train.process.extract_model import extract_model
 
 VOCODERS = ("HiFi-GAN", "MRF HiFi-GAN", "RefineGAN")
-BUCKET_BOUNDARIES = (
-    50, 100, 200, 300, 400, 500, 600, 700, 800, 900,
-    1000, 1100, 1200, 1300, 1400, 1500,
-)
+BUCKET_BOUNDARIES = (100, 200, 300, 400, 500, 600, 700, 800, 900)
 LATEST_CHECKPOINT_SUFFIX = 2333333
 
 # experimental settings
@@ -660,20 +657,23 @@ class Trainer:
             self.global_step = (epoch_str - 1) * len(self.sampler)
             return epoch_str
 
-        self.load_pretrained(self.net_g, self.args.pretrained_g, "G", fresh_speakers=True)
+        self.load_pretrained(self.net_g, self.args.pretrained_g, "G", match_speakers=True)
         self.load_pretrained(self.net_d, self.args.pretrained_d, "D")
         return 1
 
-    def load_pretrained(self, net, path, label, fresh_speakers=False):
+    def load_pretrained(self, net, path, label, match_speakers=False):
         if path in ("", "None"):
             return
         target = net.module if hasattr(net, "module") else net
         try:
             ckpt = torch.load(path, map_location="cpu", weights_only=True)["model"]
-            if fresh_speakers:
+            if match_speakers:
                 if "emb_g.weight" not in ckpt:
                     raise KeyError("The pretrained generator has no speaker embedding.")
-                ckpt["emb_g.weight"] = target.emb_g.weight.detach().cpu().clone()
+                speakers = target.emb_g.weight.detach().cpu().clone()
+                rows = min(speakers.shape[0], ckpt["emb_g.weight"].shape[0])
+                speakers[:rows] = ckpt["emb_g.weight"][:rows].to(speakers.dtype)
+                ckpt["emb_g.weight"] = speakers
             target.load_state_dict(ckpt)
             del ckpt
         except Exception as e:

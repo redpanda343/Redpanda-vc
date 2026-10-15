@@ -45,7 +45,7 @@ def spectrogram_torch(y, n_fft, hop_size, win_size, center=False):
         return_complex=True,
     )
 
-    spec = torch.sqrt(spec.real.pow(2) + spec.imag.pow(2) + 1e-6)
+    spec = torch.sqrt(spec.real.pow(2) + spec.imag.pow(2) + 2e-7)
 
     return spec
 
@@ -74,7 +74,7 @@ def spec_to_mel_torch(spec, n_fft, num_mels, sample_rate, fmin, fmax):
         )
 
     melspec = torch.matmul(mel_basis[fmax_dtype_device], spec)
-    melspec = torch.log(melspec.clamp(min=1e-5) * 1)
+    melspec = torch.log(melspec.clamp(min=2e-6) * 1)
     return melspec
 
 

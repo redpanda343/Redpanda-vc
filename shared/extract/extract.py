@@ -59,6 +59,7 @@ class FeatureInput:
         elif f0_method != "pm":
             raise ValueError(f"Unsupported F0 method: {f0_method}")
         self.f0_method = f0_method
+        self.rectified = rectified
 
     def compute_f0(self, x, p_len=None):
         if self.f0_method == "pm":
@@ -119,6 +120,18 @@ class FeatureInput:
                 raise ValueError("Pitch extraction returned an empty or invalid contour.")
             if not np.isfinite(feature_pit).all() or np.any(feature_pit < 0):
                 raise ValueError("Pitch extraction returned invalid frequencies.")
+            if not self.rectified:
+                voiced = feature_pit > 0
+                if not voiced.any():
+                    for stale_path in (opt_path_coarse, opt_path_full):
+                        if os.path.exists(stale_path):
+                            os.remove(stale_path)
+                    print(f"Skipped {inp_path}: no voiced frames.")
+                    return
+                feature_pit = feature_pit.copy()
+                feature_pit[~voiced] = np.interp(
+                    np.flatnonzero(~voiced), np.flatnonzero(voiced), feature_pit[voiced]
+                )
             coarse_pit = self.coarse_f0(feature_pit)
             np.save(opt_path_full, feature_pit, allow_pickle=False)
             np.save(opt_path_coarse, coarse_pit, allow_pickle=False)
@@ -328,7 +341,10 @@ if __name__ == "__main__":
         for stale_path in glob.glob(os.path.join(exp_dir, "*.index")):
             os.remove(stale_path)
         print("Embedder changed; removed stale features and indexes.")
-    f0_model = "rmvpe_rvc" if f0_method == "rmvpe" and not rectified else f0_method
+    if rectified:
+        f0_model = f0_method
+    else:
+        f0_model = ("rmvpe_rvc" if f0_method == "rmvpe" else f0_method) + "_interpolated"
     force_pitch_extraction = (
         data.get("f0_method") != f0_method
         or data.get("f0_model", data.get("f0_method")) != f0_model
