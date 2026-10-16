@@ -74,6 +74,14 @@ EMBEDDERS = ("contentvec", "spin-v2")
 PITCH_METHODS = {"rmvpe": "rmvpe", "swift": "swift", "beatrice": "beatrice", "parselmouth": "pm"}
 METER_FLOOR_DB = -60.0
 AUTOTUNE_HEADROOM = 1 << 30
+HOTKEYS = sys.platform == "win32"
+HOTKEY_POLL_MS = 15
+HOTKEY_MODIFIERS = (0x11, 0x10, 0x12)
+HOTKEY_SIDE_MODIFIERS = {0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x5B, 0x5C}
+HOTKEY_CANDIDATES = [vk for vk in range(0x02, 0xFF) if vk not in HOTKEY_MODIFIERS]
+KEY_NAMES = {0x02: "Right mouse", 0x04: "Middle mouse", 0x05: "Mouse 4", 0x06: "Mouse 5", 0x13: "Pause", 0x2C: "Print Screen"}
+EXTENDED_KEYS = {0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2D, 0x2E, 0x6F, 0x90}
+VK_ESCAPE = 0x1B
 RESAMPLE_FILTER = dict(
     lowpass_filter_width=64,
     rolloff=0.9475937167399596,
@@ -114,6 +122,33 @@ def release_flow_models():
 
 def db_to_linear(db):
     return 10.0 ** (float(db) / 20.0)
+
+
+def fade_ramp(start, target, frames, length):
+    if start == target:
+        return np.full(frames, target, dtype=np.float32)
+    steps = np.arange(1, frames + 1, dtype=np.float32) / max(1, length)
+    return np.clip(start + (target - start) * steps, 0.0, 1.0).astype(np.float32)
+
+
+def key_down(vk):
+    return bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
+
+
+def keys_down():
+    return {vk for vk in HOTKEY_CANDIDATES if key_down(vk)}
+
+
+def key_name(vk):
+    if vk in KEY_NAMES:
+        return KEY_NAMES[vk]
+    user32 = ctypes.windll.user32
+    scan = user32.MapVirtualKeyW(vk, 4)
+    extended = 1 << 24 if vk in EXTENDED_KEYS or scan >> 8 == 0xE0 else 0
+    buffer = ctypes.create_unicode_buffer(64)
+    if user32.GetKeyNameTextW(((scan & 0xFF) << 16) | extended, buffer, len(buffer)):
+        return buffer.value.title()
+    return f"Key {vk}"
 
 
 class AudioFrameFifo:
@@ -250,6 +285,11 @@ class AudioEngine:
         self.asio_stream = None
         self.output_fifo = None
         self.monitor_queue = None
+        self.direct_output = None
+        self.direct_monitor = None
+        self.dry_gains = {}
+        self.direct_history = None
+        self.direct_gate_gain = 1.0
         self.input_fifo = None
         self.worker = None
         self.worker_stop = None
@@ -266,6 +306,7 @@ class AudioEngine:
         self.last_block_ms = 0
         self.algorithm_latency_ms = 0
         self.base_latency_ms = 0.0
+        self.device_latency_ms = 0.0
         self.input_level = 0.0
         self.output_level = 0.0
         self.reported_statuses = set()
@@ -349,6 +390,10 @@ class AudioEngine:
             self._resize_asio_fifo(self.output_fifo)
         else:
             self.output_fifo.prefill = min(self.block_frame, self.sola_buffer_frame)
+        self.dry_gains = dict.fromkeys(("output", "monitor"), float(settings["passthrough"]))
+        self.direct_history = np.zeros(4 * self.zc, dtype=np.float32)
+        self.direct_gate_gain = 1.0
+        self.direct_output = self._direct_fifo(self.output_selectors)
         if not self.output_selectors:
             self.output_stream = sd.OutputStream(
                 callback=self._fifo_output_callback,
@@ -389,9 +434,8 @@ class AudioEngine:
             model_latency = self.beatrice.latency_seconds
         else:
             model_latency = (self.crossfade_frame + self.sola_search_frame) / self.sample_rate
-        self.base_latency_ms = (
-            input_latency + output_latency + self.block_frame / self.sample_rate + model_latency
-        ) * 1000
+        self.device_latency_ms = (input_latency + output_latency) * 1000
+        self.base_latency_ms = self.device_latency_ms + (self.block_frame / self.sample_rate + model_latency) * 1000
         self._refresh_latency()
 
     def _channels(self, device, key, selectors=None):
@@ -535,7 +579,7 @@ class AudioEngine:
     def _warm_up(self):
         silence = np.zeros((self.block_frame, self.channels), dtype=np.float32)
         for _ in range(2 if self.beatrice is None else 3):
-            self._process(silence, skip_silence=False)
+            self._process(silence, warm_up=True)
 
     def _budgeted_warm_up(self):
         device = torch.device(self.device)
@@ -567,6 +611,7 @@ class AudioEngine:
     def _start_monitor_stream(self):
         self.monitor_stream = None
         self.monitor_queue = None
+        self.direct_monitor = None
         if self.monitor_device is None:
             return
         try:
@@ -576,6 +621,7 @@ class AudioEngine:
                 self._resize_asio_fifo(self.monitor_queue)
             else:
                 self.monitor_queue.prefill = min(self.block_frame, self.sola_buffer_frame)
+            self.direct_monitor = self._direct_fifo(self.monitor_selectors)
             self.monitor_stream = sd.OutputStream(
                 device=self.monitor_device,
                 callback=self._monitor_callback,
@@ -592,6 +638,7 @@ class AudioEngine:
                 self.monitor_stream.close()
             self.monitor_stream = None
             self.monitor_queue = None
+            self.direct_monitor = None
             self.error_queue.put_nowait(
                 f"The monitor device could not start; continuing with the main output only. {error}"
             )
@@ -603,6 +650,17 @@ class AudioEngine:
         frames = self.asio_callback_frames
         fifo.prefill = 2 * frames + max(0, frames - self.block_frame) + self.prefill_margin
         fifo.max_frames = 2 * (self.block_frame + fifo.prefill)
+
+    def _direct_fifo(self, selectors):
+        fifo = AudioFrameFifo(1)
+        fifo.drain_after(math.ceil(5 * self.sample_rate / self.zc), self.zc, 2 * self.zc)
+        self._resize_direct_fifo(fifo, selectors)
+        return fifo
+
+    def _resize_direct_fifo(self, fifo, selectors):
+        frames = self.asio_callback_frames
+        fifo.prefill = 0 if self.input_selectors and selectors else self.zc + frames
+        fifo.max_frames = 8 * self.zc + 4 * frames
 
     def _track_asio_frames(self, frames):
         if frames <= self.asio_callback_frames:
@@ -616,6 +674,12 @@ class AudioEngine:
         input_fifo = self.input_fifo
         if input_fifo is not None and self.input_selectors:
             input_fifo.max_frames = 4 * self.block_frame + 2 * frames
+        for fifo, selectors in (
+            (self.direct_output, self.output_selectors),
+            (self.direct_monitor, self.monitor_selectors),
+        ):
+            if fifo is not None:
+                self._resize_direct_fifo(fifo, selectors)
 
     def _start_asio_stream(self):
         if self.asio_device is None:
@@ -626,6 +690,7 @@ class AudioEngine:
             self.monitor_queue = AudioFrameFifo(1)
             self._drain(self.monitor_queue)
             self._resize_asio_fifo(self.monitor_queue)
+            self.direct_monitor = self._direct_fifo(self.monitor_selectors)
             output_selectors += self.monitor_selectors
         common = dict(samplerate=self.sample_rate, dtype="float32", blocksize=0)
         if self.input_selectors:
@@ -686,8 +751,13 @@ class AudioEngine:
                     return
 
     def _refresh_latency(self):
+        if self.settings["passthrough"]:
+            direct = self.direct_output
+            buffer_ms = 1000 * direct.prefill / self.sample_rate if direct is not None else 0
+            self.algorithm_latency_ms = round(self.device_latency_ms + buffer_ms)
+            return
         lookahead_ms = 0
-        if self.rvc is not None and not self.settings["passthrough"]:
+        if self.rvc is not None:
             lookahead_ms = 10 * self.rvc.pitch_lookahead_frames(self.settings["f0_method"])
         noise_reduction_ms = 0
         if self.settings["input_noise_reduce"]:
@@ -729,6 +799,8 @@ class AudioEngine:
         self.worker_wakeup = None
         self.output_fifo = None
         self.monitor_queue = None
+        self.direct_output = None
+        self.direct_monitor = None
         self.input_fifo = None
         self._release_models()
 
@@ -805,7 +877,7 @@ class AudioEngine:
         self.sola_buffer[:] = converted[self.block_frame : self.block_frame + self.sola_buffer_frame]
         return converted[: self.block_frame]
 
-    def _process(self, indata, skip_silence=True):
+    def _process(self, indata, warm_up=False):
         started = time.perf_counter()
         settings = self.settings
         indata = librosa.to_mono(indata.T).astype(np.float32)
@@ -833,13 +905,13 @@ class AudioEngine:
             resample_input = self.input_wav[-indata.shape[0] - 2 * self.zc :]
             self.input_wav_res[-160 * (indata.shape[0] // self.zc + 1) :] = self.resampler(resample_input)[160:]
         source = self.input_wav_denoise if denoise else self.input_wav
-        passthrough = settings["passthrough"]
+        passthrough = settings["passthrough"] and not warm_up
         infer_seconds = 0.0
-        silent = False
+        silent = passthrough
         if self.beatrice is not None:
             block = source[-self.block_frame :]
             if passthrough:
-                infer_wav = block.clone()
+                infer_wav = torch.zeros_like(block)
             else:
                 infer_started = time.perf_counter()
                 infer_wav = torch.from_numpy(self.beatrice.process(block.cpu().numpy())).to(self.device)
@@ -851,14 +923,12 @@ class AudioEngine:
             output_block = infer_wav[: self.block_frame]
         else:
             lookahead = self.rvc.pitch_lookahead_frames(settings["f0_method"])
-            silent = skip_silence and not passthrough and not bool(
-                self.input_wav[max(0, self.extra_frame - lookahead * self.zc) :].any()
+            silent = passthrough or (
+                not warm_up and not bool(self.input_wav[max(0, self.extra_frame - lookahead * self.zc) :].any())
             )
-            if passthrough or silent:
+            if silent:
                 self.rvc.skip_block(self.block_frame_16k)
-                infer_wav = source[self.extra_frame :].clone()
-                if silent:
-                    infer_wav.zero_()
+                infer_wav = torch.zeros_like(source[self.extra_frame :])
             else:
                 infer_wav, infer_seconds = self.rvc.infer(
                     self.input_wav_res,
@@ -873,16 +943,17 @@ class AudioEngine:
                     infer_wav = self.resampler2(infer_wav)
                 else:
                     infer_wav = infer_wav.clone()
-            if settings["output_noise_reduce"] and not (passthrough or silent):
+            if settings["output_noise_reduce"] and not silent:
                 self.output_buffer[: -self.block_frame] = self.output_buffer[self.block_frame :].clone()
                 self.output_buffer[-self.block_frame :] = infer_wav[-self.block_frame :]
                 infer_wav = self.tg(infer_wav.unsqueeze(0), self.output_buffer.unsqueeze(0)).squeeze(0)
-            if settings["rms_mix_rate"] < 1 and not (passthrough or silent):
+            if settings["rms_mix_rate"] < 1 and not silent:
                 infer_wav = self._mix_volume(infer_wav, source)
             output_block = self._apply_sola(infer_wav)
         gain = db_to_linear(settings["output_gain_db"])
         output = torch.clamp(output_block * gain, -1.0, 1.0).cpu().numpy().astype(np.float32)
-        self.output_level = float(np.abs(output).max(initial=0.0))
+        if not passthrough:
+            self.output_level = float(np.abs(output).max(initial=0.0))
         if not silent:
             self.last_infer_ms = round(infer_seconds * 1000)
             self.last_block_ms = round((time.perf_counter() - started) * 1000)
@@ -906,6 +977,35 @@ class AudioEngine:
                 np.clip(output * np.float32(db_to_linear(self.settings["monitor_gain_db"])), -1.0, 1.0)
             )
 
+    def _gate_direct(self, dry):
+        threshold = self.settings["threshold"]
+        self.direct_history = np.concatenate((self.direct_history, dry))[-4 * self.zc :]
+        target = 1.0
+        if threshold > -60:
+            rms = float(np.sqrt(np.mean(np.square(self.direct_history))))
+            target = float(20.0 * math.log10(max(rms, 1e-5)) >= threshold)
+        gain = fade_ramp(self.direct_gate_gain, target, dry.shape[0], self.zc)
+        self.direct_gate_gain = float(gain[-1])
+        return dry * gain
+
+    def _write_direct(self, indata):
+        direct = self.direct_output
+        if direct is None:
+            return
+        settings = self.settings
+        dry = indata.mean(axis=1, dtype=np.float32)
+        dry *= np.float32(db_to_linear(settings["input_gain_db"]))
+        np.clip(dry, -1.0, 1.0, out=dry)
+        dry = self._gate_direct(dry)
+        dry *= np.float32(db_to_linear(settings["output_gain_db"]))
+        np.clip(dry, -1.0, 1.0, out=dry)
+        if settings["passthrough"]:
+            self.output_level = float(np.abs(dry).max(initial=0.0))
+        direct.write(dry)
+        monitor = self.direct_monitor
+        if monitor is not None:
+            monitor.write(np.clip(dry * np.float32(db_to_linear(settings["monitor_gain_db"])), -1.0, 1.0))
+
     def _input_callback(self, indata, frames, times, status):
         if not self.running:
             return
@@ -917,6 +1017,7 @@ class AudioEngine:
             if fifo is not None and wakeup is not None:
                 fifo.write(indata)
                 wakeup.set()
+            self._write_direct(indata)
         except Exception:
             self.running = False
             self.error_queue.put_nowait(traceback.format_exc())
@@ -928,35 +1029,35 @@ class AudioEngine:
         self._track_asio_frames(frames)
         self._input_callback(indata, frames, times, status)
 
+    def _mix(self, key, fifo, direct, frames):
+        target = 1.0 if self.settings["passthrough"] else 0.0
+        gain = fade_ramp(self.dry_gains.get(key, target), target, frames, self.crossfade_frame)
+        self.dry_gains[key] = float(gain[-1])
+        mixed = np.zeros(frames, dtype=np.float32)
+        for source, weight in ((fifo, 1.0 - gain), (direct, gain)):
+            block = source.read(frames) if source is not None else None
+            if block is not None:
+                mixed[: block.shape[0]] += block[:, 0] * weight[: block.shape[0]]
+        return mixed[:, None]
+
     def _asio_output_callback(self, outdata, frames, times, status):
         outdata.fill(0)
         self._track_asio_frames(frames)
-        output_fifo = self.output_fifo if self.output_selectors else None
-        monitor_queue = self.monitor_queue if self.monitor_selectors else None
         main_channels = self.asio_main_channels
-        block = output_fifo.read(frames) if output_fifo is not None else None
-        if block is not None:
-            outdata[: block.shape[0], :main_channels] = block[:, :1]
-        block = monitor_queue.read(frames) if monitor_queue is not None else None
-        if block is not None:
-            outdata[: block.shape[0], main_channels:] = block[:, :1]
+        if self.output_selectors:
+            outdata[:, :main_channels] = self._mix("output", self.output_fifo, self.direct_output, frames)
+        if self.monitor_selectors:
+            outdata[:, main_channels:] = self._mix("monitor", self.monitor_queue, self.direct_monitor, frames)
 
     def _asio_duplex_callback(self, indata, outdata, frames, times, status):
-        self._asio_output_callback(outdata, frames, times, status)
         self._asio_input_callback(indata, frames, times, status)
-
-    @staticmethod
-    def _play_fifo(outdata, fifo, frames):
-        outdata.fill(0)
-        block = fifo.read(frames) if fifo is not None else None
-        if block is not None:
-            outdata[: block.shape[0]] = block[:, :1]
+        self._asio_output_callback(outdata, frames, times, status)
 
     def _fifo_output_callback(self, outdata, frames, times, status):
-        self._play_fifo(outdata, self.output_fifo, frames)
+        outdata[:] = self._mix("output", self.output_fifo, self.direct_output, frames)
 
     def _monitor_callback(self, outdata, frames, times, status):
-        self._play_fifo(outdata, self.monitor_queue, frames)
+        outdata[:] = self._mix("monitor", self.monitor_queue, self.direct_monitor, frames)
 
 
 def system_theme():
@@ -1045,6 +1146,8 @@ class RealtimeGUI:
         self.root.update_idletasks()
         self.root.minsize(self.root.winfo_reqwidth(), self.root.winfo_reqheight())
         self.root.after(100, self._poll)
+        if HOTKEYS:
+            self.root.after(HOTKEY_POLL_MS, self._poll_hotkey)
         self.root.protocol("WM_DELETE_WINDOW", self._close)
 
     def _load_config(self):
@@ -1101,6 +1204,11 @@ class RealtimeGUI:
         self.crossfade_time = tk.DoubleVar(value=min(value.get("crossfade_time", 0.01), 0.02))
         self.extra_time = tk.DoubleVar(value=value.get("extra_time", 3.0))
         self.passthrough = tk.BooleanVar(value=False)
+        self.passthrough_hold = tk.BooleanVar(value=value.get("passthrough_hold", False))
+        self.hotkey = list(value.get("passthrough_hotkey", [])) if HOTKEYS else []
+        self.hotkey_down = False
+        self.hotkey_capture = None
+        self.hotkey_text = tk.StringVar()
         self.status = tk.StringVar(value="Ready")
         self.stats = tk.StringVar()
         self.sample_rate_text = tk.StringVar()
@@ -1364,16 +1472,29 @@ class RealtimeGUI:
 
     def _build_actions(self, parent):
         frame = ttk.Frame(parent)
-        frame.columnconfigure(2, weight=1)
+        frame.columnconfigure(3, weight=1)
         self.start_button = ttk.Button(frame, text="Start", style="Accent.TButton", width=12, command=self._toggle)
         self.start_button.grid(row=0, column=0, sticky="w")
         passthrough = ttk.Checkbutton(frame, text="Passthrough", variable=self.passthrough,
                                       style="Switch.TCheckbutton")
         passthrough.grid(row=0, column=1, sticky="w", padx=(16, 0))
-        Tooltip(passthrough, "Send the input straight to the output without conversion.")
-        ttk.Label(frame, textvariable=self.stats, style="Muted.TLabel").grid(row=0, column=2, sticky="e")
+        Tooltip(passthrough, "Send the input straight to the output without conversion or its delay. "
+                             "Input noise reduction does not apply.")
+        if HOTKEYS:
+            hotkey = ttk.Frame(frame)
+            hotkey.grid(row=0, column=2, sticky="w", padx=(12, 0))
+            hotkey_button = ttk.Button(hotkey, textvariable=self.hotkey_text, command=self._capture_hotkey)
+            hotkey_button.pack(side="left")
+            Tooltip(hotkey_button, "Optional global hotkey for Passthrough that works while other apps are "
+                                   "focused. Click, then press a key, key combination or mouse button. "
+                                   "Esc removes it.")
+            hold = ttk.Checkbutton(hotkey, text="Hold", variable=self.passthrough_hold, command=self._store_hotkey)
+            hold.pack(side="left", padx=(8, 0))
+            Tooltip(hold, "On: Passthrough only while the hotkey is held. Off: the hotkey toggles Passthrough.")
+            self._show_hotkey()
+        ttk.Label(frame, textvariable=self.stats, style="Muted.TLabel").grid(row=0, column=3, sticky="e")
         status = ttk.Label(frame, textvariable=self.status, style="Muted.TLabel")
-        status.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        status.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(8, 0))
         frame.bind("<Configure>", lambda event: status.configure(wraplength=max(200, event.width)))
         return frame
 
@@ -1552,6 +1673,8 @@ class RealtimeGUI:
         saved["beatrice_block_time"] = BEATRICE_BLOCK_TIME
         saved["theme"] = self.theme
         saved["show_flow_options"] = self.show_flow_options.get()
+        saved["passthrough_hotkey"] = self.hotkey
+        saved["passthrough_hold"] = self.passthrough_hold.get()
         self._write_config(saved)
 
     def _toggle(self):
@@ -1625,8 +1748,73 @@ class RealtimeGUI:
                 ("output_noise_reduce", self.output_noise_reduce),
             ):
                 self.engine.settings[key] = variable.get()
+            self.engine._refresh_latency()
         except (tk.TclError, ValueError) as error:
             self.status.set(str(error))
+
+    def _show_hotkey(self):
+        if self.hotkey_capture is not None:
+            text = "Press a key..."
+        elif self.hotkey:
+            text = "Hotkey: " + "+".join(key_name(vk) for vk in self.hotkey)
+        else:
+            text = "Set hotkey"
+        self.hotkey_text.set(text)
+
+    def _store_hotkey(self):
+        data = self._load_config()
+        data["passthrough_hotkey"] = self.hotkey
+        data["passthrough_hold"] = self.passthrough_hold.get()
+        try:
+            self._write_config(data)
+        except OSError:
+            pass
+
+    def _capture_hotkey(self):
+        if self.hotkey_capture is None:
+            self.hotkey_capture = {"held": keys_down(), "modifier": None}
+            self.root.focus_set()
+        else:
+            self.hotkey_capture = None
+        self._show_hotkey()
+
+    def _set_hotkey(self, keys):
+        self.hotkey_capture = None
+        self.hotkey = keys
+        self.hotkey_down = bool(keys) and all(key_down(vk) for vk in keys)
+        self._show_hotkey()
+        self._store_hotkey()
+
+    def _capture_step(self):
+        capture = self.hotkey_capture
+        held = keys_down()
+        pressed = held - capture["held"]
+        released = capture["held"] - held
+        capture["held"] = held
+        for vk in sorted(pressed):
+            if vk == VK_ESCAPE:
+                self._set_hotkey([])
+                return
+            if vk in HOTKEY_SIDE_MODIFIERS:
+                capture["modifier"] = vk
+            else:
+                self._set_hotkey([modifier for modifier in HOTKEY_MODIFIERS if key_down(modifier)] + [vk])
+                return
+        if capture["modifier"] in released:
+            self._set_hotkey([capture["modifier"]])
+
+    def _poll_hotkey(self):
+        if self.hotkey_capture is not None:
+            self._capture_step()
+        elif self.hotkey:
+            down = all(key_down(vk) for vk in self.hotkey)
+            if down != self.hotkey_down:
+                self.hotkey_down = down
+                if self.passthrough_hold.get():
+                    self.passthrough.set(down)
+                elif down:
+                    self.passthrough.set(not self.passthrough.get())
+        self.root.after(HOTKEY_POLL_MS, self._poll_hotkey)
 
     def _update_meters(self):
         engine = self.engine
@@ -1642,7 +1830,9 @@ class RealtimeGUI:
             self.meters[key]["value"] = value
 
     def _poll(self):
-        if self.engine.running:
+        if self.engine.running and self.engine.settings["passthrough"]:
+            self.stats.set(f"Latency {self.engine.algorithm_latency_ms} ms   ·   Passthrough")
+        elif self.engine.running:
             self.stats.set(
                 f"Latency {self.engine.algorithm_latency_ms} ms   ·   "
                 f"Processing {self.engine.last_block_ms} ms   ·   "
