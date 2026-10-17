@@ -112,8 +112,6 @@ def prepare_config(paths, args, resuming):
         config = new_config(args.kind, index['data'], source['hparams'] if source else None, args.pretrained or None)
         if source:
             config['train'].update(deepcopy(FINETUNE))
-            if source['discriminator'] is None:
-                config['train']['discriminator_warmup'] = max(0, args.discriminator_warmup)
     learning_rate = 'finetune_learning_rate' if config['pretrained'] else 'learning_rate'
     apply_overrides(config, {'batch_size': args.batch_size, 'crop_mel_frames': args.crop_mel_frames,
                              learning_rate: args.learning_rate, 'key_aug': args.key_aug,
@@ -136,10 +134,7 @@ def fit(args):
     task = VocoderTask(config, finetune)
     if source is not None:
         task.load_pretrained(source)
-        print(f"Fine-tuning from {source['path']}"
-              + ('.' if source['discriminator'] is not None else
-                 f" (generator only; the discriminator warms up for {config['train']['discriminator_warmup']} steps)."),
-              flush=True)
+        print(f"Fine-tuning generator and discriminator from {source['path']}.", flush=True)
     options = device_options(args.device)
     strategy = 'auto'
     if device_count(options) > 1:
@@ -171,10 +166,9 @@ def main():
                         help='pc trains PC-NSF-HiFiGAN (mini-NSF with pitch-cycle augmentation); nsf trains the '
                              'classic NSF-HiFiGAN.')
     parser.add_argument('--pretrained', default='',
-                        help='Fine-tune source for a new experiment: a Rectified Flow vocoder name or a '
-                             '.ckpt/.onnx path. Ignored when resuming.')
-    parser.add_argument('--discriminator-warmup', type=int, default=0,
-                        help='Steps that train only the discriminator when the source has no discriminator weights.')
+                        help='Fine-tune source for a new experiment: pc_nsf_hifigan_2025_02 or a training checkpoint '
+                             'containing both generator and discriminator weights. Ignored when resuming.')
+    parser.add_argument('--discriminator-warmup', type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument('--batch-size', type=int)
     parser.add_argument('--crop-mel-frames', type=int)
     parser.add_argument('--learning-rate', type=float)

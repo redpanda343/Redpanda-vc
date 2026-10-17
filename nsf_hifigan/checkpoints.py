@@ -6,7 +6,7 @@ import torch
 
 from nsf_hifigan.config import EXPORT_ROOT, ROOT, openvpi_config, write_json
 from nsf_hifigan.resources import FINETUNE_SOURCE, pretrained_path
-from rectified_flow.openvpi import generator_state, onnx_generator_state, openvpi_spec
+from rectified_flow.openvpi import generator_state, openvpi_spec
 from rectified_flow.resources import VOCODERS, vocoder_path
 from rectified_flow.vocoder import mel_mismatch
 
@@ -32,18 +32,24 @@ def resolve_source(source):
 
 def load_source(source, data):
     path = resolve_source(source)
-    discriminator = None
+    discriminator_error = (f'Cannot fine-tune {path}: discriminator weights are missing. '
+                           'Use a full NSF-HiFiGAN training checkpoint with both generator and discriminator weights.')
     if path.lower().endswith('.onnx'):
-        state = onnx_generator_state(path)
+        raise ValueError(discriminator_error)
+    checkpoint = torch.load(path, map_location='cpu', weights_only=True)
+    state = generator_state(checkpoint)
+    if state is None:
+        raise ValueError(f'{path} is not an NSF-HiFiGAN vocoder.')
+    discriminator = None
+    if isinstance(checkpoint.get('generator'), dict):
+        discriminator = checkpoint.get('discriminator')
     else:
-        checkpoint = torch.load(path, map_location='cpu', weights_only=True)
-        state = generator_state(checkpoint)
         lightning = checkpoint.get('state_dict')
         if isinstance(lightning, dict):
             discriminator = {key[len('discriminator.'):]: value for key, value in lightning.items()
                              if key.startswith('discriminator.')} or None
-    if state is None:
-        raise ValueError(f'{path} is not an NSF-HiFiGAN vocoder.')
+    if not isinstance(discriminator, dict) or not discriminator:
+        raise ValueError(discriminator_error)
     hparams, mel, folded = openvpi_spec(path, state)
     mismatch = mel_mismatch(data, mel)
     if mismatch:

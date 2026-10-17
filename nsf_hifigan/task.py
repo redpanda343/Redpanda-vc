@@ -47,9 +47,12 @@ class VocoderTask(pl.LightningModule):
         self.valid_losses = torch.nn.ModuleDict({name: MeanMetric() for name in VALIDATION_LOSSES})
 
     def load_pretrained(self, source):
+        discriminator = source.get('discriminator')
+        if not isinstance(discriminator, dict) or not discriminator:
+            raise ValueError('Fine-tuning requires a full NSF-HiFiGAN training checkpoint with both generator '
+                             'and discriminator weights. Discriminator weights are missing.')
         load_generator_weights(self.generator, source['generator'])
-        if source['discriminator'] is not None:
-            self.discriminator.load_state_dict(source['discriminator'])
+        self.discriminator.load_state_dict(discriminator)
 
     def configure_optimizers(self):
         options = dict(lr=self.learning_rate, betas=tuple(self.settings['betas']),
