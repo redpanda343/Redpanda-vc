@@ -109,9 +109,10 @@ class RedpandaRealtime extends AudioWorkletProcessor {
         this.ring.set(samples.subarray(0, first), write);
         this.ring.set(samples.subarray(first), 0);
         this.count += samples.length;
-        if (this.count > this.limit) {
+        const headroom = Math.max(this.limit - this.target, samples.length);
+        if (this.count > this.target + headroom) {
             this.trimmed += 1;
-            this.drop(this.count - this.target);
+            this.drop(this.count - Math.max(this.target, samples.length));
         }
     }
 
@@ -274,7 +275,8 @@ if (!window.redpandaRealtime) {
         const buffered = (1000 * state.buffered) / state.rate;
         const total = state.rtt + buffered + (1000 * (state.block + state.chunk)) / state.rate + 1000 * state.delay;
         const server = state.server || {};
-        let text = "Delay about " + Math.round(total) + " ms   ·   Round trip " + Math.round(state.rtt) + " ms   ·   Buffered " + Math.round(buffered) + " ms   ·   Processing " + (server.blockMs || 0) + " ms   ·   Dropouts " + state.underruns;
+        const transport = state.transport === "websocket" ? "WebSocket" : "HTTP fallback";
+        let text = "Delay about " + Math.round(total) + " ms   ·   Audio return " + Math.round(state.rtt) + " ms   ·   Buffered " + Math.round(buffered) + " ms   ·   Processing " + (server.blockMs || 0) + " ms   ·   Dropouts " + state.underruns + "   ·   " + transport;
         if (server.lost) text += "   ·   Lost chunks " + server.lost;
         if (state.dropped) text += "   ·   Dropped uploads " + state.dropped;
         if (server.skipped) text += "   ·   Skipped blocks " + server.skipped;
