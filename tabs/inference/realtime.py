@@ -61,6 +61,9 @@ REALTIME_CSS = """
 
 REALTIME_JS = r"""
 const CHUNK_SECONDS = 0.04;
+const MAX_IN_FLIGHT = 2;
+const MAX_MERGE_SECONDS = 0.5;
+const MAX_QUEUED_SECONDS = 1.0;
 const STORAGE_PREFIX = "redpanda-realtime-";
 const WORKLET = `
 class RedpandaRealtime extends AudioWorkletProcessor {
@@ -174,8 +177,13 @@ if (!window.redpandaRealtime) {
         events: null,
         token: "",
         ready: false,
-        seq: 0,
-        sent: new Map(),
+        queue: [],
+        queued: 0,
+        inFlight: 0,
+        offset: 0,
+        captured: 0,
+        captures: [],
+        dropped: 0,
         block: 0,
         chunk: 0,
         rate: 0,
@@ -259,6 +267,7 @@ if (!window.redpandaRealtime) {
         const server = state.server || {};
         let text = "Delay about " + Math.round(total) + " ms   ·   Round trip " + Math.round(state.rtt) + " ms   ·   Buffered " + Math.round(buffered) + " ms   ·   Processing " + (server.blockMs || 0) + " ms   ·   Dropouts " + state.underruns;
         if (server.lost) text += "   ·   Lost chunks " + server.lost;
+        if (state.dropped) text += "   ·   Dropped uploads " + state.dropped;
         if (server.skipped) text += "   ·   Skipped blocks " + server.skipped;
         node.textContent = text;
     };
@@ -268,32 +277,70 @@ if (!window.redpandaRealtime) {
         limit: Math.round(state.rate * (seconds + Math.max(seconds, 0.15))),
     });
 
-    const sendChunk = (samples) => {
-        const pcm = new Int16Array(samples.length);
-        for (let index = 0; index < samples.length; index++) {
-            const value = Math.max(-1, Math.min(1, samples[index]));
-            pcm[index] = value < 0 ? value * 32768 : value * 32767;
+    const flush = () => {
+        const limit = Math.round(state.rate * MAX_MERGE_SECONDS);
+        while (state.inFlight < MAX_IN_FLIGHT && state.queue.length) {
+            const parts = [state.queue.shift()];
+            let total = parts[0].length;
+            while (state.queue.length && total + state.queue[0].length <= limit) {
+                const part = state.queue.shift();
+                parts.push(part);
+                total += part.length;
+            }
+            state.queued -= total;
+            const pcm = new Int16Array(total);
+            let position = 0;
+            for (const part of parts) {
+                for (let index = 0; index < part.length; index++) {
+                    const value = Math.max(-1, Math.min(1, part[index]));
+                    pcm[position++] = value < 0 ? value * 32768 : value * 32767;
+                }
+            }
+            const offset = state.offset;
+            const token = state.token;
+            state.offset += total;
+            state.inFlight += 1;
+            fetch(state.audioUrl, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/octet-stream",
+                    "X-Realtime-Token": token,
+                    "X-Realtime-Offset": String(offset),
+                },
+                body: pcm.buffer,
+                credentials: "same-origin",
+                cache: "no-store",
+            })
+                .catch(() => {})
+                .finally(() => {
+                    if (state.token === token) {
+                        state.inFlight -= 1;
+                        flush();
+                    }
+                });
         }
-        const seq = state.seq++;
-        state.sent.set(seq, performance.now());
-        state.sent.delete(seq - 500);
-        fetch(state.audioUrl, {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/octet-stream",
-                "X-Realtime-Token": state.token,
-                "X-Realtime-Seq": String(seq),
-            },
-            body: pcm.buffer,
-            credentials: "same-origin",
-            cache: "no-store",
-        }).catch(() => {});
+    };
+
+    const onCapture = (samples) => {
+        state.captured += samples.length;
+        state.captures.push([state.captured, performance.now()]);
+        if (state.captures.length > 400) state.captures.shift();
+        state.queue.push(samples);
+        state.queued += samples.length;
+        const limit = Math.round(state.rate * MAX_QUEUED_SECONDS);
+        while (state.queued > limit && state.queue.length > 1) {
+            const dropped = state.queue.shift();
+            state.queued -= dropped.length;
+            state.offset += dropped.length;
+            state.dropped += 1;
+        }
+        flush();
     };
 
     const onWorklet = (event) => {
         const data = event.data;
         if (data.type === "capture") {
-            if (state.ready) sendChunk(data.samples);
+            if (state.ready) onCapture(data.samples);
         } else if (data.type === "level") {
             state.buffered = data.buffered;
             state.underruns = data.underruns;
@@ -317,8 +364,9 @@ if (!window.redpandaRealtime) {
             samples[position] = pcm[position] / 32768;
         }
         state.node.port.postMessage({ type: "audio", samples }, [samples.buffer]);
-        const sent = state.sent.get(Math.floor(((index + 1) * state.block - 1) / state.chunk));
-        if (sent !== undefined) state.rtt = performance.now() - sent;
+        const sample = (index + 1) * state.block;
+        while (state.captures.length && state.captures[0][0] < sample) state.captures.shift();
+        if (state.captures.length) state.rtt = performance.now() - state.captures[0][1];
     };
 
     const stop = () => {
@@ -401,8 +449,13 @@ if (!window.redpandaRealtime) {
             }
             state.rate = context.sampleRate;
             state.chunk = Math.round(state.rate * CHUNK_SECONDS);
-            state.seq = 0;
-            state.sent = new Map();
+            state.queue = [];
+            state.queued = 0;
+            state.inFlight = 0;
+            state.offset = 0;
+            state.captured = 0;
+            state.captures = [];
+            state.dropped = 0;
             state.rtt = 0;
             state.buffered = 0;
             state.underruns = 0;
@@ -422,7 +475,6 @@ if (!window.redpandaRealtime) {
             const url = endpoint("realtime/stream");
             url.searchParams.set("token", token);
             url.searchParams.set("rate", String(state.rate));
-            url.searchParams.set("chunk", String(state.chunk));
             const events = new EventSource(url.toString());
             state.events = events;
             events.addEventListener("status", (event) => setStatus(JSON.parse(event.data).message));
@@ -719,8 +771,8 @@ def realtime_tab(model_file, index_file, rectified_vocoder_path):
             )
             cached_context = gr.Checkbox(
                 label=i18n("Cached Context"),
-                info=i18n("Reuses ContentVec results for older context, so a long extra context stays cheap. RVC models only."),
-                value=False,
+                info=i18n("Reuses ContentVec results for older context, so a long extra context stays cheap. Needs about 1 s of extra context or more. RVC models only."),
+                value=True,
                 interactive=True,
             )
     gr.Markdown(

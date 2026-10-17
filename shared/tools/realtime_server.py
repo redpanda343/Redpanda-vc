@@ -14,10 +14,12 @@ from fastapi.responses import StreamingResponse
 from rvc.infer.realtime_engine import RealtimeProcessor
 from shared.tools.web_auth import current_user
 
-MAX_PENDING_CHUNKS = 12
+MAX_PENDING_CHUNKS = 64
 MAX_QUEUED_BLOCKS = 4
 MAX_QUEUED_OUTPUTS = 40
-MAX_CHUNK_SAMPLES = 1 << 15
+MAX_CHUNK_SAMPLES = 1 << 16
+MAX_AHEAD_SECONDS = 4.0
+GAP_SECONDS = 0.5
 STATS_SECONDS = 0.5
 IDLE_SECONDS = 30.0
 UNUSED_SECONDS = 120.0
@@ -47,9 +49,10 @@ class RealtimeSession:
         self.preparing = threading.Lock()
         self.blocks = queue.Queue()
         self.pending = {}
-        self.next_seq = 0
+        self.next_offset = 0
+        self.waiting_since = None
+        self.ahead = 0
         self.next_block = 0
-        self.chunk = 0
         self.buffer = np.zeros(0, dtype=np.float32)
         self.lost = 0
         self.skipped = 0
@@ -70,11 +73,9 @@ class RealtimeSession:
             return now - self.last_audio > IDLE_SECONDS
         return now - self.created > UNUSED_SECONDS
 
-    def start_stream(self, sample_rate, chunk, loop, outputs):
+    def start_stream(self, sample_rate, loop, outputs):
         if sample_rate % 100 or not 8000 <= sample_rate <= 192000:
             raise ValueError(f"The browser runs audio at {sample_rate} Hz, which real-time conversion cannot use.")
-        if not 0 < chunk <= MAX_CHUNK_SAMPLES:
-            raise ValueError("The browser sent an invalid audio chunk size.")
         with self.lock:
             if self.streaming or self.closed.is_set():
                 raise RuntimeError("This real-time session has already started or ended.")
@@ -86,7 +87,7 @@ class RealtimeSession:
             processor.sample_rate = int(sample_rate)
             processor.channels = 1
             processor.prepare(self.beatrice_path)
-        self.chunk = int(chunk)
+        self.ahead = int(MAX_AHEAD_SECONDS * processor.sample_rate)
         self.loop = loop
         self.outputs = outputs
         self.last_audio = time.monotonic()
@@ -96,24 +97,43 @@ class RealtimeSession:
         delay = (processor.crossfade_frame + processor.sola_search_frame) / processor.sample_rate + lookahead / 100
         return {"block": processor.block_frame, "sampleRate": processor.sample_rate, "delay": delay}
 
-    def feed(self, seq, samples):
+    def feed(self, offset, samples):
         if self.closed.is_set() or self.worker is None:
-            return
-        self.last_audio = time.monotonic()
+            return True
+        now = time.monotonic()
+        self.last_audio = now
         ready = []
         with self.lock:
-            if seq < self.next_seq:
+            if offset + samples.shape[0] <= self.next_offset:
                 self.lost += 1
-                return
-            self.pending[seq] = samples
-            if len(self.pending) > MAX_PENDING_CHUNKS and self.next_seq not in self.pending:
-                first = min(self.pending)
-                self.lost += first - self.next_seq
-                self._append(np.zeros((first - self.next_seq) * self.chunk, dtype=np.float32))
-                self.next_seq = first
-            while self.next_seq in self.pending:
-                self._append(self.pending.pop(self.next_seq))
-                self.next_seq += 1
+                return True
+            if offset > self.next_offset + self.ahead or len(self.pending) >= MAX_PENDING_CHUNKS:
+                return False
+            if offset < self.next_offset:
+                samples = samples[self.next_offset - offset:]
+                offset = self.next_offset
+            self.pending[offset] = samples
+            if self.next_offset not in self.pending:
+                if self.waiting_since is None:
+                    self.waiting_since = now
+                elif now - self.waiting_since > GAP_SECONDS:
+                    first = min(self.pending)
+                    self.lost += 1
+                    self._append(np.zeros(first - self.next_offset, dtype=np.float32))
+                    self.next_offset = first
+            advanced = False
+            while self.next_offset in self.pending:
+                chunk = self.pending.pop(self.next_offset)
+                self._append(chunk)
+                self.next_offset += chunk.shape[0]
+                advanced = True
+            for stale in [key for key in self.pending if key < self.next_offset]:
+                del self.pending[stale]
+                self.lost += 1
+            if not self.pending:
+                self.waiting_since = None
+            elif advanced:
+                self.waiting_since = now
             block = self.processor.block_frame
             while self.buffer.shape[0] >= block:
                 ready.append((self.next_block, self.buffer[:block]))
@@ -127,6 +147,7 @@ class RealtimeSession:
                 except queue.Empty:
                     break
             self.blocks.put(item)
+        return True
 
     def _append(self, samples):
         self.buffer = np.concatenate((self.buffer, samples))
@@ -254,7 +275,7 @@ def register_realtime_routes(app):
     first_new_route = len(app.router.routes)
 
     @app.get("/realtime/stream")
-    async def realtime_stream(request: Request, token: str = "", rate: int = 0, chunk: int = 0):
+    async def realtime_stream(request: Request, token: str = "", rate: int = 0):
         session = get_session(token, await current_user(app, request))
         if session is None:
             return Response("Real-time session not found", status_code=404, headers=NO_STORE)
@@ -264,7 +285,7 @@ def register_realtime_routes(app):
         async def events():
             try:
                 yield _event("status", {"message": "Warming up the model..."})
-                info = await asyncio.to_thread(session.start_stream, rate, chunk, loop, outputs)
+                info = await asyncio.to_thread(session.start_stream, rate, loop, outputs)
                 yield _event("ready", info)
                 last_stats = 0.0
                 while not session.closed.is_set():
@@ -301,13 +322,22 @@ def register_realtime_routes(app):
         if session is None:
             return Response("Real-time session not found", status_code=404, headers=NO_STORE)
         try:
-            seq = int(request.headers.get("x-realtime-seq", ""))
+            offset = int(request.headers.get("x-realtime-offset", ""))
         except ValueError:
-            return Response("Missing chunk number", status_code=400, headers=NO_STORE)
-        body = await request.body()
-        if len(body) % 2 or len(body) > 2 * MAX_CHUNK_SAMPLES or seq < 0:
+            return Response("Missing audio offset", status_code=400, headers=NO_STORE)
+        limit = 2 * MAX_CHUNK_SAMPLES
+        declared = request.headers.get("content-length")
+        if declared is not None and (not declared.isdigit() or int(declared) > limit):
+            return Response("Audio chunk is too large", status_code=413, headers=NO_STORE)
+        body = bytearray()
+        async for part in request.stream():
+            body.extend(part)
+            if len(body) > limit:
+                return Response("Audio chunk is too large", status_code=413, headers=NO_STORE)
+        if not body or len(body) % 2 or offset < 0:
             return Response("Invalid audio chunk", status_code=400, headers=NO_STORE)
-        session.feed(seq, np.frombuffer(body, dtype="<i2").astype(np.float32) / 32768.0)
+        if not session.feed(offset, np.frombuffer(body, dtype="<i2").astype(np.float32) / 32768.0):
+            return Response("Audio chunk is too far ahead", status_code=400, headers=NO_STORE)
         return Response(status_code=204, headers=NO_STORE)
 
     new_routes = app.router.routes[first_new_route:]
