@@ -17,6 +17,7 @@ from core import (
     run_multi_model_infer_script,
 )
 from shared.utils import format_title
+from tabs.inference.realtime import realtime_tab
 from tabs.settings.sections.filter import get_filter_trigger, load_config_filter
 from tabs.settings.sections.restart import stop_infer
 
@@ -2334,3 +2335,6 @@ def inference_tab():
         inputs=[],
         outputs=[convert_button_batch_multi, stop_button_batch_multi],
     )
+
+    with gr.Tab(i18n("Real-time")):
+        realtime_tab(model_file, index_file, rectified_vocoder_path)

@@ -520,10 +520,12 @@ def launch_gradio(server_name: str, server_port: int, auth=None) -> None:
             else {}
         ),
     )
+    from shared.tools.realtime_server import register_realtime_routes
     from shared.tools.tensorboard_proxy import register_tensorboard_proxy
 
     try:
         register_tensorboard_proxy(app)
+        register_realtime_routes(app)
         if _has_open:
             import webbrowser
 

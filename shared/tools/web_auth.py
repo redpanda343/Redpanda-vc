@@ -1,6 +1,21 @@
+import inspect
 import ipaddress
 import os
 import secrets
+
+
+async def current_user(app, request):
+    if app.auth is None and app.auth_dependency is None:
+        return "local"
+    if app.auth_dependency is not None:
+        user = app.auth_dependency(request)
+        if inspect.isawaitable(user):
+            user = await user
+        return user
+    token = request.cookies.get(
+        f"access-token-{app.cookie_id}"
+    ) or request.cookies.get(f"access-token-unsecure-{app.cookie_id}")
+    return app.tokens.get(token)
 
 
 def _is_loopback(server_name):

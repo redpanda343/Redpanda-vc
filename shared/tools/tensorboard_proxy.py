@@ -1,4 +1,3 @@
-import inspect
 import logging
 from urllib.parse import urlsplit
 
@@ -6,6 +5,7 @@ import httpx
 from fastapi import Request, Response
 
 from shared.tools.launch_tensorboard import get_tb_url
+from shared.tools.web_auth import current_user
 
 MAX_REQUEST_BYTES = 1024 * 1024
 MAX_RESPONSE_BYTES = 128 * 1024 * 1024
@@ -27,20 +27,6 @@ RESPONSE_HEADERS = {
     "last-modified",
 }
 logger = logging.getLogger(__name__)
-
-
-async def _current_user(app, request):
-    if app.auth is None and app.auth_dependency is None:
-        return "local"
-    if app.auth_dependency is not None:
-        user = app.auth_dependency(request)
-        if inspect.isawaitable(user):
-            user = await user
-        return user
-    token = request.cookies.get(
-        f"access-token-{app.cookie_id}"
-    ) or request.cookies.get(f"access-token-unsecure-{app.cookie_id}")
-    return app.tokens.get(token)
 
 
 def _same_origin(request):
@@ -129,7 +115,7 @@ def register_tensorboard_proxy(app):
     )
     @app.api_route("/tensorboard", methods=["GET", "HEAD", "POST"])
     async def tensorboard_proxy(request: Request, path: str = ""):
-        if not await _current_user(app, request):
+        if not await current_user(app, request):
             return Response(
                 "Authentication required",
                 status_code=401,
