@@ -4,13 +4,13 @@ import gradio as gr
 
 from nsf_hifigan.checkpoints import finetune_sources, latest_checkpoint
 from nsf_hifigan.config import FINETUNE, KINDS, PITCH_EXTRACTORS, PRECISIONS, TRAINING, experiment_paths, read_json
-from rectified_flow.resources import VOCODERS
-from tabs.train.jobs import ROOT, JobRunner, device_id, experiment_path, positive_integer
+from nsf_hifigan.resources import FINETUNE_SOURCE, FINETUNE_TITLE
+from tabs.train.jobs import JobRunner, device_id, experiment_path, positive_integer
 from tabs.train.slicing import preprocess_step, slicing_controls
 
 SLICERS = ('Simple',)
 SCRATCH = 'scratch'
-DEFAULT_SOURCES = {'pc': 'pc_nsf_hifigan', 'nsf': 'nsf_hifigan'}
+DEFAULT_SOURCES = {'pc': FINETUNE_SOURCE, 'nsf': SCRATCH}
 IDLE_CONTROLS = 4
 runner = JobRunner('vocoder')
 
@@ -19,19 +19,13 @@ def status():
     return runner.controls(IDLE_CONTROLS)
 
 
-def source_choices():
-    labels = {name: spec['title'] for name, spec in VOCODERS.items()}
-    return [('Train from scratch', SCRATCH), *[(labels.get(source, source), source) for source in finetune_sources()]]
-
-
-def refresh_sources(kind, current):
-    choices = source_choices()
-    value = current if current else DEFAULT_SOURCES[kind]
-    return gr.update(choices=choices, value=value)
+def source_choices(kind='pc'):
+    sources = [(FINETUNE_TITLE, source) for source in finetune_sources()] if kind == 'pc' else []
+    return [('Train from scratch', SCRATCH), *sources]
 
 
 def default_source(kind):
-    return gr.update(value=DEFAULT_SOURCES[kind])
+    return gr.update(choices=source_choices(kind), value=DEFAULT_SOURCES[kind])
 
 
 def check_kind(kind):
@@ -76,14 +70,10 @@ def resolve_source(kind, source, resuming):
     source = str(source or '').strip().strip('"')
     if resuming or source in {'', SCRATCH}:
         return ''
-    if source in VOCODERS:
-        source_kind = VOCODERS[source]['kind']
-        if kind != source_kind:
-            raise gr.Error(f'{VOCODERS[source]["title"]} fine-tunes the {KINDS[source_kind]} vocoder type. '
-                           'Choose that type, or another vocoder to fine-tune.')
-        return source
-    if not Path(source).is_file() and not (ROOT / source).is_file():
-        raise gr.Error(f'Pretrained vocoder not found: {source}')
+    if source != FINETUNE_SOURCE:
+        raise gr.Error('Choose the PC-NSF-HiFiGAN 2025.02 checkpoint or train from scratch.')
+    if kind != 'pc':
+        raise gr.Error('This checkpoint fine-tunes PC-NSF-HiFiGAN. Choose that vocoder type to fine-tune.')
     return source
 
 
@@ -95,7 +85,7 @@ def optional_number(value, label, integer=True):
     return str(int(value) if integer else float(value))
 
 
-def start(name, kind, source, discriminator_warmup, precision, batch, crop_frames, max_updates, checkpoint_interval,
+def start(name, kind, source, precision, batch, crop_frames, max_updates, checkpoint_interval,
           learning_rate, key_aug, workers, device):
     directory = experiment_path(name)
     check_kind(kind)
@@ -114,8 +104,7 @@ def start(name, kind, source, discriminator_warmup, precision, batch, crop_frame
                  '--device', device_option(device), '--workers', positive_integer(workers, 'CPU workers'),
                  '--key-aug' if key_aug else '--no-key-aug']
     if source:
-        arguments.extend(['--pretrained', source, '--discriminator-warmup',
-                          str(int(discriminator_warmup or 0))])
+        arguments.extend(['--pretrained', source])
     for flag, value, label in (('--batch-size', batch, 'Batch size'),
                                ('--crop-mel-frames', crop_frames, 'Crop length')):
         arguments.extend([flag, positive_integer(value, label)])
@@ -152,8 +141,8 @@ def nsf_hifigan_train_tab():
         device = gr.Textbox(label='Device', value='auto',
                             info='auto, cpu, cuda:0 or cuda:0,cuda:1. RMVPE extraction uses the first GPU.')
     kind = gr.Radio(label='Vocoder type', value='pc', choices=[(title, key) for key, title in KINDS.items()],
-                    info='PC-NSF-HiFiGAN trains with pitch-cycle augmentation so pitch-shifted output stays clean; '
-                         'it is the type Rectified Flow ships with. NSF-HiFiGAN is the classic model.')
+                    info='PC-NSF-HiFiGAN supports fine-tuning from the full SingingVocoders checkpoint. '
+                         'Classic NSF-HiFiGAN trains from scratch.')
     workers = gr.Number(label='CPU workers', value=4, minimum=1, precision=0,
                         info='Processes for slicing, feature extraction and the training data loader.')
     with gr.Accordion('1. Slice dataset', open=True):
@@ -174,20 +163,12 @@ def nsf_hifigan_train_tab():
                                          'clips.')
         extract_button = gr.Button('Extract features')
     with gr.Accordion('3. Train vocoder', open=True):
-        with gr.Row():
-            source = gr.Dropdown(label='Fine-tune from', choices=source_choices(), value=DEFAULT_SOURCES['pc'],
-                                 allow_custom_value=True, scale=4,
-                                 info='The Rectified Flow vocoders (downloaded on first use), your exported '
-                                      'vocoders, or a .ckpt/.onnx path. Only used when the experiment has no '
-                                      'checkpoint yet.')
-            refresh = gr.Button('Refresh', scale=1)
-        with gr.Row():
-            discriminator_warmup = gr.Number(label='Discriminator warm-up (steps)', value=0, minimum=0, precision=0,
-                                             info='Released vocoders ship without discriminator weights; only the '
-                                                  'discriminator trains for these first steps. 0 trains both from the '
-                                                  'start, as SingingVocoders fine-tuning does.')
-            precision = gr.Radio(label='Precision', choices=list(PRECISIONS), value='fp32',
-                                 info='SingingVocoders trains in fp32 and advises against bf16.')
+        source = gr.Dropdown(label='Fine-tune from', choices=source_choices(), value=DEFAULT_SOURCES['pc'],
+                             allow_custom_value=False,
+                             info='Downloads automatically and loads both generator and discriminator weights. '
+                                  'Only used for new experiments; existing checkpoints resume normally.')
+        precision = gr.Radio(label='Precision', choices=list(PRECISIONS), value='fp32',
+                             info='SingingVocoders trains in fp32 and advises against bf16.')
         with gr.Row():
             batch = gr.Number(label='Batch size', value=TRAINING['batch_size'], minimum=1, precision=0,
                               info='Clips per step and GPU. Lower it to reduce GPU memory use.')
@@ -215,11 +196,10 @@ def nsf_hifigan_train_tab():
     timer = gr.Timer(2)
     outputs = [slice_button, extract_button, train_button, export_button, stop_button, timer]
     kind.change(default_source, [kind], [source], queue=False)
-    refresh.click(refresh_sources, [kind, source], [source], queue=False)
     slice_button.click(slice_dataset, [name, dataset, workers, *slicing.inputs], outputs, queue=False)
     extract_button.click(extract_features, [name, workers, pitch_extractor, device, valid_clips], outputs,
                          queue=False)
-    train_button.click(start, [name, kind, source, discriminator_warmup, precision, batch, crop_frames, max_updates,
+    train_button.click(start, [name, kind, source, precision, batch, crop_frames, max_updates,
                                checkpoint_interval, learning_rate, key_aug, workers, device], outputs, queue=False)
     export_button.click(export, [name], outputs, queue=False)
     stop_button.click(stop, [], outputs, queue=False)

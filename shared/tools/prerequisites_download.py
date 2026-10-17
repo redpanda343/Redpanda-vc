@@ -362,5 +362,7 @@ def prequisites_download_pipeline(
             if pretraineds_hifigan:
                 download_mapping_files(pretraineds_hifigan_list, global_bar)
                 download_mapping_files(pretraineds_refinegan_list, global_bar)
-    else:
-        pass
+    if pretraineds_hifigan:
+        from nsf_hifigan.resources import pretrained_path
+
+        pretrained_path()

@@ -100,7 +100,8 @@ def _install_bundle(destination, url, archive_sha256, archive_size, archive_fold
                     extracted = temporary / 'files' / name
                     extracted.parent.mkdir(parents=True, exist_ok=True)
                     member = (members or {}).get(name, name)
-                    with archive.open(archive_folder + '/' + member) as source, extracted.open('wb') as target:
+                    member = f'{archive_folder}/{member}' if archive_folder else member
+                    with archive.open(member) as source, extracted.open('wb') as target:
                         shutil.copyfileobj(source, target)
                     if _sha256(extracted) != checksum:
                         raise IOError(f'Checksum verification failed for {description} file {name}.')

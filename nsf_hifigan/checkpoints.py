@@ -5,6 +5,7 @@ from pathlib import Path
 import torch
 
 from nsf_hifigan.config import EXPORT_ROOT, ROOT, openvpi_config, write_json
+from nsf_hifigan.resources import FINETUNE_SOURCE, pretrained_path
 from rectified_flow.openvpi import generator_state, onnx_generator_state, openvpi_spec
 from rectified_flow.resources import VOCODERS, vocoder_path
 from rectified_flow.vocoder import mel_mismatch
@@ -13,13 +14,13 @@ CHECKPOINT_PATTERN = re.compile(r'model_ckpt_steps_(\d+)\.ckpt')
 
 
 def finetune_sources():
-    exports = sorted(path.relative_to(ROOT).as_posix() for path in EXPORT_ROOT.glob('*/model.ckpt')) \
-        if EXPORT_ROOT.is_dir() else []
-    return [*VOCODERS, *exports]
+    return [FINETUNE_SOURCE]
 
 
 def resolve_source(source):
     source = str(source).strip().strip('"')
+    if source == FINETUNE_SOURCE:
+        return pretrained_path()
     if source in VOCODERS:
         return vocoder_path(source)
     path = Path(source)
