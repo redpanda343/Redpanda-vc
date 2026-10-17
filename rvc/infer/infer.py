@@ -12,19 +12,6 @@ import soundfile as sf
 import noisereduce as nr
 from contextlib import contextmanager
 from functools import wraps
-from pedalboard import (
-    Pedalboard,
-    Chorus,
-    Distortion,
-    Reverb,
-    PitchShift,
-    Limiter,
-    Gain,
-    Bitcrush,
-    Clipping,
-    Compressor,
-    Delay,
-)
 
 now_dir = os.getcwd()
 sys.path.append(now_dir)
@@ -214,6 +201,20 @@ class VoiceConverter:
         sample_rate,
         **kwargs,
     ):
+        from pedalboard import (
+            Pedalboard,
+            Chorus,
+            Distortion,
+            Reverb,
+            PitchShift,
+            Limiter,
+            Gain,
+            Bitcrush,
+            Clipping,
+            Compressor,
+            Delay,
+        )
+
         board = Pedalboard()
         if kwargs.get("reverb", False):
             reverb = Reverb(
