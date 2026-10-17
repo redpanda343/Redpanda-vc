@@ -10,6 +10,9 @@ import torch.nn.functional as F
 
 from rectified_flow.pitch import release_rmvpe_model
 from rectified_flow.realtime import RealtimeGraph
+from rvc.algorithm.generators.hifigan_nsf import HiFiGANNSFGenerator
+from rvc.infer.content_cache import CachedContentEncoder, SpeechGroupNormConv
+from rvc.infer.feature_index import FeatureIndex
 from rvc.infer.infer import VoiceConverter
 from shared.predictors.f0 import BeatricePitch
 from shared.utils import V1_FEATURE_LAYER, extract_embedding_features
@@ -19,6 +22,53 @@ SUPPORTED_VOCODERS = {"HiFi-GAN", "RefineGAN"}
 SUPPORTED_EMBEDDERS = {"contentvec", "spin-v2"}
 PITCH_PREDICTORS = ("rmvpe", "swift", "beatrice")
 FLOW_WINDOW_CONTEXT = 0.5
+FLOW_RECEPTIVE_FRAMES = 24
+SEAMLESS_DECODER_CONTEXT = 8
+CACHED_CONTEXT_FRESH_FRAMES = 30
+
+
+def decoder_radius(generator):
+    radius = generator.conv_pre.kernel_size[0] // 2
+    scale = 1
+    for stage, up in enumerate(generator.ups):
+        scale *= up.stride[0]
+        radius += (up.kernel_size[0] - 1) / scale
+        blocks = generator.resblocks[stage * generator.num_kernels:(stage + 1) * generator.num_kernels]
+        radius += max(
+            sum((layer.kernel_size[0] - 1) * layer.dilation[0] / 2
+                for layer in block.modules() if isinstance(layer, torch.nn.Conv1d))
+            for block in blocks
+        ) / scale
+    return radius + (generator.conv_post.kernel_size[0] // 2) / scale
+
+
+class AlignedNoise:
+    def __init__(self, channels, device, seed):
+        self.channels = int(channels)
+        self.device = device
+        self.seed = int(seed)
+        self.generator = torch.Generator(device=device)
+        self.reset()
+
+    def reset(self):
+        self.generator.manual_seed(self.seed)
+        self.start = 0
+        self.values = torch.zeros(1, self.channels, 0, device=self.device)
+
+    def take(self, start, length):
+        stored_end = self.start + self.values.shape[-1]
+        if start < self.start or start > stored_end:
+            self.start = start
+            self.values = self.values[..., :0]
+            stored_end = start
+        if start + length > stored_end:
+            fresh = torch.randn(
+                1, self.channels, start + length - stored_end, device=self.device, generator=self.generator
+            )
+            self.values = torch.cat((self.values, fresh), dim=-1)
+        self.values = self.values[..., start - self.start:]
+        self.start = start
+        return self.values[..., :length]
 
 
 class RMVPEViterbi:
@@ -187,6 +237,9 @@ class RealTimeRVC:
         rectified_steps=0,
         cuda_graph=True,
         rectified_flow_window=True,
+        lookahead_frames=0,
+        seamless=False,
+        cached_context=False,
     ):
         self.converter = VoiceConverter()
         self.converter.get_vc(model_path, speaker_id)
@@ -251,6 +304,10 @@ class RealTimeRVC:
         positional = getattr(getattr(self.embedder, "encoder", None), "pos_conv_embed", None)
         if positional is not None and isinstance(positional.conv, torch.nn.Conv1d):
             positional.conv = MatmulGroupedConv1d(positional.conv)
+        conv_layers = self.embedder.feature_extractor.conv_layers
+        if isinstance(getattr(conv_layers[0], "layer_norm", None), torch.nn.GroupNorm):
+            conv_layers[0] = SpeechGroupNormConv(conv_layers[0])
+        self.speech_norm = conv_layers[0] if isinstance(conv_layers[0], SpeechGroupNormConv) else None
         if self.version == "v1" and not self.embedder.config.do_stable_layer_norm:
             self.embedder.encoder.layers = self.embedder.encoder.layers[:V1_FEATURE_LAYER]
         self.expected_feature_dim = (
@@ -295,22 +352,24 @@ class RealTimeRVC:
                 self.variance_stream = StreamingVariances(
                     self.model.variance_names, self.pipeline.data, self.converter.cpt["config"]["flow"], self.device
                 )
-            generator = vocoder.generator
-            radius = generator.conv_pre.kernel_size[0] // 2
-            scale = 1
-            for stage, up in enumerate(generator.ups):
-                scale *= up.stride[0]
-                radius += (up.kernel_size[0] - 1) / scale
-                blocks = generator.resblocks[
-                    stage * generator.num_kernels:(stage + 1) * generator.num_kernels
-                ]
-                radius += max(
-                    sum((layer.kernel_size[0] - 1) * layer.dilation[0] / 2
-                        for layer in block.modules() if isinstance(layer, torch.nn.Conv1d))
-                    for block in blocks
-                ) / scale
-            radius += (generator.conv_post.kernel_size[0] // 2) / scale
-            self.vocoder_context_frames = math.ceil(radius) + 2
+            self.vocoder_context_frames = math.ceil(decoder_radius(vocoder.generator)) + 2
+        self.lookahead = int(lookahead_frames)
+        self.seamless = bool(seamless) and not self.is_rectified
+        if self.seamless:
+            decoder = self.model.dec
+            self.decoder_hop = int(decoder.upp)
+            self.decoder_context = SEAMLESS_DECODER_CONTEXT
+            self.phase_step = 0.0
+            if isinstance(decoder, HiFiGANNSFGenerator):
+                self.decoder_context = math.ceil(decoder_radius(decoder) / 2)
+                self.phase_step = self.decoder_hop / decoder.m_source.l_sin_gen.sampling_rate
+            self.latent_noise = AlignedNoise(self.model.enc_p.out_channels, self.device, self.seed)
+            self.source_noise = AlignedNoise(1, self.device, self.seed + 1)
+            self.source_phase = torch.zeros((), device=self.device)
+        self.cached_context = bool(cached_context) and not self.is_rectified
+        if self.cached_context and not CachedContentEncoder.supports(self.embedder):
+            raise ValueError("Cached context does not support this embedder.")
+        self.content_cache = None
         if index_path:
             self._load_index(index_path)
         if self.index_rate > 0 and self.index is None:
@@ -321,6 +380,9 @@ class RealTimeRVC:
         if method == "beatrice":
             return BeatricePitch.lookahead_frames
         return 20 if method == "swift" else 0
+
+    def lookahead_frames(self, method):
+        return max(self.pitch_lookahead_frames(method), self.lookahead)
 
     @property
     def speaker_count(self):
@@ -337,12 +399,7 @@ class RealTimeRVC:
             )
         if index.ntotal < 1:
             raise ValueError("The selected feature index is empty.")
-        try:
-            faiss.extract_index_ivf(index).make_direct_map()
-        except RuntimeError:
-            pass
-        index.reconstruct(0)
-        self.index = index
+        self.index = FeatureIndex(index)
 
     def change_pitch(self, pitch):
         with self.lock:
@@ -362,11 +419,31 @@ class RealTimeRVC:
         self.last_f0_method = None
         self.pitch_sample_count = 0
         self.beatrice_sample_count = None
+        if self.index is not None:
+            self.index.reset()
+        if self.content_cache is not None:
+            self.content_cache.reset()
+        if self.speech_norm is not None:
+            self.speech_norm.reset()
         if getattr(self, "variance_stream", None) is not None:
             self.variance_stream.reset()
+        if self.seamless:
+            self.latent_noise.reset()
+            self.source_noise.reset()
+            self.source_phase = torch.zeros((), device=self.device)
 
-    def skip_block(self, block_frame_16k):
+    @torch.inference_mode()
+    def skip_block(self, block_frame_16k, input_wav=None, speech=False):
         with self.lock:
+            cache = self.content_cache
+            if cache is not None and input_wav is not None and input_wav.shape[0] == cache.window:
+                cache.keep(
+                    input_wav,
+                    self.pitch_sample_count + int(block_frame_16k),
+                    math.ceil(int(block_frame_16k) / cache.stride),
+                    cache.active - CACHED_CONTEXT_FRESH_FRAMES,
+                    speech,
+                )
             shift = max(1, block_frame_16k // 160)
             self.cache_pitch[:-shift] = self.cache_pitch[shift:].clone()
             self.cache_pitchf[:-shift] = self.cache_pitchf[shift:].clone()
@@ -375,40 +452,50 @@ class RealTimeRVC:
             self.rmvpe_viterbi.reset()
             self.pitch_sample_count += int(block_frame_16k)
 
-    def _extract_features(self, input_wav):
-        source = input_wav.float().view(1, -1)
+    def _extract_features(self, input_wav, drop=0):
+        source = input_wav[drop:].float().view(1, -1)
         if getattr(self.embedder, "audio_requires_normalization", False):
             source = F.layer_norm(source, source.shape)
         features = self.feature_graph(source)
+        self._check_feature_dim(features)
+        if self.is_rectified:
+            return features
+        return torch.cat((features, features[:, -1:, :]), dim=1)
+
+    def _check_feature_dim(self, features):
         if features.shape[-1] != self.expected_feature_dim:
             raise RuntimeError(
                 f"{self.embedder_name} outputs {features.shape[-1]} channels, but "
                 f"this model expects {self.expected_feature_dim}."
             )
-        if self.is_rectified:
-            return features
-        return torch.cat((features, features[:, -1:, :]), dim=1)
 
-    def _apply_index(self, features, skip_head):
+    def _content_cache(self, window, skip_head):
+        if not self.cached_context:
+            return None
+        active = math.ceil((window // 160 - skip_head) / 2) + CACHED_CONTEXT_FRESH_FRAMES
+        if not CachedContentEncoder.fits(self.embedder, window, active):
+            return None
+        cache = self.content_cache
+        if cache is None or (cache.window, cache.active) != (window, active):
+            cache = CachedContentEncoder(self.embedder, self.version, window, active, self.cuda_graph)
+            self.content_cache = cache
+        return cache
+
+    def _cached_features(self, cache, input_wav, end, index_head):
+        features, first = cache(input_wav, end)
+        self._check_feature_dim(features)
+        window_start = (end - input_wav.shape[0]) // 160
+        features = self._apply_index(features, max(0, (window_start + index_head) // 2 - first))
+        frames = torch.arange(window_start, window_start + input_wav.shape[0] // 160, device=features.device)
+        frames = (torch.div(frames, 2, rounding_mode="floor") - first).clamp_(0, features.shape[1] - 1)
+        return features[:, frames]
+
+    def _apply_index(self, features, start):
         if self.index is None or self.index_rate <= 0:
             return features
-        start = skip_head // 2
-        query = features[0, start:].detach().cpu().numpy().astype("float32")
-        score, indices = self.index.search(query, k=min(8, self.index.ntotal))
-        valid = indices >= 0
-        if not valid.any(axis=1).all():
-            raise RuntimeError("The selected index returned no valid neighbors.")
-        indices = np.where(valid, indices, 0)
-        score = np.maximum(score, 1e-6)
-        weight = np.where(valid, np.square(1.0 / score), 0.0)
-        weight /= weight.sum(axis=1, keepdims=True)
-        neighbors = self.index.reconstruct_batch(indices.ravel()).reshape(*indices.shape, -1)
-        retrieved = np.sum(neighbors * np.expand_dims(weight, axis=2), axis=1)
-        replacement = torch.from_numpy(retrieved).unsqueeze(0).to(self.device)
-        features[0, start:] = (
-            replacement * self.index_rate
-            + features[0, start:] * (1.0 - self.index_rate)
-        )
+        query = features[0, start:].detach().cpu().numpy()
+        blended = self.index.blend(query, self.index_rate)
+        features[0, start:] = torch.from_numpy(blended).to(self.device)
         return features
 
     def _prepare_pitch_predictor(self, method):
@@ -458,6 +545,8 @@ class RealTimeRVC:
 
     def _graphs(self):
         graphs = [self.feature_graph, self.rmvpe_graph, *self.synthesizer_graphs.values()]
+        if self.content_cache is not None:
+            graphs.append(self.content_cache.graph)
         if self.is_rectified:
             graphs += [self.flow_sampler, self.vocoder_graph]
         return [graph for graph in graphs if graph is not None]
@@ -484,6 +573,47 @@ class RealTimeRVC:
             )
         return self.synthesizer_graphs[key]
 
+    def _synthesize_seamless(self, features, lengths, coarse, continuous, speaker, latent, source, phase,
+                             skip_head, return_length, left, right):
+        model = self.model
+        start = skip_head - left
+        count = left + return_length + right
+        flow_head = max(start - FLOW_RECEPTIVE_FRAMES, 0)
+        g = model.emb_g(speaker).unsqueeze(-1)
+        m_p, logs_p, x_mask = model.enc_p(features, coarse, lengths, flow_head)
+        z_p = (m_p + torch.exp(logs_p) * latent[:, :, flow_head:] * 0.66666) * x_mask
+        z = model.flow(z_p, x_mask, g=g, reverse=True)
+        z = z[:, :, start - flow_head:start - flow_head + count]
+        f0 = continuous[:, start:start + count]
+        if isinstance(model.dec, HiFiGANNSFGenerator):
+            offset = phase - f0[:, :left].sum() * self.phase_step
+            audio = model.dec(z, f0, g=g, phase=offset, noise=source.transpose(1, 2))
+        else:
+            audio = model.dec(z, f0, g=g)
+        return audio[0, 0, left * self.decoder_hop:(left + return_length) * self.decoder_hop]
+
+    def _infer_seamless(self, features, lengths, coarse, continuous, speaker, skip_head, return_length, shift):
+        p_len = features.shape[1]
+        left = min(self.decoder_context, skip_head)
+        right = max(0, min(self.decoder_context, p_len - skip_head - return_length))
+        key = ("seamless", skip_head, return_length, left, right)
+        if key not in self.synthesizer_graphs:
+            self.synthesizer_graphs[key] = RealtimeGraph(
+                lambda *inputs: self._synthesize_seamless(*inputs, skip_head, return_length, left, right),
+                "synthesizer", self.cuda_graph,
+            )
+        window_start = self.pitch_sample_count // 160 - p_len
+        latent = self.latent_noise.take(window_start, p_len)
+        hop = self.decoder_hop
+        count = left + return_length + right
+        source = self.source_noise.take((window_start + skip_head - left) * hop, count * hop)
+        audio = self.synthesizer_graphs[key](
+            features, lengths, coarse, continuous, speaker, latent, source, self.source_phase
+        )
+        advance = continuous[0, skip_head:skip_head + shift].sum() * self.phase_step
+        self.source_phase = torch.remainder(self.source_phase + advance, 1.0)
+        return audio
+
     def _update_pitch(self, input_wav, block_frame_16k, method):
         if method != self.last_f0_method:
             self.rmvpe_viterbi.reset()
@@ -498,7 +628,7 @@ class RealTimeRVC:
         if method == "beatrice":
             self._update_beatrice_pitch(input_wav, block_frame_16k)
             return
-        extractor_frame = block_frame_16k + 800
+        extractor_frame = block_frame_16k + 800 + 160 * self.lookahead
         if method == "swift":
             extractor_frame = min(block_frame_16k + 19200, input_wav.shape[0])
             start = self.pitch_sample_count - extractor_frame
@@ -648,15 +778,28 @@ class RealTimeRVC:
         source_wav=None,
         source_rate=None,
     ):
-        lookahead = self.pitch_lookahead_frames(f0_method)
+        lookahead = self.lookahead_frames(f0_method)
         if skip_head < lookahead:
-            raise ValueError("SwiftF0 realtime requires at least 0.2 seconds of extra context.")
+            raise ValueError(
+                f"Extra context must be at least {lookahead / 100:g} seconds for this lookahead and pitch method."
+            )
         skip_head = int(skip_head) - lookahead
         started = time.perf_counter()
         with self.lock:
             torch.manual_seed(self.seed)
-            features = self._extract_features(input_wav)
-            features = self._apply_index(features, skip_head)
+            end = self.pitch_sample_count + int(block_frame_16k)
+            drop = 0
+            index_head = skip_head
+            if self.seamless:
+                if (end - input_wav.shape[0]) // 160 % 2:
+                    drop = 160
+                index_head = max(0, skip_head - self.decoder_context - FLOW_RECEPTIVE_FRAMES - 1)
+            cache = self._content_cache(input_wav.shape[0], skip_head)
+            if cache is None:
+                features = self._extract_features(input_wav, drop)
+                features = self._apply_index(features, index_head // 2)
+            else:
+                features = self._cached_features(cache, input_wav, end, index_head)
             self._update_pitch(input_wav, block_frame_16k, f0_method)
             speaker = torch.tensor(
                 [self.speaker_id], device=self.device, dtype=torch.long
@@ -669,19 +812,28 @@ class RealTimeRVC:
                 if torch.device(self.device).type == "cuda":
                     torch.cuda.synchronize(self.device)
                 return audio.float(), time.perf_counter() - started
-            p_len = min(input_wav.shape[0] // 160, features.shape[1] * 2)
-            features = F.interpolate(
-                features.permute(0, 2, 1), scale_factor=2
-            ).permute(0, 2, 1)
+            if cache is None:
+                features = F.interpolate(
+                    features.permute(0, 2, 1), scale_factor=2
+                ).permute(0, 2, 1)
+                if drop:
+                    features = torch.cat((features[:, :1], features), dim=1)
+            p_len = min(input_wav.shape[0] // 160, features.shape[1])
             features = features[:, :p_len]
             lengths = torch.tensor(
                 [p_len], device=self.device, dtype=torch.long
             )
             coarse = self.cache_pitch[None, -p_len:]
             continuous = self.cache_pitchf[None, -p_len:]
-            audio = self._synthesizer_graph(int(skip_head), int(return_length))(
-                features.float(), lengths, coarse, continuous, speaker
-            )
+            if self.seamless:
+                audio = self._infer_seamless(
+                    features.float(), lengths, coarse, continuous, speaker,
+                    int(skip_head), int(return_length), int(block_frame_16k) // 160,
+                )
+            else:
+                audio = self._synthesizer_graph(int(skip_head), int(return_length))(
+                    features.float(), lengths, coarse, continuous, speaker
+                )
             if torch.device(self.device).type == "cuda":
                 torch.cuda.synchronize(self.device)
         return audio.squeeze().float(), time.perf_counter() - started

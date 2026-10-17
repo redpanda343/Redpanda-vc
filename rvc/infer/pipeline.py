@@ -12,6 +12,7 @@ now_dir = os.getcwd()
 sys.path.append(now_dir)
 
 from shared.predictors.f0 import BeatricePitch, RVCRMVPE, Swift
+from rvc.infer.feature_index import FeatureIndex
 from rvc.infer.pm import extract_pm
 from shared.utils import extract_embedding_features
 
@@ -165,7 +166,6 @@ class Pipeline:
         pitch,
         pitchf,
         index,
-        big_npy,
         index_rate,
         version,
         protect,
@@ -182,8 +182,7 @@ class Pipeline:
             audio0: The input audio segment.
             pitch: Quantized F0 contour for pitch guidance.
             pitchf: Original F0 contour for pitch guidance.
-            index: FAISS index for speaker embedding retrieval.
-            big_npy: Speaker embeddings stored in a NumPy array.
+            index: FeatureIndex for speaker embedding retrieval.
             index_rate: Blending rate for speaker embedding retrieval.
             version: Model version (Keep to support old models).
             protect: Protection level for preserving the original pitch.
@@ -212,9 +211,7 @@ class Pipeline:
             if (
                 index
             ):  # set by parent function, only true if index is available, loaded, and index rate > 0
-                feats = self._retrieve_speaker_embeddings(
-                    feats, index, big_npy, index_rate
-                )
+                feats = self._retrieve_speaker_embeddings(feats, index, index_rate)
             # feature upsampling
             feats = F.interpolate(feats.permute(0, 2, 1), scale_factor=2).permute(
                 0, 2, 1
@@ -249,31 +246,14 @@ class Pipeline:
             del feats, feats0, p_len
         return audio1
 
-    def _retrieve_speaker_embeddings(self, feats, index, big_npy, index_rate):
-        if int(index.d) != feats.shape[-1]:
+    def _retrieve_speaker_embeddings(self, feats, index, index_rate):
+        if index.dim != feats.shape[-1]:
             raise RuntimeError(
-                f"The selected index has {index.d} channels, but the embedder outputs "
+                f"The selected index has {index.dim} channels, but the embedder outputs "
                 f"{feats.shape[-1]}. Select the index created for this voice model."
             )
-        npy = feats[0].cpu().numpy()
-        neighbor_count = min(8, int(index.ntotal))
-        if neighbor_count < 1:
-            raise RuntimeError("The selected feature index is empty.")
-        score, ix = index.search(npy, k=neighbor_count)
-        valid = ix >= 0
-        if not valid.any(axis=1).all():
-            raise RuntimeError("The selected feature index returned no valid neighbors.")
-        ix = np.where(valid, ix, 0)
-        score = np.maximum(score, 1e-6)
-        weight = np.square(1 / score)
-        weight = np.where(valid, weight, 0.0)
-        weight /= weight.sum(axis=1, keepdims=True)
-        npy = np.sum(big_npy[ix] * np.expand_dims(weight, axis=2), axis=1)
-        feats = (
-            torch.from_numpy(npy).unsqueeze(0).to(self.device) * index_rate
-            + (1 - index_rate) * feats
-        )
-        return feats
+        npy = index.blend(feats[0].cpu().numpy(), index_rate)
+        return torch.from_numpy(npy).unsqueeze(0).to(self.device)
 
     def pipeline(
         self,
@@ -315,9 +295,9 @@ class Pipeline:
             index = faiss.read_index(file_index)
             if index.ntotal < 1:
                 raise RuntimeError("The selected feature index is empty.")
-            big_npy = index.reconstruct_n(0, index.ntotal)
+            index = FeatureIndex(index)
         else:
-            index = big_npy = None
+            index = None
         if self.high_pass:
             audio = signal.filtfilt(bh, ah, audio)
         audio_pad = np.pad(audio, (self.window // 2, self.window // 2), mode="reflect")
@@ -366,7 +346,6 @@ class Pipeline:
                         pitch[:, s // self.window : (t + self.t_pad2) // self.window],
                         pitchf[:, s // self.window : (t + self.t_pad2) // self.window],
                         index,
-                        big_npy,
                         index_rate,
                         version,
                         protect,
@@ -384,7 +363,6 @@ class Pipeline:
                         None,
                         None,
                         index,
-                        big_npy,
                         index_rate,
                         version,
                         protect,
@@ -403,7 +381,6 @@ class Pipeline:
                     pitch[:, t // self.window :] if t is not None else pitch,
                     pitchf[:, t // self.window :] if t is not None else pitchf,
                     index,
-                    big_npy,
                     index_rate,
                     version,
                     protect,
@@ -421,7 +398,6 @@ class Pipeline:
                     None,
                     None,
                     index,
-                    big_npy,
                     index_rate,
                     version,
                     protect,

@@ -332,6 +332,9 @@ class AudioEngine:
                 rectified_vocoder_path=settings.get("rectified_vocoder_path", ""),
                 rectified_steps=settings.get("rectified_steps", 0),
                 rectified_flow_window=settings.get("rectified_flow_window", True),
+                lookahead_frames=round(settings.get("lookahead_time", 0.0) * 100),
+                seamless=settings.get("seamless", False),
+                cached_context=settings.get("cached_context", False),
             )
             model_rate = self.rvc.sample_rate
             self.device = self.rvc.device
@@ -530,7 +533,7 @@ class AudioEngine:
                 int(np.round(settings["crossfade_time"] * rate / self.zc)) * self.zc, 2 * self.zc
             )
         self.sola_buffer_frame = self.crossfade_frame
-        self.sola_search_frame = self.zc
+        self.sola_search_frame = 0 if self.rvc is not None and self.rvc.seamless else self.zc
         self.extra_frame = int(np.round(settings["extra_time"] * rate / self.zc)) * self.zc
         self.input_wav = torch.zeros(
             self.extra_frame + self.crossfade_frame + self.sola_search_frame + self.block_frame,
@@ -758,7 +761,7 @@ class AudioEngine:
             return
         lookahead_ms = 0
         if self.rvc is not None:
-            lookahead_ms = 10 * self.rvc.pitch_lookahead_frames(self.settings["f0_method"])
+            lookahead_ms = 10 * self.rvc.lookahead_frames(self.settings["f0_method"])
         noise_reduction_ms = 0
         if self.settings["input_noise_reduce"]:
             noise_reduction_ms = 1000 * self.sola_buffer_frame / self.sample_rate
@@ -843,7 +846,7 @@ class AudioEngine:
 
     def _mix_volume(self, converted, source):
         rate = self.settings["rms_mix_rate"]
-        lookahead = self.rvc.pitch_lookahead_frames(self.settings["f0_method"])
+        lookahead = self.rvc.lookahead_frames(self.settings["f0_method"])
         start = self.extra_frame - lookahead * self.zc
         source = source[start : start + converted.shape[0]]
         rms_source = librosa.feature.rms(
@@ -867,11 +870,12 @@ class AudioEngine:
         needed = self.block_frame + self.sola_buffer_frame + self.sola_search_frame
         if converted.shape[0] < needed:
             converted = F.pad(converted, (0, needed - converted.shape[0]))
-        conv_input = converted[None, None, : self.sola_buffer_frame + self.sola_search_frame]
-        cor_nom = F.conv1d(conv_input, self.sola_buffer[None, None, :])
-        cor_den = torch.sqrt(F.conv1d(conv_input**2, self.sola_den_kernel) + 1e-8)
-        sola_offset = int(torch.argmax(cor_nom[0, 0] / cor_den[0, 0]).item())
-        converted = converted[sola_offset:]
+        if self.sola_search_frame:
+            conv_input = converted[None, None, : self.sola_buffer_frame + self.sola_search_frame]
+            cor_nom = F.conv1d(conv_input, self.sola_buffer[None, None, :])
+            cor_den = torch.sqrt(F.conv1d(conv_input**2, self.sola_den_kernel) + 1e-8)
+            sola_offset = int(torch.argmax(cor_nom[0, 0] / cor_den[0, 0]).item())
+            converted = converted[sola_offset:]
         converted[: self.sola_buffer_frame] *= self.fade_in_window
         converted[: self.sola_buffer_frame] += self.sola_buffer * self.fade_out_window
         self.sola_buffer[:] = converted[self.block_frame : self.block_frame + self.sola_buffer_frame]
@@ -922,12 +926,11 @@ class AudioEngine:
                 infer_wav = self.tg(infer_wav.unsqueeze(0), self.output_buffer.unsqueeze(0)).squeeze(0)
             output_block = infer_wav[: self.block_frame]
         else:
-            lookahead = self.rvc.pitch_lookahead_frames(settings["f0_method"])
-            silent = passthrough or (
-                not warm_up and not bool(self.input_wav[max(0, self.extra_frame - lookahead * self.zc) :].any())
-            )
+            lookahead = self.rvc.lookahead_frames(settings["f0_method"])
+            quiet = not warm_up and not bool(self.input_wav[max(0, self.extra_frame - lookahead * self.zc) :].any())
+            silent = passthrough or quiet
             if silent:
-                self.rvc.skip_block(self.block_frame_16k)
+                self.rvc.skip_block(self.block_frame_16k, self.input_wav_res, not quiet)
                 infer_wav = torch.zeros_like(source[self.extra_frame :])
             else:
                 infer_wav, infer_seconds = self.rvc.infer(
@@ -1203,6 +1206,9 @@ class RealtimeGUI:
         self.block_time = tk.DoubleVar(value=self.block_times["rvc"])
         self.crossfade_time = tk.DoubleVar(value=min(value.get("crossfade_time", 0.01), 0.02))
         self.extra_time = tk.DoubleVar(value=value.get("extra_time", 3.0))
+        self.lookahead_time = tk.DoubleVar(value=value.get("lookahead_time", 0.0))
+        self.seamless = tk.BooleanVar(value=value.get("seamless", False))
+        self.cached_context = tk.BooleanVar(value=value.get("cached_context", False))
         self.passthrough = tk.BooleanVar(value=False)
         self.passthrough_hold = tk.BooleanVar(value=value.get("passthrough_hold", False))
         self.hotkey = list(value.get("passthrough_hotkey", [])) if HOTKEYS else []
@@ -1457,12 +1463,34 @@ class RealtimeGUI:
             frame, 2, "Extra context", self.extra_time, 0.05, 5.0, 0.01,
             tooltip="Seconds of past audio the model sees. More is smoother but slower.",
         )
-        self.rvc_widgets.update(crossfade + extra)
-        self.locked_widgets.update(crossfade + extra)
+        lookahead = self._slider(
+            frame, 3, "Lookahead", self.lookahead_time, 0.0, 0.3, 0.01,
+            tooltip=(
+                "Seconds of future audio every model sees past each output block, added to the delay. "
+                "Lets small block times keep the quality of large ones. Taken from the extra context."
+            ),
+        )
+        seamless = ttk.Checkbutton(frame, text="Seamless blocks", variable=self.seamless)
+        seamless.grid(row=4, column=0, columnspan=3, sticky="w", pady=3)
+        Tooltip(seamless, "Makes consecutive blocks agree where they crossfade: the same latent noise, a continuous "
+                          "NSF sine phase, content features on a fixed 20 ms grid and decoder context on both sides "
+                          "of each block. The blocks then line up exactly, so the crossfade skips SOLA's search, "
+                          "which removes its small timing jumps and 10 ms of delay. Uses more GPU time; helps most "
+                          "with small block times. RVC models only.")
+        cached = ttk.Checkbutton(frame, text="Cached context", variable=self.cached_context)
+        cached.grid(row=5, column=0, columnspan=3, sticky="w", pady=3)
+        Tooltip(cached, "Runs ContentVec only on the newest 0.6 s plus the output block and lookahead, and reuses "
+                        "its earlier results for the rest of the extra context. A long extra context (3 s or more) "
+                        "then costs about as much GPU time as a short one, so small block times can keep the "
+                        "context that large ones use. During pauses and passthrough it keeps the cache current "
+                        "with a short ContentVec-only pass every few blocks, about one per 0.7 s once a pause has "
+                        "settled. Needs at least about 1 s of extra context. RVC models only.")
+        self.rvc_widgets.update(crossfade + extra + lookahead + [seamless, cached])
+        self.locked_widgets.update(crossfade + extra + lookahead + [seamless, cached])
         pitch_label = ttk.Label(frame, text="Pitch extraction")
-        pitch_label.grid(row=3, column=0, sticky="w", padx=(0, 12), pady=(6, 3))
+        pitch_label.grid(row=6, column=0, sticky="w", padx=(0, 12), pady=(6, 3))
         methods = ttk.Frame(frame)
-        methods.grid(row=3, column=1, columnspan=2, sticky="w", pady=(6, 3))
+        methods.grid(row=6, column=1, columnspan=2, sticky="w", pady=(6, 3))
         self.rvc_widgets.add(pitch_label)
         for label, method in PITCH_METHODS.items():
             radio = ttk.Radiobutton(methods, text=label, variable=self.f0_method, value=method)
@@ -1658,6 +1686,9 @@ class RealtimeGUI:
             "block_time": BEATRICE_BLOCK_TIME if self.block_kind == "beatrice" else self.block_time.get(),
             "crossfade_time": self.crossfade_time.get(),
             "extra_time": self.extra_time.get(),
+            "lookahead_time": self.lookahead_time.get(),
+            "seamless": self.seamless.get(),
+            "cached_context": self.cached_context.get(),
             "passthrough": self.passthrough.get(),
         }
 

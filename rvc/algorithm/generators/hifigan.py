@@ -153,7 +153,12 @@ class SineGenerator(torch.nn.Module):
         uv_mask = (f0 > self.voiced_threshold).float()
         return uv_mask
 
-    def _generate_sine_wave(self, f0: torch.Tensor, upsampling_factor: int):
+    def _generate_sine_wave(
+        self,
+        f0: torch.Tensor,
+        upsampling_factor: int,
+        phase: Optional[torch.Tensor] = None,
+    ):
         """
         Generates sine waves for the fundamental frequency and its harmonics.
 
@@ -178,6 +183,8 @@ class SineGenerator(torch.nn.Module):
 
         # Reshape to match the sine wave shape
         phase_increments = phase_increments.reshape(batch_size, -1, 1)
+        if phase is not None:
+            phase_increments = phase_increments + phase.reshape(-1, 1, 1)
 
         # Scale for harmonics
         harmonic_scale = torch.arange(
@@ -194,14 +201,21 @@ class SineGenerator(torch.nn.Module):
         sine_waves = torch.sin(2 * np.pi * phase_increments)
         return sine_waves
 
-    def forward(self, f0: torch.Tensor, upsampling_factor: int):
+    def forward(
+        self,
+        f0: torch.Tensor,
+        upsampling_factor: int,
+        phase: Optional[torch.Tensor] = None,
+        noise: Optional[torch.Tensor] = None,
+    ):
         with torch.no_grad():
             # Expand `f0` to include waveform dimensions
             f0 = f0.unsqueeze(-1)
 
             # Generate sine waves
             sine_waves = (
-                self._generate_sine_wave(f0, upsampling_factor) * self.sine_amplitude
+                self._generate_sine_wave(f0, upsampling_factor, phase)
+                * self.sine_amplitude
             )
 
             # Compute voiced/unvoiced mask
@@ -220,7 +234,9 @@ class SineGenerator(torch.nn.Module):
             )
 
             # Add Gaussian noise
-            noise = noise_amplitude * torch.randn_like(sine_waves)
+            if noise is None:
+                noise = torch.randn_like(sine_waves)
+            noise = noise_amplitude * noise
 
             # Combine sine waves and noise
             sine_waveforms = sine_waves * voiced_mask + noise

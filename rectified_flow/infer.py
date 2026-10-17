@@ -56,7 +56,7 @@ class RectifiedPipeline(Pipeline):
 
     @torch.inference_mode()
     def voice_conversion(self, model, net_g, sid, audio0, pitch, pitchf, index,
-                         big_npy, index_rate, version, protect, inference_rng=None, segment_start=0):
+                         index_rate, version, protect, inference_rng=None, segment_start=0):
         if self.vocoder_model is None:
             vocoder, _ = load_vocoder(self.resolved_vocoder_path(), self.data)
             self.vocoder_model = vocoder.to(self.device).float()
@@ -71,7 +71,7 @@ class RectifiedPipeline(Pipeline):
             raise ValueError(f'The flow expects {self.content_channels} content channels, got {content.shape[-1]}.')
         original = content
         if index is not None:
-            content = self._retrieve_speaker_embeddings(content, index, big_npy, index_rate)
+            content = self._retrieve_speaker_embeddings(content, index, index_rate)
             if protect < .5:
                 voiced = (pitchf > 0).float()
                 voiced = F.interpolate(voiced.unsqueeze(1), size=content.shape[1], mode='nearest').transpose(1, 2)
