@@ -1,14 +1,17 @@
 import os
 import pickle
 import queue
+import signal
 import struct
 import subprocess
 import sys
 import threading
+import traceback
 from pathlib import Path
 
 
 MAX_MESSAGE_BYTES = 64 << 20
+MAX_ERROR_BYTES = 16384
 START_TIMEOUT = 180
 PROCESS_TIMEOUT = 30
 
@@ -41,7 +44,17 @@ def _worker_environment(device):
     else:
         raise ValueError(f"Unsupported inference device: {device}")
     environment["PYTHONUNBUFFERED"] = "1"
+    environment["PYTHONFAULTHANDLER"] = "1"
     return environment
+
+
+def _memory_events():
+    try:
+        return {key: int(value) for key, value in (
+            line.split() for line in Path("/sys/fs/cgroup/memory.events").read_text().splitlines()
+        )}
+    except (OSError, ValueError):
+        return {}
 
 
 def _read_exact(stream, length):
@@ -79,17 +92,26 @@ class RealtimeWorker:
         self.device = device
         self.lock = threading.Lock()
         self.closed = threading.Event()
+        self.failed = threading.Event()
         self.responses = queue.Queue()
+        self.stage = "starting the inference worker"
+        self.error_lock = threading.Lock()
+        self.error_output = bytearray()
+        self.error_done = threading.Event()
+        self.memory_events = _memory_events()
         self.process_handle = subprocess.Popen(
             [sys.executable, "-u", "-m", "shared.tools.realtime_worker"],
             cwd=str(Path(__file__).resolve().parents[2]),
             env=_worker_environment(device),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             bufsize=0,
             creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
         )
         self.reader = threading.Thread(target=self._read_responses, name="realtime-worker-output", daemon=True)
+        self.error_reader = threading.Thread(target=self._read_errors, name="realtime-worker-errors", daemon=True)
+        self.error_reader.start()
         self.reader.start()
         try:
             self._call("load", settings, timeout=START_TIMEOUT)
@@ -100,23 +122,88 @@ class RealtimeWorker:
     def _read_responses(self):
         try:
             while True:
-                self.responses.put(_receive(self.process_handle.stdout))
+                response = _receive(self.process_handle.stdout)
+                if isinstance(response, dict) and isinstance(response.get("stage"), str):
+                    self.stage = response["stage"]
+                else:
+                    self.responses.put(response)
         except Exception as error:
-            self.responses.put({"ok": False, "error": str(error)})
+            self.failed.set()
+            self.responses.put({"ok": False, "error": str(error), "worker_exit": True})
+
+    def _read_errors(self):
+        try:
+            while True:
+                data = self.process_handle.stderr.read(4096)
+                if not data:
+                    return
+                with self.error_lock:
+                    self.error_output.extend(data)
+                    del self.error_output[:-MAX_ERROR_BYTES]
+                try:
+                    sys.stderr.write(data.decode("utf-8", errors="replace"))
+                    sys.stderr.flush()
+                except (OSError, ValueError, UnicodeError):
+                    pass
+        except (OSError, ValueError):
+            pass
+        finally:
+            self.error_done.set()
+
+    def _failure_message(self, reason, killed=False):
+        process = self.process_handle
+        try:
+            code = process.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            code = None
+        if code is not None:
+            self.error_done.wait(timeout=0.5)
+        message = f"Inference worker failed while {self.stage} on {self.device}. {reason}"
+        if code is not None:
+            if code < 0 and os.name != "nt":
+                try:
+                    status = signal.Signals(-code).name
+                except ValueError:
+                    status = f"signal {-code}"
+                message += f" Exit: {status} ({code})."
+            else:
+                message += f" Exit code: {code}."
+            if not killed and code == -getattr(signal, "SIGKILL", 9) and os.name != "nt":
+                events = _memory_events()
+                if events.get("oom_kill", 0) > self.memory_events.get("oom_kill", 0):
+                    message += " The container reported an out-of-memory kill. Check the instance's system RAM limit."
+                else:
+                    message += " The process was killed externally. Check system RAM limits and host logs."
+        with self.error_lock:
+            details = self.error_output.decode("utf-8", errors="replace").strip()
+        if details:
+            message += f"\nWorker output:\n{details}"
+        else:
+            message += "\nNo worker error output was captured."
+        return message
 
     def _call(self, command, payload=None, timeout=PROCESS_TIMEOUT):
         with self.lock:
             if self.closed.is_set():
                 raise RuntimeError("The inference worker was stopped.")
+            if self.failed.is_set():
+                raise RuntimeError(self._failure_message("The worker closed its response pipe."))
+            self.stage = {"load": "loading the model", "start": "warming up the model", "process": "converting audio", "update": "updating settings"}.get(command, command)
+            if command in {"load", "start"}:
+                self.memory_events = _memory_events()
             try:
                 _send(self.process_handle.stdin, (command, payload))
                 response = self.responses.get(timeout=timeout)
             except queue.Empty:
                 self.process_handle.kill()
-                raise RuntimeError(f"The inference worker timed out during {command}.") from None
+                self.failed.set()
+                raise RuntimeError(self._failure_message(f"Timed out after {timeout} seconds during {command}.", killed=True)) from None
             except (BrokenPipeError, OSError) as error:
-                raise RuntimeError("The inference worker disconnected. Check the server console.") from error
+                self.failed.set()
+                raise RuntimeError(self._failure_message(str(error))) from error
             if not response["ok"]:
+                if response.get("worker_exit"):
+                    raise RuntimeError(self._failure_message(response["error"]))
                 raise RuntimeError(response["error"])
             return response.get("result")
 
@@ -154,7 +241,8 @@ class RealtimeWorker:
             if acquired:
                 self.lock.release()
             self.reader.join(timeout=1)
-            for stream in (process.stdin, process.stdout):
+            self.error_reader.join(timeout=1)
+            for stream in (process.stdin, process.stdout, process.stderr):
                 if stream is not None:
                     stream.close()
 
@@ -174,12 +262,16 @@ def _run_worker():
             try:
                 result = None
                 if command == "load":
+                    _send(outgoing, {"stage": "importing PyTorch"})
                     import torch
+                    _send(outgoing, {"stage": "initializing CUDA"})
                     import shared.zluda
+                    _send(outgoing, {"stage": "importing inference modules"})
                     from rvc.infer.realtime_engine import RealtimeProcessor
 
                     torch.set_num_threads(max(1, min(4, os.cpu_count() or 1)))
                     processor = RealtimeProcessor()
+                    _send(outgoing, {"stage": "loading the voice model and embedder"})
                     _, beatrice_path = processor.load_model(payload)
                 elif command == "start":
                     processor.sample_rate = payload
@@ -202,8 +294,9 @@ def _run_worker():
                 else:
                     raise ValueError(f"Unknown inference worker command: {command}")
                 _send(outgoing, {"ok": True, "result": result})
-            except Exception as error:
-                _send(outgoing, {"ok": False, "error": str(error)})
+            except (Exception, SystemExit) as error:
+                traceback.print_exc(file=sys.stderr)
+                _send(outgoing, {"ok": False, "error": f"{type(error).__name__}: {error}"})
     except (EOFError, BrokenPipeError):
         pass
     finally:
