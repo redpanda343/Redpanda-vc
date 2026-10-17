@@ -63,7 +63,9 @@ REALTIME_JS = r"""
 const CHUNK_SECONDS = 0.04;
 const MAX_IN_FLIGHT = 2;
 const MAX_MERGE_SECONDS = 0.5;
-const MAX_QUEUED_SECONDS = 1.0;
+const MAX_QUEUED_SECONDS = 0.5;
+const MAX_SOCKET_SECONDS = 0.2;
+const SOCKET_HANDSHAKE_MS = 8000;
 const STORAGE_PREFIX = "redpanda-realtime-";
 const WORKLET = `
 class RedpandaRealtime extends AudioWorkletProcessor {
@@ -175,12 +177,17 @@ if (!window.redpandaRealtime) {
         source: null,
         stream: null,
         events: null,
+        socket: null,
+        socketTimer: null,
+        uploads: new Set(),
+        transport: "",
+        run: 0,
+        pendingStart: "",
         token: "",
         ready: false,
         queue: [],
         queued: 0,
         inFlight: 0,
-        offset: 0,
         captured: 0,
         captures: [],
         dropped: 0,
@@ -231,6 +238,7 @@ if (!window.redpandaRealtime) {
 
     const refreshDevices = async (ask) => {
         if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+        const run = state.run;
         try {
             let devices = await navigator.mediaDevices.enumerateDevices();
             if (ask && !devices.some((device) => device.kind === "audioinput" && device.label)) {
@@ -241,17 +249,18 @@ if (!window.redpandaRealtime) {
             fill(part("input"), devices.filter((device) => device.kind === "audioinput"), recall("input"));
             fill(part("output"), devices.filter((device) => device.kind === "audiooutput"), recall("output"));
         } catch (error) {
-            setStatus("Could not list audio devices: " + message(error));
+            if (state.run === run) setStatus("Could not list audio devices: " + message(error));
         }
     };
 
     const applySink = async () => {
         const select = part("output");
         if (!state.context || !canPickOutput() || !select) return;
+        const run = state.run;
         try {
             await state.context.setSinkId(select.value || "");
         } catch (error) {
-            setStatus("Could not switch the speaker: " + message(error));
+            if (state.run === run) setStatus("Could not switch the speaker: " + message(error));
         }
     };
 
@@ -278,27 +287,49 @@ if (!window.redpandaRealtime) {
     });
 
     const flush = () => {
-        const limit = Math.round(state.rate * MAX_MERGE_SECONDS);
-        while (state.inFlight < MAX_IN_FLIGHT && state.queue.length) {
+        if (!state.ready) return;
+        const socket = state.socket;
+        const websocket = state.transport === "websocket";
+        const limit = Math.min(65536, Math.round(state.rate * (websocket ? MAX_SOCKET_SECONDS : MAX_MERGE_SECONDS)));
+        const socketLimit = Math.max(8 + state.chunk * 2, Math.round(state.rate * MAX_SOCKET_SECONDS) * 2);
+        while (state.queue.length && (websocket || state.inFlight < MAX_IN_FLIGHT)) {
+            if (websocket && (!socket || socket.readyState !== WebSocket.OPEN || socket.bufferedAmount + 8 + state.queue[0].samples.length * 2 > socketLimit)) return;
             const parts = [state.queue.shift()];
-            let total = parts[0].length;
-            while (state.queue.length && total + state.queue[0].length <= limit) {
+            let total = parts[0].samples.length;
+            while (state.queue.length && total + state.queue[0].samples.length <= limit && parts[0].offset + total === state.queue[0].offset && (!websocket || socket.bufferedAmount + 8 + (total + state.queue[0].samples.length) * 2 <= socketLimit)) {
                 const part = state.queue.shift();
                 parts.push(part);
-                total += part.length;
+                total += part.samples.length;
             }
             state.queued -= total;
-            const pcm = new Int16Array(total);
-            let position = 0;
+            const offset = parts[0].offset;
+            const buffer = new ArrayBuffer(total * 2 + (websocket ? 8 : 0));
+            const view = new DataView(buffer);
+            let position = websocket ? 8 : 0;
+            if (websocket) {
+                view.setUint32(0, offset >>> 0, true);
+                view.setUint32(4, Math.floor(offset / 4294967296), true);
+            }
             for (const part of parts) {
-                for (let index = 0; index < part.length; index++) {
-                    const value = Math.max(-1, Math.min(1, part[index]));
-                    pcm[position++] = value < 0 ? value * 32768 : value * 32767;
+                for (let index = 0; index < part.samples.length; index++) {
+                    const value = Math.max(-1, Math.min(1, part.samples[index]));
+                    view.setInt16(position, value < 0 ? value * 32768 : value * 32767, true);
+                    position += 2;
                 }
             }
-            const offset = state.offset;
+            if (websocket) {
+                try {
+                    socket.send(buffer);
+                } catch (error) {
+                    fail("Stopped: " + message(error));
+                    return;
+                }
+                continue;
+            }
             const token = state.token;
-            state.offset += total;
+            const run = state.run;
+            const controller = new AbortController();
+            state.uploads.add(controller);
             state.inFlight += 1;
             fetch(state.audioUrl, {
                 method: "POST",
@@ -307,13 +338,20 @@ if (!window.redpandaRealtime) {
                     "X-Realtime-Token": token,
                     "X-Realtime-Offset": String(offset),
                 },
-                body: pcm.buffer,
+                body: buffer,
                 credentials: "same-origin",
                 cache: "no-store",
+                signal: controller.signal,
             })
-                .catch(() => {})
+                .then((response) => {
+                    if (!response.ok) throw new Error("audio upload failed (" + response.status + ").");
+                })
+                .catch((error) => {
+                    if (state.run === run && !controller.signal.aborted) fail("Stopped: " + message(error));
+                })
                 .finally(() => {
-                    if (state.token === token) {
+                    state.uploads.delete(controller);
+                    if (state.run === run) {
                         state.inFlight -= 1;
                         flush();
                     }
@@ -322,16 +360,16 @@ if (!window.redpandaRealtime) {
     };
 
     const onCapture = (samples) => {
+        const offset = state.captured;
         state.captured += samples.length;
         state.captures.push([state.captured, performance.now()]);
         if (state.captures.length > 400) state.captures.shift();
-        state.queue.push(samples);
+        state.queue.push({ samples, offset });
         state.queued += samples.length;
         const limit = Math.round(state.rate * MAX_QUEUED_SECONDS);
         while (state.queued > limit && state.queue.length > 1) {
             const dropped = state.queue.shift();
-            state.queued -= dropped.length;
-            state.offset += dropped.length;
+            state.queued -= dropped.samples.length;
             state.dropped += 1;
         }
         flush();
@@ -348,20 +386,11 @@ if (!window.redpandaRealtime) {
         }
     };
 
-    const onAudio = (event) => {
+    const playAudio = (index, view, start) => {
         if (!state.node) return;
-        const text = event.data;
-        const space = text.indexOf(" ");
-        const index = Number(text.slice(0, space));
-        const binary = atob(text.slice(space + 1));
-        const bytes = new Uint8Array(binary.length);
-        for (let position = 0; position < binary.length; position++) {
-            bytes[position] = binary.charCodeAt(position);
-        }
-        const pcm = new Int16Array(bytes.buffer);
-        const samples = new Float32Array(pcm.length);
-        for (let position = 0; position < pcm.length; position++) {
-            samples[position] = pcm[position] / 32768;
+        const samples = new Float32Array((view.byteLength - start) / 2);
+        for (let position = 0; position < samples.length; position++) {
+            samples[position] = view.getInt16(start + position * 2, true) / 32768;
         }
         state.node.port.postMessage({ type: "audio", samples }, [samples.buffer]);
         const sample = (index + 1) * state.block;
@@ -369,12 +398,37 @@ if (!window.redpandaRealtime) {
         if (state.captures.length) state.rtt = performance.now() - state.captures[0][1];
     };
 
+    const release = (token) => {
+        if (!token) return;
+        fetch(endpoint("realtime/stop").toString(), {
+            method: "POST",
+            headers: { "X-Realtime-Token": token },
+            credentials: "same-origin",
+            cache: "no-store",
+            keepalive: true,
+        }).catch(() => {});
+    };
+
     const stop = () => {
+        state.run += 1;
+        state.pendingStart = "";
         const events = state.events;
+        const socket = state.socket;
+        const token = state.token;
         state.events = null;
+        state.socket = null;
+        clearTimeout(state.socketTimer);
+        state.socketTimer = null;
+        state.transport = "";
         state.ready = false;
         state.token = "";
         if (events) events.close();
+        if (socket) socket.close();
+        release(token);
+        state.uploads.forEach((controller) => controller.abort());
+        state.uploads.clear();
+        state.queue = [];
+        state.queued = 0;
         if (state.source) state.source.disconnect();
         if (state.node) {
             state.node.port.onmessage = null;
@@ -393,6 +447,126 @@ if (!window.redpandaRealtime) {
         setStatus(text);
     };
 
+    const control = (info) => {
+        if (info.type === "status") {
+            setStatus(info.message);
+        } else if (info.type === "ready") {
+            state.block = info.block;
+            state.delay = info.delay;
+            state.ready = true;
+            setStatus("Running at " + state.rate / 1000 + " kHz" + (info.device ? " on " + info.device : "") + ". Use headphones so the converted voice does not reach the microphone.");
+        } else if (info.type === "stats") {
+            state.server = info;
+            renderStats();
+        } else if (info.type === "failure") {
+            fail("Stopped: " + info.message);
+        }
+    };
+
+    const openFallback = (token, run) => {
+        if (state.run !== run || state.events) return;
+        state.transport = "http";
+        const url = endpoint("realtime/stream");
+        url.searchParams.set("token", token);
+        url.searchParams.set("rate", String(state.rate));
+        const events = new EventSource(url.toString());
+        state.events = events;
+        const active = () => state.run === run && state.events === events;
+        ["status", "ready", "stats", "failure"].forEach((type) => {
+            events.addEventListener(type, (event) => {
+                if (!active()) return;
+                try {
+                    control({ ...JSON.parse(event.data), type });
+                } catch (error) {
+                    fail("Stopped: invalid server response.");
+                }
+            });
+        });
+        events.addEventListener("audio", (event) => {
+            if (!active()) return;
+            try {
+                const space = event.data.indexOf(" ");
+                const index = Number(event.data.slice(0, space));
+                const binary = atob(event.data.slice(space + 1));
+                const bytes = new Uint8Array(binary.length);
+                for (let position = 0; position < binary.length; position++) bytes[position] = binary.charCodeAt(position);
+                if (space < 0 || !Number.isSafeInteger(index) || bytes.length % 2) throw new Error("invalid audio");
+                playAudio(index, new DataView(bytes.buffer), 0);
+            } catch (error) {
+                fail("Stopped: invalid audio from the server.");
+            }
+        });
+        events.onerror = () => {
+            if (active()) fail(state.ready ? "Stopped: the connection to the server was lost." : "Could not start real-time conversion.");
+        };
+    };
+
+    const openSocket = (token, run) => {
+        let accepted = false;
+        let socket;
+        const fallback = () => {
+            if (state.run !== run || state.socket !== socket) return;
+            clearTimeout(state.socketTimer);
+            state.socketTimer = null;
+            state.socket = null;
+            socket.close();
+            if (accepted) {
+                fail("Stopped: the connection to the server was lost.");
+            } else {
+                openFallback(token, run);
+            }
+        };
+        try {
+            const url = endpoint("realtime/ws");
+            url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+            socket = new WebSocket(url.toString());
+            socket.binaryType = "arraybuffer";
+            state.socket = socket;
+            state.transport = "websocket";
+            state.socketTimer = setTimeout(fallback, SOCKET_HANDSHAKE_MS);
+            const active = () => state.run === run && state.socket === socket;
+            socket.onopen = () => {
+                if (!active()) return;
+                try {
+                    socket.send(JSON.stringify({ token, rate: state.rate }));
+                } catch (error) {
+                    fallback();
+                }
+            };
+            socket.onmessage = (event) => {
+                if (!active()) return;
+                try {
+                    if (typeof event.data === "string") {
+                        const info = JSON.parse(event.data);
+                        if (info.type === "accepted") {
+                            accepted = true;
+                            clearTimeout(state.socketTimer);
+                            state.socketTimer = null;
+                        } else if (accepted || info.type === "failure") {
+                            control(info);
+                        }
+                    } else if (accepted && event.data instanceof ArrayBuffer) {
+                        const view = new DataView(event.data);
+                        if (view.byteLength < 8 || view.byteLength % 2) throw new Error("invalid audio");
+                        const index = view.getUint32(0, true) + view.getUint32(4, true) * 4294967296;
+                        if (!Number.isSafeInteger(index)) throw new Error("invalid audio index");
+                        playAudio(index, view, 8);
+                    }
+                } catch (error) {
+                    fail("Stopped: invalid server response.");
+                }
+            };
+            socket.onerror = fallback;
+            socket.onclose = fallback;
+        } catch (error) {
+            if (socket) {
+                fallback();
+            } else {
+                openFallback(token, run);
+            }
+        }
+    };
+
     const unlock = () => {
         try {
             if (!state.context || state.context.state === "closed") {
@@ -401,6 +575,22 @@ if (!window.redpandaRealtime) {
             }
             state.context.resume();
         } catch (error) {}
+    };
+
+    const beginStart = () => {
+        stop();
+        state.pendingStart = Date.now().toString(36) + "-" + Math.random().toString(36).slice(2);
+        unlock();
+        setStatus("Preparing real-time conversion...");
+        return state.pendingStart;
+    };
+
+    const finishStart = (token, seconds, request) => {
+        if (state.pendingStart !== request) {
+            release(token);
+            return;
+        }
+        start(token, seconds);
     };
 
     const setBuffer = (seconds) => {
@@ -414,10 +604,12 @@ if (!window.redpandaRealtime) {
         if (!token) return;
         stop();
         if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+            release(token);
             setStatus("The browser only allows the microphone on HTTPS pages or on localhost. Open the share link or http://127.0.0.1 instead.");
             return;
         }
         state.token = token;
+        const run = state.run;
         try {
             unlock();
             const context = state.context;
@@ -433,18 +625,20 @@ if (!window.redpandaRealtime) {
                     channelCount: 1,
                 },
             });
-            if (state.token !== token) {
+            if (state.run !== run) {
                 stream.getTracks().forEach((track) => track.stop());
                 return;
             }
             state.stream = stream;
             refreshDevices(false);
             await applySink();
+            if (state.run !== run) return;
             if (state.module !== context) {
                 if (!state.workletUrl) {
                     state.workletUrl = URL.createObjectURL(new Blob([WORKLET], { type: "application/javascript" }));
                 }
                 await context.audioWorklet.addModule(state.workletUrl);
+                if (state.run !== run) return;
                 state.module = context;
             }
             state.rate = context.sampleRate;
@@ -452,7 +646,6 @@ if (!window.redpandaRealtime) {
             state.queue = [];
             state.queued = 0;
             state.inFlight = 0;
-            state.offset = 0;
             state.captured = 0;
             state.captures = [];
             state.dropped = 0;
@@ -467,37 +660,16 @@ if (!window.redpandaRealtime) {
                 outputChannelCount: [2],
                 processorOptions: { chunk: state.chunk, capacity: Math.round(state.rate * 4), ...bufferOptions(state.buffer) },
             });
-            state.node.port.onmessage = onWorklet;
+            state.node.port.onmessage = (event) => {
+                if (state.run === run) onWorklet(event);
+            };
             state.source = context.createMediaStreamSource(stream);
             state.source.connect(state.node);
             state.node.connect(context.destination);
             state.audioUrl = endpoint("realtime/audio").toString();
-            const url = endpoint("realtime/stream");
-            url.searchParams.set("token", token);
-            url.searchParams.set("rate", String(state.rate));
-            const events = new EventSource(url.toString());
-            state.events = events;
-            events.addEventListener("status", (event) => setStatus(JSON.parse(event.data).message));
-            events.addEventListener("ready", (event) => {
-                const info = JSON.parse(event.data);
-                state.block = info.block;
-                state.delay = info.delay;
-                state.ready = true;
-                setStatus("Running at " + state.rate / 1000 + " kHz. Use headphones so the converted voice does not reach the microphone.");
-            });
-            events.addEventListener("audio", onAudio);
-            events.addEventListener("stats", (event) => {
-                state.server = JSON.parse(event.data);
-                renderStats();
-            });
-            events.addEventListener("failure", (event) => fail("Stopped: " + JSON.parse(event.data).message));
-            events.onerror = () => {
-                if (state.events === events) {
-                    fail(state.ready ? "Stopped: the connection to the server was lost." : "Could not start real-time conversion.");
-                }
-            };
+            openSocket(token, run);
         } catch (error) {
-            fail("Could not start: " + message(error));
+            if (state.run === run) fail("Could not start: " + message(error));
         }
     };
 
@@ -528,7 +700,8 @@ if (!window.redpandaRealtime) {
         if (state.ready) setStatus("Running");
     };
 
-    window.redpandaRealtime = { attach, unlock, start, stop, setBuffer };
+    window.addEventListener("pagehide", () => stop());
+    window.redpandaRealtime = { attach, unlock, beginStart, finishStart, start, stop, setBuffer };
 }
 window.redpandaRealtime.attach(element);
 """
@@ -559,6 +732,9 @@ def start_realtime(
     lookahead_time,
     seamless,
     cached_context,
+    inference_device,
+    previous_token,
+    start_request,
     request: gr.Request,
 ):
     if not model:
@@ -582,6 +758,7 @@ def start_realtime(
         "lookahead_time": float(lookahead_time),
         "seamless": bool(seamless),
         "cached_context": bool(cached_context),
+        "inference_device": inference_device or "auto",
         "safety_buffer": 0.0,
         "threshold": int(threshold),
         "rms_mix_rate": float(rms_mix_rate),
@@ -592,7 +769,7 @@ def start_realtime(
         "passthrough": False,
     }
     try:
-        return realtime_server.create_session(_user(request), settings)
+        return realtime_server.create_session(_user(request), settings, previous_token=previous_token), start_request
     except Exception as error:
         raise gr.Error(str(error))
 
@@ -644,6 +821,15 @@ def realtime_tab(model_file, index_file, rectified_vocoder_path):
         start_button = gr.Button(i18n("Start"), variant="primary")
         stop_button = gr.Button(i18n("Stop"))
     token = gr.Textbox(visible=False)
+    start_request = gr.Textbox(visible=False)
+    inference_device = gr.Dropdown(
+        label=i18n("Inference Device"),
+        choices=[(i18n("Automatic"), "auto")]
+        + [(device["label"], device["value"]) for device in realtime_server.realtime_devices()],
+        value="auto",
+        info=i18n("Automatic spreads concurrent sessions across GPUs. Each stream stays on one GPU to keep audio blocks in order."),
+        interactive=True,
+    )
     with gr.Row():
         pitch = gr.Slider(
             minimum=-24,
@@ -722,7 +908,7 @@ def realtime_tab(model_file, index_file, rectified_vocoder_path):
                 step=0.01,
                 value=0.2,
                 label=i18n("Block Time"),
-                info=i18n("Seconds of audio per step. Lower is less delay but more GPU load and more network requests."),
+                info=i18n("Seconds of audio per step. Lower is less delay but more GPU load."),
                 interactive=True,
             )
             buffer_time = gr.Slider(
@@ -777,7 +963,7 @@ def realtime_tab(model_file, index_file, rectified_vocoder_path):
             )
     gr.Markdown(
         i18n(
-            "Block Time, Crossfade, Extra Context, Lookahead, the embedder, the speaker and the toggles above them apply on the next Start. Pitch, Index Rate, the pitch algorithm and the Audio settings apply while running."
+            "Inference Device, Block Time, Crossfade, Extra Context, Lookahead, the embedder, the speaker and the toggles above them apply on the next Start. Pitch, Index Rate, the pitch algorithm and the Audio settings apply while running."
         )
     )
 
@@ -804,14 +990,17 @@ def realtime_tab(model_file, index_file, rectified_vocoder_path):
             lookahead_time,
             seamless,
             cached_context,
+            inference_device,
+            token,
+            start_request,
         ],
-        outputs=[token],
-        js="(...args) => { window.redpandaRealtime && window.redpandaRealtime.unlock(); return args; }",
+        outputs=[token, start_request],
+        js="(...args) => { if (window.redpandaRealtime) args[args.length - 1] = window.redpandaRealtime.beginStart(); return args; }",
     ).success(
         fn=None,
-        inputs=[token, buffer_time],
+        inputs=[token, buffer_time, start_request],
         outputs=None,
-        js="(token, buffer) => { window.redpandaRealtime && window.redpandaRealtime.start(token, buffer); }",
+        js="(token, buffer, request) => { window.redpandaRealtime && window.redpandaRealtime.finishStart(token, buffer, request); }",
     )
     stop_button.click(
         fn=stop_realtime,

@@ -10,6 +10,10 @@ The Rectified Flow model uses the same architecture as [DiffSinger](https://gith
 
 The realtime GUI (`run-realtime-gui.bat`) supports RVC, Beatrice and Rectified Flow models.
 
+The WebUI realtime tab supports multiple GPUs through isolated inference workers. Set Inference Device to Automatic to assign each new stream to an available GPU, or select a specific GPU. Separate browser tabs or users can run streams on different GPUs. Each stream stays on one GPU to preserve its audio state; additional GPUs increase concurrent capacity. Beatrice uses the CPU.
+
+Browser realtime audio uses a binary WebSocket connection, including with `--share`, and falls back to HTTP streaming when WebSockets are unavailable. Audio queues are bounded to avoid accumulating delay on slow connections. Install the updated requirements before launching.
+
 ## Credits
 
 - [DiffSinger](https://github.com/openvpi/DiffSinger)
