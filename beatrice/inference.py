@@ -7,6 +7,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from shared.pitch_map import PitchMap
+
 VERSION = '2.0.0-rc.0'
 IN_SAMPLE_RATE = 16000
 OUT_SAMPLE_RATE = 24000
@@ -32,6 +34,14 @@ FILTER_FFT = 768
 PHONE_LOOKAHEAD = 40
 HISTORY = 2 * IN_HOP + (PITCH_WINDOW - IN_HOP) // 2
 LATENCY_SECONDS = 0.0375
+
+
+def pitch_bins(band):
+    if band is None:
+        return None
+    low = max(1, math.floor(BINS_PER_OCTAVE * math.log2(band[0] / PITCH_BASE_HZ)))
+    high = min(PITCH_BINS - 1, math.ceil(BINS_PER_OCTAVE * math.log2(band[1] / PITCH_BASE_HZ)))
+    return (low, high) if high - low >= 2 * PITCH_BAND else None
 
 
 def is_beatrice_checkpoint(path):
@@ -285,12 +295,15 @@ class PitchEstimator:
         difference = self.correlation_embed[1](F.gelu(self.correlation_embed[0](difference), approximate='tanh'))
         return self.head(self.backbone(F.gelu(instfreq + difference, approximate='tanh'))).softmax(-1)
 
-    def __call__(self, instfreq, difference):
+    def __call__(self, instfreq, difference, bins=None):
         probabilities = self.probabilities(instfreq, difference)
         unvoiced = probabilities[:, 0].clone()
         probabilities[:, 0] = -100.0
         band = probabilities.unfold(1, PITCH_BAND, 1).sum(-1)
-        top = band.argmax(1)
+        if bins is None:
+            top = band.argmax(1)
+        else:
+            top = band[:, bins[0]:bins[1] - PITCH_BAND + 2].argmax(1) + bins[0]
         top_probability = band.gather(1, top[:, None])[:, 0] + 1e-6
         half = band.gather(1, (top - BINS_PER_OCTAVE).clamp(min=1)[:, None])[:, 0]
         half = torch.where(top <= BINS_PER_OCTAVE, 0.0, half)
@@ -313,7 +326,7 @@ class BeatriceModel:
         self.hann = torch.hann_window(2 * OUT_HOP, device=self.device)
         self.ir_bins = torch.arange(IR_LENGTH // 2 + 1, device=self.device) * (-2.0 * math.pi / IR_LENGTH)
         self.ir_offsets = torch.arange(IR_LENGTH, device=self.device)
-        self.pitch_shift = 0.0
+        self.pitch_map = PitchMap()
         self.vq_neighbors = 0
         self.set_speaker(0)
         self.set_formant_shift(0.0)
@@ -384,8 +397,15 @@ class BeatriceModel:
         self.formant_shift = min(max(float(semitones), -2.0), 2.0)
         self.formant_index = int(round(self.formant_shift * 2.0 + 4.0))
 
+    @property
+    def pitch_shift(self):
+        return self.pitch_map.semitones
+
     def set_pitch_shift(self, semitones):
-        self.pitch_shift = min(max(float(semitones), -24.0), 24.0)
+        self.pitch_map.configure(pitch=min(max(float(semitones), -24.0), 24.0))
+
+    def set_pitch(self, pitch=0.0, **options):
+        self.pitch_map.configure(pitch=min(max(float(pitch), -24.0), 24.0), **options)
 
     def set_vq_neighbors(self, count):
         self.vq_neighbors = min(max(int(count), 0), 8)
@@ -470,8 +490,15 @@ class BeatriceModel:
         offset = HISTORY - PHONE_LOOKAHEAD
         phones = self._phones(self.audio[offset:offset + IN_HOP * (frames - 1) + 240])
         instfreq, difference, loudness = self.pitch_estimator.inputs(self.audio, frames)
-        quantized, pitch_features = self.pitch_estimator(instfreq, difference)
-        quantized = (quantized + round(self.pitch_shift * BINS_PER_OCTAVE / 12)).clamp(1, PITCH_BINS - 1)
+        pitch_map = self.pitch_map
+        quantized, pitch_features = self.pitch_estimator(instfreq, difference, pitch_bins(pitch_map.band()))
+        source_hertz = PITCH_BASE_HZ * 2.0 ** (quantized.float() / BINS_PER_OCTAVE)
+        pitch_map.observe(torch.where(pitch_features[0] < 0.5, source_hertz, 0.0).cpu().numpy())
+        if pitch_map.plain:
+            quantized = (quantized + round(pitch_map.semitones * BINS_PER_OCTAVE / 12)).clamp(1, PITCH_BINS - 1)
+        else:
+            mapped = torch.from_numpy(pitch_map.apply(source_hertz.cpu().numpy())).to(self.device)
+            quantized = (BINS_PER_OCTAVE * torch.log2(mapped / PITCH_BASE_HZ)).round().long().clamp(1, PITCH_BINS - 1)
         features = torch.cat([loudness[None], pitch_features]).T
         x = (self.embed_phone(phones) + self.embed_pitch[quantized] + self.embed_pitch_features(features)
              + self.additive_speakers[self.speaker] + self.formant_embeddings[self.formant_index])

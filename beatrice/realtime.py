@@ -53,10 +53,11 @@ class StreamResampler:
 
 
 class BeatriceRealtime:
-    def __init__(self, model_path, stream_rate, device='cpu', speaker=0, pitch=0.0, formant=0.0, vq_neighbors=0):
+    def __init__(self, model_path, stream_rate, device='cpu', speaker=0, pitch=0.0, formant=0.0, vq_neighbors=0,
+                 **pitch_options):
         self.model = BeatriceModel(model_path, device)
         self.model.set_speaker(speaker)
-        self.model.set_pitch_shift(pitch)
+        self.model.set_pitch(pitch, **pitch_options)
         self.model.set_formant_shift(formant)
         self.model.set_vq_neighbors(vq_neighbors)
         self.stream_rate = int(stream_rate)
@@ -73,6 +74,7 @@ class BeatriceRealtime:
 
     def reset(self):
         self.model.reset()
+        self.model.pitch_map.reset()
         self.input_resampler.reset()
         self.output_resampler.reset()
         self.pending = np.zeros(0, dtype=np.float32)

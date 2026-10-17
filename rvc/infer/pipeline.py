@@ -89,6 +89,7 @@ class Pipeline:
         pitch: int = 0,
         f0_decoder=None,
         f0_network=None,
+        f0_band=None,
     ):
         """
         Estimates the fundamental frequency (F0) of a given audio signal using various methods.
@@ -99,6 +100,7 @@ class Pipeline:
             pitch: Key to adjust the pitch of the F0 contour.
             f0_method: Method to use for F0 estimation (e.g., "pm", "rmvpe").
         """
+        f0_min, f0_max = (self.f0_min, self.f0_max) if f0_band is None else f0_band
         if f0_method == "pm":
             f0 = extract_pm(
                 audio=x,
@@ -106,8 +108,8 @@ class Pipeline:
                 p_len=p_len,
                 time_step=self.time_step / 1000,
                 voicing_threshold=0.6,
-                pitch_floor=self.f0_min,
-                pitch_ceiling=self.f0_max,
+                pitch_floor=f0_min,
+                pitch_ceiling=f0_max,
             )
         elif f0_method == "rmvpe":
             if not hasattr(self, "model_rmvpe"):
@@ -126,7 +128,10 @@ class Pipeline:
                     sample_rate=self.sample_rate,
                     hop_size=self.window,
                 )
-            f0 = self.model_swift.get_f0(x, p_len)
+            if f0_band is None:
+                f0 = self.model_swift.get_f0(x, p_len)
+            else:
+                f0 = self.model_swift.get_f0(x, p_len, f0_min=f0_min, f0_max=f0_max)
         elif f0_method == "beatrice":
             if not hasattr(self, "model_beatrice"):
                 self.model_beatrice = BeatricePitch(

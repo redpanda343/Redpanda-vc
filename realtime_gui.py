@@ -60,6 +60,7 @@ from noisereduce.torchgate.utils import amp_to_db
 from beatrice.inference import OUT_SAMPLE_RATE, find_paraphernalia, is_beatrice_checkpoint
 from beatrice.realtime import BeatriceRealtime
 from rvc.infer.realtime import RealTimeRVC
+from shared.pitch_map import pitch_options
 from shared.platform import migrate_models_folder
 
 
@@ -68,6 +69,8 @@ migrate_models_folder(ROOT)
 CONFIG_PATH = ROOT / "assets" / "realtime_config.json"
 BEATRICE_BLOCK_TIME = 0.02
 BEATRICE_THREADS = 1
+MAX_CROSSFADE_TIME = 0.1
+MAX_SAFETY_BUFFER = 0.2
 MONITOR_DISABLED = "Disabled"
 MAIN_HOST_APIS = ("ASIO", "Windows WASAPI")
 EMBEDDERS = ("contentvec", "spin-v2")
@@ -156,6 +159,7 @@ class AudioFrameFifo:
         self.channels = int(channels)
         self.max_frames = None if max_frames is None else int(max_frames)
         self.prefill = 0
+        self.dropouts = 0
         self.fade = 0
         self.trim_threshold = 0
         self._chunks = deque()
@@ -200,6 +204,8 @@ class AudioFrameFifo:
                 return None
             take = min(int(frames), self._frames)
             if take < int(frames):
+                if not self._starved:
+                    self.dropouts += 1
                 self._starved = True
             if take <= 0:
                 return None
@@ -326,7 +332,6 @@ class AudioEngine:
                 model_path=settings["model_path"],
                 index_path=settings["index_path"],
                 index_rate=settings["index_rate"],
-                pitch=settings["pitch"],
                 speaker_id=settings["speaker_id"],
                 embedder_model=settings["embedder_model"],
                 rectified_vocoder_path=settings.get("rectified_vocoder_path", ""),
@@ -335,6 +340,7 @@ class AudioEngine:
                 lookahead_frames=round(settings.get("lookahead_time", 0.0) * 100),
                 seamless=settings.get("seamless", False),
                 cached_context=settings.get("cached_context", False),
+                **pitch_options(settings),
             )
             model_rate = self.rvc.sample_rate
             self.device = self.rvc.device
@@ -379,20 +385,20 @@ class AudioEngine:
                 beatrice_path,
                 self.sample_rate,
                 speaker=settings["speaker_id"],
-                pitch=settings["pitch"],
                 formant=settings["formant_shift"],
                 vq_neighbors=settings["vq_neighbors"],
+                **pitch_options(settings),
             )
         self._prewarm()
         self.reported_statuses = set()
         self.asio_callback_frames = 0
-        self.prefill_margin = max(self.block_frame // 4, self.zc)
-        self.output_fifo = AudioFrameFifo(1, max_frames=self.block_frame * 4)
+        self.prefill_margin = max(self.block_frame // 4, self.zc) + self.safety_frame
+        self.output_fifo = AudioFrameFifo(1, max_frames=self.block_frame * 4 + self.safety_frame)
         self._drain(self.output_fifo)
         if self.output_selectors or self.input_selectors:
             self._resize_asio_fifo(self.output_fifo)
         else:
-            self.output_fifo.prefill = min(self.block_frame, self.sola_buffer_frame)
+            self.output_fifo.prefill = min(self.block_frame, self.sola_buffer_frame) + self.safety_frame
         self.dry_gains = dict.fromkeys(("output", "monitor"), float(settings["passthrough"]))
         self.direct_history = np.zeros(4 * self.zc, dtype=np.float32)
         self.direct_gate_gain = 1.0
@@ -530,8 +536,9 @@ class AudioEngine:
             self.crossfade_frame = self.zc
         else:
             self.crossfade_frame = min(
-                int(np.round(settings["crossfade_time"] * rate / self.zc)) * self.zc, 2 * self.zc
+                int(np.round(settings["crossfade_time"] * rate / self.zc)) * self.zc, self.block_frame
             )
+        self.safety_frame = int(np.round(settings.get("safety_buffer", 0.0) * rate / self.zc)) * self.zc
         self.sola_buffer_frame = self.crossfade_frame
         self.sola_search_frame = 0 if self.rvc is not None and self.rvc.seamless else self.zc
         self.extra_frame = int(np.round(settings["extra_time"] * rate / self.zc)) * self.zc
@@ -618,12 +625,12 @@ class AudioEngine:
         if self.monitor_device is None:
             return
         try:
-            self.monitor_queue = AudioFrameFifo(1, max_frames=self.block_frame * 4)
+            self.monitor_queue = AudioFrameFifo(1, max_frames=self.block_frame * 4 + self.safety_frame)
             self._drain(self.monitor_queue)
             if self.input_selectors:
                 self._resize_asio_fifo(self.monitor_queue)
             else:
-                self.monitor_queue.prefill = min(self.block_frame, self.sola_buffer_frame)
+                self.monitor_queue.prefill = min(self.block_frame, self.sola_buffer_frame) + self.safety_frame
             self.direct_monitor = self._direct_fifo(self.monitor_selectors)
             self.monitor_stream = sd.OutputStream(
                 device=self.monitor_device,
@@ -817,11 +824,22 @@ class AudioEngine:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def update_pitch(self, pitch):
+    def update_pitch(self, options):
         if self.beatrice is not None:
-            self.beatrice.model.set_pitch_shift(pitch)
+            self.beatrice.model.set_pitch(**options)
         elif self.rvc is not None:
-            self.rvc.change_pitch(pitch)
+            self.rvc.change_pitch(**options)
+
+    @property
+    def dropouts(self):
+        fifo = self.output_fifo
+        return 0 if fifo is None else fifo.dropouts
+
+    @property
+    def voice_hz(self):
+        beatrice, rvc = self.beatrice, self.rvc
+        model = beatrice.model if beatrice is not None else rvc
+        return None if model is None else model.pitch_map.voice_hz
 
     def update_index_rate(self, index_rate):
         if self.rvc is not None:
@@ -1139,7 +1157,7 @@ class RealtimeGUI:
         self._load_devices()
         self._refresh_states()
         for variable in (
-            self.pitch, self.index_rate, self.rms_mix_rate, self.threshold, self.f0_method,
+            self.pitch, self.dataset_hz, self.pitch_range, self.index_rate, self.rms_mix_rate, self.threshold, self.f0_method,
             self.passthrough, self.speaker_id, self.formant_shift, self.vq_neighbors,
             self.input_gain_db, self.output_gain_db, self.monitor_gain_db,
             self.input_noise_reduce, self.output_noise_reduce,
@@ -1185,6 +1203,8 @@ class RealtimeGUI:
         self.exclusive_input = tk.BooleanVar(value=value.get("exclusive_input", legacy_exclusive))
         self.exclusive_output = tk.BooleanVar(value=value.get("exclusive_output", legacy_exclusive))
         self.pitch = tk.IntVar(value=value.get("pitch", 0))
+        self.dataset_hz = tk.IntVar(value=value.get("dataset_hz", 0))
+        self.pitch_range = tk.IntVar(value=value.get("pitch_range", 12))
         self.speaker_id = tk.IntVar(value=value.get("speaker_id", 0))
         self.index_rate = tk.DoubleVar(value=value.get("index_rate", 0.0))
         self.rms_mix_rate = tk.DoubleVar(value=value.get("rms_mix_rate", 0.0))
@@ -1204,7 +1224,8 @@ class RealtimeGUI:
         }
         self.block_kind = "rvc"
         self.block_time = tk.DoubleVar(value=self.block_times["rvc"])
-        self.crossfade_time = tk.DoubleVar(value=min(value.get("crossfade_time", 0.01), 0.02))
+        self.crossfade_time = tk.DoubleVar(value=min(value.get("crossfade_time", 0.01), MAX_CROSSFADE_TIME))
+        self.safety_buffer = tk.DoubleVar(value=value.get("safety_buffer", 0.0))
         self.extra_time = tk.DoubleVar(value=value.get("extra_time", 3.0))
         self.lookahead_time = tk.DoubleVar(value=value.get("lookahead_time", 0.0))
         self.seamless = tk.BooleanVar(value=value.get("seamless", False))
@@ -1424,21 +1445,41 @@ class RealtimeGUI:
 
     def _build_voice(self, parent):
         frame = self._card(parent, "Voice")
-        self._slider(frame, 0, "Pitch", self.pitch, -24, 24, 1, tooltip="Shift in semitones. +12 is one octave up.")
+        self._slider(
+            frame, 0, "Pitch", self.pitch, -24, 24, 1,
+            tooltip="Shift in semitones. +12 is one octave up. The stats line shows your own average pitch as "
+                    "Voice; 12 × log2(dataset Hz ÷ Voice) is the shift that lands on the dataset average.",
+        )
+        dataset_label = ttk.Label(frame, text="Dataset")
+        dataset_label.grid(row=1, column=0, sticky="w", padx=(0, 12), pady=3)
+        Tooltip(dataset_label, "Average pitch of the model's training data in Hz, and how many semitones around "
+                               "it the output may reach. Pitch is then only tracked where it can land inside "
+                               "that range after the Pitch shift, which removes octave errors, and output past "
+                               "the range is softly limited instead of reaching pitches the model never learned. "
+                               "0 Hz turns this off.")
+        dataset = ttk.Frame(frame)
+        dataset.grid(row=1, column=1, columnspan=2, sticky="w", pady=3)
+        ttk.Spinbox(dataset, from_=0, to=1100, increment=1, textvariable=self.dataset_hz, width=6).pack(side="left")
+        ttk.Label(dataset, text="Hz", style="Muted.TLabel").pack(side="left", padx=(6, 16))
+        ttk.Label(dataset, text="Range ±").pack(side="left")
+        ttk.Spinbox(dataset, from_=1, to=36, increment=1, textvariable=self.pitch_range, width=4).pack(
+            side="left", padx=(6, 0)
+        )
+        ttk.Label(dataset, text="st", style="Muted.TLabel").pack(side="left", padx=(6, 0))
         self.rvc_widgets.update(self._slider(
-            frame, 1, "Index rate", self.index_rate, 0, 1, 0.01,
+            frame, 2, "Index rate", self.index_rate, 0, 1, 0.01,
             tooltip="How strongly the feature index pulls the voice toward the training data.",
         ))
         self.rvc_widgets.update(self._slider(
-            frame, 2, "RMS mix", self.rms_mix_rate, 0, 1, 0.01,
+            frame, 3, "RMS mix", self.rms_mix_rate, 0, 1, 0.01,
             tooltip="0 follows your input loudness, 1 keeps the model's own loudness.",
         ))
         self._slider(
-            frame, 3, "Noise gate", self.threshold, -60, 0, 1,
+            frame, 4, "Noise gate", self.threshold, -60, 0, 1,
             tooltip="Input quieter than this (dB) is muted. -60 turns the gate off.",
         )
         toggles = ttk.Frame(frame)
-        toggles.grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        toggles.grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
         ttk.Checkbutton(toggles, text="Input noise reduction", variable=self.input_noise_reduce).pack(side="left")
         ttk.Checkbutton(toggles, text="Output noise reduction", variable=self.output_noise_reduce).pack(
             side="left", padx=(16, 0)
@@ -1458,27 +1499,41 @@ class RealtimeGUI:
         self.block_time_slider.configure(variable=self.block_time)
         self.rvc_widgets.update(block_widgets)
         self.locked_widgets.update(block_widgets)
-        crossfade = self._slider(frame, 1, "Crossfade", self.crossfade_time, 0.01, 0.02, 0.01)
+        crossfade = self._slider(
+            frame, 1, "Crossfade", self.crossfade_time, 0.01, MAX_CROSSFADE_TIME, 0.01,
+            tooltip=(
+                "Seconds each block blends into the next. Longer hides block joins better but adds the same "
+                "delay. Capped at the block time."
+            ),
+        )
+        safety = self._slider(
+            frame, 2, "Safety buffer", self.safety_buffer, 0.0, MAX_SAFETY_BUFFER, 0.01,
+            tooltip=(
+                "Extra seconds of converted audio kept queued before playback. When the GPU briefly slows "
+                "down, this covers the gap instead of the output running dry and clicking. Adds the same "
+                "delay. Watch Dropouts in the stats line: raise this until it stays at 0."
+            ),
+        )
         extra = self._slider(
-            frame, 2, "Extra context", self.extra_time, 0.05, 5.0, 0.01,
+            frame, 3, "Extra context", self.extra_time, 0.05, 5.0, 0.01,
             tooltip="Seconds of past audio the model sees. More is smoother but slower.",
         )
         lookahead = self._slider(
-            frame, 3, "Lookahead", self.lookahead_time, 0.0, 0.3, 0.01,
+            frame, 4, "Lookahead", self.lookahead_time, 0.0, 0.3, 0.01,
             tooltip=(
                 "Seconds of future audio every model sees past each output block, added to the delay. "
                 "Lets small block times keep the quality of large ones. Taken from the extra context."
             ),
         )
         seamless = ttk.Checkbutton(frame, text="Seamless blocks", variable=self.seamless)
-        seamless.grid(row=4, column=0, columnspan=3, sticky="w", pady=3)
+        seamless.grid(row=5, column=0, columnspan=3, sticky="w", pady=3)
         Tooltip(seamless, "Makes consecutive blocks agree where they crossfade: the same latent noise, a continuous "
                           "NSF sine phase, content features on a fixed 20 ms grid and decoder context on both sides "
                           "of each block. The blocks then line up exactly, so the crossfade skips SOLA's search, "
                           "which removes its small timing jumps and 10 ms of delay. Uses more GPU time; helps most "
                           "with small block times. RVC models only.")
         cached = ttk.Checkbutton(frame, text="Cached context", variable=self.cached_context)
-        cached.grid(row=5, column=0, columnspan=3, sticky="w", pady=3)
+        cached.grid(row=6, column=0, columnspan=3, sticky="w", pady=3)
         Tooltip(cached, "Runs ContentVec only on the newest 0.6 s plus the output block and lookahead, and reuses "
                         "its earlier results for the rest of the extra context. A long extra context (3 s or more) "
                         "then costs about as much GPU time as a short one, so small block times can keep the "
@@ -1486,11 +1541,11 @@ class RealtimeGUI:
                         "with a short ContentVec-only pass every few blocks, about one per 0.7 s once a pause has "
                         "settled. Needs at least about 1 s of extra context. RVC models only.")
         self.rvc_widgets.update(crossfade + extra + lookahead + [seamless, cached])
-        self.locked_widgets.update(crossfade + extra + lookahead + [seamless, cached])
+        self.locked_widgets.update(crossfade + safety + extra + lookahead + [seamless, cached])
         pitch_label = ttk.Label(frame, text="Pitch extraction")
-        pitch_label.grid(row=6, column=0, sticky="w", padx=(0, 12), pady=(6, 3))
+        pitch_label.grid(row=7, column=0, sticky="w", padx=(0, 12), pady=(6, 3))
         methods = ttk.Frame(frame)
-        methods.grid(row=6, column=1, columnspan=2, sticky="w", pady=(6, 3))
+        methods.grid(row=7, column=1, columnspan=2, sticky="w", pady=(6, 3))
         self.rvc_widgets.add(pitch_label)
         for label, method in PITCH_METHODS.items():
             radio = ttk.Radiobutton(methods, text=label, variable=self.f0_method, value=method)
@@ -1670,7 +1725,7 @@ class RealtimeGUI:
             "show_legacy_devices": self.show_legacy_devices.get(),
             "exclusive_input": self.exclusive_input.get(),
             "exclusive_output": self.exclusive_output.get(),
-            "pitch": self.pitch.get(),
+            **self._pitch_options(),
             "speaker_id": self.speaker_id.get(),
             "index_rate": self.index_rate.get(),
             "rms_mix_rate": self.rms_mix_rate.get(),
@@ -1685,11 +1740,19 @@ class RealtimeGUI:
             "f0_method": self.f0_method.get(),
             "block_time": BEATRICE_BLOCK_TIME if self.block_kind == "beatrice" else self.block_time.get(),
             "crossfade_time": self.crossfade_time.get(),
+            "safety_buffer": self.safety_buffer.get(),
             "extra_time": self.extra_time.get(),
             "lookahead_time": self.lookahead_time.get(),
             "seamless": self.seamless.get(),
             "cached_context": self.cached_context.get(),
             "passthrough": self.passthrough.get(),
+        }
+
+    def _pitch_options(self):
+        return {
+            "pitch": self.pitch.get(),
+            "dataset_hz": self.dataset_hz.get(),
+            "pitch_range": self.pitch_range.get(),
         }
 
     def _save_config(self, settings):
@@ -1760,7 +1823,7 @@ class RealtimeGUI:
         if not self.engine.running:
             return
         try:
-            self.engine.update_pitch(self.pitch.get())
+            self.engine.update_pitch(self._pitch_options())
             self.engine.update_index_rate(self.index_rate.get())
             self.engine.update_beatrice(
                 self.speaker_id.get(),
@@ -1864,11 +1927,18 @@ class RealtimeGUI:
         if self.engine.running and self.engine.settings["passthrough"]:
             self.stats.set(f"Latency {self.engine.algorithm_latency_ms} ms   ·   Passthrough")
         elif self.engine.running:
-            self.stats.set(
+            stats = (
                 f"Latency {self.engine.algorithm_latency_ms} ms   ·   "
                 f"Processing {self.engine.last_block_ms} ms   ·   "
                 f"Model {self.engine.last_infer_ms} ms"
             )
+            voice_hz = self.engine.voice_hz
+            if voice_hz:
+                stats += f"   ·   Voice {voice_hz:.0f} Hz"
+            dropouts = self.engine.dropouts
+            if dropouts:
+                stats += f"   ·   Dropouts {dropouts}"
+            self.stats.set(stats)
         else:
             self.stats.set("")
         self._update_meters()
