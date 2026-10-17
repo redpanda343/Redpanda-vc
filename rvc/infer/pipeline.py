@@ -254,8 +254,7 @@ class Pipeline:
                 f"The selected index has {index.dim} channels, but the embedder outputs "
                 f"{feats.shape[-1]}. Select the index created for this voice model."
             )
-        npy = index.blend(feats[0].cpu().numpy(), index_rate)
-        return torch.from_numpy(npy).unsqueeze(0).to(self.device)
+        return index.blend(feats[0], index_rate).unsqueeze(0)
 
     def pipeline(
         self,
@@ -297,7 +296,7 @@ class Pipeline:
             index = faiss.read_index(file_index)
             if index.ntotal < 1:
                 raise RuntimeError("The selected feature index is empty.")
-            index = FeatureIndex(index)
+            index = FeatureIndex(index, device=self.device)
         else:
             index = None
         if self.high_pass:

@@ -412,7 +412,7 @@ class RealTimeRVC:
             )
         if index.ntotal < 1:
             raise ValueError("The selected feature index is empty.")
-        self.index = FeatureIndex(index)
+        self.index = FeatureIndex(index, device=self.device)
 
     def change_pitch(self, pitch):
         with self.lock:
@@ -506,9 +506,9 @@ class RealTimeRVC:
     def _apply_index(self, features, start):
         if self.index is None or self.index_rate <= 0:
             return features
-        query = features[0, start:].detach().cpu().numpy()
+        query = features[0, start:].detach()
         blended = self.index.blend(query, self.index_rate)
-        features[0, start:] = torch.from_numpy(blended).to(self.device)
+        features[0, start:] = blended
         return features
 
     def _prepare_pitch_predictor(self, method):
