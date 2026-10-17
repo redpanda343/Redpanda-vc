@@ -61,6 +61,7 @@ REALTIME_CSS = """
 
 REALTIME_JS = r"""
 const CHUNK_SECONDS = 0.04;
+const SOCKET_CHUNK_SECONDS = 0.02;
 const MAX_IN_FLIGHT = 2;
 const MAX_MERGE_SECONDS = 0.5;
 const MAX_QUEUED_SECONDS = 0.5;
@@ -92,6 +93,10 @@ class RedpandaRealtime extends AudioWorkletProcessor {
             } else if (data.type === "buffer") {
                 this.target = data.target;
                 this.limit = data.limit;
+            } else if (data.type === "chunk") {
+                this.chunk = data.samples;
+                this.capture = new Float32Array(this.chunk);
+                this.filled = 0;
             }
         };
     }
@@ -180,6 +185,11 @@ if (!window.redpandaRealtime) {
         events: null,
         socket: null,
         socketTimer: null,
+        pingTimer: null,
+        pingId: 0,
+        pingSent: null,
+        networkRtt: null,
+        probing: false,
         uploads: new Set(),
         transport: "",
         run: 0,
@@ -223,6 +233,57 @@ if (!window.redpandaRealtime) {
     };
     const endpoint = (path) => new URL(path, new URL(".", window.location.href));
     const canPickOutput = () => Boolean(window.AudioContext && AudioContext.prototype.setSinkId);
+
+    const testConnection = async () => {
+        if (state.probing) return;
+        state.probing = true;
+        const node = part("connection");
+        const button = part("ping");
+        if (button) button.disabled = true;
+        if (node) node.textContent = "Testing the connection...";
+        try {
+            const times = [];
+            for (let index = 0; index < 6; index++) {
+                const controller = new AbortController();
+                const timer = setTimeout(() => controller.abort(), 5000);
+                const start = performance.now();
+                try {
+                    const response = await fetch(endpoint("realtime/ping").toString(), {
+                        method: "HEAD",
+                        credentials: "same-origin",
+                        cache: "no-store",
+                        signal: controller.signal,
+                    });
+                    if (response.status === 404) throw new Error("restart the WebUI to load the connection test.");
+                    if (!response.ok) throw new Error("connection test failed (" + response.status + ").");
+                    if (index) times.push(performance.now() - start);
+                } finally {
+                    clearTimeout(timer);
+                }
+            }
+            times.sort((left, right) => left - right);
+            if (node) node.textContent = "Connection round trip " + Math.round(times[2]) + " ms. Includes the share tunnel; no inference.";
+        } catch (error) {
+            if (node) node.textContent = "Could not test the connection: " + message(error);
+        } finally {
+            state.probing = false;
+            if (button) button.disabled = false;
+        }
+    };
+
+    const pingSocket = () => {
+        const socket = state.socket;
+        if (!state.ready || !socket || socket.readyState !== WebSocket.OPEN) return;
+        const now = performance.now();
+        if (state.pingSent !== null && now - state.pingSent < 5000) return;
+        state.pingId = (state.pingId + 1) >>> 0;
+        state.pingSent = now;
+        try {
+            socket.send(JSON.stringify({ type: "ping", id: state.pingId }));
+        } catch (error) {
+            state.pingSent = null;
+        }
+    };
 
     const fill = (select, devices, saved) => {
         if (!select) return;
@@ -276,7 +337,8 @@ if (!window.redpandaRealtime) {
         const total = state.rtt + buffered + (1000 * (state.block + state.chunk)) / state.rate + 1000 * state.delay;
         const server = state.server || {};
         const transport = state.transport === "websocket" ? "WebSocket" : "HTTP fallback";
-        let text = "Delay about " + Math.round(total) + " ms   ·   Audio return " + Math.round(state.rtt) + " ms   ·   Buffered " + Math.round(buffered) + " ms   ·   Processing " + (server.blockMs || 0) + " ms   ·   Dropouts " + state.underruns + "   ·   " + transport;
+        const connection = state.networkRtt === null ? "" : "   ·   Connection " + Math.round(state.networkRtt) + " ms";
+        let text = transport + connection + "   ·   Delay about " + Math.round(total) + " ms   ·   Audio return " + Math.round(state.rtt) + " ms   ·   Buffered " + Math.round(buffered) + " ms   ·   Processing " + (server.blockMs || 0) + " ms   ·   Dropouts " + state.underruns;
         if (server.lost) text += "   ·   Lost chunks " + server.lost;
         if (state.dropped) text += "   ·   Dropped uploads " + state.dropped;
         if (server.skipped) text += "   ·   Skipped blocks " + server.skipped;
@@ -421,6 +483,10 @@ if (!window.redpandaRealtime) {
         state.socket = null;
         clearTimeout(state.socketTimer);
         state.socketTimer = null;
+        clearInterval(state.pingTimer);
+        state.pingTimer = null;
+        state.pingSent = null;
+        state.networkRtt = null;
         state.transport = "";
         state.ready = false;
         state.token = "";
@@ -455,8 +521,23 @@ if (!window.redpandaRealtime) {
         } else if (info.type === "ready") {
             state.block = info.block;
             state.delay = info.delay;
+            if (state.transport === "websocket") {
+                state.chunk = Math.round(state.rate * SOCKET_CHUNK_SECONDS);
+                state.node.port.postMessage({ type: "chunk", samples: state.chunk });
+            }
             state.ready = true;
+            if (state.transport === "websocket") {
+                pingSocket();
+                state.pingTimer = setInterval(pingSocket, 2000);
+            }
             setStatus("Running at " + state.rate / 1000 + " kHz" + (info.device ? " on " + info.device : "") + ". Use headphones so the converted voice does not reach the microphone.");
+            renderStats();
+        } else if (info.type === "pong") {
+            if (state.pingSent !== null && info.id === state.pingId) {
+                state.networkRtt = performance.now() - state.pingSent;
+                state.pingSent = null;
+                renderStats();
+            }
         } else if (info.type === "stats") {
             state.server = info;
             renderStats();
@@ -683,11 +764,14 @@ if (!window.redpandaRealtime) {
             '<label>Microphone<select data-rt="input"><option value="">Default</option></select></label>' +
             '<label>Speaker<select data-rt="output"><option value="">Default</option></select></label>' +
             '<button type="button" data-rt="refresh">Refresh devices</button>' +
+            '<button type="button" data-rt="ping">Test connection</button>' +
             "</div>" +
             '<div class="rp-rt-status" data-rt="status">Stopped</div>' +
+            '<div class="rp-rt-stats" data-rt="connection"></div>' +
             '<div class="rp-rt-stats" data-rt="stats"></div>' +
             "</div>";
         part("refresh").addEventListener("click", () => refreshDevices(true));
+        part("ping").addEventListener("click", testConnection);
         ["input", "output"].forEach((name) => {
             part(name).addEventListener("change", () => {
                 remember(name, part(name).value);
@@ -703,7 +787,7 @@ if (!window.redpandaRealtime) {
     };
 
     window.addEventListener("pagehide", () => stop());
-    window.redpandaRealtime = { attach, unlock, beginStart, finishStart, start, stop, setBuffer };
+    window.redpandaRealtime = { attach, unlock, beginStart, finishStart, start, stop, setBuffer, testConnection };
 }
 window.redpandaRealtime.attach(element);
 """

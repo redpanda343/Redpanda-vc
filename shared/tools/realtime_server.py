@@ -331,6 +331,12 @@ async def _next_output(session, outputs):
 def register_realtime_routes(app):
     first_new_route = len(app.router.routes)
 
+    @app.api_route("/realtime/ping", methods=["GET", "HEAD"])
+    async def realtime_ping(request: Request):
+        if await current_user(app, request) is None:
+            return Response(status_code=401, headers=NO_STORE)
+        return Response(status_code=204, headers=NO_STORE)
+
     @app.websocket("/realtime/ws")
     async def realtime_websocket(websocket: WebSocket):
         user = await current_user(app, websocket)
@@ -377,12 +383,23 @@ def register_realtime_routes(app):
             await asyncio.gather(startup_message, return_exceptions=True)
             info = warmup.result()
             await websocket.send_json({"type": "ready", **info})
+            send_lock = asyncio.Lock()
 
             async def receive_audio():
                 while not session.closed.is_set():
                     message = await websocket.receive()
                     if message["type"] == "websocket.disconnect":
                         return
+                    text = message.get("text")
+                    if text is not None:
+                        if len(text) > 128:
+                            raise ValueError("Invalid connection probe.")
+                        probe = json.loads(text)
+                        if not isinstance(probe, dict) or probe.get("type") != "ping" or type(probe.get("id")) is not int or not 0 <= probe["id"] < 1 << 32:
+                            raise ValueError("Invalid connection probe.")
+                        async with send_lock:
+                            await websocket.send_json({"type": "pong", "id": probe["id"]})
+                        continue
                     data = message.get("bytes")
                     if data is None or not 10 <= len(data) <= 8 + 2 * MAX_CHUNK_SAMPLES or len(data) % 2:
                         raise ValueError("Invalid microphone audio chunk.")
@@ -396,16 +413,20 @@ def register_realtime_routes(app):
                 while not session.closed.is_set():
                     item = await _next_output(session, outputs)
                     if item is not None and item[0] == "failure":
-                        await websocket.send_json({"type": "failure", "message": item[1]})
+                        async with send_lock:
+                            await websocket.send_json({"type": "failure", "message": item[1]})
                         return
                     if item is not None:
-                        await websocket.send_bytes(struct.pack("<Q", item[1]) + item[2])
+                        async with send_lock:
+                            await websocket.send_bytes(struct.pack("<Q", item[1]) + item[2])
                     now = time.monotonic()
                     if now - last_stats >= STATS_SECONDS:
                         last_stats = now
-                        await websocket.send_json({"type": "stats", **session.stats()})
+                        async with send_lock:
+                            await websocket.send_json({"type": "stats", **session.stats()})
                     if not session.failed.is_set() and session.expired():
-                        await websocket.send_json({"type": "failure", "message": "No microphone audio arrived for 30 seconds."})
+                        async with send_lock:
+                            await websocket.send_json({"type": "failure", "message": "No microphone audio arrived for 30 seconds."})
                         return
 
             receiver = asyncio.create_task(receive_audio())
