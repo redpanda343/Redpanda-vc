@@ -1,4 +1,5 @@
 import gc
+import logging
 import sys
 import time
 
@@ -12,6 +13,7 @@ from torchaudio.transforms import Resample
 
 from beatrice.inference import OUT_SAMPLE_RATE, find_paraphernalia, is_beatrice_checkpoint
 from beatrice.realtime import BeatriceRealtime
+from rectified_flow.realtime import RealtimeGraph
 from rvc.infer.realtime import RealTimeRVC
 
 
@@ -23,6 +25,7 @@ RESAMPLE_FILTER = dict(
     resampling_method="sinc_interp_kaiser",
     beta=14.769656459379492,
 )
+logger = logging.getLogger(__name__)
 
 
 class BlockTorchGate(TorchGate):
@@ -94,6 +97,7 @@ class RealtimeProcessor:
                 lookahead_frames=round(settings.get("lookahead_time", 0.0) * 100),
                 seamless=settings.get("seamless", False),
                 cached_context=settings.get("cached_context", False),
+                use_fp32=settings.get("use_fp32", False),
             )
             model_rate = self.rvc.sample_rate
             self.device = self.rvc.device
@@ -158,14 +162,17 @@ class RealtimeProcessor:
             ** 2
         )
         self.fade_out_window = 1 - self.fade_in_window
-        self.resampler = Resample(
-            orig_freq=rate, new_freq=16000, dtype=torch.float32, **RESAMPLE_FILTER
-        ).to(device)
+        graph_enabled = self.rvc is not None and self.rvc.cuda_graph
+        self.resampler = RealtimeGraph(
+            Resample(orig_freq=rate, new_freq=16000, dtype=torch.float32, **RESAMPLE_FILTER).to(device),
+            "input resample", graph_enabled,
+        )
         self.resampler2 = None
         if self.rvc is not None and self.rvc.sample_rate != rate:
-            self.resampler2 = Resample(
-                orig_freq=self.rvc.sample_rate, new_freq=rate, dtype=torch.float32, **RESAMPLE_FILTER
-            ).to(device)
+            self.resampler2 = RealtimeGraph(
+                Resample(orig_freq=self.rvc.sample_rate, new_freq=rate, dtype=torch.float32, **RESAMPLE_FILTER).to(device),
+                "output resample", graph_enabled,
+            )
         self.tg = BlockTorchGate(sr=rate, n_fft=4 * self.zc, prop_decrease=0.9).to(device)
 
     def _reset_buffers(self):
@@ -205,6 +212,17 @@ class RealtimeProcessor:
 
     def _prewarm(self):
         try:
+            if not self._budgeted_warm_up():
+                self._warm_up()
+        except (RuntimeError, FloatingPointError) as error:
+            if self.rvc is None or self.rvc.dtype != torch.float16:
+                raise
+            logger.warning("Realtime FP16 warm-up failed; retrying with FP32: %s", error)
+            self.rvc.use_full_precision()
+            for graph in (self.resampler, self.resampler2):
+                if graph is not None:
+                    graph.reset()
+            self._reset_buffers()
             if not self._budgeted_warm_up():
                 self._warm_up()
         finally:
@@ -357,6 +375,8 @@ class RealtimeProcessor:
                 infer_wav = self._mix_volume(infer_wav, source)
             output_block = self._apply_sola(infer_wav)
         gain = db_to_linear(settings["output_gain_db"])
+        if warm_up and not bool(torch.isfinite(output_block).all()):
+            raise FloatingPointError("Realtime warm-up produced non-finite audio.")
         output = torch.clamp(output_block * gain, -1.0, 1.0).cpu().numpy().astype(np.float32)
         if not passthrough:
             self.output_level = float(np.abs(output).max(initial=0.0))

@@ -818,6 +818,7 @@ def start_realtime(
     lookahead_time,
     seamless,
     cached_context,
+    use_fp32,
     inference_device,
     previous_token,
     start_request,
@@ -844,6 +845,7 @@ def start_realtime(
         "lookahead_time": float(lookahead_time),
         "seamless": bool(seamless),
         "cached_context": bool(cached_context),
+        "use_fp32": bool(use_fp32),
         "inference_device": inference_device or "auto",
         "safety_buffer": 0.0,
         "threshold": int(threshold),
@@ -1047,9 +1049,15 @@ def realtime_tab(model_file, index_file, rectified_vocoder_path):
                 value=True,
                 interactive=True,
             )
+            use_fp32 = gr.Checkbox(
+                label=i18n("FP32 inference"),
+                info=i18n("Use full precision. Otherwise compatible NVIDIA GPUs use FP16 for RVC. CPU, GTX 16-series and Flow models use FP32."),
+                value=False,
+                interactive=True,
+            )
     gr.Markdown(
         i18n(
-            "Inference Device, Block Time, Crossfade, Extra Context, Lookahead, the embedder, the speaker and the toggles above them apply on the next Start. Pitch, Index Rate, the pitch algorithm and the Audio settings apply while running."
+            "Inference Device, FP32 inference, Block Time, Crossfade, Extra Context, Lookahead, the embedder, the speaker and the toggles above them apply on the next Start. Pitch, Index Rate, the pitch algorithm and the Audio settings apply while running."
         )
     )
 
@@ -1076,6 +1084,7 @@ def realtime_tab(model_file, index_file, rectified_vocoder_path):
             lookahead_time,
             seamless,
             cached_context,
+            use_fp32,
             inference_device,
             token,
             start_request,

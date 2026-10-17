@@ -30,21 +30,23 @@ class SpeechGroupNormConv(torch.nn.Module):
 
     def statistics(self, audio):
         hidden = self.conv(audio)
+        values = hidden.float()
         upper = F.max_pool1d(audio, self.kernel, self.step)
         lower = -F.max_pool1d(-audio, self.kernel, self.step)
-        speech = (upper > lower).to(hidden.dtype)
+        speech = (upper > lower).to(values.dtype)
         total = hidden.shape[-1]
         silent = total - speech.sum()
-        mean = ((hidden * speech).sum(-1, keepdim=True) + silent * self.mean) / total
-        variance = ((hidden - mean).square() * speech).sum(-1, keepdim=True)
+        mean = ((values * speech).sum(-1, keepdim=True) + silent * self.mean) / total
+        variance = ((values - mean).square() * speech).sum(-1, keepdim=True)
         variance = (variance + silent * (self.variance + (self.mean - mean).square())) / total
         self.mean.copy_(mean)
         self.variance.copy_(variance)
         return hidden, mean, variance
 
     def normalize(self, hidden, mean, variance):
-        hidden = (hidden - mean) * torch.rsqrt(variance + self.norm.eps)
-        return self.activation(hidden * self.norm.weight[:, None] + self.norm.bias[:, None])
+        dtype = hidden.dtype
+        hidden = (hidden.float() - mean) * torch.rsqrt(variance + self.norm.eps)
+        return self.activation((hidden * self.norm.weight[:, None] + self.norm.bias[:, None]).to(dtype))
 
     def forward(self, audio):
         return self.normalize(*self.statistics(audio))
@@ -65,16 +67,18 @@ class CachedContentEncoder:
         self.stats_samples = self.window - self.stride // 2
         self.active_samples = self.stride * (self.active - 1) + self.field
         self.normalize = bool(getattr(embedder, "audio_requires_normalization", False))
-        device = next(embedder.parameters()).device
+        parameter = next(embedder.parameters())
+        device = parameter.device
+        self.dtype = parameter.dtype
         layers = len(embedder.encoder.layers)
         heads = config.num_attention_heads
         size = (layers, 1, heads, self.past + self.active, config.hidden_size // heads)
-        self.keys = torch.zeros(size, device=device)
-        self.values = torch.zeros(size, device=device)
+        self.keys = torch.zeros(size, device=device, dtype=self.dtype)
+        self.values = torch.zeros(size, device=device, dtype=self.dtype)
         self.mask = torch.zeros(1, 1, 1, self.past + self.active, dtype=torch.bool, device=device)
         self.mask[..., self.past:] = True
         self.valid = self.mask[0, 0, 0, :self.past]
-        self.projection = torch.zeros(1, self.context + self.active, config.hidden_size, device=device)
+        self.projection = torch.zeros(1, self.context + self.active, config.hidden_size, device=device, dtype=self.dtype)
         self.history = None
         self.output = None
         self.first = None
@@ -146,6 +150,8 @@ class CachedContentEncoder:
             scale = torch.rsqrt(variance + 1e-5)
             stats = (stats - mean) * scale
             audio = (audio - mean) * scale
+        stats = stats.to(dtype=self.dtype)
+        audio = audio.to(dtype=self.dtype)
         layers = embedder.feature_extractor.conv_layers
         hidden = audio[:, None]
         if isinstance(layers[0], SpeechGroupNormConv):

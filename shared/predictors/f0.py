@@ -51,8 +51,10 @@ class RVCRMVPE:
             device=self.device,
         )
 
-    def get_f0(self, x, filter_radius=0.03, decoder=None, network=None):
-        return self.model.infer_from_audio(x, thred=filter_radius, decoder=decoder, network=network)
+    def get_f0(self, x, filter_radius=0.03, decoder=None, network=None, mel_network=None):
+        return self.model.infer_from_audio(
+            x, thred=filter_radius, decoder=decoder, network=network, mel_network=mel_network
+        )
 
 
 class Swift:

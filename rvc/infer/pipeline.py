@@ -89,6 +89,7 @@ class Pipeline:
         pitch: int = 0,
         f0_decoder=None,
         f0_network=None,
+        f0_mel=None,
     ):
         """
         Estimates the fundamental frequency (F0) of a given audio signal using various methods.
@@ -116,8 +117,9 @@ class Pipeline:
                     sample_rate=self.sample_rate,
                     hop_size=self.window,
                 )
+            options = {"mel_network": f0_mel} if f0_mel is not None else {}
             f0 = self.model_rmvpe.get_f0(
-                x, filter_radius=0.03, decoder=f0_decoder, network=f0_network
+                x, filter_radius=0.03, decoder=f0_decoder, network=f0_network, **options
             )
         elif f0_method == "swift":
             if not hasattr(self, "model_swift"):

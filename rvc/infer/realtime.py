@@ -27,6 +27,16 @@ SEAMLESS_DECODER_CONTEXT = 8
 CACHED_CONTEXT_FRESH_FRAMES = 30
 
 
+def inference_dtype(device, use_fp32=False, rectified=False):
+    device = torch.device(device)
+    if use_fp32 or rectified or device.type != "cuda":
+        return torch.float32
+    major, _ = torch.cuda.get_device_capability(device)
+    name = torch.cuda.get_device_name(device).upper().replace(" ", "")
+    unsupported = any(token in name for token in ("GTX16", "RADEON", "ZLUDA"))
+    return torch.float16 if major >= 7 and not unsupported else torch.float32
+
+
 def decoder_radius(generator):
     radius = generator.conv_pre.kernel_size[0] // 2
     scale = 1
@@ -240,6 +250,7 @@ class RealTimeRVC:
         lookahead_frames=0,
         seamless=False,
         cached_context=False,
+        use_fp32=False,
     ):
         self.converter = VoiceConverter()
         self.converter.get_vc(model_path, speaker_id)
@@ -259,10 +270,11 @@ class RealTimeRVC:
                 f"Speaker ID must be between 0 and {self.converter.n_spk - 1}."
             )
         self.device = self.converter.config.device
+        self.dtype = inference_dtype(self.device, use_fp32, self.is_rectified)
         if torch.device(self.device).type == "cuda":
             torch.backends.cudnn.benchmark = True
         self.model = self.converter.net_g.to(
-            device=self.device, dtype=torch.float32
+            device=self.device, dtype=self.dtype
         )
         for key in ("weight", "model"):
             self.converter.cpt.pop(key, None)
@@ -299,7 +311,7 @@ class RealTimeRVC:
         self.embedder_name = embedder_model
         self.converter.load_hubert(embedder_model)
         self.embedder = self.converter.hubert_model.to(
-            device=self.device, dtype=torch.float32
+            device=self.device, dtype=self.dtype
         )
         positional = getattr(getattr(self.embedder, "encoder", None), "pos_conv_embed", None)
         if positional is not None and isinstance(positional.conv, torch.nn.Conv1d):
@@ -321,6 +333,7 @@ class RealTimeRVC:
             "content feature", self.cuda_graph,
         )
         self.rmvpe_graph = None
+        self.rmvpe_mel_graph = None
         self.synthesizer_graphs = {}
         if self.is_rectified:
             from torchaudio.transforms import Resample
@@ -456,7 +469,7 @@ class RealTimeRVC:
         source = input_wav[drop:].float().view(1, -1)
         if getattr(self.embedder, "audio_requires_normalization", False):
             source = F.layer_norm(source, source.shape)
-        features = self.feature_graph(source)
+        features = self.feature_graph(source.to(dtype=self.dtype))
         self._check_feature_dim(features)
         if self.is_rectified:
             return features
@@ -500,6 +513,11 @@ class RealTimeRVC:
 
     def _prepare_pitch_predictor(self, method):
         predictor = getattr(self.pipeline, f"model_{method}", None)
+        if predictor is None and method == "rmvpe":
+            predictor = self.pipeline.rmvpe_class(
+                device=self.device, sample_rate=16000, hop_size=160
+            )
+            self.pipeline.model_rmvpe = predictor
         if predictor is None and method == "swift":
             from shared.predictors.f0 import Swift
 
@@ -519,7 +537,7 @@ class RealTimeRVC:
         current = predictor
         for _ in range(4):
             if isinstance(current, torch.nn.Module):
-                current.float()
+                current.to(dtype=self.dtype if method == "rmvpe" else torch.float32)
             mel_extractor = getattr(current, "mel_extractor", None)
             if isinstance(mel_extractor, torch.nn.Module):
                 mel_extractor.float()
@@ -538,13 +556,14 @@ class RealTimeRVC:
         if method != "rmvpe":
             released = released or self.rmvpe_graph is not None
             self.rmvpe_graph = None
+            self.rmvpe_mel_graph = None
             if self.is_rectified:
                 released = release_rmvpe_model(self.device) or released
         if released and torch.device(self.device).type == "cuda":
             torch.cuda.empty_cache()
 
     def _graphs(self):
-        graphs = [self.feature_graph, self.rmvpe_graph, *self.synthesizer_graphs.values()]
+        graphs = [self.feature_graph, self.rmvpe_graph, self.rmvpe_mel_graph, *self.synthesizer_graphs.values()]
         if self.content_cache is not None:
             graphs.append(self.content_cache.graph)
         if self.is_rectified:
@@ -559,10 +578,23 @@ class RealTimeRVC:
         for graph in self._graphs():
             graph.reset()
 
+    def use_full_precision(self):
+        self.dtype = torch.float32
+        self.model.float()
+        self.embedder.float()
+        self.prepared_f0_methods.clear()
+        self.content_cache = None
+        self.reset_graphs()
+
     def _rmvpe_network(self, model):
         if self.rmvpe_graph is None or self.rmvpe_graph.function is not model:
             self.rmvpe_graph = RealtimeGraph(model, "RMVPE", self.cuda_graph)
         return self.rmvpe_graph
+
+    def _rmvpe_mel(self, extractor):
+        if self.rmvpe_mel_graph is None or self.rmvpe_mel_graph.function is not extractor:
+            self.rmvpe_mel_graph = RealtimeGraph(extractor, "RMVPE mel", self.cuda_graph)
+        return self.rmvpe_mel_graph
 
     def _synthesizer_graph(self, skip_head, return_length):
         key = (skip_head, return_length)
@@ -638,10 +670,13 @@ class RealTimeRVC:
             extractor_frame = self.pitch_sample_count - aligned_start
         if method == "rmvpe":
             extractor_frame = 5120 * ((extractor_frame - 1) // 5120 + 1) - 160
-        source = input_wav[-extractor_frame:].detach().cpu().numpy()
+        source = input_wav[-extractor_frame:].detach()
+        if method != "rmvpe":
+            source = source.cpu().numpy()
         shift = max(1, block_frame_16k // 160)
         decoder = None
         network = None
+        mel_network = None
         if method == "rmvpe":
             decoder = lambda salience, threshold: self.rmvpe_viterbi.decode(
                 salience, threshold, shift
@@ -649,6 +684,7 @@ class RealTimeRVC:
             predictor = getattr(self.pipeline, "model_rmvpe", None)
             if predictor is not None:
                 network = self._rmvpe_network(predictor.model.model)
+                mel_network = self._rmvpe_mel(predictor.model.mel_extractor)
         pitch, pitchf = self.pipeline.get_f0(
             source,
             source.shape[0] // 160,
@@ -656,6 +692,7 @@ class RealTimeRVC:
             pitch=self.pitch,
             f0_decoder=decoder,
             f0_network=network,
+            f0_mel=mel_network,
         )
         if method not in self.prepared_f0_methods:
             self._prepare_pitch_predictor(method)
@@ -785,7 +822,7 @@ class RealTimeRVC:
             )
         skip_head = int(skip_head) - lookahead
         started = time.perf_counter()
-        with self.lock:
+        with self.lock, torch.autocast("cuda", dtype=torch.float16, enabled=self.dtype == torch.float16):
             torch.manual_seed(self.seed)
             end = self.pitch_sample_count + int(block_frame_16k)
             drop = 0
@@ -800,7 +837,9 @@ class RealTimeRVC:
                 features = self._apply_index(features, index_head // 2)
             else:
                 features = self._cached_features(cache, input_wav, end, index_head)
-            self._update_pitch(input_wav, block_frame_16k, f0_method)
+            with torch.autocast("cuda", dtype=torch.float16,
+                                enabled=self.dtype == torch.float16 and f0_method == "rmvpe"):
+                self._update_pitch(input_wav, block_frame_16k, f0_method)
             speaker = torch.tensor(
                 [self.speaker_id], device=self.device, dtype=torch.long
             )
@@ -827,12 +866,12 @@ class RealTimeRVC:
             continuous = self.cache_pitchf[None, -p_len:]
             if self.seamless:
                 audio = self._infer_seamless(
-                    features.float(), lengths, coarse, continuous, speaker,
+                    features.to(dtype=self.dtype), lengths, coarse, continuous, speaker,
                     int(skip_head), int(return_length), int(block_frame_16k) // 160,
                 )
             else:
                 audio = self._synthesizer_graph(int(skip_head), int(return_length))(
-                    features.float(), lengths, coarse, continuous, speaker
+                    features.to(dtype=self.dtype), lengths, coarse, continuous, speaker
                 )
             if torch.device(self.device).type == "cuda":
                 torch.cuda.synchronize(self.device)

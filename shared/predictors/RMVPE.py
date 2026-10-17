@@ -450,6 +450,7 @@ class RMVPE0Predictor:
             mel (torch.Tensor): Mel-spectrogram features.
         """
         with torch.no_grad():
+            mel = mel.to(dtype=next(self.model.parameters()).dtype)
             n_frames = mel.shape[-1]
             # print('n_frames', n_frames)
             # print('mel shape before padding', mel.shape)
@@ -494,7 +495,7 @@ class RMVPE0Predictor:
         f0[f0 == 10] = 0
         return f0
 
-    def infer_from_audio(self, audio, thred=0.03, decoder=None, network=None):
+    def infer_from_audio(self, audio, thred=0.03, decoder=None, network=None, mel_network=None):
         """
         Infers F0 from audio.
 
@@ -502,10 +503,11 @@ class RMVPE0Predictor:
             audio (np.ndarray): Audio signal.
             thred (float, optional): Threshold for salience. Defaults to 0.03.
         """
-        audio = torch.from_numpy(audio).float().to(self.device).unsqueeze(0)
-        mel = self.mel_extractor(audio, center=True)
+        audio = torch.as_tensor(audio, device=self.device, dtype=torch.float32).unsqueeze(0)
+        with torch.autocast("cuda", enabled=False):
+            mel = (self.mel_extractor if mel_network is None else mel_network)(audio)
         hidden = self.mel2hidden(mel, network=network)
-        hidden = hidden.squeeze(0).cpu().numpy()
+        hidden = hidden.squeeze(0).float().cpu().numpy()
         center = decoder(hidden, thred) if decoder is not None else None
         f0 = self.decode(hidden, thred=thred, center=center)
         return f0

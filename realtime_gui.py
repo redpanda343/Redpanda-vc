@@ -879,6 +879,7 @@ class RealtimeGUI:
         self.lookahead_time = tk.DoubleVar(value=value.get("lookahead_time", 0.0))
         self.seamless = tk.BooleanVar(value=value.get("seamless", False))
         self.cached_context = tk.BooleanVar(value=value.get("cached_context", False))
+        self.use_fp32 = tk.BooleanVar(value=value.get("use_fp32", False))
         self.passthrough = tk.BooleanVar(value=False)
         self.passthrough_hold = tk.BooleanVar(value=value.get("passthrough_hold", False))
         self.hotkey = list(value.get("passthrough_hotkey", [])) if HOTKEYS else []
@@ -1169,12 +1170,16 @@ class RealtimeGUI:
                         "context that large ones use. During pauses and passthrough it keeps the cache current "
                         "with a short ContentVec-only pass every few blocks, about one per 0.7 s once a pause has "
                         "settled. Needs at least about 1 s of extra context. RVC models only.")
-        self.rvc_widgets.update(crossfade + extra + lookahead + [seamless, cached])
-        self.locked_widgets.update(crossfade + safety + extra + lookahead + [seamless, cached])
+        precision = ttk.Checkbutton(frame, text="FP32 inference", variable=self.use_fp32)
+        precision.grid(row=7, column=0, columnspan=3, sticky="w", pady=3)
+        Tooltip(precision, "Use full precision. Otherwise compatible NVIDIA GPUs use FP16 for RVC. "
+                           "CPU, GTX 16-series and Flow models use FP32. Applies on the next Start.")
+        self.rvc_widgets.update(crossfade + extra + lookahead + [seamless, cached, precision])
+        self.locked_widgets.update(crossfade + safety + extra + lookahead + [seamless, cached, precision])
         pitch_label = ttk.Label(frame, text="Pitch extraction")
-        pitch_label.grid(row=7, column=0, sticky="w", padx=(0, 12), pady=(6, 3))
+        pitch_label.grid(row=8, column=0, sticky="w", padx=(0, 12), pady=(6, 3))
         methods = ttk.Frame(frame)
-        methods.grid(row=7, column=1, columnspan=2, sticky="w", pady=(6, 3))
+        methods.grid(row=8, column=1, columnspan=2, sticky="w", pady=(6, 3))
         self.rvc_widgets.add(pitch_label)
         for label, method in PITCH_METHODS.items():
             radio = ttk.Radiobutton(methods, text=label, variable=self.f0_method, value=method)
@@ -1374,6 +1379,7 @@ class RealtimeGUI:
             "lookahead_time": self.lookahead_time.get(),
             "seamless": self.seamless.get(),
             "cached_context": self.cached_context.get(),
+            "use_fp32": self.use_fp32.get(),
             "passthrough": self.passthrough.get(),
         }
 
