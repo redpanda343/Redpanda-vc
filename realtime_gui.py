@@ -60,7 +60,6 @@ from noisereduce.torchgate.utils import amp_to_db
 from beatrice.inference import OUT_SAMPLE_RATE, find_paraphernalia, is_beatrice_checkpoint
 from beatrice.realtime import BeatriceRealtime
 from rvc.infer.realtime import RealTimeRVC
-from shared.pitch_map import pitch_options
 from shared.platform import migrate_models_folder
 
 
@@ -332,6 +331,7 @@ class AudioEngine:
                 model_path=settings["model_path"],
                 index_path=settings["index_path"],
                 index_rate=settings["index_rate"],
+                pitch=settings["pitch"],
                 speaker_id=settings["speaker_id"],
                 embedder_model=settings["embedder_model"],
                 rectified_vocoder_path=settings.get("rectified_vocoder_path", ""),
@@ -340,7 +340,6 @@ class AudioEngine:
                 lookahead_frames=round(settings.get("lookahead_time", 0.0) * 100),
                 seamless=settings.get("seamless", False),
                 cached_context=settings.get("cached_context", False),
-                **pitch_options(settings),
             )
             model_rate = self.rvc.sample_rate
             self.device = self.rvc.device
@@ -385,9 +384,9 @@ class AudioEngine:
                 beatrice_path,
                 self.sample_rate,
                 speaker=settings["speaker_id"],
+                pitch=settings["pitch"],
                 formant=settings["formant_shift"],
                 vq_neighbors=settings["vq_neighbors"],
-                **pitch_options(settings),
             )
         self._prewarm()
         self.reported_statuses = set()
@@ -824,22 +823,16 @@ class AudioEngine:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def update_pitch(self, options):
+    def update_pitch(self, pitch):
         if self.beatrice is not None:
-            self.beatrice.model.set_pitch(**options)
+            self.beatrice.model.set_pitch_shift(pitch)
         elif self.rvc is not None:
-            self.rvc.change_pitch(**options)
+            self.rvc.change_pitch(pitch)
 
     @property
     def dropouts(self):
         fifo = self.output_fifo
         return 0 if fifo is None else fifo.dropouts
-
-    @property
-    def voice_hz(self):
-        beatrice, rvc = self.beatrice, self.rvc
-        model = beatrice.model if beatrice is not None else rvc
-        return None if model is None else model.pitch_map.voice_hz
 
     def update_index_rate(self, index_rate):
         if self.rvc is not None:
@@ -1157,7 +1150,7 @@ class RealtimeGUI:
         self._load_devices()
         self._refresh_states()
         for variable in (
-            self.pitch, self.dataset_hz, self.pitch_range, self.index_rate, self.rms_mix_rate, self.threshold, self.f0_method,
+            self.pitch, self.index_rate, self.rms_mix_rate, self.threshold, self.f0_method,
             self.passthrough, self.speaker_id, self.formant_shift, self.vq_neighbors,
             self.input_gain_db, self.output_gain_db, self.monitor_gain_db,
             self.input_noise_reduce, self.output_noise_reduce,
@@ -1203,8 +1196,6 @@ class RealtimeGUI:
         self.exclusive_input = tk.BooleanVar(value=value.get("exclusive_input", legacy_exclusive))
         self.exclusive_output = tk.BooleanVar(value=value.get("exclusive_output", legacy_exclusive))
         self.pitch = tk.IntVar(value=value.get("pitch", 0))
-        self.dataset_hz = tk.IntVar(value=value.get("dataset_hz", 0))
-        self.pitch_range = tk.IntVar(value=value.get("pitch_range", 12))
         self.speaker_id = tk.IntVar(value=value.get("speaker_id", 0))
         self.index_rate = tk.DoubleVar(value=value.get("index_rate", 0.0))
         self.rms_mix_rate = tk.DoubleVar(value=value.get("rms_mix_rate", 0.0))
@@ -1445,41 +1436,21 @@ class RealtimeGUI:
 
     def _build_voice(self, parent):
         frame = self._card(parent, "Voice")
-        self._slider(
-            frame, 0, "Pitch", self.pitch, -24, 24, 1,
-            tooltip="Shift in semitones. +12 is one octave up. The stats line shows your own average pitch as "
-                    "Voice; 12 × log2(dataset Hz ÷ Voice) is the shift that lands on the dataset average.",
-        )
-        dataset_label = ttk.Label(frame, text="Dataset")
-        dataset_label.grid(row=1, column=0, sticky="w", padx=(0, 12), pady=3)
-        Tooltip(dataset_label, "Average pitch of the model's training data in Hz, and how many semitones around "
-                               "it the output may reach. Pitch is then only tracked where it can land inside "
-                               "that range after the Pitch shift, which removes octave errors, and output past "
-                               "the range is softly limited instead of reaching pitches the model never learned. "
-                               "0 Hz turns this off.")
-        dataset = ttk.Frame(frame)
-        dataset.grid(row=1, column=1, columnspan=2, sticky="w", pady=3)
-        ttk.Spinbox(dataset, from_=0, to=1100, increment=1, textvariable=self.dataset_hz, width=6).pack(side="left")
-        ttk.Label(dataset, text="Hz", style="Muted.TLabel").pack(side="left", padx=(6, 16))
-        ttk.Label(dataset, text="Range ±").pack(side="left")
-        ttk.Spinbox(dataset, from_=1, to=36, increment=1, textvariable=self.pitch_range, width=4).pack(
-            side="left", padx=(6, 0)
-        )
-        ttk.Label(dataset, text="st", style="Muted.TLabel").pack(side="left", padx=(6, 0))
+        self._slider(frame, 0, "Pitch", self.pitch, -24, 24, 1, tooltip="Shift in semitones. +12 is one octave up.")
         self.rvc_widgets.update(self._slider(
-            frame, 2, "Index rate", self.index_rate, 0, 1, 0.01,
+            frame, 1, "Index rate", self.index_rate, 0, 1, 0.01,
             tooltip="How strongly the feature index pulls the voice toward the training data.",
         ))
         self.rvc_widgets.update(self._slider(
-            frame, 3, "RMS mix", self.rms_mix_rate, 0, 1, 0.01,
+            frame, 2, "RMS mix", self.rms_mix_rate, 0, 1, 0.01,
             tooltip="0 follows your input loudness, 1 keeps the model's own loudness.",
         ))
         self._slider(
-            frame, 4, "Noise gate", self.threshold, -60, 0, 1,
+            frame, 3, "Noise gate", self.threshold, -60, 0, 1,
             tooltip="Input quieter than this (dB) is muted. -60 turns the gate off.",
         )
         toggles = ttk.Frame(frame)
-        toggles.grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        toggles.grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
         ttk.Checkbutton(toggles, text="Input noise reduction", variable=self.input_noise_reduce).pack(side="left")
         ttk.Checkbutton(toggles, text="Output noise reduction", variable=self.output_noise_reduce).pack(
             side="left", padx=(16, 0)
@@ -1725,7 +1696,7 @@ class RealtimeGUI:
             "show_legacy_devices": self.show_legacy_devices.get(),
             "exclusive_input": self.exclusive_input.get(),
             "exclusive_output": self.exclusive_output.get(),
-            **self._pitch_options(),
+            "pitch": self.pitch.get(),
             "speaker_id": self.speaker_id.get(),
             "index_rate": self.index_rate.get(),
             "rms_mix_rate": self.rms_mix_rate.get(),
@@ -1746,13 +1717,6 @@ class RealtimeGUI:
             "seamless": self.seamless.get(),
             "cached_context": self.cached_context.get(),
             "passthrough": self.passthrough.get(),
-        }
-
-    def _pitch_options(self):
-        return {
-            "pitch": self.pitch.get(),
-            "dataset_hz": self.dataset_hz.get(),
-            "pitch_range": self.pitch_range.get(),
         }
 
     def _save_config(self, settings):
@@ -1823,7 +1787,7 @@ class RealtimeGUI:
         if not self.engine.running:
             return
         try:
-            self.engine.update_pitch(self._pitch_options())
+            self.engine.update_pitch(self.pitch.get())
             self.engine.update_index_rate(self.index_rate.get())
             self.engine.update_beatrice(
                 self.speaker_id.get(),
@@ -1932,9 +1896,6 @@ class RealtimeGUI:
                 f"Processing {self.engine.last_block_ms} ms   ·   "
                 f"Model {self.engine.last_infer_ms} ms"
             )
-            voice_hz = self.engine.voice_hz
-            if voice_hz:
-                stats += f"   ·   Voice {voice_hz:.0f} Hz"
             dropouts = self.engine.dropouts
             if dropouts:
                 stats += f"   ·   Dropouts {dropouts}"

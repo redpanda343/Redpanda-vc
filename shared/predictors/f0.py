@@ -12,7 +12,6 @@ from beatrice.inference import (
     PitchEstimator,
     Weights,
     checkpoint_pitch_values,
-    pitch_bins,
 )
 from beatrice.resources import ensure_pitch_estimator
 from shared.predictors.rmvpe import N_CLASS, RMVPE as RMVPEModel, to_local_average_f0
@@ -156,7 +155,6 @@ class BeatricePitch:
         path = ensure_pitch_estimator()
         self.model = PitchEstimator(Weights(path, self.device, checkpoint_pitch_values(path)), self.device)
         self.offsets = torch.arange(1, PITCH_BAND + 1, device=self.device)
-        self.bins = None
         self.reset()
 
     def reset(self):
@@ -165,18 +163,11 @@ class BeatricePitch:
         self.samples = 0
         self.frames = 0
 
-    def set_band(self, band):
-        self.bins = pitch_bins(band)
-
     def _decode(self, probabilities):
         band = probabilities[:, 1:].unfold(1, PITCH_BAND, 1)
-        start = 0
-        if self.bins is not None:
-            start = self.bins[0] - 1
-            band = band[:, start:self.bins[1] - PITCH_BAND + 1]
         confidence, top = band.sum(-1).max(1)
         weights = band[torch.arange(band.shape[0], device=self.device), top]
-        position = (weights * (top[:, None] + start + self.offsets)).sum(1) / weights.sum(1)
+        position = (weights * (top[:, None] + self.offsets)).sum(1) / weights.sum(1)
         f0 = PITCH_BASE_HZ * 2.0 ** (position / BINS_PER_OCTAVE)
         return torch.where(confidence > self.threshold, f0, 0.0)
 

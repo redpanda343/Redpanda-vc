@@ -14,9 +14,7 @@ from rvc.algorithm.generators.hifigan_nsf import HiFiGANNSFGenerator
 from rvc.infer.content_cache import CachedContentEncoder, SpeechGroupNormConv
 from rvc.infer.feature_index import FeatureIndex
 from rvc.infer.infer import VoiceConverter
-from shared.pitch_map import PitchMap
 from shared.predictors.f0 import BeatricePitch
-from shared.predictors.rmvpe.constants import CONST as RMVPE_CENTS, N_CLASS as RMVPE_BINS
 from shared.utils import V1_FEATURE_LAYER, extract_embedding_features
 
 
@@ -42,14 +40,6 @@ def decoder_radius(generator):
             for block in blocks
         ) / scale
     return radius + (generator.conv_post.kernel_size[0] // 2) / scale
-
-
-def rmvpe_bins(band):
-    if band is None:
-        return None
-    low, high = ((1200 * math.log2(hz / 10) - RMVPE_CENTS) / 20 for hz in band)
-    low, high = max(0, math.floor(low)), min(RMVPE_BINS - 1, math.ceil(high))
-    return (low, high) if high - low >= 8 else None
 
 
 class AlignedNoise:
@@ -99,7 +89,6 @@ class RMVPEViterbi:
         self.state_indices = None
         self.previous_path = None
         self.previous_tracking_voiced = None
-        self.voiced = None
 
     def reset(self):
         self.previous_path = None
@@ -176,14 +165,10 @@ class RMVPEViterbi:
                 tracking[start:end] = True
         return tracking
 
-    def decode(self, salience, threshold, advance_frames=0, bins=None):
+    def decode(self, salience, threshold, advance_frames=0):
         salience = np.asarray(salience, dtype=np.float32)
         if salience.ndim != 2 or salience.shape[0] == 0 or salience.shape[1] == 0:
             raise ValueError("RMVPE salience must contain frames and pitch bins.")
-        low = 0
-        if bins is not None:
-            low = bins[0]
-            salience = salience[:, low:bins[1] + 1]
         centers = np.argmax(salience, axis=1).astype(np.int64)
         voiced = np.max(salience, axis=1) > threshold
         initial_center = None
@@ -194,9 +179,7 @@ class RMVPEViterbi:
             )
             previous_voiced = bool(self.previous_tracking_voiced[previous_index])
             if previous_voiced:
-                initial_center = int(self.previous_path[previous_index]) - low
-                if not 0 <= initial_center < salience.shape[1]:
-                    initial_center = None
+                initial_center = int(self.previous_path[previous_index])
         tracking_voiced = self._tracking_mask(voiced, previous_voiced)
         changes = np.flatnonzero(
             np.diff(
@@ -208,10 +191,8 @@ class RMVPEViterbi:
             centers[start:end] = self._decode_segment(
                 salience[start:end], segment_initial
             )
-        centers += low
         self.previous_path = centers.copy()
         self.previous_tracking_voiced = tracking_voiced.copy()
-        self.voiced = voiced
         return centers
 
 
@@ -259,7 +240,6 @@ class RealTimeRVC:
         lookahead_frames=0,
         seamless=False,
         cached_context=False,
-        **pitch_options,
     ):
         self.converter = VoiceConverter()
         self.converter.get_vc(model_path, speaker_id)
@@ -290,7 +270,7 @@ class RealTimeRVC:
         self.sample_rate = self.converter.tgt_sr
         self.version = self.converter.version
         self.speaker_id = speaker_id
-        self.pitch_map = PitchMap(pitch=pitch, **pitch_options)
+        self.pitch = pitch
         self.index_rate = float(index_rate)
         self.index = None
         self.lock = threading.RLock()
@@ -421,9 +401,9 @@ class RealTimeRVC:
             raise ValueError("The selected feature index is empty.")
         self.index = FeatureIndex(index)
 
-    def change_pitch(self, pitch=None, **options):
+    def change_pitch(self, pitch):
         with self.lock:
-            self.pitch_map.configure(pitch=None if pitch is None else int(pitch), **options)
+            self.pitch = int(pitch)
 
     def change_index_rate(self, index_rate):
         rate = float(index_rate)
@@ -436,7 +416,6 @@ class RealTimeRVC:
         self.cache_pitch.zero_()
         self.cache_pitchf.zero_()
         self.rmvpe_viterbi.reset()
-        self.pitch_map.reset()
         self.last_f0_method = None
         self.pitch_sample_count = 0
         self.beatrice_sample_count = None
@@ -646,9 +625,8 @@ class RealTimeRVC:
         if method not in self.prepared_f0_methods:
             self._prepare_pitch_predictor(method)
         self.pitch_sample_count += int(block_frame_16k)
-        band = self.pitch_map.band()
         if method == "beatrice":
-            self._update_beatrice_pitch(input_wav, block_frame_16k, band)
+            self._update_beatrice_pitch(input_wav, block_frame_16k)
             return
         extractor_frame = block_frame_16k + 800 + 160 * self.lookahead
         if method == "swift":
@@ -664,47 +642,42 @@ class RealTimeRVC:
         shift = max(1, block_frame_16k // 160)
         decoder = None
         network = None
-        bins = None
         if method == "rmvpe":
-            bins = rmvpe_bins(band)
             decoder = lambda salience, threshold: self.rmvpe_viterbi.decode(
-                salience, threshold, shift, bins
+                salience, threshold, shift
             )
             predictor = getattr(self.pipeline, "model_rmvpe", None)
             if predictor is not None:
                 network = self._rmvpe_network(predictor.model.model)
-        _, f0 = self.pipeline.get_f0(
+        pitch, pitchf = self.pipeline.get_f0(
             source,
             source.shape[0] // 160,
             f0_method=method,
+            pitch=self.pitch,
             f0_decoder=decoder,
             f0_network=network,
-            f0_band=band,
         )
         if method not in self.prepared_f0_methods:
             self._prepare_pitch_predictor(method)
-        f0 = np.asarray(f0).reshape(-1)
-        voiced = self.rmvpe_viterbi.voiced
-        if bins is not None and voiced is not None and voiced.shape == f0.shape:
-            f0 = np.where(voiced, f0, 0.0)
-        if method != "swift" and f0.size > 4:
-            f0 = f0[3:-1]
-        self.pitch_map.observe(f0[-shift:])
-        pitch, pitchf = self.pipeline.quantize_f0(f0 if self.is_rectified else self.pitch_map.apply(f0), 0)
         pitch = torch.as_tensor(pitch, device=self.device, dtype=torch.long).flatten()
         pitchf = torch.as_tensor(
             pitchf, device=self.device, dtype=torch.float32
         ).flatten()
         self.cache_pitch[:-shift] = self.cache_pitch[shift:].clone()
         self.cache_pitchf[:-shift] = self.cache_pitchf[shift:].clone()
-        count = min(pitch.numel(), self.cache_pitch.numel())
+        if method == "swift":
+            usable_pitch = pitch
+            usable_pitchf = pitchf
+        else:
+            usable_pitch = pitch[3:-1] if pitch.numel() > 4 else pitch
+            usable_pitchf = pitchf[3:-1] if pitchf.numel() > 4 else pitchf
+        count = min(usable_pitch.numel(), self.cache_pitch.numel())
         if count:
-            self.cache_pitch[-count:] = pitch[-count:]
-            self.cache_pitchf[-count:] = pitchf[-count:]
+            self.cache_pitch[-count:] = usable_pitch[-count:]
+            self.cache_pitchf[-count:] = usable_pitchf[-count:]
 
-    def _update_beatrice_pitch(self, input_wav, block_frame_16k, band=None):
+    def _update_beatrice_pitch(self, input_wav, block_frame_16k):
         predictor = self.pipeline.model_beatrice
-        predictor.set_band(band)
         source = input_wav[-int(block_frame_16k):]
         if self.beatrice_sample_count != self.pitch_sample_count - block_frame_16k:
             predictor.reset()
@@ -713,12 +686,10 @@ class RealTimeRVC:
         f0 = predictor.push(source)
         if not f0.numel():
             return
-        f0 = f0.cpu().numpy()
-        shift = max(1, block_frame_16k // 160)
-        self.pitch_map.observe(f0[-shift:])
-        pitch, pitchf = self.pipeline.quantize_f0(f0 if self.is_rectified else self.pitch_map.apply(f0), 0)
+        pitch, pitchf = self.pipeline.quantize_f0(f0.cpu().numpy(), self.pitch)
         pitch = torch.as_tensor(pitch, device=self.device, dtype=torch.long)
         pitchf = torch.as_tensor(pitchf, device=self.device, dtype=torch.float32)
+        shift = max(1, block_frame_16k // 160)
         self.cache_pitch[:-shift] = self.cache_pitch[shift:].clone()
         self.cache_pitchf[:-shift] = self.cache_pitchf[shift:].clone()
         end = predictor.frames - predictor.samples // 160
@@ -741,7 +712,7 @@ class RealTimeRVC:
             source = F.pad(source, (length - source.numel(), 0))
         return source[-length:]
 
-    def _rectified_f0(self, waveform, input_wav, f0_method, source_wav, source_rate, frames, block_frame_16k):
+    def _rectified_f0(self, waveform, input_wav, f0_method, source_wav, source_rate, frames):
         from rectified_flow.pitch import parselmouth_pitch, resample_f0, resample_voicing, rmvpe_model, rmvpe_pitch
 
         rate = self.sample_rate
@@ -751,26 +722,21 @@ class RealTimeRVC:
             source = self._full_rate_source(source_wav, source_rate, waveform.shape[-1])
         if f0_method in ("pm", "rmvpe"):
             audio = source.cpu().numpy()
-            band = self.pitch_map.band()
             if f0_method == "pm":
-                f0, uv = parselmouth_pitch(audio, rate, hop, frames, band)
+                f0, uv = parselmouth_pitch(audio, rate, hop, frames)
             else:
                 predictor = getattr(self.pipeline, "model_rmvpe", None)
                 model = predictor.model if predictor is not None else rmvpe_model(self.device)
-                f0, uv = rmvpe_pitch(
-                    model, audio, rate, hop, frames, self._rmvpe_network(model.model), rmvpe_bins(band)
-                )
-            fresh = max(1, round(int(block_frame_16k) * rate / (16000 * hop)))
-            self.pitch_map.observe(np.where(uv, 0.0, f0)[-fresh:])
+                f0, uv = rmvpe_pitch(model, audio, rate, hop, frames, self._rmvpe_network(model.model))
             return f0, uv, source
         p_len = input_wav.shape[0] // 160
         pitchf = self.cache_pitchf[-p_len:].cpu().numpy()
-        f0 = resample_f0(pitchf, 100, frames, rate / hop)
+        f0 = resample_f0(pitchf, 100, frames, rate / hop) / 2 ** (self.pitch / 12)
         uv = ~resample_voicing(pitchf > 0, 100, frames, rate / hop)
         return f0, uv, source
 
     def _infer_rectified(self, features, input_wav, speaker, skip_head, return_length,
-                         f0_method, source_wav=None, source_rate=None, block_frame_16k=0):
+                         f0_method, source_wav=None, source_rate=None):
         rate = self.sample_rate
         hop = int(self.pipeline.data["hop_length"])
         waveform = self.flow_resampler(input_wav.float()).view(1, -1)
@@ -780,15 +746,13 @@ class RealTimeRVC:
         if start < 0 or count < 1 or start + count > length:
             raise ValueError("The requested flow output exceeds the input context.")
         frames = math.ceil(length / hop)
-        f0, uv, source = self._rectified_f0(
-            waveform, input_wav, f0_method, source_wav, source_rate, frames, block_frame_16k
-        )
+        f0, uv, source = self._rectified_f0(waveform, input_wav, f0_method, source_wav, source_rate, frames)
         variances = None
         if self.variance_stream is not None:
             position = self.pitch_sample_count * rate // 16000
             curves = self.variance_stream(source.cpu().numpy(), f0, uv, position, frames)
             variances = torch.from_numpy(curves).to(self.device)[None]
-        f0 = torch.from_numpy(np.asarray(self.pitch_map.apply(f0), dtype=np.float32)).to(waveform.device)[None]
+        f0 = torch.from_numpy(f0).to(waveform.device)[None] * 2 ** (self.pitch / 12)
         mask = torch.ones(1, 1, frames, device=self.device)
         first_frame = max(0, start // hop - self.vocoder_context_frames)
         window = 0 if self.flow_context_frames is None else max(0, first_frame - self.flow_context_frames)
@@ -843,7 +807,7 @@ class RealTimeRVC:
             if self.is_rectified:
                 audio = self._infer_rectified(
                     features, input_wav, speaker, skip_head, int(return_length),
-                    f0_method, source_wav, source_rate, block_frame_16k,
+                    f0_method, source_wav, source_rate,
                 )
                 if torch.device(self.device).type == "cuda":
                     torch.cuda.synchronize(self.device)

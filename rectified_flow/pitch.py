@@ -51,13 +51,8 @@ def parselmouth_contour(waveform, sample_rate, hop, frames, f0_min=PARSELMOUTH_F
     return np.pad(contour, (0, max(0, frames - len(contour))))[:frames]
 
 
-def parselmouth_pitch(waveform, sample_rate, hop, frames, band=None):
-    limits = ()
-    if band is not None:
-        low, high = max(band[0], PARSELMOUTH_F0_MIN), min(band[1], PARSELMOUTH_F0_MAX)
-        if low < high:
-            limits = (low, high)
-    contour = parselmouth_contour(waveform, sample_rate, hop, frames, *limits)
+def parselmouth_pitch(waveform, sample_rate, hop, frames):
+    contour = parselmouth_contour(waveform, sample_rate, hop, frames)
     return interpolate_f0(contour), contour == 0
 
 
@@ -76,14 +71,10 @@ def release_rmvpe_model(device):
     return _RMVPE.pop(str(device), None) is not None
 
 
-def rmvpe_pitch(model, waveform, sample_rate, hop, frames, network=None, bins=None):
+def rmvpe_pitch(model, waveform, sample_rate, hop, frames, network=None):
     from shared.predictors.rmvpe import interp_f0, resample_align_curve
 
     hidden = model.infer_hidden(np.asarray(waveform, dtype=np.float32), sample_rate, network)
-    if bins is not None:
-        hidden = hidden.clone()
-        hidden[..., :bins[0]] = 0
-        hidden[..., bins[1] + 1:] = 0
     f0 = model.decode(hidden)
     uv = f0 == 0
     f0, _ = interp_f0(f0, uv)
