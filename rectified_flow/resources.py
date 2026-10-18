@@ -7,6 +7,7 @@ from pathlib import Path
 
 from tqdm import tqdm
 
+from shared.file_hash import cached_sha256
 from shared.tools.prerequisites_download import _sha256, download_file
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -79,7 +80,7 @@ _download_lock = threading.Lock()
 
 
 def _valid_bundle(directory, files):
-    return all((directory / name).is_file() and _sha256(directory / name) == checksum
+    return all((directory / name).is_file() and cached_sha256(directory / name) == checksum
                for name, checksum in files.items())
 
 

@@ -9,7 +9,6 @@ import librosa
 import logging
 import numpy as np
 import soundfile as sf
-import noisereduce as nr
 from contextlib import contextmanager
 from functools import wraps
 
@@ -153,6 +152,8 @@ class VoiceConverter:
             reduction_strength (float): Strength of the noise reduction. Default is 0.7.
         """
         try:
+            import noisereduce as nr
+
             reduced_noise = nr.reduce_noise(
                 y=data, sr=sr, prop_decrease=reduction_strength
             )

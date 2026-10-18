@@ -1,12 +1,10 @@
-import hashlib
 import os
 import shutil
 import tempfile
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 
-import requests
-from tqdm import tqdm
+from shared.file_hash import cached_sha256, sha256 as _sha256
 
 
 DOWNLOAD_TIMEOUT = (10, 120)
@@ -121,19 +119,11 @@ def get_download_url(remote_folder, file):
     return f"{url_base}/{remote_folder}{remote_file}"
 
 
-def _sha256(file_path):
-    digest = hashlib.sha256()
-    with open(file_path, "rb") as file:
-        for block in iter(lambda: file.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
 def _file_is_valid(remote_folder, file, destination_path):
     if not os.path.isfile(destination_path) or os.path.getsize(destination_path) == 0:
         return False
     expected_sha256 = expected_sha256_mapping.get((remote_folder, file))
-    return expected_sha256 is None or _sha256(destination_path) == expected_sha256
+    return expected_sha256 is None or cached_sha256(destination_path) == expected_sha256
 
 
 def _files_need_download(file_list):
@@ -156,6 +146,8 @@ def get_file_size_if_missing(file_list):
         for file in files:
             destination_path = os.path.join(local_folder, file)
             if not _file_is_valid(remote_folder, file, destination_path):
+                import requests
+
                 url = get_download_url(remote_folder, file)
                 with requests.head(
                     url,
@@ -173,6 +165,7 @@ def download_file(url, destination_path, global_bar, expected_sha256=None, archi
     Download a file from the given URL to the specified destination path,
     updating the global progress bar as data is downloaded.
     """
+    import requests
 
     dir_name = os.path.dirname(destination_path)
     if dir_name:
@@ -348,6 +341,8 @@ def prequisites_download_pipeline(
     )
 
     if files_need_download:
+        from tqdm import tqdm
+
         with tqdm(
             total=total_size, unit="iB", unit_scale=True, desc="Downloading all files"
         ) as global_bar:

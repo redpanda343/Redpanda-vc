@@ -815,9 +815,6 @@ def start_realtime(
     block_time,
     crossfade_time,
     extra_time,
-    lookahead_time,
-    seamless,
-    cached_context,
     use_fp32,
     inference_device,
     previous_token,
@@ -842,12 +839,8 @@ def start_realtime(
         "block_time": float(block_time),
         "crossfade_time": float(crossfade_time),
         "extra_time": float(extra_time),
-        "lookahead_time": float(lookahead_time),
-        "seamless": bool(seamless),
-        "cached_context": bool(cached_context),
         "use_fp32": bool(use_fp32),
         "inference_device": inference_device or "auto",
-        "safety_buffer": 0.0,
         "threshold": int(threshold),
         "rms_mix_rate": float(rms_mix_rate),
         "input_gain_db": float(input_gain_db),
@@ -1027,28 +1020,7 @@ def realtime_tab(model_file, index_file, rectified_vocoder_path):
                 info=i18n("Seconds of past audio the model sees. More is smoother but slower."),
                 interactive=True,
             )
-            lookahead_time = gr.Slider(
-                minimum=0.0,
-                maximum=0.3,
-                step=0.01,
-                value=0.0,
-                label=i18n("Lookahead"),
-                info=i18n("Seconds of future audio the model sees past each block, added to the delay."),
-                interactive=True,
-            )
         with gr.Row():
-            seamless = gr.Checkbox(
-                label=i18n("Seamless Blocks"),
-                info=i18n("Makes consecutive blocks line up exactly. Uses more GPU time. RVC models only."),
-                value=False,
-                interactive=True,
-            )
-            cached_context = gr.Checkbox(
-                label=i18n("Cached Context"),
-                info=i18n("Reuses ContentVec results for older context, so a long extra context stays cheap. Needs about 1 s of extra context or more. RVC models only."),
-                value=True,
-                interactive=True,
-            )
             use_fp32 = gr.Checkbox(
                 label=i18n("FP32 inference"),
                 info=i18n("Use full precision. Otherwise compatible NVIDIA GPUs use FP16 for RVC. CPU, GTX 16-series and Flow models use FP32."),
@@ -1057,7 +1029,7 @@ def realtime_tab(model_file, index_file, rectified_vocoder_path):
             )
     gr.Markdown(
         i18n(
-            "Inference Device, FP32 inference, Block Time, Crossfade, Extra Context, Lookahead, the embedder, the speaker and the toggles above them apply on the next Start. Pitch, Index Rate, the pitch algorithm and the Audio settings apply while running."
+            "Inference Device, FP32 inference, Block Time, Crossfade, Extra Context, the embedder and the speaker apply on the next Start. Pitch, Index Rate, the pitch algorithm and the Audio settings apply while running."
         )
     )
 
@@ -1081,9 +1053,6 @@ def realtime_tab(model_file, index_file, rectified_vocoder_path):
             block_time,
             crossfade_time,
             extra_time,
-            lookahead_time,
-            seamless,
-            cached_context,
             use_fp32,
             inference_device,
             token,

@@ -45,14 +45,8 @@ class SourceModuleHnNSF(torch.nn.Module):
         self.l_linear = torch.nn.Linear(harmonic_num + 1, 1)
         self.l_tanh = torch.nn.Tanh()
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        upsample_factor: int = 1,
-        phase: Optional[torch.Tensor] = None,
-        noise: Optional[torch.Tensor] = None,
-    ):
-        sine_wavs, uv, _ = self.l_sin_gen(x, upsample_factor, phase, noise)
+    def forward(self, x: torch.Tensor, upsample_factor: int = 1):
+        sine_wavs, uv, _ = self.l_sin_gen(x, upsample_factor)
         sine_wavs = sine_wavs.to(dtype=self.l_linear.weight.dtype)
         sine_merge = self.l_tanh(self.l_linear(sine_wavs))
         return sine_merge, None, None
@@ -177,14 +171,9 @@ class HiFiGANNSFGenerator(torch.nn.Module):
         self.lrelu_slope = LRELU_SLOPE
 
     def forward(
-        self,
-        x: torch.Tensor,
-        f0: torch.Tensor,
-        g: Optional[torch.Tensor] = None,
-        phase: Optional[torch.Tensor] = None,
-        noise: Optional[torch.Tensor] = None,
+        self, x: torch.Tensor, f0: torch.Tensor, g: Optional[torch.Tensor] = None
     ):
-        har_source, _, _ = self.m_source(f0, self.upp, phase, noise)
+        har_source, _, _ = self.m_source(f0, self.upp)
         har_source = har_source.squeeze(-1).unsqueeze(1)
         # new tensor
         x = self.conv_pre(x)

@@ -1,5 +1,8 @@
+import collections
+import csv
 import functools
-import hashlib
+import importlib.metadata
+import inspect
 import os
 import shutil
 import sys
@@ -14,8 +17,9 @@ import wget
 from torch import nn
 
 import logging
-from transformers import AutoFeatureExtractor, HubertModel
 import warnings
+
+from shared.file_hash import cached_sha256, sha256 as _sha256
 
 # Remove this to see warnings about transformers models
 warnings.filterwarnings("ignore")
@@ -29,10 +33,44 @@ now_dir = os.getcwd()
 sys.path.append(now_dir)
 
 
-class HubertModelWithFinalProj(HubertModel):
-    def __init__(self, config):
-        super().__init__(config)
-        self.final_proj = nn.Linear(config.hidden_size, config.classifier_proj_size)
+def _top_level_names(distribution):
+    declared = (distribution.read_text("top_level.txt") or "").split()
+    if declared:
+        return declared
+    record = distribution.read_text("RECORD")
+    if record is None:
+        return importlib.metadata._top_level_inferred(distribution)
+    names = set()
+    for row in csv.reader(record.splitlines()):
+        if row:
+            parts = importlib.metadata.PackagePath(row[0]).parts
+            names.add(parts[0] if len(parts) > 1 else inspect.getmodulename(row[0]) or row[0])
+    return [name for name in names if "." not in name]
+
+
+def packages_distributions():
+    mapping = collections.defaultdict(list)
+    for distribution in importlib.metadata.distributions():
+        for name in _top_level_names(distribution):
+            mapping[name].append(distribution.metadata["Name"])
+    return dict(mapping)
+
+
+importlib.metadata.packages_distributions = packages_distributions
+
+
+@functools.cache
+def hubert_model_class():
+    from transformers import HubertModel
+
+    logging.getLogger("transformers").setLevel(logging.ERROR)
+
+    class HubertModelWithFinalProj(HubertModel):
+        def __init__(self, config):
+            super().__init__(config)
+            self.final_proj = nn.Linear(config.hidden_size, config.classifier_proj_size)
+
+    return HubertModelWithFinalProj
 
 
 def get_embedding_metadata(embedder_model, version="v2"):
@@ -121,22 +159,8 @@ CONTENTVEC_CONFIG_SHA256 = "2ddde063b795d38d9051a7215a092fecf4cfe148b54251e38de5
 V1_FEATURE_LAYER = 9
 
 
-def _sha256(file_path):
-    digest = hashlib.sha256()
-    with open(file_path, "rb") as file:
-        for block in iter(lambda: file.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-@functools.lru_cache(maxsize=None)
-def _cached_sha256(file_path, size, modified):
-    return _sha256(file_path)
-
-
 def _file_sha256(file_path):
-    stat = os.stat(file_path)
-    return _cached_sha256(os.path.abspath(file_path), stat.st_size, stat.st_mtime_ns)
+    return cached_sha256(file_path)
 
 
 def _download_file(url, destination_path, expected_sha256=None):
@@ -245,8 +269,10 @@ def load_embedding(embedder_model, version="v2"):
         if not os.path.exists(json_file):
             _download_file(config_files[embedder_model], json_file)
 
-    models = HubertModelWithFinalProj.from_pretrained(model_path)
+    models = hubert_model_class().from_pretrained(model_path)
     if os.path.isfile(preprocessor_json_file):
+        from transformers import AutoFeatureExtractor
+
         feature_extractor = AutoFeatureExtractor.from_pretrained(
             model_path, local_files_only=True
         )

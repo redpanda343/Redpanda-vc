@@ -3,12 +3,9 @@ import logging
 import sys
 import time
 
-import librosa
 import numpy as np
 import torch
 import torch.nn.functional as F
-from noisereduce.torchgate import TorchGate
-from noisereduce.torchgate.utils import amp_to_db
 from torchaudio.transforms import Resample
 
 from beatrice.inference import OUT_SAMPLE_RATE, find_paraphernalia, is_beatrice_checkpoint
@@ -19,6 +16,7 @@ from rvc.infer.realtime import RealTimeRVC
 
 BEATRICE_BLOCK_TIME = 0.02
 AUTOTUNE_HEADROOM = 1 << 30
+PITCH_METHODS = ("rmvpe", "swift", "beatrice", "pm")
 RESAMPLE_FILTER = dict(
     lowpass_filter_width=64,
     rolloff=0.9475937167399596,
@@ -28,26 +26,57 @@ RESAMPLE_FILTER = dict(
 logger = logging.getLogger(__name__)
 
 
-class BlockTorchGate(TorchGate):
-    def forward(self, x, xn=None):
-        window = torch.hann_window(self.win_length, device=x.device)
-        spectrum = torch.stft(x, n_fft=self.n_fft, hop_length=self.hop_length, win_length=self.win_length,
-                              return_complex=True, pad_mode="constant", center=True, window=window)
-        if self.nonstationary:
-            mask = self._nonstationary_mask(spectrum.abs())
-        else:
-            mask = self._stationary_mask(amp_to_db(spectrum), xn)
+def smoothing_ramp(count):
+    return torch.cat((torch.linspace(0, 1, count + 2)[:-1], torch.linspace(1, 0, count + 2)))[1:-1]
+
+
+def amplitude_db(spectrum, top_db=40.0):
+    values = 20 * torch.log10(spectrum.abs() + torch.finfo(torch.float64).eps)
+    return torch.max(values, (values.max(-1).values - top_db).unsqueeze(-1))
+
+
+class BlockTorchGate(torch.nn.Module):
+    def __init__(self, sr, n_fft, prop_decrease=0.9, std_threshold=1.5, freq_smooth_hz=500, time_smooth_ms=50):
+        super().__init__()
+        self.n_fft = n_fft
+        self.hop_length = n_fft // 4
+        self.prop_decrease = prop_decrease
+        self.std_threshold = std_threshold
+        self.register_buffer("window", torch.hann_window(n_fft), persistent=False)
+        frequency = int(freq_smooth_hz / (sr / (n_fft / 2)))
+        time_bins = int(time_smooth_ms / ((self.hop_length / sr) * 1000))
+        smoothing = None
+        if frequency > 1 or time_bins > 1:
+            smoothing = torch.outer(smoothing_ramp(frequency), smoothing_ramp(time_bins))[None, None]
+            smoothing = smoothing / smoothing.sum()
+        self.register_buffer("smoothing", smoothing, persistent=False)
+
+    def _stft(self, audio):
+        return torch.stft(audio, n_fft=self.n_fft, hop_length=self.hop_length, win_length=self.n_fft,
+                          return_complex=True, pad_mode="constant", center=True, window=self.window)
+
+    def forward(self, x, xn):
+        spectrum = self._stft(x)
+        spectrum_db = amplitude_db(spectrum)
+        deviation, mean = torch.std_mean(amplitude_db(self._stft(xn)).to(spectrum_db.dtype), dim=-1)
+        mask = spectrum_db > (mean + deviation * self.std_threshold).unsqueeze(2)
         mask = self.prop_decrease * (mask.float() - 1.0) + 1.0
-        if self.smoothing_filter is not None:
-            mask = F.conv2d(mask.unsqueeze(1), self.smoothing_filter.to(mask.dtype), padding="same")
-        y = torch.istft(spectrum * mask.squeeze(1), n_fft=self.n_fft, hop_length=self.hop_length,
-                        win_length=self.win_length, center=True, window=window)
+        if self.smoothing is not None:
+            mask = F.conv2d(mask.unsqueeze(1), self.smoothing.to(mask.dtype), padding="same").squeeze(1)
+        y = torch.istft(spectrum * mask, n_fft=self.n_fft, hop_length=self.hop_length, win_length=self.n_fft,
+                        center=True, window=self.window)
         return y.to(dtype=x.dtype)
 
 
+def frame_rms(signal, frame_length, hop_length):
+    power = np.pad(np.square(signal), frame_length // 2)
+    frames = np.lib.stride_tricks.sliding_window_view(power, frame_length)[::hop_length]
+    return np.sqrt(frames.mean(axis=1))
+
+
 DEVICE_BUFFERS = (
-    "input_wav", "input_wav_denoise", "input_wav_res", "sola_buffer", "sola_den_kernel", "nr_buffer",
-    "output_buffer", "fade_in_window", "fade_out_window", "resampler", "resampler2", "tg",
+    "input_wav", "input_wav_denoise", "input_wav_res", "sola_buffer", "sola_den_kernel", "sola_positions",
+    "nr_buffer", "output_buffer", "fade_in_window", "fade_out_window", "resampler", "resampler2", "tg",
 )
 
 
@@ -94,9 +123,6 @@ class RealtimeProcessor:
                 rectified_vocoder_path=settings.get("rectified_vocoder_path", ""),
                 rectified_steps=settings.get("rectified_steps", 0),
                 rectified_flow_window=settings.get("rectified_flow_window", True),
-                lookahead_frames=round(settings.get("lookahead_time", 0.0) * 100),
-                seamless=settings.get("seamless", False),
-                cached_context=settings.get("cached_context", False),
                 use_fp32=settings.get("use_fp32", False),
             )
             model_rate = self.rvc.sample_rate
@@ -106,6 +132,7 @@ class RealtimeProcessor:
             self.device = torch.device("cpu")
         return model_rate, beatrice_path
 
+    @torch.inference_mode()
     def prepare(self, beatrice_path=None):
         settings = self.settings
         self._prepare_buffers()
@@ -134,9 +161,8 @@ class RealtimeProcessor:
             self.crossfade_frame = min(
                 int(np.round(settings["crossfade_time"] * rate / self.zc)) * self.zc, self.block_frame
             )
-        self.safety_frame = int(np.round(settings.get("safety_buffer", 0.0) * rate / self.zc)) * self.zc
         self.sola_buffer_frame = self.crossfade_frame
-        self.sola_search_frame = 0 if self.rvc is not None and self.rvc.seamless else self.zc
+        self.sola_search_frame = self.zc
         self.extra_frame = int(np.round(settings["extra_time"] * rate / self.zc)) * self.zc
         self.input_wav = torch.zeros(
             self.extra_frame + self.crossfade_frame + self.sola_search_frame + self.block_frame,
@@ -147,9 +173,14 @@ class RealtimeProcessor:
         self.input_wav_res = torch.zeros(
             160 * self.input_wav.shape[0] // self.zc, device=device, dtype=torch.float32
         )
+        lookahead = max(RealTimeRVC.pitch_lookahead_frames(method) for method in PITCH_METHODS)
+        self.recent_input = np.zeros(
+            self.input_wav.shape[0] - max(0, self.extra_frame - lookahead * self.zc), dtype=np.float32
+        )
         self.rms_buffer = np.zeros(4 * self.zc, dtype="float32")
         self.sola_buffer = torch.zeros(self.sola_buffer_frame, device=device, dtype=torch.float32)
         self.sola_den_kernel = torch.ones(1, 1, self.sola_buffer_frame, device=device, dtype=torch.float32)
+        self.sola_positions = torch.arange(self.block_frame + self.sola_buffer_frame, device=device)
         self.nr_buffer = self.sola_buffer.clone()
         self.output_buffer = self.input_wav.clone()
         self.skip_head = self.extra_frame // self.zc
@@ -180,6 +211,7 @@ class RealtimeProcessor:
                        self.sola_buffer, self.nr_buffer):
             buffer.zero_()
         self.rms_buffer[:] = 0
+        self.recent_input[:] = 0
         if self.rvc is not None:
             self.rvc.reset_caches()
         if self.beatrice is not None:
@@ -256,56 +288,45 @@ class RealtimeProcessor:
 
     def _gate(self, indata):
         indata = np.append(self.rms_buffer, indata)
-        rms = librosa.feature.rms(y=indata, frame_length=4 * self.zc, hop_length=self.zc)[:, 2:]
+        rms = frame_rms(indata, 4 * self.zc, self.zc)[2:]
         self.rms_buffer[:] = indata[-4 * self.zc :]
         indata = indata[2 * self.zc - self.zc // 2 :]
-        quiet = librosa.amplitude_to_db(rms, ref=1.0)[0] < self.settings["threshold"]
-        for index in range(quiet.shape[0]):
-            if quiet[index]:
-                indata[index * self.zc : (index + 1) * self.zc] = 0
+        quiet = 20 * np.log10(np.maximum(rms, 1e-5)) < self.settings["threshold"]
+        indata[np.repeat(quiet, self.zc)[: indata.shape[0]]] = 0
         return indata[self.zc // 2 :]
+
+    def _rms(self, audio, size):
+        frame = 4 * self.zc
+        power = F.pad(audio.square()[None, None], (frame // 2, frame // 2))
+        rms = F.avg_pool1d(power, frame, self.zc).sqrt_()
+        return F.interpolate(rms, size=size + 1, mode="linear", align_corners=True)[0, 0, :-1]
 
     def _mix_volume(self, converted, source):
         rate = self.settings["rms_mix_rate"]
-        lookahead = self.rvc.lookahead_frames(self.settings["f0_method"])
-        start = self.extra_frame - lookahead * self.zc
-        source = source[start : start + converted.shape[0]]
-        rms_source = librosa.feature.rms(
-            y=source.cpu().numpy(), frame_length=4 * self.zc, hop_length=self.zc
-        )
-        rms_source = torch.from_numpy(rms_source).to(self.device)
-        rms_source = F.interpolate(
-            rms_source.unsqueeze(0), size=converted.shape[0] + 1, mode="linear", align_corners=True
-        )[0, 0, :-1]
-        rms_converted = librosa.feature.rms(
-            y=converted[:].cpu().numpy(), frame_length=4 * self.zc, hop_length=self.zc
-        )
-        rms_converted = torch.from_numpy(rms_converted).to(self.device)
-        rms_converted = F.interpolate(
-            rms_converted.unsqueeze(0), size=converted.shape[0] + 1, mode="linear", align_corners=True
-        )[0, 0, :-1]
-        rms_converted = torch.max(rms_converted, torch.zeros_like(rms_converted) + 1e-3)
+        start = self.extra_frame - self.rvc.pitch_lookahead_frames(self.settings["f0_method"]) * self.zc
+        size = converted.shape[0]
+        rms_source = self._rms(source[start : start + size], size)
+        rms_converted = self._rms(converted, size).clamp_min_(1e-3)
         return converted * torch.pow(rms_source / rms_converted, 1.0 - rate)
 
     def _apply_sola(self, converted):
         needed = self.block_frame + self.sola_buffer_frame + self.sola_search_frame
         if converted.shape[0] < needed:
             converted = F.pad(converted, (0, needed - converted.shape[0]))
-        if self.sola_search_frame:
-            conv_input = converted[None, None, : self.sola_buffer_frame + self.sola_search_frame]
-            cor_nom = F.conv1d(conv_input, self.sola_buffer[None, None, :])
-            cor_den = torch.sqrt(F.conv1d(conv_input**2, self.sola_den_kernel) + 1e-8)
-            sola_offset = int(torch.argmax(cor_nom[0, 0] / cor_den[0, 0]).item())
-            converted = converted[sola_offset:]
+        conv_input = converted[None, None, : self.sola_buffer_frame + self.sola_search_frame]
+        cor_nom = F.conv1d(conv_input, self.sola_buffer[None, None, :])
+        cor_den = torch.sqrt(F.conv1d(conv_input**2, self.sola_den_kernel) + 1e-8)
+        converted = converted[self.sola_positions + torch.argmax(cor_nom[0, 0] / cor_den[0, 0])]
         converted[: self.sola_buffer_frame] *= self.fade_in_window
         converted[: self.sola_buffer_frame] += self.sola_buffer * self.fade_out_window
-        self.sola_buffer[:] = converted[self.block_frame : self.block_frame + self.sola_buffer_frame]
+        self.sola_buffer[:] = converted[self.block_frame :]
         return converted[: self.block_frame]
 
+    @torch.inference_mode()
     def process(self, indata, warm_up=False):
         started = time.perf_counter()
         settings = self.settings
-        indata = librosa.to_mono(indata.T).astype(np.float32)
+        indata = indata.mean(axis=1, dtype=np.float32)
         indata *= np.float32(db_to_linear(settings["input_gain_db"]))
         np.clip(indata, -1.0, 1.0, out=indata)
         self.input_level = float(np.abs(indata).max(initial=0.0))
@@ -313,6 +334,10 @@ class RealtimeProcessor:
             indata = self._gate(indata)
         self.input_wav[: -self.block_frame] = self.input_wav[self.block_frame :].clone()
         self.input_wav[-indata.shape[0] :] = torch.from_numpy(indata).to(self.device)
+        recent = self.recent_input
+        recent[: -self.block_frame] = recent[self.block_frame :]
+        tail = indata[-recent.shape[0] :]
+        recent[-tail.shape[0] :] = tail
         self.input_wav_res[: -self.block_frame_16k] = self.input_wav_res[self.block_frame_16k :].clone()
         denoise = settings["input_noise_reduce"]
         if denoise:
@@ -347,11 +372,11 @@ class RealtimeProcessor:
                 infer_wav = self.tg(infer_wav.unsqueeze(0), self.output_buffer.unsqueeze(0)).squeeze(0)
             output_block = infer_wav[: self.block_frame]
         else:
-            lookahead = self.rvc.lookahead_frames(settings["f0_method"])
-            quiet = not warm_up and not bool(self.input_wav[max(0, self.extra_frame - lookahead * self.zc) :].any())
+            start = max(0, self.extra_frame - self.rvc.pitch_lookahead_frames(settings["f0_method"]) * self.zc)
+            quiet = not warm_up and not self.recent_input[start - self.input_wav.shape[0] :].any()
             silent = passthrough or quiet
             if silent:
-                self.rvc.skip_block(self.block_frame_16k, self.input_wav_res, not quiet)
+                self.rvc.skip_block(self.block_frame_16k)
                 infer_wav = torch.zeros_like(source[self.extra_frame :])
             else:
                 infer_wav, infer_seconds = self.rvc.infer(
@@ -377,7 +402,7 @@ class RealtimeProcessor:
         gain = db_to_linear(settings["output_gain_db"])
         if warm_up and not bool(torch.isfinite(output_block).all()):
             raise FloatingPointError("Realtime warm-up produced non-finite audio.")
-        output = torch.clamp(output_block * gain, -1.0, 1.0).cpu().numpy().astype(np.float32)
+        output = torch.clamp(output_block * gain, -1.0, 1.0).cpu().numpy()
         if not passthrough:
             self.output_level = float(np.abs(output).max(initial=0.0))
         if not silent:

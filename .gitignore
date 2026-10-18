@@ -16,11 +16,15 @@
 *.png
 !assets/applio_mascot.png
 *.safetensors
+*.nbi
+*.nbc
+__pycache__/
 
 assets/audios
 assets/datasets
 assets/config.json
 assets/realtime_config.json
+assets/sha256_cache.json
 
 logs/*
 !logs/.gitkeep

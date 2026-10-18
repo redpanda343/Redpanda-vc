@@ -262,6 +262,9 @@ def _run_worker():
             try:
                 result = None
                 if command == "load":
+                    from shared.cuda_sync import use_blocking_cuda_sync
+
+                    use_blocking_cuda_sync()
                     _send(outgoing, {"stage": "importing PyTorch"})
                     import torch
                     _send(outgoing, {"stage": "initializing CUDA"})
@@ -278,7 +281,7 @@ def _run_worker():
                     processor.channels = 1
                     with torch.inference_mode():
                         processor.prepare(beatrice_path)
-                    lookahead = 0 if processor.rvc is None else processor.rvc.lookahead_frames(processor.settings["f0_method"])
+                    lookahead = 0 if processor.rvc is None else processor.rvc.pitch_lookahead_frames(processor.settings["f0_method"])
                     delay = (processor.crossfade_frame + processor.sola_search_frame) / payload + lookahead / 100
                     result = {"block": processor.block_frame, "sampleRate": payload, "delay": delay}
                 elif command == "process":

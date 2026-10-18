@@ -28,22 +28,7 @@ os.environ.setdefault("OMP_NUM_THREADS", "4")
 os.environ.setdefault("KMP_BLOCKTIME", "1")
 os.environ.setdefault("SD_ENABLE_ASIO", "1")
 
-CU_CTX_SCHED_BLOCKING_SYNC = 4
-
-
-def use_blocking_cuda_sync():
-    try:
-        driver = ctypes.WinDLL("nvcuda.dll") if sys.platform == "win32" else ctypes.CDLL("libcuda.so.1")
-        count = ctypes.c_int()
-        if driver.cuInit(0) or driver.cuDeviceGetCount(ctypes.byref(count)):
-            return
-        for index in range(count.value):
-            device = ctypes.c_int()
-            if not driver.cuDeviceGet(ctypes.byref(device), index):
-                driver.cuDevicePrimaryCtxSetFlags_v2(device, CU_CTX_SCHED_BLOCKING_SYNC)
-    except (AttributeError, OSError):
-        pass
-
+from shared.cuda_sync import use_blocking_cuda_sync
 
 use_blocking_cuda_sync()
 
@@ -61,7 +46,6 @@ migrate_models_folder(ROOT)
 CONFIG_PATH = ROOT / "assets" / "realtime_config.json"
 BEATRICE_THREADS = 1
 MAX_CROSSFADE_TIME = 0.1
-MAX_SAFETY_BUFFER = 0.2
 MONITOR_DISABLED = "Disabled"
 MAIN_HOST_APIS = ("ASIO", "Windows WASAPI")
 EMBEDDERS = ("contentvec", "spin-v2")
@@ -299,13 +283,13 @@ class AudioEngine(RealtimeProcessor):
         self.prepare(beatrice_path)
         self.reported_statuses = set()
         self.asio_callback_frames = 0
-        self.prefill_margin = max(self.block_frame // 4, self.zc) + self.safety_frame
-        self.output_fifo = AudioFrameFifo(1, max_frames=self.block_frame * 4 + self.safety_frame)
+        self.prefill_margin = max(self.block_frame // 4, self.zc)
+        self.output_fifo = AudioFrameFifo(1, max_frames=self.block_frame * 4)
         self._drain(self.output_fifo)
         if self.output_selectors or self.input_selectors:
             self._resize_asio_fifo(self.output_fifo)
         else:
-            self.output_fifo.prefill = min(self.block_frame, self.sola_buffer_frame) + self.safety_frame
+            self.output_fifo.prefill = min(self.block_frame, self.sola_buffer_frame)
         self.dry_gains = dict.fromkeys(("output", "monitor"), float(settings["passthrough"]))
         self.direct_history = np.zeros(4 * self.zc, dtype=np.float32)
         self.direct_gate_gain = 1.0
@@ -438,12 +422,12 @@ class AudioEngine(RealtimeProcessor):
         if self.monitor_device is None:
             return
         try:
-            self.monitor_queue = AudioFrameFifo(1, max_frames=self.block_frame * 4 + self.safety_frame)
+            self.monitor_queue = AudioFrameFifo(1, max_frames=self.block_frame * 4)
             self._drain(self.monitor_queue)
             if self.input_selectors:
                 self._resize_asio_fifo(self.monitor_queue)
             else:
-                self.monitor_queue.prefill = min(self.block_frame, self.sola_buffer_frame) + self.safety_frame
+                self.monitor_queue.prefill = min(self.block_frame, self.sola_buffer_frame)
             self.direct_monitor = self._direct_fifo(self.monitor_selectors)
             self.monitor_stream = sd.OutputStream(
                 device=self.monitor_device,
@@ -579,9 +563,9 @@ class AudioEngine(RealtimeProcessor):
             buffer_ms = 1000 * direct.prefill / self.sample_rate if direct is not None else 0
             self.algorithm_latency_ms = round(self.device_latency_ms + buffer_ms)
             return
-        lookahead_ms = 0
+        pitch_delay_ms = 0
         if self.rvc is not None:
-            lookahead_ms = 10 * self.rvc.lookahead_frames(self.settings["f0_method"])
+            pitch_delay_ms = 10 * self.rvc.pitch_lookahead_frames(self.settings["f0_method"])
         noise_reduction_ms = 0
         if self.settings["input_noise_reduce"]:
             noise_reduction_ms = 1000 * self.sola_buffer_frame / self.sample_rate
@@ -590,7 +574,7 @@ class AudioEngine(RealtimeProcessor):
         if output_fifo is not None and self.sample_rate:
             prefill_ms = 1000 * output_fifo.prefill / self.sample_rate
         self.algorithm_latency_ms = round(
-            self.base_latency_ms + lookahead_ms + noise_reduction_ms + prefill_ms + self.last_block_ms
+            self.base_latency_ms + pitch_delay_ms + noise_reduction_ms + prefill_ms + self.last_block_ms
         )
 
     def stop(self):
@@ -805,7 +789,7 @@ class RealtimeGUI:
         self._make_variables()
         self._apply_theme(self.saved.get("theme") or system_theme())
         self._build()
-        self._load_devices()
+        self._load_devices(rescan=False)
         self._refresh_states()
         for variable in (
             self.pitch, self.index_rate, self.rms_mix_rate, self.threshold, self.f0_method,
@@ -874,11 +858,7 @@ class RealtimeGUI:
         self.block_kind = "rvc"
         self.block_time = tk.DoubleVar(value=self.block_times["rvc"])
         self.crossfade_time = tk.DoubleVar(value=min(value.get("crossfade_time", 0.01), MAX_CROSSFADE_TIME))
-        self.safety_buffer = tk.DoubleVar(value=value.get("safety_buffer", 0.0))
         self.extra_time = tk.DoubleVar(value=value.get("extra_time", 3.0))
-        self.lookahead_time = tk.DoubleVar(value=value.get("lookahead_time", 0.0))
-        self.seamless = tk.BooleanVar(value=value.get("seamless", False))
-        self.cached_context = tk.BooleanVar(value=value.get("cached_context", False))
         self.use_fp32 = tk.BooleanVar(value=value.get("use_fp32", False))
         self.passthrough = tk.BooleanVar(value=False)
         self.passthrough_hold = tk.BooleanVar(value=value.get("passthrough_hold", False))
@@ -1136,50 +1116,20 @@ class RealtimeGUI:
                 "delay. Capped at the block time."
             ),
         )
-        safety = self._slider(
-            frame, 2, "Safety buffer", self.safety_buffer, 0.0, MAX_SAFETY_BUFFER, 0.01,
-            tooltip=(
-                "Extra seconds of converted audio kept queued before playback. When the GPU briefly slows "
-                "down, this covers the gap instead of the output running dry and clicking. Adds the same "
-                "delay. Watch Dropouts in the stats line: raise this until it stays at 0."
-            ),
-        )
         extra = self._slider(
-            frame, 3, "Extra context", self.extra_time, 0.05, 5.0, 0.01,
+            frame, 2, "Extra context", self.extra_time, 0.05, 5.0, 0.01,
             tooltip="Seconds of past audio the model sees. More is smoother but slower.",
         )
-        lookahead = self._slider(
-            frame, 4, "Lookahead", self.lookahead_time, 0.0, 0.3, 0.01,
-            tooltip=(
-                "Seconds of future audio every model sees past each output block, added to the delay. "
-                "Lets small block times keep the quality of large ones. Taken from the extra context."
-            ),
-        )
-        seamless = ttk.Checkbutton(frame, text="Seamless blocks", variable=self.seamless)
-        seamless.grid(row=5, column=0, columnspan=3, sticky="w", pady=3)
-        Tooltip(seamless, "Makes consecutive blocks agree where they crossfade: the same latent noise, a continuous "
-                          "NSF sine phase, content features on a fixed 20 ms grid and decoder context on both sides "
-                          "of each block. The blocks then line up exactly, so the crossfade skips SOLA's search, "
-                          "which removes its small timing jumps and 10 ms of delay. Uses more GPU time; helps most "
-                          "with small block times. RVC models only.")
-        cached = ttk.Checkbutton(frame, text="Cached context", variable=self.cached_context)
-        cached.grid(row=6, column=0, columnspan=3, sticky="w", pady=3)
-        Tooltip(cached, "Runs ContentVec only on the newest 0.6 s plus the output block and lookahead, and reuses "
-                        "its earlier results for the rest of the extra context. A long extra context (3 s or more) "
-                        "then costs about as much GPU time as a short one, so small block times can keep the "
-                        "context that large ones use. During pauses and passthrough it keeps the cache current "
-                        "with a short ContentVec-only pass every few blocks, about one per 0.7 s once a pause has "
-                        "settled. Needs at least about 1 s of extra context. RVC models only.")
         precision = ttk.Checkbutton(frame, text="FP32 inference", variable=self.use_fp32)
-        precision.grid(row=7, column=0, columnspan=3, sticky="w", pady=3)
+        precision.grid(row=3, column=0, columnspan=3, sticky="w", pady=3)
         Tooltip(precision, "Use full precision. Otherwise compatible NVIDIA GPUs use FP16 for RVC. "
                            "CPU, GTX 16-series and Flow models use FP32. Applies on the next Start.")
-        self.rvc_widgets.update(crossfade + extra + lookahead + [seamless, cached, precision])
-        self.locked_widgets.update(crossfade + safety + extra + lookahead + [seamless, cached, precision])
+        self.rvc_widgets.update(crossfade + extra + [precision])
+        self.locked_widgets.update(crossfade + extra + [precision])
         pitch_label = ttk.Label(frame, text="Pitch extraction")
-        pitch_label.grid(row=8, column=0, sticky="w", padx=(0, 12), pady=(6, 3))
+        pitch_label.grid(row=4, column=0, sticky="w", padx=(0, 12), pady=(6, 3))
         methods = ttk.Frame(frame)
-        methods.grid(row=8, column=1, columnspan=2, sticky="w", pady=(6, 3))
+        methods.grid(row=4, column=1, columnspan=2, sticky="w", pady=(6, 3))
         self.rvc_widgets.add(pitch_label)
         for label, method in PITCH_METHODS.items():
             radio = ttk.Radiobutton(methods, text=label, variable=self.f0_method, value=method)
@@ -1263,10 +1213,11 @@ class RealtimeGUI:
         if path:
             self.index_path.set(path)
 
-    def _load_devices(self):
+    def _load_devices(self, rescan=True):
         try:
-            sd._terminate()
-            sd._initialize()
+            if rescan:
+                sd._terminate()
+                sd._initialize()
             devices = sd.query_devices()
             hostapis = sd.query_hostapis()
             show_legacy = self.show_legacy_devices.get()
@@ -1374,11 +1325,7 @@ class RealtimeGUI:
             "f0_method": self.f0_method.get(),
             "block_time": BEATRICE_BLOCK_TIME if self.block_kind == "beatrice" else self.block_time.get(),
             "crossfade_time": self.crossfade_time.get(),
-            "safety_buffer": self.safety_buffer.get(),
             "extra_time": self.extra_time.get(),
-            "lookahead_time": self.lookahead_time.get(),
-            "seamless": self.seamless.get(),
-            "cached_context": self.cached_context.get(),
             "use_fp32": self.use_fp32.get(),
             "passthrough": self.passthrough.get(),
         }
