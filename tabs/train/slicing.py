@@ -90,6 +90,6 @@ def preprocess_step(directory, dataset, workers, cutting, chunk_len, overlap_len
     if silence_action not in SILENCE_ACTIONS:
         raise gr.Error('Choose a silence action.')
     return ('shared.preprocess.preprocess',
-            [str(directory), dataset, '44100', workers, cutting, 'False', 'False', '0.0', str(float(chunk_len)),
+            [str(directory), dataset, '44100', workers, cutting, 'False', '0.0', str(float(chunk_len)),
              str(float(overlap_len)), 'none', 'WAV', str(bool(truncate_silence)), str(float(silence_threshold)),
              str(float(silence_to)), str(float(silence_minimum)), silence_action, str(float(silence_compress))])
