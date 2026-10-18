@@ -9,7 +9,7 @@ import psutil
 
 from tabs.settings.sections.precision import get_precision
 from tabs.train.jobs import QUIET_WARNINGS, experiment_path, positive_integer
-from tabs.train.slicing import SILENCE_ACTIONS, check_cutting, slicing_controls
+from tabs.train.slicing import check_cutting, slicing_controls
 
 ROOT = Path(__file__).resolve().parents[2]
 BEATRICE_WARNINGS = 'ignore:wav_length % 160 != 0,ignore:Some clusters have no assigned data points'
@@ -75,8 +75,8 @@ def launch(name, arguments):
 
 
 def dataset_arguments(name, dataset, workers, device, pause_threshold=-42.0, pause_minimum=1.0, cutting='Skip',
-                      chunk_len=MINIMUM_CHUNK, overlap_len=0.3, truncate_silence=False, silence_action='truncate',
-                      silence_threshold=-45.0, silence_minimum=0.3, silence_to=0.3, silence_compress=50.0):
+                      chunk_len=MINIMUM_CHUNK, overlap_len=0.3, truncate_silence=False,
+                      silence_threshold=-45.0, silence_minimum=0.3, silence_to=0.3):
     experiment_path(name)
     dataset = str(dataset).strip().strip('"')
     if not Path(dataset).is_dir():
@@ -85,16 +85,14 @@ def dataset_arguments(name, dataset, workers, device, pause_threshold=-42.0, pau
     if device not in {'auto', 'cpu'} and not (device.startswith('cuda:') and device[5:].isdigit()):
         raise gr.Error('Device must be auto, cpu or cuda:N.')
     check_cutting(cutting, chunk_len, SLICERS, MINIMUM_CHUNK)
-    if silence_action not in SILENCE_ACTIONS:
-        raise gr.Error('Choose a silence action.')
     if not 0.1 <= float(pause_minimum) <= 10.0:
         raise gr.Error('Minimum pause must be between 0.1 and 10 seconds.')
     arguments = ['--model-name', str(name).strip(), '--dataset', dataset, '--device', device,
                  '--workers', positive_integer(workers, 'CPU workers'), '--cutting', cutting,
                  '--chunk-len', str(float(chunk_len)), '--overlap-len', str(float(overlap_len)),
-                 '--silence-action', silence_action, '--silence-threshold', str(float(silence_threshold)),
+                 '--silence-threshold', str(float(silence_threshold)),
                  '--silence-minimum', str(float(silence_minimum)), '--silence-to', str(float(silence_to)),
-                 '--silence-compress', str(float(silence_compress)), '--pause-threshold', str(float(pause_threshold)),
+                 '--pause-threshold', str(float(pause_threshold)),
                  '--pause-minimum', str(float(pause_minimum))]
     if truncate_silence:
         arguments.append('--truncate-silence')

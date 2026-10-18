@@ -39,8 +39,7 @@ def launch(name, steps, description, finished='done.'):
 
 
 def preprocess(name, dataset, workers, device, cutting='Simple', chunk_len=MINIMUM_CHUNK, overlap_len=0.3,
-               truncate_silence=False, silence_action='truncate', silence_threshold=-45.0, silence_minimum=0.3,
-               silence_to=0.3, silence_compress=50.0):
+               truncate_silence=False, silence_threshold=-45.0, silence_minimum=0.3, silence_to=0.3):
     directory = experiment_path(name)
     dataset = str(dataset).strip().strip('"')
     if not Path(dataset).is_dir():
@@ -49,7 +48,7 @@ def preprocess(name, dataset, workers, device, cutting='Simple', chunk_len=MINIM
     gpu = device_id(device)
     steps = [
         preprocess_step(directory, dataset, workers, cutting, chunk_len, overlap_len, truncate_silence,
-                        silence_action, silence_threshold, silence_minimum, silence_to, silence_compress,
+                        silence_threshold, silence_minimum, silence_to,
                         choices=SLICERS, chunk_minimum=MINIMUM_CHUNK),
         ('shared.extract.extract',
          [str(directory), 'rmvpe', workers, gpu, '44100', 'contentvec', '0', 'v2', '--rectified']),
