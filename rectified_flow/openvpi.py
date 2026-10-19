@@ -291,8 +291,8 @@ def _read_config(path: str) -> dict:
         return json.load(handle)
 
 
-def openvpi_spec(path: str, state: dict):
-    config = _read_config(path)
+def openvpi_spec(path: str, state: dict, config=None):
+    config = _read_config(path) if config is None else config
     state = _fold_weight_norm(state)
     mel = dict(DEFAULT_MEL)
     for source, target in CONFIG_MEL_KEYS.items():

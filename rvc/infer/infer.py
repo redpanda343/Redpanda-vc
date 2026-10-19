@@ -685,6 +685,8 @@ class VoiceConverter:
         Args:
             weight_root (str): Path to the model weights.
         """
+        from nsf_hifigan.infer import load_checkpoint
+
         self.model_path = weight_root
         if str(weight_root).lower().endswith('.onnx') and os.path.isfile(weight_root):
             from rectified_flow.openvpi import onnx_generator_state
@@ -695,7 +697,7 @@ class VoiceConverter:
             self.cpt = {'generator': state}
             return
         self.cpt = (
-            torch.load(weight_root, map_location="cpu", weights_only=True)
+            load_checkpoint(weight_root)
             if os.path.isfile(weight_root)
             else None
         )

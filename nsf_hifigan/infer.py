@@ -4,9 +4,19 @@ import math
 import numpy as np
 import torch
 
+from nsf_hifigan.config import openvpi_config
 from rectified_flow.mel import LogMel
 from rectified_flow.openvpi import NSFHiFiGAN, generator_state, openvpi_spec
 from rectified_flow.pitch import extract_pitch
+
+
+def load_checkpoint(path):
+    try:
+        return torch.load(path, map_location='cpu', weights_only=True, mmap=True)
+    except RuntimeError as error:
+        if 'mmap can only be used with files saved with' not in str(error):
+            raise
+        return torch.load(path, map_location='cpu', weights_only=True)
 
 
 def is_nsf_hifigan(checkpoint):
@@ -18,7 +28,10 @@ def is_nsf_hifigan(checkpoint):
 
 class VocoderInference:
     def __init__(self, path, checkpoint, device):
-        hparams, self.data, weights = openvpi_spec(path, generator_state(checkpoint))
+        metadata = checkpoint.get('vocoder')
+        saved = metadata.get('config') if isinstance(metadata, dict) else None
+        config = openvpi_config(saved) if isinstance(saved, dict) else None
+        hparams, self.data, weights = openvpi_spec(path, generator_state(checkpoint), config=config)
         self.device = torch.device(device)
         self.generator = NSFHiFiGAN(**hparams)
         self.generator.load_state_dict(weights, strict=True)

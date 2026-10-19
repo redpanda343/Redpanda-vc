@@ -7,7 +7,6 @@ import traceback
 
 import gradio as gr
 import regex as re
-import torch
 
 from assets.i18n.i18n import I18nAuto
 from core import (
@@ -99,7 +98,7 @@ def get_vocoders():
 def get_files(type="model"):
     assert type in ("model", "index"), "Invalid type for get_files (models or index)"
     is_model = type == "model"
-    exts = (".pth", ".onnx") if is_model else (".index",)
+    exts = (".pth", ".onnx", ".ckpt") if is_model else (".index",)
     exclude_prefixes = ("G_", "D_") if is_model else ("trained_",)
 
     best = {}
@@ -113,6 +112,8 @@ def get_files(type="model"):
                 continue
 
             full = os.path.join(root, file)
+            if is_model and file.endswith('.ckpt') and not get_model_info(full)[2]:
+                continue
             real = os.path.realpath(full)
             score = alias_score(full, is_model)
 
@@ -132,8 +133,6 @@ def get_files(type="model"):
         paths.extend(path for path in get_vocoders() if os.path.realpath(path) not in best)
     return paths
 
-
-default_weight = next(iter(get_files("model")), None)
 
 audio_paths = [
     os.path.join(root, name)
@@ -379,14 +378,14 @@ def match_index(model_file_value, available_indexes=None):
 
 @lru_cache(maxsize=32)
 def read_model_info(path, modified, size):
-    from nsf_hifigan.infer import is_nsf_hifigan
+    from nsf_hifigan.infer import is_nsf_hifigan, load_checkpoint
 
     if path.lower().endswith('.onnx'):
         from rectified_flow.openvpi import onnx_generator_state
 
         state = onnx_generator_state(path)
         return False, 1, is_nsf_hifigan({'generator': state})
-    model_data = torch.load(path, map_location="cpu", weights_only=True)
+    model_data = load_checkpoint(path)
     if is_nsf_hifigan(model_data):
         return False, 1, True
     rectified = model_data.get("kind") == "rectified_flow"
@@ -407,6 +406,9 @@ def get_model_info(model):
 
 def get_speakers_id(model):
     return list(range(get_model_info(model)[1]))
+
+
+default_weight = next(iter(get_files("model")), None)
 
 
 def filter_dropdowns(filter_text):
