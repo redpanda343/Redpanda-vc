@@ -81,24 +81,29 @@ def alias_score(path: str, want_model: bool) -> int:
         return 2 if has_idx else (1 if has_mdl else 0)
 
 
-def get_vocoders():
+def get_vocoders(include_sifigan=False):
     roots = (
         os.path.join(now_dir, "models", "pretraineds", "rectified"),
         os.path.join(now_dir, "models", "rectified", "custom"),
     )
+    if include_sifigan:
+        roots += (
+            os.path.join(now_dir, "models", "pretraineds", "sifigan"),
+            os.path.join(now_dir, "models", "sifigan", "custom"),
+        )
     return sorted(
         os.path.relpath(os.path.join(folder, name), now_dir)
         for root in roots
         for folder, _, files in os.walk(root)
         for name in files
-        if name.lower().endswith((".pth", ".ckpt", ".onnx"))
+        if name.lower().endswith((".pth", ".ckpt", ".onnx") + ((".pkl",) if include_sifigan else ()))
     )
 
 
 def get_files(type="model"):
     assert type in ("model", "index"), "Invalid type for get_files (models or index)"
     is_model = type == "model"
-    exts = (".pth", ".onnx", ".ckpt") if is_model else (".index",)
+    exts = (".pth", ".onnx", ".ckpt", ".pkl") if is_model else (".index",)
     exclude_prefixes = ("G_", "D_") if is_model else ("trained_",)
 
     best = {}
@@ -112,7 +117,7 @@ def get_files(type="model"):
                 continue
 
             full = os.path.join(root, file)
-            if is_model and file.endswith('.ckpt') and not get_model_info(full)[2]:
+            if is_model and file.endswith(('.ckpt', '.pkl')) and not get_model_info(full)[2]:
                 continue
             real = os.path.realpath(full)
             score = alias_score(full, is_model)
@@ -130,7 +135,7 @@ def get_files(type="model"):
 
     paths = [t[2] for t in sorted(best.values(), key=lambda x: x[1])]
     if is_model:
-        paths.extend(path for path in get_vocoders() if os.path.realpath(path) not in best)
+        paths.extend(path for path in get_vocoders(include_sifigan=True) if os.path.realpath(path) not in best)
     return paths
 
 
@@ -379,6 +384,7 @@ def match_index(model_file_value, available_indexes=None):
 @lru_cache(maxsize=32)
 def read_model_info(path, modified, size):
     from nsf_hifigan.infer import is_nsf_hifigan, load_checkpoint
+    from sifigan.infer import is_sifigan
 
     if path.lower().endswith('.onnx'):
         from rectified_flow.openvpi import onnx_generator_state
@@ -386,7 +392,7 @@ def read_model_info(path, modified, size):
         state = onnx_generator_state(path)
         return False, 1, is_nsf_hifigan({'generator': state})
     model_data = load_checkpoint(path)
-    if is_nsf_hifigan(model_data):
+    if is_nsf_hifigan(model_data) or is_sifigan(model_data):
         return False, 1, True
     rectified = model_data.get("kind") == "rectified_flow"
     speakers = model_data.get("speaker_count", model_data.get("speakers_id")) or 1
@@ -440,7 +446,7 @@ def inference_tab():
         with gr.Row():
             model_file = gr.Dropdown(
                 label=i18n("Voice Model / Vocoder"),
-                info=i18n("Select a voice model or NSF-HiFiGAN vocoder. Keep config.json or vocoder.yaml beside the vocoder."),
+                info=i18n("Select a voice model, NSF-HiFiGAN or SiFiGAN vocoder. Keep the vocoder configuration and SiFiGAN statistics beside the checkpoint."),
                 choices=sorted(get_files("model"), key=extract_model_and_epoch),
                 value=default_weight,
                 interactive=True,

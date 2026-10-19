@@ -1,0 +1,35 @@
+sample_rate: 24000
+hop_size: 120
+fft_size: 1024
+mcep_dim: 39
+mcap_dim: 19
+alpha: 0.466
+aux_feats: [mcep, bap]
+dense_factors: [0.5, 1, 4, 8]
+df_f0_type: cf0
+sine_f0_type: cf0
+sine_amp: 0.1
+noise_amp: 0.003
+signal_types: [sine]
+generator:
+  in_channels: 43
+  out_channels: 1
+  channels: 512
+  kernel_size: 7
+  upsample_scales: [5, 4, 3, 2]
+  upsample_kernel_sizes: [10, 8, 6, 4]
+  source_network_params:
+    resblock_kernel_size: 3
+    resblock_dilations: [[1], [1, 2], [1, 2, 4], [1, 2, 4, 8]]
+    use_additional_convs: true
+  filter_network_params:
+    resblock_kernel_sizes: [3, 5, 7]
+    resblock_dilations: [[1, 3, 5], [1, 3, 5], [1, 3, 5]]
+    use_additional_convs: false
+  share_upsamples: false
+  share_downsamples: false
+  bias: true
+  nonlinear_activation: LeakyReLU
+  nonlinear_activation_params:
+    negative_slope: 0.1
+  use_weight_norm: true

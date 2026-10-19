@@ -1,5 +1,6 @@
 from contextlib import nullcontext
 import math
+import pickle
 
 import numpy as np
 import torch
@@ -11,6 +12,25 @@ from rectified_flow.pitch import extract_pitch
 
 
 def load_checkpoint(path):
+    try:
+        return _load_checkpoint(path)
+    except pickle.UnpicklingError as error:
+        if 'omegaconf.' not in str(error):
+            raise
+        from collections import defaultdict
+        from typing import Any
+        from omegaconf import DictConfig, ListConfig
+        from omegaconf.base import ContainerMetadata, Metadata
+        from omegaconf.nodes import AnyNode
+
+        with torch.serialization.safe_globals([
+            DictConfig, ListConfig, ContainerMetadata, Metadata, AnyNode,
+            Any, defaultdict, int, list, dict,
+        ]):
+            return _load_checkpoint(path)
+
+
+def _load_checkpoint(path):
     try:
         return torch.load(path, map_location='cpu', weights_only=True, mmap=True)
     except RuntimeError as error:
