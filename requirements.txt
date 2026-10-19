@@ -28,7 +28,6 @@ torchaudio==2.11.0
 torchvision==0.29.1
 praat-parselmouth
 pyworld==0.3.5
-omegaconf>=2.3,<3
 onnxruntime-gpu==1.30.0
 transformers==5.13.1
 huggingface_hub>=1.5.0,<2
