@@ -16,6 +16,7 @@ Browser realtime audio uses a binary WebSocket connection, including with `--sha
 
 ## Credits
 
+- ShiromiyaG, for the original idea of the rectified flow models (https://github.com/ShiromiyaG)
 - [DiffSinger](https://github.com/openvpi/DiffSinger)
 - [MeanVC2](https://github.com/ASLP-lab/MeanVC2) by ASLP-lab for the optional MeanFlow training method.
 - [RVC-Realtime-GUI](https://github.com/niel-blue/RVC-Realtime-GUI/)
