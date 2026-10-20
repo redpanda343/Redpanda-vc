@@ -3,7 +3,7 @@ from torch import nn
 from torch.nn import functional as F
 from torch.nn.utils import spectral_norm, weight_norm
 
-from rectified_flow.openvpi import LRELU_SLOPE, NSFHiFiGAN, ResBlock1
+from rectified_flow.openvpi import LRELU_SLOPE, NSFHiFiGAN, ResBlock1, _fold_weight_norm
 
 
 def _padding(kernel_size, dilation=1):
@@ -69,15 +69,19 @@ def build_generator(hparams):
     return generator
 
 
-def load_generator_weights(generator, folded):
+def load_generator_weights(generator, weights):
+    folded = _fold_weight_norm(weights)
     state = {}
     for key, target in generator.state_dict().items():
         base = key[:-2] if key.endswith(('.weight_g', '.weight_v')) else key
         if base not in folded:
             raise ValueError(f'The pretrained generator has no weights for {key}.')
-        value = folded[base]
-        if key.endswith('.weight_g'):
-            value = value.flatten(1).norm(dim=1).view(-1, *([1] * (value.dim() - 1)))
+        if key in weights:
+            value = weights[key]
+        elif key.endswith('.weight_g'):
+            value = folded[base].flatten(1).norm(dim=1).view(-1, *([1] * (folded[base].dim() - 1)))
+        else:
+            value = folded[base]
         if value.shape != target.shape:
             raise ValueError(f'The pretrained generator stores {key} as {tuple(value.shape)}, not {tuple(target.shape)}.')
         state[key] = value

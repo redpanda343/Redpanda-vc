@@ -66,11 +66,11 @@ def load_source(source, data):
     if periods is not None and list(periods) != DISCRIMINATOR_PERIODS:
         raise ValueError(f'Cannot fine-tune {path}: it was trained with discriminator periods {list(periods)}, '
                          f'but fine-tuning uses {DISCRIMINATOR_PERIODS}.')
-    hparams, mel, folded = openvpi_spec(path, state)
+    hparams, mel, _ = openvpi_spec(path, state)
     mismatch = mel_mismatch(data, mel)
     if mismatch:
         raise ValueError(f'{path} uses another mel configuration: {mismatch}.')
-    return dict(path=path, hparams=hparams, generator=folded, discriminator=discriminator)
+    return dict(path=path, hparams=hparams, generator=state, discriminator=discriminator)
 
 
 def checkpoints(output):
