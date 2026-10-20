@@ -4,7 +4,7 @@ from pathlib import Path
 
 import torch
 
-from nsf_hifigan.config import EXPORT_ROOT, ROOT, openvpi_config, write_json
+from nsf_hifigan.config import DISCRIMINATOR_PERIODS, EXPORT_ROOT, ROOT, openvpi_config, read_json, write_json
 from nsf_hifigan.resources import FINETUNE_SOURCE, pretrained_path
 from rectified_flow.openvpi import generator_state, openvpi_spec
 from rectified_flow.resources import VOCODERS, vocoder_path
@@ -30,6 +30,18 @@ def resolve_source(source):
     return str(path)
 
 
+def trained_periods(path):
+    folder = Path(path).parent
+    if (folder / 'config.yaml').is_file():
+        import yaml
+
+        config = yaml.safe_load((folder / 'config.yaml').read_text(encoding='utf-8'))
+        model = config.get('model_args') if isinstance(config, dict) else None
+        return model.get('discriminator_periods') if isinstance(model, dict) else None
+    config = read_json(folder / 'config.json')
+    return config.get('discriminator_periods') if isinstance(config, dict) else None
+
+
 def load_source(source, data):
     path = resolve_source(source)
     discriminator_error = (f'Cannot fine-tune {path}: discriminator weights are missing. '
@@ -50,6 +62,10 @@ def load_source(source, data):
                              if key.startswith('discriminator.')} or None
     if not isinstance(discriminator, dict) or not discriminator:
         raise ValueError(discriminator_error)
+    periods = trained_periods(path)
+    if periods is not None and list(periods) != DISCRIMINATOR_PERIODS:
+        raise ValueError(f'Cannot fine-tune {path}: it was trained with discriminator periods {list(periods)}, '
+                         f'but fine-tuning uses {DISCRIMINATOR_PERIODS}.')
     hparams, mel, folded = openvpi_spec(path, state)
     mismatch = mel_mismatch(data, mel)
     if mismatch:

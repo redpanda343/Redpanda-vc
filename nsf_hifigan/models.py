@@ -81,6 +81,10 @@ def load_generator_weights(generator, folded):
         if value.shape != target.shape:
             raise ValueError(f'The pretrained generator stores {key} as {tuple(value.shape)}, not {tuple(target.shape)}.')
         state[key] = value
+    unused = sorted(set(folded) - {key[:-2] if key.endswith(('.weight_g', '.weight_v')) else key for key in state})
+    if unused:
+        raise ValueError(f'The generator has no place for {len(unused)} pretrained weight(s), such as {unused[0]}. '
+                         'The checkpoint uses another generator architecture.')
     generator.load_state_dict(state)
 
 
