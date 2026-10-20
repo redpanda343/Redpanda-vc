@@ -90,7 +90,11 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, load_opt=1):
         checkpoint_dict.get("learning_rate", 0),
         checkpoint_dict["iteration"],
         checkpoint_dict.get("scaler", {}),
-        checkpoint_dict.get("ema"),
+        {
+            key: value
+            for key, value in checkpoint_dict.items()
+            if key not in ("model", "optimizer", "iteration", "learning_rate", "scaler")
+        },
     )
 
 

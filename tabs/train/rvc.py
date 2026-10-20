@@ -669,14 +669,14 @@ def rvc_train_tab():
                 info=i18n("Determine at how many epochs the model will saved at."),
                 interactive=True,
             )
-            total_epoch = gr.Slider(
+            total_steps = gr.Slider(
                 1,
+                1000000,
                 10000,
-                200,
                 step=1,
-                label=i18n("Total Epoch"),
+                label=i18n("Total Steps"),
                 info=i18n(
-                    "Specifies the overall quantity of epochs for the model training process."
+                    "Stops training after this many training steps. G and D checkpoints are still saved by epoch, and once more at the last step."
                 ),
                 interactive=True,
             )
@@ -752,6 +752,16 @@ def rvc_train_tab():
                         interactive=True,
                     )
             with gr.Row():
+                lr_schedule = gr.Radio(
+                    label=i18n("Learning Rate Schedule"),
+                    info=i18n(
+                        "Exponential applies the learning rate decay every epoch or every X steps. Cosine lowers the learning rate smoothly to the final learning rate at the last step. Raising the total steps later continues from the current learning rate."
+                    ),
+                    choices=["Exponential", "Cosine"],
+                    value="Exponential",
+                    interactive=True,
+                )
+            with gr.Row():
                 warmup_steps = gr.Slider(
                     0,
                     10000,
@@ -772,6 +782,18 @@ def rvc_train_tab():
                     info=i18n(
                         "Applies the learning rate decay every X steps, so it no longer depends on the dataset size. 0 decays once per epoch."
                     ),
+                    interactive=True,
+                )
+                lr_final_ratio = gr.Slider(
+                    0.01,
+                    1,
+                    0.1,
+                    step=0.01,
+                    label=i18n("Final Learning Rate"),
+                    info=i18n(
+                        "Fraction of the starting learning rate that the cosine schedule reaches at the last step."
+                    ),
+                    visible=False,
                     interactive=True,
                 )
                 max_batch_seconds = gr.Slider(
@@ -846,13 +868,15 @@ def rvc_train_tab():
             )
 
         def start_training(*args):
-            *arguments, warmup, decay_steps, batch_seconds, ema = args
+            *arguments, warmup, decay_steps, batch_seconds, ema, schedule, final_ratio = args
             message = start_train_script(
                 *arguments,
                 warmup_steps=warmup,
                 lr_decay_steps=decay_steps,
                 max_batch_seconds=batch_seconds,
                 ema_decay=ema,
+                lr_schedule=schedule,
+                lr_final_ratio=final_ratio,
             )
             gr.Info(message)
             return training_ui_state(args[0])
@@ -1035,6 +1059,10 @@ def rvc_train_tab():
             def update_slider_visibility(noise_reduction):
                 return gr.update(visible=noise_reduction)
 
+            def toggle_lr_schedule(schedule):
+                cosine = schedule == "Cosine"
+                return gr.update(visible=not cosine), gr.update(visible=cosine)
+
             def update_truncate_silence_visibility(
                 cut_method, truncate_enabled
             ):
@@ -1061,6 +1089,11 @@ def rvc_train_tab():
                 fn=update_slider_visibility,
                 inputs=noise_reduction,
                 outputs=clean_strength,
+            )
+            lr_schedule.change(
+                fn=toggle_lr_schedule,
+                inputs=[lr_schedule],
+                outputs=[lr_decay_steps, lr_final_ratio],
             )
             cut_preprocess.change(
                 fn=update_truncate_silence_visibility,
@@ -1153,7 +1186,7 @@ def rvc_train_tab():
                     save_every_epoch,
                     save_only_latest,
                     save_every_weights,
-                    total_epoch,
+                    total_steps,
                     sampling_rate,
                     batch_size,
                     gpu,
@@ -1173,6 +1206,8 @@ def rvc_train_tab():
                     lr_decay_steps,
                     max_batch_seconds,
                     ema_decay,
+                    lr_schedule,
+                    lr_final_ratio,
                 ],
                 outputs=training_outputs,
             ).then(**wake_training_timer)

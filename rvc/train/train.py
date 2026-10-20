@@ -6,6 +6,7 @@ import argparse
 import glob
 import json
 import logging
+import math
 from concurrent.futures import Future, ThreadPoolExecutor
 from random import randint
 
@@ -41,6 +42,7 @@ from rvc.algorithm import commons
 from rvc.train.process.extract_model import extract_model
 
 VOCODERS = ("HiFi-GAN", "MRF HiFi-GAN", "RefineGAN")
+LR_SCHEDULES = ("exponential", "cosine")
 BUCKET_BOUNDARIES = (100, 200, 300, 400, 500, 600, 700, 800, 900)
 LATEST_CHECKPOINT_SUFFIX = 2333333
 
@@ -218,7 +220,7 @@ def parse_arguments(argv=None):
     parser = argparse.ArgumentParser(description="Train an RVC voice model.")
     parser.add_argument("--model-name", required=True)
     parser.add_argument("--sample-rate", type=int, required=True)
-    parser.add_argument("--total-epoch", type=int, required=True)
+    parser.add_argument("--total-steps", type=int, required=True)
     parser.add_argument("--save-every-epoch", type=int, required=True)
     parser.add_argument("--save-every-steps", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -245,6 +247,18 @@ def parse_arguments(argv=None):
         help="Apply lr_decay every this many steps instead of once per epoch (0).",
     )
     parser.add_argument(
+        "--lr-schedule",
+        choices=LR_SCHEDULES,
+        default="exponential",
+        help="exponential applies lr_decay every epoch or every --lr-decay-steps; cosine decays to --lr-final-ratio at --total-steps.",
+    )
+    parser.add_argument(
+        "--lr-final-ratio",
+        type=float,
+        default=0.1,
+        help="Fraction of the starting learning rate that the cosine schedule reaches at the last step.",
+    )
+    parser.add_argument(
         "--max-batch-seconds",
         type=float,
         default=0.0,
@@ -258,7 +272,7 @@ def parse_arguments(argv=None):
     )
     args = parser.parse_args(argv)
 
-    for name in ("total_epoch", "save_every_epoch", "batch_size"):
+    for name in ("total_steps", "save_every_epoch", "batch_size"):
         if getattr(args, name) < 1:
             parser.error(f"--{name.replace('_', '-')} must be at least 1.")
     for name in ("warmup_steps", "lr_decay_steps", "max_batch_seconds"):
@@ -266,6 +280,8 @@ def parse_arguments(argv=None):
             parser.error(f"--{name.replace('_', '-')} cannot be negative.")
     if not 0 <= args.ema_decay < 1:
         parser.error("--ema-decay must be at least 0 and below 1.")
+    if not 0 < args.lr_final_ratio <= 1:
+        parser.error("--lr-final-ratio must be above 0 and at most 1.")
     args.save_every_steps = max(0, args.save_every_steps)
     if args.version == "v1" and (args.sample_rate != 40000 or args.vocoder != "HiFi-GAN"):
         parser.error("RVC v1 training requires HiFi-GAN at 40000 Hz.")
@@ -462,6 +478,7 @@ class Trainer:
         self.writer = None
         self.exporter = None
         self.ema = None
+        self.lr_schedule = None
         self.progress = None
         self.epoch = 0
         self.logged_losses = None
@@ -470,12 +487,14 @@ class Trainer:
         self.build_data()
         last_g, last_d = latest_checkpoint_pair(self.args.experiment_dir)
         self.build_models(last_g)
-        epoch_str, ema_state = self.restore(last_g, last_d)
+        epoch_str, extra = self.restore(last_g, last_d)
         for optimizer in (self.optim_g, self.optim_d):
             for group in optimizer.param_groups:
                 group.setdefault("initial_lr", group["lr"])
+        if self.args.lr_schedule == "cosine":
+            self.build_lr_schedule(extra.get("lr_schedule"))
         if self.rank == 0 and self.args.ema_decay > 0:
-            self.build_ema(last_g, ema_state)
+            self.build_ema(last_g, extra.get("ema"))
 
         if self.rank == 0:
             self.writer = SummaryWriter(
@@ -488,27 +507,30 @@ class Trainer:
 
         if self.rank == 0:
             print(self.summary(epoch_str, last_g))
-        if epoch_str > self.args.total_epoch and self.rank == 0:
+        total_steps = self.args.total_steps
+        finished = self.global_step >= total_steps
+        if finished and self.rank == 0:
             print(
-                f"{self.args.model_name} already reached epoch {self.args.total_epoch}. "
-                "Raise the total epochs to continue training."
+                f"{self.args.model_name} already reached step {total_steps}. "
+                "Raise the total steps to continue training."
             )
-        total_steps = self.args.total_epoch * len(self.sampler)
         self.progress = tqdm(
             total=max(total_steps, self.global_step),
             initial=self.global_step,
             desc="Training",
             unit="step",
             dynamic_ncols=True,
-            disable=self.rank != 0 or epoch_str > self.args.total_epoch,
+            disable=self.rank != 0 or finished,
         )
         completed = None
+        epoch = epoch_str
         try:
-            for epoch in range(epoch_str, self.args.total_epoch + 1):
+            while self.global_step < total_steps:
                 self.train_epoch(epoch)
                 if self.finish_epoch(epoch):
                     completed = epoch
                     break
+                epoch += 1
         finally:
             self.progress.close()
             if self.exporter is not None:
@@ -535,6 +557,7 @@ class Trainer:
             f"{speakers} speaker{'' if speakers == 1 else 's'}",
             f"{device} {precision}",
             f"batch {args.batch_size}, {len(self.sampler)} steps per epoch",
+            f"{args.total_steps} total steps (~{math.ceil(args.total_steps / len(self.sampler))} epochs)",
         ]
         options = []
         if args.max_batch_seconds:
@@ -544,7 +567,13 @@ class Trainer:
             )
         if args.warmup_steps:
             options.append(f"{args.warmup_steps} warmup steps")
-        if args.lr_decay_steps:
+        if self.lr_schedule is not None:
+            schedule = self.lr_schedule
+            end = min(schedule["final_ratio"], schedule["start_factor"])
+            options.append(
+                f"cosine LR {schedule['start_factor']:.3g}x to {end:.3g}x from step {schedule['start_step']}"
+            )
+        elif args.lr_decay_steps:
             options.append(f"lr_decay every {args.lr_decay_steps} steps")
         if self.ema is not None:
             options.append(f"generator EMA {args.ema_decay:g}")
@@ -568,7 +597,7 @@ class Trainer:
         return " | ".join(parts)
 
     def update_postfix(self):
-        text = f"epoch {self.epoch}/{self.args.total_epoch}"
+        text = f"epoch {self.epoch}"
         if self.logged_losses is not None:
             total, disc, mel = self.logged_losses
             text += f", g {total:.2f}, d {disc:.2f}, mel {mel:.2f}"
@@ -698,7 +727,7 @@ class Trainer:
                 _, _, _, epoch_str, scaler_dict, _ = load_checkpoint(
                     last_d, self.net_d, self.optim_d
                 )
-                _, _, _, epoch_str, _, ema_state = load_checkpoint(
+                _, _, _, epoch_str, _, extra = load_checkpoint(
                     last_g, self.net_g, self.optim_g
                 )
             except Exception as e:
@@ -708,12 +737,35 @@ class Trainer:
             if scaler_dict:
                 self.scaler.load_state_dict(scaler_dict)
             epoch_str += 1
-            self.global_step = (epoch_str - 1) * len(self.sampler)
-            return epoch_str, ema_state
+            step = extra.get("step")
+            self.global_step = (
+                int(step) if step is not None else (epoch_str - 1) * len(self.sampler)
+            )
+            return epoch_str, extra
 
         self.load_pretrained(self.net_g, self.args.pretrained_g, "G", match_speakers=True)
         self.load_pretrained(self.net_d, self.args.pretrained_d, "D")
-        return 1, None
+        return 1, {}
+
+    def build_lr_schedule(self, saved):
+        target = {
+            "total_steps": self.args.total_steps,
+            "final_ratio": self.args.lr_final_ratio,
+        }
+        if saved and all(saved.get(key) == value for key, value in target.items()):
+            self.lr_schedule = saved
+            return
+        start_factor = 1.0
+        if self.global_step:
+            group = self.optim_g.param_groups[0]
+            start_factor = (
+                group["lr"] / group["initial_lr"] / self.warmup_ramp(self.global_step - 1)
+            )
+        self.lr_schedule = dict(
+            target,
+            start_step=max(self.global_step, self.args.warmup_steps),
+            start_factor=start_factor,
+        )
 
     def build_ema(self, last_g, ema_state):
         self.ema = GeneratorEMA(self.generator(), self.args.ema_decay)
@@ -784,16 +836,34 @@ class Trainer:
             self.train_step(batch)
             self.export_step_weights(epoch)
             self.progress.update(1)
+            if self.global_step >= self.args.total_steps:
+                break
+
+    def warmup_ramp(self, step):
+        warmup = self.args.warmup_steps
+        return (step + 1) / warmup if step < warmup else 1.0
+
+    def exponential_factor(self, epoch, step):
+        args, decay = self.args, self.config.train.lr_decay
+        if args.lr_decay_steps:
+            return decay ** (max(0, step - args.warmup_steps) / args.lr_decay_steps)
+        return decay ** (epoch - 1)
+
+    def cosine_factor(self, step):
+        schedule = self.lr_schedule
+        start, start_factor = schedule["start_step"], schedule["start_factor"]
+        end = min(schedule["final_ratio"], start_factor)
+        span = schedule["total_steps"] - 1 - start
+        progress = min(1.0, max(0, step - start) / span) if span > 0 else 1.0
+        return end + (start_factor - end) * 0.5 * (1 + math.cos(math.pi * progress))
 
     def set_learning_rate(self, epoch):
-        args, step = self.args, self.global_step
-        decay = self.config.train.lr_decay
-        if args.lr_decay_steps:
-            factor = decay ** (max(0, step - args.warmup_steps) / args.lr_decay_steps)
+        step = self.global_step
+        if self.lr_schedule is not None:
+            factor = self.cosine_factor(step)
         else:
-            factor = decay ** (epoch - 1)
-        if step < args.warmup_steps:
-            factor *= (step + 1) / args.warmup_steps
+            factor = self.exponential_factor(epoch, step)
+        factor *= self.warmup_ramp(step)
         for optimizer in (self.optim_g, self.optim_d):
             for group in optimizer.param_groups:
                 group["lr"] = group["initial_lr"] * factor
@@ -1010,14 +1080,18 @@ class Trainer:
         args = self.args
         spec, ids_slice, y_hat = self.last_batch
         save_epoch = epoch % args.save_every_epoch == 0
-        done = epoch >= args.total_epoch
+        done = self.global_step >= args.total_steps
         if save_epoch:
             self.summarize_epoch(spec, ids_slice, y_hat)
 
         weights = []
         if save_epoch or done:
             suffix = LATEST_CHECKPOINT_SUFFIX if args.save_only_latest else self.global_step
-            generator_extra = {"ema": self.ema.state_dict()} if self.ema is not None else None
+            generator_extra = {"step": self.global_step}
+            if self.ema is not None:
+                generator_extra["ema"] = self.ema.state_dict()
+            if self.lr_schedule is not None:
+                generator_extra["lr_schedule"] = self.lr_schedule
             for prefix, net, optimizer, extra in (
                 ("G", self.net_g, self.optim_g, generator_extra),
                 ("D", self.net_d, self.optim_d, None),

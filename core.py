@@ -614,14 +614,14 @@ def shutdown_after_training():
 
 
 def append_data_shutdown_log(
-    model_name, total_epoch, batch_size, sample_rate, gpu, shutdown_time, os_name
+    model_name, total_steps, batch_size, sample_rate, gpu, shutdown_time, os_name
 ):
     log_file = "training_shutdown_log.txt"
 
     log_entry = (
         f"[{datetime.now()}] "
         f"Model: {model_name} | "
-        f"Epochs: {total_epoch} | "
+        f"Steps: {total_steps} | "
         f"Batch: {batch_size} | "
         f"SR: {sample_rate} | "
         f"GPU: {gpu} | "
@@ -638,7 +638,7 @@ def _build_train_command(
     save_every_epoch: int,
     save_only_latest: bool,
     save_every_weights: bool,
-    total_epoch: int,
+    total_steps: int,
     sample_rate: int,
     batch_size: int,
     gpu: int,
@@ -657,6 +657,8 @@ def _build_train_command(
     lr_decay_steps: int = 0,
     max_batch_seconds: float = 0.0,
     ema_decay: float = 0.999,
+    lr_schedule: str = "exponential",
+    lr_final_ratio: float = 0.1,
 ):
     if version not in {"v1", "v2"}:
         raise ValueError(f"Unsupported RVC version: {version}")
@@ -700,8 +702,8 @@ def _build_train_command(
         model_name,
         "--sample-rate",
         str(sample_rate),
-        "--total-epoch",
-        str(total_epoch),
+        "--total-steps",
+        str(total_steps),
         "--save-every-epoch",
         str(save_every_epoch),
         "--save-every-steps",
@@ -722,6 +724,10 @@ def _build_train_command(
         str(float(max_batch_seconds)),
         "--ema-decay",
         str(float(ema_decay)),
+        "--lr-schedule",
+        str(lr_schedule).lower(),
+        "--lr-final-ratio",
+        str(float(lr_final_ratio)),
     ]
     if pg:
         command += ["--pretrained-g", pg]
@@ -745,7 +751,7 @@ def run_train_script(
     save_every_epoch: int,
     save_only_latest: bool,
     save_every_weights: bool,
-    total_epoch: int,
+    total_steps: int,
     sample_rate: int,
     batch_size: int,
     gpu: int,
@@ -765,13 +771,15 @@ def run_train_script(
     lr_decay_steps: int = 0,
     max_batch_seconds: float = 0.0,
     ema_decay: float = 0.999,
+    lr_schedule: str = "exponential",
+    lr_final_ratio: float = 0.1,
 ):
     command = _build_train_command(
         model_name,
         save_every_epoch,
         save_only_latest,
         save_every_weights,
-        total_epoch,
+        total_steps,
         sample_rate,
         batch_size,
         gpu,
@@ -790,6 +798,8 @@ def run_train_script(
         lr_decay_steps,
         max_batch_seconds,
         ema_decay,
+        lr_schedule,
+        lr_final_ratio,
     )
     result = subprocess.run(command)
     if result.returncode != 0:
@@ -800,7 +810,7 @@ def run_train_script(
 
         append_data_shutdown_log(
             model_name=model_name,
-            total_epoch=total_epoch,
+            total_steps=total_steps,
             batch_size=batch_size,
             sample_rate=sample_rate,
             gpu=gpu,
@@ -821,7 +831,7 @@ def start_train_script(
     save_every_epoch: int,
     save_only_latest: bool,
     save_every_weights: bool,
-    total_epoch: int,
+    total_steps: int,
     sample_rate: int,
     batch_size: int,
     gpu: int,
@@ -842,13 +852,15 @@ def start_train_script(
     lr_decay_steps: int = 0,
     max_batch_seconds: float = 0.0,
     ema_decay: float = 0.999,
+    lr_schedule: str = "exponential",
+    lr_final_ratio: float = 0.1,
 ):
     command = _build_train_command(
         model_name,
         save_every_epoch,
         save_only_latest,
         save_every_weights,
-        total_epoch,
+        total_steps,
         sample_rate,
         batch_size,
         gpu,
@@ -867,6 +879,8 @@ def start_train_script(
         lr_decay_steps,
         max_batch_seconds,
         ema_decay,
+        lr_schedule,
+        lr_final_ratio,
     )
 
     on_success = None
@@ -881,7 +895,7 @@ def start_train_script(
             os_name, shutdown_datetime = shutdown_after_training()
             append_data_shutdown_log(
                 model_name=model_name,
-                total_epoch=total_epoch,
+                total_steps=total_steps,
                 batch_size=batch_size,
                 sample_rate=sample_rate,
                 gpu=gpu,
@@ -1461,10 +1475,10 @@ def extract(**kwargs):
     help="Save an inference-only model every N training steps (0 disables it).",
 )
 @click.option(
-    "--total-epoch",
-    type=click.IntRange(1, 10000),
-    default=1000,
-    help="Total number of training epochs.",
+    "--total-steps",
+    type=click.IntRange(min=1),
+    default=10000,
+    help="Total number of training steps.",
 )
 @click.option(
     "--sample-rate",
@@ -1541,6 +1555,18 @@ def extract(**kwargs):
     default=0.999,
     help="Export inference models from an EMA of the generator weights with this decay (0 disables it).",
 )
+@click.option(
+    "--lr-schedule",
+    type=click.Choice(["exponential", "cosine"]),
+    default="exponential",
+    help="exponential applies lr_decay every epoch or every --lr-decay-steps; cosine decays to --lr-final-ratio at --total-steps.",
+)
+@click.option(
+    "--lr-final-ratio",
+    type=click.FloatRange(min=0, max=1, min_open=True),
+    default=0.1,
+    help="Fraction of the starting learning rate that the cosine schedule reaches at the last step.",
+)
 def train(**kwargs):
     """Train an RVC model."""
     result = run_train_script(
@@ -1548,7 +1574,7 @@ def train(**kwargs):
         save_every_epoch=kwargs["save_every_epoch"],
         save_only_latest=kwargs["save_only_latest"],
         save_every_weights=kwargs["save_every_weights"],
-        total_epoch=kwargs["total_epoch"],
+        total_steps=kwargs["total_steps"],
         sample_rate=int(kwargs["sample_rate"]),
         batch_size=kwargs["batch_size"],
         gpu=kwargs["gpu"],
@@ -1567,6 +1593,8 @@ def train(**kwargs):
         lr_decay_steps=kwargs["lr_decay_steps"],
         max_batch_seconds=kwargs["max_batch_seconds"],
         ema_decay=kwargs["ema_decay"],
+        lr_schedule=kwargs["lr_schedule"],
+        lr_final_ratio=kwargs["lr_final_ratio"],
     )
     click.echo(result)
 
