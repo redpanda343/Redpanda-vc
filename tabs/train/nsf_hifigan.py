@@ -188,7 +188,7 @@ def nsf_hifigan_train_tab():
                                            'value.')
         key_aug = gr.Checkbox(label='Speed augmentation', value=False,
                               info='Resamples random clips 0.9-1.4x faster to cover more pitches. It may lower quality. '
-                                   'Fine-tuning always trains without augmentation.')
+                                   'Fine-tuning always trains without it.')
         with gr.Row():
             train_button = gr.Button('Start / resume vocoder training', variant='primary')
             export_button = gr.Button('Export latest checkpoint')

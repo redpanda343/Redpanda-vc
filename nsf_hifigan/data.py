@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader, Dataset
 from torchaudio.functional import resample
 
 from nsf_hifigan.config import max_f0, read_json
-from nsf_hifigan.losses import vocoder_mel
+from nsf_hifigan.losses import FEATURE_MEL_FLOOR, vocoder_mel
 
 MIN_LOG_MEL = math.log(1e-5)
 KEY_AUG_MARGIN = 2
@@ -23,7 +23,7 @@ class VocoderDataset(Dataset):
         self.crop = self.settings['crop_mel_frames']
         self.entries = [name for name, frames in entries if not training or frames >= self.crop]
         self.max_f0 = max_f0(config['model'])
-        self.mel = vocoder_mel(self.data) if training and self.settings['key_aug'] else None
+        self.mel = vocoder_mel(self.data, floor=FEATURE_MEL_FLOOR) if training and self.settings['key_aug'] else None
 
     def __len__(self):
         return len(self.entries)

@@ -4,11 +4,12 @@ from torch.nn import functional as F
 from rectified_flow.mel import LogMel
 
 DISCRIMINATORS = ('msd', 'mpd')
+FEATURE_MEL_FLOOR = 1e-9
 
 
-def vocoder_mel(data, fmax='config'):
+def vocoder_mel(data, fmax='config', floor=1e-5):
     return LogMel(data['sample_rate'], data['n_fft'], data['win_length'], data['hop_length'], data['n_mels'],
-                  data['mel_fmin'], data['mel_fmax'] if fmax == 'config' else fmax)
+                  data['mel_fmin'], data['mel_fmax'] if fmax == 'config' else fmax, floor)
 
 
 def discriminate(discriminator, audio):

@@ -5,8 +5,9 @@ from torch.nn import functional as F
 
 
 class LogMel(nn.Module):
-    def __init__(self, sample_rate, n_fft, win_length, hop_length, n_mels, fmin, fmax):
+    def __init__(self, sample_rate, n_fft, win_length, hop_length, n_mels, fmin, fmax, floor=1e-5):
         super().__init__()
+        self.floor = float(floor)
         self.n_fft = int(n_fft)
         self.win_length = int(win_length)
         self.hop_length = int(hop_length)
@@ -53,7 +54,7 @@ class LogMel(nn.Module):
             bins = self.n_fft // 2 + 1
             spec = F.pad(spec, (0, 0, 0, max(0, bins - spec.shape[1])))[:, :bins]
             spec = spec * (self.win_length / win_length)
-        return torch.log(torch.clamp(self.basis @ spec, min=1e-5))
+        return torch.log(torch.clamp(self.basis @ spec, min=self.floor))
 
 
 def normalize_mel(mel: torch.Tensor, data: dict) -> torch.Tensor:

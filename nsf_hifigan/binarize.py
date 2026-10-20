@@ -11,7 +11,7 @@ import torch
 from tqdm import tqdm
 
 from nsf_hifigan.config import PITCH_EXTRACTORS, default_data, experiment_paths, write_json
-from nsf_hifigan.losses import vocoder_mel
+from nsf_hifigan.losses import FEATURE_MEL_FLOOR, vocoder_mel
 from rectified_flow.distributed import parse_devices
 from rectified_flow.pitch import extract_pitch, interpolate_f0, parselmouth_contour
 
@@ -37,7 +37,7 @@ def read_audio(path, sample_rate):
 def load_clip(path, data):
     key = tuple(sorted(data.items()))
     if key not in _MEL:
-        _MEL[key] = vocoder_mel(data)
+        _MEL[key] = vocoder_mel(data, floor=FEATURE_MEL_FLOOR)
     audio = np.clip(read_audio(path, data['sample_rate']), -1.0, 1.0)
     with torch.no_grad():
         mel = _MEL[key](torch.from_numpy(audio)[None])[0].T.numpy().astype(np.float32)
