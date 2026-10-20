@@ -146,7 +146,7 @@ def build_dataset(experiment, speakers, args):
     workers = str(args.workers or os.cpu_count() or 1)
     for speaker, source in speakers:
         print(f'Slicing {speaker} ({args.cutting}, {sample_rate} Hz)...', flush=True)
-        arguments = [str(staging / speaker), str(source), sample_rate, workers, args.cutting, 'False', 'False', '0.0',
+        arguments = [str(staging / speaker), str(source), sample_rate, workers, args.cutting, 'False', '0.0',
                      str(args.chunk_len), str(args.overlap_len), 'none', 'WAV', str(args.truncate_silence),
                      str(args.silence_threshold), str(args.silence_to), str(args.silence_minimum), args.silence_action,
                      str(args.silence_compress), 'v2', str(args.pause_threshold), str(args.pause_minimum)]
