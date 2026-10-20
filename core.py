@@ -656,6 +656,7 @@ def _build_train_command(
     warmup_steps: int = 0,
     lr_decay_steps: int = 0,
     max_batch_seconds: float = 0.0,
+    ema_decay: float = 0.999,
 ):
     if version not in {"v1", "v2"}:
         raise ValueError(f"Unsupported RVC version: {version}")
@@ -719,6 +720,8 @@ def _build_train_command(
         str(int(lr_decay_steps)),
         "--max-batch-seconds",
         str(float(max_batch_seconds)),
+        "--ema-decay",
+        str(float(ema_decay)),
     ]
     if pg:
         command += ["--pretrained-g", pg]
@@ -761,6 +764,7 @@ def run_train_script(
     warmup_steps: int = 0,
     lr_decay_steps: int = 0,
     max_batch_seconds: float = 0.0,
+    ema_decay: float = 0.999,
 ):
     command = _build_train_command(
         model_name,
@@ -785,6 +789,7 @@ def run_train_script(
         warmup_steps,
         lr_decay_steps,
         max_batch_seconds,
+        ema_decay,
     )
     result = subprocess.run(command)
     if result.returncode != 0:
@@ -836,6 +841,7 @@ def start_train_script(
     warmup_steps: int = 0,
     lr_decay_steps: int = 0,
     max_batch_seconds: float = 0.0,
+    ema_decay: float = 0.999,
 ):
     command = _build_train_command(
         model_name,
@@ -860,6 +866,7 @@ def start_train_script(
         warmup_steps,
         lr_decay_steps,
         max_batch_seconds,
+        ema_decay,
     )
 
     on_success = None
@@ -1528,6 +1535,12 @@ def extract(**kwargs):
     default=0.0,
     help="Limit clips per batch times the longest clip to this much audio (0 disables it).",
 )
+@click.option(
+    "--ema-decay",
+    type=click.FloatRange(min=0, max=1, max_open=True),
+    default=0.999,
+    help="Export inference models from an EMA of the generator weights with this decay (0 disables it).",
+)
 def train(**kwargs):
     """Train an RVC model."""
     result = run_train_script(
@@ -1553,6 +1566,7 @@ def train(**kwargs):
         warmup_steps=kwargs["warmup_steps"],
         lr_decay_steps=kwargs["lr_decay_steps"],
         max_batch_seconds=kwargs["max_batch_seconds"],
+        ema_decay=kwargs["ema_decay"],
     )
     click.echo(result)
 

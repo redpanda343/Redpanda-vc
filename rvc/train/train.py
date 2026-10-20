@@ -120,9 +120,8 @@ class AsyncInferenceExporter:
             if "enc_q" not in key
         }
 
-    def submit(self, model, export_dtype, **export_args):
+    def submit(self, state_dict, export_dtype, **export_args):
         self.wait_for_completion()
-        state_dict = model.state_dict()
         if self.device.type == "cuda":
             snapshot, copy_event = self._stage_cuda(state_dict, export_dtype)
             staging_future = Future()
@@ -175,6 +174,46 @@ class AsyncInferenceExporter:
             self.executor = None
 
 
+class GeneratorEMA:
+    def __init__(self, model, decay):
+        self.decay = decay
+        self.updates = 0
+        live = {
+            key: value
+            for key, value in model.state_dict().items()
+            if "enc_q" not in key
+        }
+        self.weights = {key: value.clone() for key, value in live.items()}
+        float_keys = [key for key, value in live.items() if value.is_floating_point()]
+        self.live_floats = [live[key] for key in float_keys]
+        self.ema_floats = [self.weights[key] for key in float_keys]
+        self.copied = [
+            (self.weights[key], value)
+            for key, value in live.items()
+            if not value.is_floating_point()
+        ]
+
+    @torch.no_grad()
+    def update(self):
+        self.updates += 1
+        decay = min(self.decay, (1 + self.updates) / (10 + self.updates))
+        torch._foreach_lerp_(self.ema_floats, self.live_floats, 1 - decay)
+        for target, value in self.copied:
+            target.copy_(value)
+
+    def state_dict(self):
+        return {"updates": self.updates, "weights": self.weights}
+
+    @torch.no_grad()
+    def load_state_dict(self, state):
+        weights = state["weights"]
+        if weights.keys() != self.weights.keys():
+            raise ValueError("the saved EMA weights do not match the generator")
+        for key, value in weights.items():
+            self.weights[key].copy_(value)
+        self.updates = int(state["updates"])
+
+
 def parse_arguments(argv=None):
     parser = argparse.ArgumentParser(description="Train an RVC voice model.")
     parser.add_argument("--model-name", required=True)
@@ -211,6 +250,12 @@ def parse_arguments(argv=None):
         default=0.0,
         help="Limit clips per batch times the longest clip to this much audio (0 disables it).",
     )
+    parser.add_argument(
+        "--ema-decay",
+        type=float,
+        default=0.999,
+        help="Export inference models from an EMA of the generator weights with this decay (0 disables it).",
+    )
     args = parser.parse_args(argv)
 
     for name in ("total_epoch", "save_every_epoch", "batch_size"):
@@ -219,6 +264,8 @@ def parse_arguments(argv=None):
     for name in ("warmup_steps", "lr_decay_steps", "max_batch_seconds"):
         if not getattr(args, name) >= 0:
             parser.error(f"--{name.replace('_', '-')} cannot be negative.")
+    if not 0 <= args.ema_decay < 1:
+        parser.error("--ema-decay must be at least 0 and below 1.")
     args.save_every_steps = max(0, args.save_every_steps)
     if args.version == "v1" and (args.sample_rate != 40000 or args.vocoder != "HiFi-GAN"):
         parser.error("RVC v1 training requires HiFi-GAN at 40000 Hz.")
@@ -414,6 +461,7 @@ class Trainer:
         self.last_batch = None
         self.writer = None
         self.exporter = None
+        self.ema = None
         self.progress = None
         self.epoch = 0
         self.logged_losses = None
@@ -422,10 +470,12 @@ class Trainer:
         self.build_data()
         last_g, last_d = latest_checkpoint_pair(self.args.experiment_dir)
         self.build_models(last_g)
-        epoch_str = self.restore(last_g, last_d)
+        epoch_str, ema_state = self.restore(last_g, last_d)
         for optimizer in (self.optim_g, self.optim_d):
             for group in optimizer.param_groups:
                 group.setdefault("initial_lr", group["lr"])
+        if self.rank == 0 and self.args.ema_decay > 0:
+            self.build_ema(last_g, ema_state)
 
         if self.rank == 0:
             self.writer = SummaryWriter(
@@ -496,6 +546,8 @@ class Trainer:
             options.append(f"{args.warmup_steps} warmup steps")
         if args.lr_decay_steps:
             options.append(f"lr_decay every {args.lr_decay_steps} steps")
+        if self.ema is not None:
+            options.append(f"generator EMA {args.ema_decay:g}")
         if self.cache_in_gpu:
             options.append("dataset cached in GPU")
         if args.checkpointing:
@@ -643,10 +695,12 @@ class Trainer:
                     raise FileNotFoundError(
                         "resuming needs a G_*.pth and a D_*.pth checkpoint with the same suffix"
                     )
-                _, _, _, epoch_str, scaler_dict = load_checkpoint(
+                _, _, _, epoch_str, scaler_dict, _ = load_checkpoint(
                     last_d, self.net_d, self.optim_d
                 )
-                _, _, _, epoch_str, _ = load_checkpoint(last_g, self.net_g, self.optim_g)
+                _, _, _, epoch_str, _, ema_state = load_checkpoint(
+                    last_g, self.net_g, self.optim_g
+                )
             except Exception as e:
                 print(f"Could not resume from the checkpoints in {self.args.experiment_dir}: {e}")
                 print("Fix or remove them, or enable cleanup to start over from the pretrained models.")
@@ -655,11 +709,22 @@ class Trainer:
                 self.scaler.load_state_dict(scaler_dict)
             epoch_str += 1
             self.global_step = (epoch_str - 1) * len(self.sampler)
-            return epoch_str
+            return epoch_str, ema_state
 
         self.load_pretrained(self.net_g, self.args.pretrained_g, "G", match_speakers=True)
         self.load_pretrained(self.net_d, self.args.pretrained_d, "D")
-        return 1
+        return 1, None
+
+    def build_ema(self, last_g, ema_state):
+        self.ema = GeneratorEMA(self.generator(), self.args.ema_decay)
+        if ema_state is not None:
+            try:
+                self.ema.load_state_dict(ema_state)
+                return
+            except Exception as e:
+                print(f"Could not restore the generator EMA from {last_g}: {e}")
+        if last_g:
+            print("Starting the generator EMA from the resumed weights.")
 
     def load_pretrained(self, net, path, label, match_speakers=False):
         if path in ("", "None"):
@@ -825,6 +890,8 @@ class Trainer:
 
         if self.freeze_discriminator:
             self.net_d.requires_grad_(True)
+        if self.ema is not None:
+            self.ema.update()
 
         self.global_step += 1
         self.record_losses(
@@ -869,6 +936,9 @@ class Trainer:
     def generator(self):
         return self.net_g.module if hasattr(self.net_g, "module") else self.net_g
 
+    def export_state_dict(self):
+        return self.ema.weights if self.ema is not None else self.generator().state_dict()
+
     def weights_path(self, epoch):
         return os.path.join(
             self.args.experiment_dir,
@@ -893,7 +963,7 @@ class Trainer:
         path = self.weights_path(epoch)
         if not os.path.exists(path):
             self.exporter.submit(
-                model=self.generator(),
+                state_dict=self.export_state_dict(),
                 export_dtype=self.args.export_dtype,
                 model_path=path,
                 **self.export_arguments(epoch),
@@ -947,9 +1017,10 @@ class Trainer:
         weights = []
         if save_epoch or done:
             suffix = LATEST_CHECKPOINT_SUFFIX if args.save_only_latest else self.global_step
-            for prefix, net, optimizer in (
-                ("G", self.net_g, self.optim_g),
-                ("D", self.net_d, self.optim_d),
+            generator_extra = {"ema": self.ema.state_dict()} if self.ema is not None else None
+            for prefix, net, optimizer, extra in (
+                ("G", self.net_g, self.optim_g, generator_extra),
+                ("D", self.net_d, self.optim_d, None),
             ):
                 save_checkpoint(
                     net,
@@ -958,6 +1029,7 @@ class Trainer:
                     epoch,
                     os.path.join(args.experiment_dir, f"{prefix}_{suffix}.pth"),
                     self.scaler,
+                    extra,
                 )
             if args.save_every_weights and args.save_every_steps == 0:
                 weights.append(self.weights_path(epoch))
@@ -967,7 +1039,7 @@ class Trainer:
             if self.exporter is not None:
                 self.exporter.wait_for_completion()
 
-        state_dict = self.generator().state_dict() if weights else None
+        state_dict = self.export_state_dict() if weights else None
         for path in weights:
             if not os.path.exists(path):
                 extract_model(

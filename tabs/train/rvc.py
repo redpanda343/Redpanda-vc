@@ -785,6 +785,17 @@ def rvc_train_tab():
                     ),
                     interactive=True,
                 )
+                ema_decay = gr.Slider(
+                    0,
+                    0.9999,
+                    0.999,
+                    step=0.0001,
+                    label=i18n("Generator EMA Decay"),
+                    info=i18n(
+                        "Saves inference models from a running average of the generator weights, so quality changes less between epochs. Higher values average over more steps. 0 saves the raw weights."
+                    ),
+                    interactive=True,
+                )
             with gr.Row():
                 custom_pretrained = gr.Checkbox(
                     label=i18n("Custom Pretrained"),
@@ -835,12 +846,13 @@ def rvc_train_tab():
             )
 
         def start_training(*args):
-            *arguments, warmup, decay_steps, batch_seconds = args
+            *arguments, warmup, decay_steps, batch_seconds, ema = args
             message = start_train_script(
                 *arguments,
                 warmup_steps=warmup,
                 lr_decay_steps=decay_steps,
                 max_batch_seconds=batch_seconds,
+                ema_decay=ema,
             )
             gr.Info(message)
             return training_ui_state(args[0])
@@ -1160,6 +1172,7 @@ def rvc_train_tab():
                     warmup_steps,
                     lr_decay_steps,
                     max_batch_seconds,
+                    ema_decay,
                 ],
                 outputs=training_outputs,
             ).then(**wake_training_timer)

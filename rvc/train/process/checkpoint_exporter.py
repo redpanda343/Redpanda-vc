@@ -83,6 +83,10 @@ def export_generator_checkpoint(checkpoint_path, precision, output_name=None):
     else:
         version = "v3" if vocoder == "RefineGAN" else "v2"
     export_dtype = torch.float16 if precision == "fp16" else torch.float32
+    ema = checkpoint.get("ema")
+    use_ema = isinstance(ema, dict) and isinstance(ema.get("weights"), dict)
+    if use_ema:
+        state_dict = ema["weights"]
 
     checkpoint_label = f"{epoch}e"
     if step:
@@ -108,6 +112,6 @@ def export_generator_checkpoint(checkpoint_path, precision, output_name=None):
 
     message = (
         f"Exported epoch {epoch} to '{filename}' as {precision.upper()} "
-        f"using {vocoder}."
+        f"using {vocoder}{' and the generator EMA' if use_ema else ''}."
     )
     return message, output_path
