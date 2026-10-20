@@ -780,7 +780,7 @@ def rvc_train_tab():
                     step=1,
                     label=i18n("Learning Rate Decay Every X Steps"),
                     info=i18n(
-                        "Applies the learning rate decay every X steps, so it no longer depends on the dataset size. 0 decays once per epoch."
+                        "Applies the learning rate decay every X steps, so it no longer depends on the dataset size. 0 uses the default RVC decay, applied once per epoch."
                     ),
                     interactive=True,
                 )
