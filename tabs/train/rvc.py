@@ -908,6 +908,8 @@ def rvc_train_tab():
                 outputs=[],
             )
 
+    training_status_timer = gr.Timer(value=2.0, active=True)
+
     # Export Model section
     with gr.Accordion(i18n("Export Model"), open=False):
         if os.getenv("COLAB_RELEASE_TAG"):
@@ -1126,7 +1128,6 @@ def rvc_train_tab():
                 training_status_info,
             ]
 
-            training_status_timer = gr.Timer(value=2.0, active=True)
             wake_training_timer = dict(
                 fn=lambda: gr.Timer(active=True),
                 outputs=[training_status_timer],
