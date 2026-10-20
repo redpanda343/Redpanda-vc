@@ -50,9 +50,9 @@ TRAINING = dict(
     prefetch_factor=2,
 )
 FINETUNE = dict(
-    max_updates=100000,
-    checkpoint_interval=2000,
-    eval_interval=2000,
+    max_updates=10000,
+    checkpoint_interval=1000,
+    eval_interval=1000,
     num_valid_plots=100,
 )
 FINETUNE_AUGMENTATION = dict(key_aug=False)
