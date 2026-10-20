@@ -676,7 +676,7 @@ def rvc_train_tab():
                 step=1,
                 label=i18n("Total Steps"),
                 info=i18n(
-                    "Stops training after this many training steps. G and D checkpoints are still saved by epoch, and once more at the last step."
+                    "Stops training after this many training steps. G and D checkpoints are only saved at the end of an epoch, as set by Save Every Epoch, and the last step saves only the inference model."
                 ),
                 interactive=True,
             )

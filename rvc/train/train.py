@@ -526,8 +526,8 @@ class Trainer:
         epoch = epoch_str
         try:
             while self.global_step < total_steps:
-                self.train_epoch(epoch)
-                if self.finish_epoch(epoch):
+                complete = self.train_epoch(epoch)
+                if self.finish_epoch(epoch, complete):
                     completed = epoch
                     break
                 epoch += 1
@@ -831,13 +831,16 @@ class Trainer:
         self.net_d.train()
         self.epoch = epoch
         self.update_postfix()
+        steps = 0
         for batch in self.batches():
             self.set_learning_rate(epoch)
             self.train_step(batch)
             self.export_step_weights(epoch)
             self.progress.update(1)
+            steps += 1
             if self.global_step >= self.args.total_steps:
                 break
+        return steps == len(self.sampler)
 
     def warmup_ramp(self, step):
         warmup = self.args.warmup_steps
@@ -1074,18 +1077,18 @@ class Trainer:
             },
         )
 
-    def finish_epoch(self, epoch):
+    def finish_epoch(self, epoch, complete):
         if self.rank != 0:
             return False
         args = self.args
         spec, ids_slice, y_hat = self.last_batch
-        save_epoch = epoch % args.save_every_epoch == 0
+        save_epoch = complete and epoch % args.save_every_epoch == 0
         done = self.global_step >= args.total_steps
         if save_epoch:
             self.summarize_epoch(spec, ids_slice, y_hat)
 
         weights = []
-        if save_epoch or done:
+        if save_epoch:
             suffix = LATEST_CHECKPOINT_SUFFIX if args.save_only_latest else self.global_step
             generator_extra = {"step": self.global_step}
             if self.ema is not None:
