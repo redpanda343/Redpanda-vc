@@ -115,8 +115,8 @@
       "t_start": 0.4,
       "t_start_infer": 0.4,
       "dual_timestep": true,
-      "sampling_method": "rk2",
-      "sampling_steps": 10,
+      "sampling_method": "euler",
+      "sampling_steps": 20,
       "train_aux_decoder": true,
       "train_diffusion": true,
       "val_gt_start": false

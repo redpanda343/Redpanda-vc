@@ -10,8 +10,8 @@ from rectified_flow.content_encoder import ContentConditionEncoder
 from rectified_flow.variance import variance_names
 
 SAMPLERS = ("euler", "rk2", "rk4", "rk5")
-LEGACY_SAMPLER = ("euler", 20)
-DEFAULT_SAMPLER = ("rk2", 10)
+LEGACY_SAMPLER = ("rk2", 10)
+DEFAULT_SAMPLER = ("euler", 20)
 
 
 class MixedPrecisionLayerNorm(nn.LayerNorm):
