@@ -34,6 +34,7 @@ class ConvNeXtBlock(nn.Module):
     def __init__(self, channels: int, layer_scale: float = 1e-6, dropout: float = 0.0, kernel_size: int = 7):
         super().__init__()
         self.depthwise = nn.Conv1d(channels, channels, kernel_size, padding=kernel_size // 2, groups=channels)
+        self.depthwise.use_adamw = True
         self.norm = MixedPrecisionLayerNorm(channels, eps=1e-6)
         self.up = nn.Linear(channels, channels * 4)
         self.down = nn.Linear(channels * 4, channels)
@@ -104,6 +105,7 @@ class LYNXNet2Block(nn.Module):
         self.dropout = nn.Dropout(dropout_rate)
         self.norm = MixedPrecisionLayerNorm(channels)
         self.depthwise = nn.Conv1d(channels, channels, kernel_size, padding=kernel_size // 2, groups=channels)
+        self.depthwise.use_adamw = True
         self.up = nn.Linear(channels, inner * 2)
         self.mid = nn.Linear(inner, inner * 2)
         self.down = nn.Linear(inner, channels)
