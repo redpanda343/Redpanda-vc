@@ -16,17 +16,17 @@ Browser realtime audio uses a binary WebSocket connection, including with `--sha
 
 ## Credits
 
-- [ShiromiyaG](https://github.com/ShiromiyaG), for the original idea of the rectified flow models
-- [DiffSinger](https://github.com/openvpi/DiffSinger)
-- [MeanVC2](https://github.com/ASLP-lab/MeanVC2) by ASLP-lab for the optional MeanFlow training method.
-- [RVC-Realtime-GUI](https://github.com/niel-blue/RVC-Realtime-GUI/)
-- [Retrieval-based-Voice-Conversion-WebUI](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI)
 - [Applio](https://github.com/IAHispano/Applio)
-- [FireRedVAD](https://github.com/FireRedTeam/FireRedVAD)
 - [Beatrice Trainer](https://huggingface.co/fierce-cats/beatrice-trainer)
+- [ContentVec](https://github.com/auspicious3000/contentvec/)
+- [DiffSinger](https://github.com/openvpi/DiffSinger)
+- [FireRedVAD](https://github.com/FireRedTeam/FireRedVAD)
+- [MeanVC2](https://github.com/ASLP-lab/MeanVC2) by ASLP-lab for the optional MeanFlow training method.
 - [OpenVPI PC-NSF-HiFiGAN](https://github.com/openvpi/vocoders)
+- [Retrieval-based-Voice-Conversion-WebUI](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI)
+- [RMVPE](https://github.com/yxlllc/RMVPE)
+- [RVC-Realtime-GUI](https://github.com/niel-blue/RVC-Realtime-GUI/)
+- [ShiromiyaG](https://github.com/ShiromiyaG), for the original idea of the rectified flow models
 - [SingingVocoders](https://github.com/openvpi/SingingVocoders)
 - [tgm_hifigan](https://github.com/mrtigermeat/tgm_hifigan) by tigermeat (CC BY-NC 4.0)
-- [ContentVec](https://github.com/auspicious3000/contentvec/)
-- [RMVPE](https://github.com/yxlllc/RMVPE)
 - [vocal-remover](https://github.com/yxlllc/vocal-remover)
