@@ -2,11 +2,6 @@
   "flow": {
     "decay_step": 15000,
     "max_updates": 300000,
-    "augmentation_args": {
-      "random_time_stretching": {
-        "enabled": true
-      }
-    },
     "model": {
       "mean_flow": true,
       "hidden_channels": 256,
