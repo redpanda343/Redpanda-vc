@@ -85,7 +85,7 @@
     "sampler_frame_count_grid": 6,
     "model": {
       "content_channels": 768,
-      "hidden_channels": 384,
+      "hidden_channels": 768,
       "encoder_layers": 4,
       "enc_ffn_kernel_size": 3,
       "use_rope": true,
