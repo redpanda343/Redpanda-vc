@@ -9,6 +9,7 @@ import threading
 import time
 import traceback
 from collections import deque
+from functools import lru_cache
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -86,6 +87,24 @@ def key_name(vk):
     if user32.GetKeyNameTextW(((scan & 0xFF) << 16) | extended, buffer, len(buffer)):
         return buffer.value.title()
     return f"Key {vk}"
+
+
+@lru_cache(maxsize=8)
+def _rectified_checkpoint(path, modified, size):
+    from nsf_hifigan.infer import load_checkpoint
+
+    checkpoint = load_checkpoint(path)
+    return isinstance(checkpoint, dict) and checkpoint.get("kind") == "rectified_flow"
+
+
+def is_rectified_model(path):
+    if not path.lower().endswith(".pth"):
+        return False
+    try:
+        stat = os.stat(path)
+        return _rectified_checkpoint(os.path.abspath(path), stat.st_mtime_ns, stat.st_size)
+    except Exception:
+        return False
 
 
 class AudioFrameFifo:
@@ -1131,10 +1150,12 @@ class RealtimeGUI:
         methods = ttk.Frame(frame)
         methods.grid(row=4, column=1, columnspan=2, sticky="w", pady=(6, 3))
         self.rvc_widgets.add(pitch_label)
+        self.pitch_radios = {}
         for label, method in PITCH_METHODS.items():
             radio = ttk.Radiobutton(methods, text=label, variable=self.f0_method, value=method)
             radio.pack(side="left", padx=(0, 12))
             self.rvc_widgets.add(radio)
+            self.pitch_radios[method] = radio
         return frame
 
     def _build_actions(self, parent):
@@ -1185,6 +1206,11 @@ class RealtimeGUI:
         for widget in self.beatrice_rows:
             widget.grid() if beatrice else widget.grid_remove()
         self.flow_toggle.grid_remove() if beatrice else self.flow_toggle.grid()
+        rectified = not beatrice and is_rectified_model(path)
+        parselmouth = self.pitch_radios["pm"]
+        parselmouth.pack_forget() if rectified else parselmouth.pack(side="left", padx=(0, 12))
+        if rectified and self.f0_method.get() == "pm":
+            self.f0_method.set("rmvpe")
 
     def _browse_model(self):
         path = filedialog.askopenfilename(
