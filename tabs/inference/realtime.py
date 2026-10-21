@@ -891,7 +891,7 @@ def update_realtime(
     )
 
 
-def realtime_tab(model_file, index_file, rectified_vocoder_path):
+def realtime_tab(model_file, index_file, rectified_vocoder_path, pitch_choices):
     gr.Markdown(
         i18n(
             "Converts your microphone in real time through this browser, also over a public share link. The browser only allows the microphone on HTTPS pages or on localhost, so open the share link or http://127.0.0.1. Use headphones so the converted voice does not reach the microphone."
@@ -933,7 +933,7 @@ def realtime_tab(model_file, index_file, rectified_vocoder_path):
     with gr.Row():
         f0_method = gr.Radio(
             label=i18n("Pitch extraction algorithm"),
-            choices=["rmvpe", "swift", "beatrice", ("parselmouth", "pm")],
+            choices=pitch_choices,
             value="rmvpe",
             interactive=True,
         )
@@ -1091,3 +1091,4 @@ def realtime_tab(model_file, index_file, rectified_vocoder_path):
         outputs=None,
         js="(buffer) => { window.redpandaRealtime && window.redpandaRealtime.setBuffer(buffer); }",
     )
+    return f0_method

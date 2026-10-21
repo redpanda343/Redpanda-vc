@@ -408,6 +408,19 @@ def get_speakers_id(model):
     return list(range(get_model_info(model)[1]))
 
 
+def pitch_methods(rectified, vocoder):
+    if vocoder:
+        return ['rmvpe']
+    if rectified:
+        return ['rmvpe', 'swift', 'beatrice']
+    return ['rmvpe', 'swift', 'beatrice', ('parselmouth', 'pm')]
+
+
+def pitch_update(choices, value):
+    methods = {choice if isinstance(choice, str) else choice[1] for choice in choices}
+    return gr.update(choices=choices, value=value if value in methods else 'rmvpe')
+
+
 default_weight = next(iter(get_files("model")), None)
 
 
@@ -432,10 +445,8 @@ def update_filter_visibility(_):
 # Inference tab
 def inference_tab():
     trigger = get_filter_trigger()
-    vocoder_selected = get_model_info(default_weight)[2]
-    pitch_choices = ['rmvpe', ('parselmouth', 'pm')] if vocoder_selected else [
-        'rmvpe', 'swift', 'beatrice', ('parselmouth', 'pm')
-    ]
+    rectified_selected, _, vocoder_selected = get_model_info(default_weight)
+    pitch_choices = pitch_methods(rectified_selected, vocoder_selected)
     with gr.Column() as model_controls:
         with gr.Row():
             model_file = gr.Dropdown(
@@ -2348,40 +2359,35 @@ def inference_tab():
     )
 
     with gr.Tab(i18n("Real-time"), visible=not vocoder_selected) as realtime_panel:
-        realtime_tab(model_file, index_file, rectified_vocoder_path)
+        realtime_f0_method = realtime_tab(model_file, index_file, rectified_vocoder_path, pitch_choices)
 
     voice_controls = [index_file, index_rate, index_rate_batch, protect, protect_batch,
                       embedder_model, embedder_model_batch, sid, sid_batch]
 
-    def update_model_controls(model, single_pitch, batch_pitch):
+    def update_model_controls(model, single_pitch, batch_pitch, realtime_pitch):
         rectified, _, vocoder = get_model_info(model)
-        choices = ['rmvpe', ('parselmouth', 'pm')] if vocoder else [
-            'rmvpe', 'swift', 'beatrice', ('parselmouth', 'pm')
-        ]
-        methods = {'rmvpe', 'pm'} if vocoder else {'rmvpe', 'swift', 'beatrice', 'pm'}
+        choices = pitch_methods(rectified, vocoder)
         return (gr.update(visible=rectified),
                 *[gr.update(visible=not vocoder) for _ in voice_controls],
                 gr.update(visible=not vocoder),
-                *[gr.update(choices=choices, value=value if value in methods else 'rmvpe')
-                  for value in (single_pitch, batch_pitch)])
+                *[pitch_update(choices, value) for value in (single_pitch, batch_pitch, realtime_pitch)])
 
     model_file.change(
         fn=update_model_controls,
-        inputs=[model_file, f0_method, f0_method_batch],
-        outputs=[rectified_vocoder_path, *voice_controls, realtime_panel, f0_method, f0_method_batch],
+        inputs=[model_file, f0_method, f0_method_batch, realtime_f0_method],
+        outputs=[rectified_vocoder_path, *voice_controls, realtime_panel, f0_method, f0_method_batch,
+                 realtime_f0_method],
         show_progress=False,
     )
 
     def update_multi_model_controls(models, current_pitch):
-        vocoders = [get_model_info(model)[2] for model in (models or [])]
+        infos = [get_model_info(model) for model in (models or [])]
+        vocoders = [vocoder for _, _, vocoder in infos]
         voice_visible = not vocoders or not all(vocoders)
-        choices = ['rmvpe', ('parselmouth', 'pm')] if any(vocoders) else [
-            'rmvpe', 'swift', 'beatrice', ('parselmouth', 'pm')
-        ]
-        methods = {'rmvpe', 'pm'} if any(vocoders) else {'rmvpe', 'swift', 'beatrice', 'pm'}
+        choices = pitch_methods(any(rectified for rectified, _, _ in infos), any(vocoders))
         return (gr.update(visible=voice_visible), gr.update(visible=voice_visible),
                 gr.update(visible=voice_visible), gr.update(visible=voice_visible),
-                gr.update(choices=choices, value=current_pitch if current_pitch in methods else 'rmvpe'))
+                pitch_update(choices, current_pitch))
 
     multi_model_files.change(
         fn=update_multi_model_controls,

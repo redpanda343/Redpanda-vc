@@ -155,9 +155,8 @@ def nsf_hifigan_train_tab():
                     'It needs about 1.25 times the space of the sliced audio as 32-bit WAV, and can be deleted '
                     'after training.')
         with gr.Row():
-            pitch_extractor = gr.Radio(label='Pitch extractor', choices=list(PITCH_EXTRACTORS), value='rmvpe',
-                                       info='RMVPE matches the F0 Rectified Flow extracts at inference. Parselmouth '
-                                            'is the original SingingVocoders recipe.')
+            pitch_extractor = gr.Radio(label='Pitch extractor', choices=['rmvpe'], value='rmvpe',
+                                       info='RMVPE matches the F0 Rectified Flow extracts at inference.')
             valid_clips = gr.Number(label='Validation clips', value=5, minimum=0, precision=0,
                                     info='Held out when there is no validation subfolder, at most a tenth of the '
                                          'clips.')
