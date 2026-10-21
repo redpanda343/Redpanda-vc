@@ -6,7 +6,7 @@ from rectified_flow.pitch import interpolate_f0
 
 VARIANCES = ('breathiness', 'voicing', 'tension')
 HNSEP_METHODS = ('vr', 'world')
-VARIANCE_SCALES = {'breathiness': 1.0 / 96, 'voicing': 1.0 / 96, 'tension': 1.0 / 10}
+VARIANCE_SCALES = {'breathiness': 1.0 / 96, 'voicing': 1.0 / 96, 'tension': 1.0}
 BASE_HARMONIC_RADIUS = 3.5
 STREAMING_CONTEXT = {'vr': 1.0, 'world': 0.3}
 STREAMING_REWRITE = 0.1
