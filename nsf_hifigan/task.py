@@ -2,8 +2,12 @@ import math
 from contextlib import nullcontext
 
 import lightning.pytorch as pl
+import numpy as np
 import torch
+from librosa import mel_frequencies
 from lightning.pytorch.strategies import ParallelStrategy
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
 from torch.nn import functional as F
 from torchmetrics import MeanMetric
 
@@ -14,6 +18,10 @@ from nsf_hifigan.losses import (
 from nsf_hifigan.models import build_discriminator, build_generator, load_generator_weights
 
 VALIDATION_LOSSES = ('mel_loss', 'stft_loss')
+DB_PER_NEPER = 20 / math.log(10)
+PLOT_DB_RANGE = 80.0
+PLOT_DIFFERENCE_DB = 20.0
+PLOT_FREQUENCIES = (500, 1000, 2000, 4000, 8000, 16000)
 
 
 def log_stft(audio, n_fft=2048, hop=512):
@@ -24,9 +32,35 @@ def log_stft(audio, n_fft=2048, hop=512):
     return torch.log10(spec.clamp(min=1e-7))
 
 
-def spectrogram_image(reference, generated):
-    image = torch.cat([reference, generated, (generated - reference).abs() + reference.min()], dim=0).flip(0)
-    return ((image - image.min()) / (image.max() - image.min()).clamp(min=1e-5)).cpu()
+def spectrogram_image(reference, generated, data):
+    reference, generated = reference.float().cpu().numpy(), generated.float().cpu().numpy()
+    loss = float(np.abs(generated - reference).mean())
+    reference, generated = reference * DB_PER_NEPER, generated * DB_PER_NEPER
+    top = math.ceil(reference.max())
+    bottom = top - PLOT_DB_RANGE
+    difference = generated.clip(min=bottom) - reference.clip(min=bottom)
+    bins, frames = reference.shape
+    duration = frames * data['hop_length'] / data['sample_rate']
+    centers = mel_frequencies(bins + 2, fmin=data['mel_fmin'], fmax=data['sample_rate'] / 2)[1:-1]
+    ticks = [hz for hz in PLOT_FREQUENCIES if centers[0] <= hz <= centers[-1]]
+    figure = Figure(figsize=(min(24.0, max(8.0, 2.5 + 1.2 * duration)), 9.0), dpi=100, layout='constrained')
+    axes = figure.subplots(3, 1, sharex=True, sharey=True)
+    panels = (('Reference', reference, 'magma', bottom, top),
+              ('Generated', generated, 'magma', bottom, top),
+              (f'Generated - reference (mel L1 {loss:.3f})', difference, 'RdBu_r',
+               -PLOT_DIFFERENCE_DB, PLOT_DIFFERENCE_DB))
+    for axis, (title, values, colormap, low, high) in zip(axes, panels):
+        image = axis.imshow(values, origin='lower', aspect='auto', cmap=colormap, vmin=low, vmax=high,
+                            extent=(0.0, duration, -0.5, bins - 0.5))
+        axis.set_title(title, loc='left')
+        axis.set_ylabel('Hz')
+        figure.colorbar(image, ax=axis, label='dB', pad=0.01)
+    axes[0].set_yticks(np.interp(ticks, centers, np.arange(bins)),
+                       [f'{hz // 1000}k' if hz >= 1000 else str(hz) for hz in ticks])
+    axes[-1].set_xlabel('Seconds')
+    canvas = FigureCanvasAgg(figure)
+    canvas.draw()
+    return np.asarray(canvas.buffer_rgba())[..., :3].copy()
 
 
 class VocoderTask(pl.LightningModule):
@@ -164,7 +198,8 @@ class VocoderTask(pl.LightningModule):
         with torch.autocast(self.device.type, enabled=False):
             generated = self.generator(batch['mel'].float(), batch['f0'].float())
             real = batch['audio']
-            mel_loss = mel_l1(self.loss_mel, generated, real)
+            generated_mel, real_mel = self.loss_mel(generated[:, 0].float()), self.loss_mel(real[:, 0].float())
+            mel_loss = F.l1_loss(generated_mel, real_mel)
             generated_stft, real_stft = log_stft(generated[:, 0].float()), log_stft(real[:, 0].float())
             stft_loss = F.l1_loss(generated_stft, real_stft)
         self.valid_losses['mel_loss'].update(mel_loss)
@@ -177,8 +212,8 @@ class VocoderTask(pl.LightningModule):
             if batch_idx not in self.logged_references:
                 writer.add_audio(f'audio/reference_{batch_idx}', real[0].cpu(), self.iteration, rate)
                 self.logged_references.add(batch_idx)
-            writer.add_image(f'spectrogram/{batch_idx}', spectrogram_image(real_stft[0], generated_stft[0]),
-                             self.iteration, dataformats='HW')
+            writer.add_image(f'spectrogram/{batch_idx}', spectrogram_image(real_mel[0], generated_mel[0], self.data),
+                             self.iteration, dataformats='HWC')
 
     def on_validation_epoch_end(self):
         losses = {name: metric.compute() for name, metric in self.valid_losses.items()}
