@@ -35,6 +35,7 @@
     "hnsep": "vr",
     "breathiness_smooth_width": 0.06,
     "voicing_smooth_width": 0.06,
+    "tension_smooth_width": 0.06,
     "aux_mel_weight": 0.2,
     "augmentation_args": {
       "random_pitch_shifting": {
@@ -96,6 +97,7 @@
       "speed": true,
       "use_breathiness_embed": true,
       "use_voicing_embed": true,
+      "use_tension_embed": false,
       "backbone_args": {
         "channels": 1024,
         "layers": 6,

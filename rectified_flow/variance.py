@@ -1,9 +1,13 @@
 import numpy as np
 import torch
+from torch.nn import functional as F
 
-VARIANCES = ('breathiness', 'voicing')
+from rectified_flow.pitch import interpolate_f0
+
+VARIANCES = ('breathiness', 'voicing', 'tension')
 HNSEP_METHODS = ('vr', 'world')
-VARIANCE_SCALE = 1.0 / 96
+VARIANCE_SCALES = {'breathiness': 1.0 / 96, 'voicing': 1.0 / 96, 'tension': 1.0 / 10}
+BASE_HARMONIC_RADIUS = 3.5
 STREAMING_CONTEXT = {'vr': 1.0, 'world': 0.3}
 STREAMING_REWRITE = 0.1
 VR_CHUNK = 15.0
@@ -36,13 +40,49 @@ def smooth(curve, width, timestep):
         return _SMOOTHERS[kernel](torch.from_numpy(np.asarray(curve, dtype=np.float32))[None])[0].numpy()
 
 
-def energy_db(waveform, length, hop, win):
+def rms_energy(waveform, length, hop, win):
     import librosa
 
     energy = librosa.feature.rms(y=waveform, frame_length=win, hop_length=hop)[0]
     if len(energy) < length:
         energy = np.pad(energy, (0, length - len(energy)))
-    return librosa.amplitude_to_db(energy[:length], top_db=None)
+    return energy[:length]
+
+
+def energy_db(waveform, length, hop, win):
+    import librosa
+
+    return librosa.amplitude_to_db(rms_energy(waveform, length, hop, win), top_db=None)
+
+
+def base_harmonic(harmonic, f0, uv, sample_rate, hop, win, device):
+    waveform = torch.from_numpy(np.ascontiguousarray(harmonic, dtype=np.float32)).to(device)[None]
+    samples = waveform.shape[1]
+    f0 = np.asarray(f0, dtype=np.float32) * ~np.asarray(uv, dtype=bool)
+    pad = samples // hop - len(f0) + 1
+    if pad > 0:
+        f0 = np.pad(f0, (0, pad), mode='constant', constant_values=(f0[0], f0[-1]))
+    f0 = torch.from_numpy(interpolate_f0(f0)).to(device)[None, :, None]
+    phase = torch.arange(win, dtype=torch.float32, device=device) / win * 2 * np.pi
+    window = (0.355768 - 0.487396 * torch.cos(phase) + 0.144232 * torch.cos(2 * phase)
+              - 0.012604 * torch.cos(3 * phase))
+    spec = torch.stft(waveform, n_fft=win, win_length=win, hop_length=hop, window=window, center=True,
+                      return_complex=True).transpose(1, 2)
+    frames, bins = spec.shape[1:]
+    index = torch.arange(bins, device=device).to(f0)[None, None]
+    center = f0 * win / sample_rate
+    mask = ((center >= 1) & (index >= torch.clip(center - BASE_HARMONIC_RADIUS, min=0))
+            & (index < torch.clip(center + BASE_HARMONIC_RADIUS, max=bins))).float()
+    mask = F.pad(mask, (0, 0, 0, max(0, frames - mask.shape[1])))[:, :frames]
+    return torch.istft((spec * mask).transpose(1, 2), n_fft=win, win_length=win, hop_length=hop, window=window,
+                       center=True, length=samples)[0].cpu().numpy()
+
+
+def tension_logit(harmonic, base, length, hop, win):
+    full = rms_energy(harmonic, length, hop, win)
+    ratio = np.sqrt(np.clip(full ** 2 - rms_energy(base, length, hop, win) ** 2, 0, None)) / (full + 1e-5)
+    ratio = np.clip(ratio, 1e-4, 1 - 1e-4)
+    return np.log(ratio / (1 - ratio))
 
 
 def world_separate(waveform, sample_rate, f0, hop, fft_size):
@@ -121,13 +161,16 @@ def separate(method, waveform, sample_rate, f0, uv, data, device):
     raise ValueError(f'hnsep must be one of {HNSEP_METHODS}, not {method!r}.')
 
 
-def variance_curves(names, harmonic, aperiodic, length, data, settings):
-    hop, win = int(data['hop_length']), int(data['win_length'])
-    timestep = hop / int(data['sample_rate'])
+def variance_curves(names, harmonic, aperiodic, f0, uv, length, data, settings, device):
+    rate, hop, win = int(data['sample_rate']), int(data['hop_length']), int(data['win_length'])
+    timestep = hop / rate
     curves = []
     for name in names:
-        part = aperiodic if name == 'breathiness' else harmonic
-        curves.append(smooth(energy_db(part, length, hop, win), settings[f'{name}_smooth_width'], timestep))
+        if name == 'tension':
+            curve = tension_logit(harmonic, base_harmonic(harmonic, f0, uv, rate, hop, win, device), length, hop, win)
+        else:
+            curve = energy_db(aperiodic if name == 'breathiness' else harmonic, length, hop, win)
+        curves.append(smooth(curve, settings[f'{name}_smooth_width'], timestep))
     return np.stack(curves).astype(np.float32) if curves else np.zeros((0, length), dtype=np.float32)
 
 
@@ -136,7 +179,7 @@ def extract_variances(names, waveform, f0, uv, length, data, settings, device):
         return np.zeros((0, length), dtype=np.float32)
     sample_rate = int(data['sample_rate'])
     harmonic, aperiodic = separate(settings['hnsep'], waveform, sample_rate, f0, uv, data, device)
-    return variance_curves(names, harmonic, aperiodic, length, data, settings)
+    return variance_curves(names, harmonic, aperiodic, f0, uv, length, data, settings, device)
 
 
 def resample_variances(curves, speed, length, data):
@@ -185,4 +228,5 @@ class StreamingVariances:
             harmonic, aperiodic = self._separate(waveform[start:], f0[frame:], uv[frame:])
             self.harmonic[keep:] = harmonic[keep - start:]
             self.aperiodic[keep:] = aperiodic[keep - start:]
-        return variance_curves(self.names, self.harmonic, self.aperiodic, length, self.data, self.settings)
+        return variance_curves(self.names, self.harmonic, self.aperiodic, f0, uv, length, self.data, self.settings,
+                               self.device)

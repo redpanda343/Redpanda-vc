@@ -4,7 +4,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from rectified_flow.variance import VARIANCE_SCALE
+from rectified_flow.variance import VARIANCE_SCALES
 
 
 def adamw_linear(inputs, outputs):
@@ -139,7 +139,7 @@ class ContentConditionEncoder(nn.Module):
         if self.variance_names:
             if variances is None or variances.shape[1] != len(self.variance_names):
                 raise ValueError(f'This flow needs {", ".join(self.variance_names)} curves.')
-            x = x + torch.stack([self.variance_embeds[name](variances[:, index, :, None] * VARIANCE_SCALE)
+            x = x + torch.stack([self.variance_embeds[name](variances[:, index, :, None] * VARIANCE_SCALES[name])
                                  for index, name in enumerate(self.variance_names)], dim=-1).sum(-1)
         if self.key_shift is not None:
             values = f0.new_zeros(f0.shape[0]) if key_shift is None else key_shift

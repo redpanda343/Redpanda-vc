@@ -197,6 +197,7 @@ class RectifiedFlow(nn.Module):
         speed: bool = True,
         use_breathiness_embed: bool = False,
         use_voicing_embed: bool = False,
+        use_tension_embed: bool = False,
         backbone_args: Optional[dict] = None,
         aux_decoder: Optional[dict] = None,
         aux_grad: float = 0.1,
@@ -227,7 +228,8 @@ class RectifiedFlow(nn.Module):
             key_shift=key_shift, speed=speed, use_spk_id=self.use_spk_id, enc_ffn_kernel_size=enc_ffn_kernel_size,
             use_rope=use_rope, rope_interleaved=rope_interleaved, rope_theta=rope_theta,
             variances=variance_names(dict(use_breathiness_embed=use_breathiness_embed,
-                                          use_voicing_embed=use_voicing_embed)),
+                                          use_voicing_embed=use_voicing_embed,
+                                          use_tension_embed=use_tension_embed)),
         )
         self.backbone = LYNXNet2Backbone(n_mels, hidden_channels, **(backbone_args or {}))
         self.aux = AuxDecoder(hidden_channels, n_mels, **(aux_decoder or {}))
@@ -349,7 +351,7 @@ def validate_model_config(model: dict):
         raise ValueError('mean_flow must be a boolean.')
     for name in ('use_rope', 'rope_interleaved', 'use_spk_id', 'key_shift', 'speed', 'dual_timestep',
                  'train_aux_decoder', 'train_diffusion', 'val_gt_start', 'use_breathiness_embed',
-                 'use_voicing_embed'):
+                 'use_voicing_embed', 'use_tension_embed'):
         if not isinstance(model[name], bool):
             raise ValueError(f'{name} must be a boolean.')
     for section, key in ((model, 'enc_ffn_kernel_size'), (model['aux_decoder'], 'kernel_size'),

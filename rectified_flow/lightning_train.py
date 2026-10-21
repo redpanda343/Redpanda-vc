@@ -39,7 +39,8 @@ for _name in ('lightning.pytorch', 'lightning.fabric'):
     logging.getLogger(_name).setLevel(logging.WARNING)
 
 
-FINETUNE_OPTIONAL_KEYS = ('sampling_method', 'sampling_steps', 'use_breathiness_embed', 'use_voicing_embed')
+FINETUNE_OPTIONAL_KEYS = ('sampling_method', 'sampling_steps', 'use_breathiness_embed', 'use_voicing_embed',
+                          'use_tension_embed')
 FINETUNE_OPTIONAL_WEIGHTS = ('encoder.variance_embeds.',)
 
 
