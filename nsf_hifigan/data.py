@@ -12,6 +12,7 @@ from nsf_hifigan.losses import FEATURE_MEL_FLOOR, vocoder_mel
 
 MIN_LOG_MEL = math.log(1e-5)
 KEY_AUG_MARGIN = 2
+VALID_PEAK_DB = -3.0
 
 
 class VocoderDataset(Dataset):
@@ -23,6 +24,7 @@ class VocoderDataset(Dataset):
         self.crop = self.settings['crop_mel_frames']
         self.entries = [name for name, frames in entries if not training or frames >= self.crop]
         self.max_f0 = max_f0(config['model'])
+        self.peak_db = self.settings.get('peak_norm_db')
         self.mel = vocoder_mel(self.data, floor=FEATURE_MEL_FLOOR) if training and self.settings['key_aug'] else None
 
     def __len__(self):
@@ -78,6 +80,12 @@ class VocoderDataset(Dataset):
             audio = sample['audio'][start * hop:end * hop]
             audio = np.pad(audio, (0, (end - start) * hop - len(audio))).astype(np.float32)
             mel = sample['mel'][start:end].T.astype(np.float32)
+            peak = float(np.max(np.abs(sample['audio']))) if self.peak_db else 0.0
+            if peak > 1e-5:
+                target = random.uniform(*self.peak_db) if self.training else VALID_PEAK_DB
+                gain = 10 ** (target / 20) / peak
+                audio = audio * gain
+                mel = mel + np.log(gain)
             if self.training and random.random() < self.settings['volume_aug_prob']:
                 peak = float(np.max(np.abs(audio))) + 1e-5
                 shift = random.uniform(-3.0, min(3.0, float(np.log(1 / peak))))

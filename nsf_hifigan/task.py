@@ -11,12 +11,15 @@ from matplotlib.figure import Figure
 from torch.nn import functional as F
 from torchmetrics import MeanMetric
 
-from nsf_hifigan.config import DISCRIMINATOR_PERIODS, max_f0
+from nsf_hifigan.config import DISCRIMINATOR_PERIODS, VOCOS_FFT_SIZES, VOCOS_PERIODS, max_f0
 from nsf_hifigan.losses import (
-    discriminate, discriminator_loss, generator_adversarial_loss, mel_l1, vocoder_mel,
+    discriminate, discriminator_loss, generator_adversarial_loss, hinge_discriminator_loss, hinge_generator_loss,
+    mel_l1, vocoder_mel,
 )
-from nsf_hifigan.models import build_discriminator, build_generator, load_generator_weights, load_vocos_backbone
-from rectified_flow.vocos import Vocos
+from nsf_hifigan.models import (
+    build_discriminator, build_generator, build_vocos_discriminator, load_generator_weights, load_vocos_backbone,
+)
+from rectified_flow.vocos import Vocos, VocosMel
 
 VALIDATION_LOSSES = ('mel_loss', 'stft_loss')
 DB_PER_NEPER = 20 / math.log(10)
@@ -70,10 +73,19 @@ class VocoderTask(pl.LightningModule):
         self.config, self.finetune = config, finetune
         self.data, self.settings = config['data'], config['train']
         self.automatic_optimization = False
-        self.generator = Vocos(**config['model']) if config['kind'] == 'vocos' else build_generator(config['model'])
-        self.discriminator = build_discriminator(DISCRIMINATOR_PERIODS)
         self.input_mel = vocoder_mel(self.data)
         self.loss_mel = vocoder_mel(self.data, fmax=None)
+        self.train_mel = None
+        self.adversarial_weights = None
+        if config['kind'] == 'vocos':
+            self.generator = Vocos(**config['model'])
+            self.discriminator = build_vocos_discriminator(VOCOS_PERIODS, VOCOS_FFT_SIZES)
+            self.train_mel = VocosMel(self.data['sample_rate'], self.data['n_fft'], self.data['hop_length'],
+                                      self.data['n_mels'], 'center')
+            self.adversarial_weights = dict(mpd=1.0, mrd=self.settings['mrd_loss_weight'])
+        else:
+            self.generator = build_generator(config['model'])
+            self.discriminator = build_discriminator(DISCRIMINATOR_PERIODS)
         self.pc_aug = config['kind'] == 'pc'
         self.max_f0 = max_f0(config['model'])
         self.learning_rate = self.settings['finetune_learning_rate' if finetune else 'learning_rate']
@@ -95,8 +107,28 @@ class VocoderTask(pl.LightningModule):
     def configure_optimizers(self):
         options = dict(lr=self.learning_rate, betas=tuple(self.settings['betas']),
                        weight_decay=self.settings['weight_decay'])
-        return [torch.optim.AdamW(self.generator.parameters(), **options),
-                torch.optim.AdamW(self.discriminator.parameters(), **options)]
+        optimizers = [torch.optim.AdamW(self.generator.parameters(), **options),
+                      torch.optim.AdamW(self.discriminator.parameters(), **options)]
+        if self.settings.get('lr_schedule') != 'cosine':
+            return optimizers
+        total = self.settings['max_updates']
+        schedule = lambda step: 0.5 * (1 + math.cos(math.pi * min(step, total) / total))
+        return optimizers, [torch.optim.lr_scheduler.LambdaLR(optimizer, schedule) for optimizer in optimizers]
+
+    def discriminator_objective(self, real, fake):
+        if self.adversarial_weights:
+            return hinge_discriminator_loss(real, fake, self.adversarial_weights)
+        return discriminator_loss(real, fake)
+
+    def generator_objective(self, real, fake):
+        if self.adversarial_weights:
+            return hinge_generator_loss(real, fake, self.adversarial_weights)
+        return generator_adversarial_loss(real, fake)
+
+    def step_schedulers(self):
+        schedulers = self.lr_schedulers()
+        for scheduler in schedulers if isinstance(schedulers, list) else [schedulers] if schedulers else []:
+            scheduler.step()
 
     def shifted(self, f0, keys):
         return torch.clamp(f0 * 2 ** (keys / 12), max=self.max_f0)
@@ -137,7 +169,7 @@ class VocoderTask(pl.LightningModule):
             sync = strategy.block_backward_sync() if is_real and isinstance(strategy, ParallelStrategy) else nullcontext()
             with sync:
                 outputs = discriminate(self.discriminator, audio)
-                loss, values = discriminator_loss(outputs if is_real else None, None if is_real else outputs)
+                loss, values = self.discriminator_objective(outputs if is_real else None, None if is_real else outputs)
                 self.manual_backward(loss)
             logs.update(values)
             del outputs, loss
@@ -154,7 +186,7 @@ class VocoderTask(pl.LightningModule):
         try:
             with torch.no_grad():
                 real_output = discriminate(self.discriminator, real)
-            adversarial, logs = generator_adversarial_loss(real_output, discriminate(self.discriminator, fake))
+            adversarial, logs = self.generator_objective(real_output, discriminate(self.discriminator, fake))
             generated, reference = outputs['audio'], real
             pc_loss = 0
             if 'shift_ab' in outputs:
@@ -162,7 +194,8 @@ class VocoderTask(pl.LightningModule):
                 logs['generator/pc_wav_loss'] = pc_loss.detach()
                 generated = torch.cat((generated, outputs['shift_ab']))
                 reference = torch.cat((reference, outputs['shift_c']))
-            mel_loss = mel_l1(self.loss_mel, generated, reference) * self.settings['mel_loss_weight']
+            mel = self.loss_mel if self.train_mel is None else self.train_mel
+            mel_loss = mel_l1(mel, generated, reference) * self.settings['mel_loss_weight']
             logs['generator/mel_loss'] = mel_loss.detach()
             self.manual_backward(adversarial + mel_loss + pc_loss)
             self.clip(optimizer)
@@ -186,6 +219,7 @@ class VocoderTask(pl.LightningModule):
         logs = self.discriminator_step(optimizer_d, batch['audio'], fake)
         if not warming:
             logs.update(self.generator_step(optimizer_g, batch['audio'], outputs, fake))
+        self.step_schedulers()
         self.iteration += 1
         self.log_dict({key.split('/')[-1]: value for key, value in logs.items()
                        if key in ('generator/mel_loss', 'discriminator/mpd_fake')},

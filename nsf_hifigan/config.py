@@ -28,7 +28,17 @@ VOCOS = dict(
     num_layers=8,
     padding='same',
 )
-VOCOS_TRAINING = dict(learning_rate=2e-4)
+VOCOS_PERIODS = [2, 3, 5, 7, 11]
+VOCOS_FFT_SIZES = [2048, 1024, 512]
+VOCOS_TRAINING = dict(
+    learning_rate=5e-4,
+    betas=[0.8, 0.9],
+    weight_decay=0.01,
+    lr_schedule='cosine',
+    mrd_loss_weight=0.1,
+    volume_aug_prob=0.0,
+    peak_norm_db=[-6.0, -1.0],
+)
 TRAINING = dict(
     batch_size=10,
     crop_mel_frames=32,

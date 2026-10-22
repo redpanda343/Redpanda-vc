@@ -107,9 +107,10 @@ def load_vocos_backbone(generator, weights):
 
 
 class PeriodDiscriminator(nn.Module):
-    def __init__(self, period, kernel_size=5, stride=3):
+    def __init__(self, period, kernel_size=5, stride=3, first_feature=True):
         super().__init__()
         self.period = period
+        self.first_feature = first_feature
         channels = [1, 32, 128, 512, 1024]
         self.convs = nn.ModuleList(
             [weight_norm(nn.Conv2d(source, target, (kernel_size, 1), (stride, 1), padding=(_padding(5), 0)))
@@ -126,18 +127,21 @@ class PeriodDiscriminator(nn.Module):
             x = F.pad(x, (0, pad), 'reflect')
             length += pad
         x = x.view(batch, channels, length // self.period, self.period)
-        for layer in self.convs:
+        for index, layer in enumerate(self.convs):
             x = F.leaky_relu(layer(x), LRELU_SLOPE, inplace=True)
-            features.append(x)
+            if index or self.first_feature:
+                features.append(x)
         x = self.conv_post(x)
         features.append(x)
         return torch.flatten(x, 1, -1), features
 
 
 class MultiPeriodDiscriminator(nn.Module):
-    def __init__(self, periods):
+    def __init__(self, periods, first_feature=True):
         super().__init__()
-        self.discriminators = nn.ModuleList([PeriodDiscriminator(period) for period in periods])
+        self.discriminators = nn.ModuleList(
+            [PeriodDiscriminator(period, first_feature=first_feature) for period in periods]
+        )
 
     def forward(self, audio):
         outputs = [discriminator(audio) for discriminator in self.discriminators]
@@ -188,5 +192,64 @@ class MultiScaleDiscriminator(nn.Module):
         return outputs, features
 
 
+class ResolutionDiscriminator(nn.Module):
+    BANDS = ((0.0, 0.1), (0.1, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 1.0))
+
+    def __init__(self, window_length, channels=32, hop_factor=0.25):
+        super().__init__()
+        self.window_length = window_length
+        self.hop_length = int(window_length * hop_factor)
+        self.register_buffer('window', torch.hann_window(window_length), persistent=False)
+        bins = window_length // 2 + 1
+        self.bands = [(int(low * bins), int(high * bins)) for low, high in self.BANDS]
+
+        def stack():
+            return nn.ModuleList([
+                weight_norm(nn.Conv2d(2, channels, (3, 9), (1, 1), padding=(1, 4))),
+                weight_norm(nn.Conv2d(channels, channels, (3, 9), (1, 2), padding=(1, 4))),
+                weight_norm(nn.Conv2d(channels, channels, (3, 9), (1, 2), padding=(1, 4))),
+                weight_norm(nn.Conv2d(channels, channels, (3, 9), (1, 2), padding=(1, 4))),
+                weight_norm(nn.Conv2d(channels, channels, (3, 3), (1, 1), padding=(1, 1))),
+            ])
+
+        self.band_convs = nn.ModuleList([stack() for _ in self.bands])
+        self.conv_post = weight_norm(nn.Conv2d(channels, 1, (3, 3), (1, 1), padding=(1, 1)))
+
+    def spectrogram(self, audio):
+        audio = audio[:, 0] - audio[:, 0].mean(dim=-1, keepdim=True)
+        audio = 0.8 * audio / (audio.abs().amax(dim=-1, keepdim=True) + 1e-9)
+        spec = torch.stft(audio, self.window_length, hop_length=self.hop_length, win_length=self.window_length,
+                          window=self.window, center=True, pad_mode='reflect', return_complex=True)
+        spec = torch.view_as_real(spec).permute(0, 3, 2, 1)
+        return [spec[..., low:high] for low, high in self.bands]
+
+    def forward(self, audio):
+        features, outputs = [], []
+        for band, stack in zip(self.spectrogram(audio), self.band_convs):
+            for index, layer in enumerate(stack):
+                band = F.leaky_relu(layer(band), LRELU_SLOPE)
+                if index:
+                    features.append(band)
+            outputs.append(band)
+        x = self.conv_post(torch.cat(outputs, dim=-1))
+        features.append(x)
+        return torch.flatten(x, 1, -1), features
+
+
+class MultiResolutionDiscriminator(nn.Module):
+    def __init__(self, fft_sizes):
+        super().__init__()
+        self.discriminators = nn.ModuleList([ResolutionDiscriminator(size) for size in fft_sizes])
+
+    def forward(self, audio):
+        outputs = [discriminator(audio) for discriminator in self.discriminators]
+        return [output for output, _ in outputs], [features for _, features in outputs]
+
+
 def build_discriminator(periods):
     return nn.ModuleDict(dict(msd=MultiScaleDiscriminator(), mpd=MultiPeriodDiscriminator(periods)))
+
+
+def build_vocos_discriminator(periods, fft_sizes):
+    return nn.ModuleDict(dict(mpd=MultiPeriodDiscriminator(periods, first_feature=False),
+                              mrd=MultiResolutionDiscriminator(fft_sizes)))
