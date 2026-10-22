@@ -92,6 +92,20 @@ def load_generator_weights(generator, weights):
     generator.load_state_dict(state)
 
 
+def load_vocos_backbone(generator, weights):
+    target = generator.state_dict()
+    state = {key: value for key, value in weights.items()
+             if key.startswith('backbone.') and not key.startswith('backbone.embed.')}
+    for key, value in state.items():
+        if key not in target:
+            raise ValueError(f'The Vocos generator has no place for the pretrained weight {key}.')
+        if value.shape != target[key].shape:
+            raise ValueError(f'The pretrained Vocos stores {key} as {tuple(value.shape)}, '
+                             f'not {tuple(target[key].shape)}.')
+    generator.load_state_dict(state, strict=False)
+    return len(state)
+
+
 class PeriodDiscriminator(nn.Module):
     def __init__(self, period, kernel_size=5, stride=3):
         super().__init__()

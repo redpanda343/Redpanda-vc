@@ -198,8 +198,8 @@ def rectified_train_tab():
         with gr.Row():
             vocoder = gr.Dropdown(label='Vocoder', choices=vocoder_choices(), value=DEFAULT_VOCODER, scale=4,
                                   info='Renders the training previews and becomes the default vocoder of exported '
-                                       'models. Custom NSF-HiFiGAN vocoders (.ckpt, .pth or .onnx, with any '
-                                       'config.json or vocoder.yaml beside them) are listed from '
+                                       'models. Custom NSF-HiFiGAN (F0) or Vocos (no F0) vocoders (.ckpt, .pth or '
+                                       '.onnx, with any config.json or vocoder.yaml beside them) are listed from '
                                        f'{CUSTOM_VOCODER_ROOT.relative_to(ROOT).as_posix()}.')
             refresh_vocoder_button = gr.Button('Refresh', scale=1)
         refresh_vocoder_button.click(refresh_vocoders, vocoder, vocoder, queue=False)

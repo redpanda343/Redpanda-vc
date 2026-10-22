@@ -11,7 +11,7 @@ def train_tab():
         rvc_train_tab()
     with gr.Tab("Rectified Flow"):
         rectified_train_tab()
-    with gr.Tab("NSF-HiFiGAN Vocoder"):
+    with gr.Tab("Vocoder"):
         nsf_hifigan_train_tab()
     with gr.Tab("Beatrice"):
         beatrice_train_tab()

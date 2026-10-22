@@ -15,7 +15,8 @@ from nsf_hifigan.config import DISCRIMINATOR_PERIODS, max_f0
 from nsf_hifigan.losses import (
     discriminate, discriminator_loss, generator_adversarial_loss, mel_l1, vocoder_mel,
 )
-from nsf_hifigan.models import build_discriminator, build_generator, load_generator_weights
+from nsf_hifigan.models import build_discriminator, build_generator, load_generator_weights, load_vocos_backbone
+from rectified_flow.vocos import Vocos
 
 VALIDATION_LOSSES = ('mel_loss', 'stft_loss')
 DB_PER_NEPER = 20 / math.log(10)
@@ -69,7 +70,7 @@ class VocoderTask(pl.LightningModule):
         self.config, self.finetune = config, finetune
         self.data, self.settings = config['data'], config['train']
         self.automatic_optimization = False
-        self.generator = build_generator(config['model'])
+        self.generator = Vocos(**config['model']) if config['kind'] == 'vocos' else build_generator(config['model'])
         self.discriminator = build_discriminator(DISCRIMINATOR_PERIODS)
         self.input_mel = vocoder_mel(self.data)
         self.loss_mel = vocoder_mel(self.data, fmax=None)
@@ -81,6 +82,9 @@ class VocoderTask(pl.LightningModule):
         self.valid_losses = torch.nn.ModuleDict({name: MeanMetric() for name in VALIDATION_LOSSES})
 
     def load_pretrained(self, source):
+        if 'backbone' in source:
+            load_vocos_backbone(self.generator, source['backbone'])
+            return
         discriminator = source.get('discriminator')
         if not isinstance(discriminator, dict) or not discriminator:
             raise ValueError('Fine-tuning requires a full NSF-HiFiGAN training checkpoint with both generator '

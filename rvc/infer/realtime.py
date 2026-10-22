@@ -35,6 +35,8 @@ def inference_dtype(device, use_fp32=False, rectified=False):
 
 
 def decoder_radius(generator):
+    if hasattr(generator, "radius"):
+        return generator.radius
     radius = generator.conv_pre.kernel_size[0] // 2
     scale = 1
     for stage, up in enumerate(generator.ups):

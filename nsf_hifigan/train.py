@@ -11,7 +11,7 @@ from lightning.pytorch.strategies import DDPStrategy
 from tqdm import tqdm
 
 from nsf_hifigan.checkpoints import (
-    checkpoint_path, export_vocoder, latest_checkpoint, load_source, prune_checkpoints,
+    checkpoint_path, export_vocoder, latest_checkpoint, load_source, load_vocos_source, prune_checkpoints,
 )
 from nsf_hifigan.config import (
     FINETUNE, FINETUNE_AUGMENTATION, KINDS, PRECISIONS, ROOT, apply_overrides, experiment_paths, new_config,
@@ -106,6 +106,9 @@ def prepare_config(paths, args, resuming):
         if config['kind'] != args.kind:
             raise ValueError(f"This experiment trains a {KINDS[config['kind']]} vocoder. Choose that type to resume, "
                              'or use another model name.')
+    elif args.kind == 'vocos':
+        source = load_vocos_source(args.pretrained) if args.pretrained else None
+        config = new_config(args.kind, index['data'], warm_start=args.pretrained or None)
     else:
         if args.pretrained:
             source = load_source(args.pretrained, index['data'])
@@ -134,7 +137,11 @@ def fit(args):
     task = VocoderTask(config, finetune)
     if source is not None:
         task.load_pretrained(source)
-        print(f"Fine-tuning generator and discriminator from {source['path']}.", flush=True)
+        if 'backbone' in source:
+            print(f"Initialized the Vocos backbone from {source['path']}; its input and output layers train from "
+                  'scratch.', flush=True)
+        else:
+            print(f"Fine-tuning generator and discriminator from {source['path']}.", flush=True)
     options = device_options(args.device)
     strategy = 'auto'
     if device_count(options) > 1:
@@ -160,14 +167,16 @@ def fit(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train or fine-tune an OpenVPI NSF-HiFiGAN or PC-NSF-HiFiGAN vocoder.')
+    parser = argparse.ArgumentParser(description='Train or fine-tune a PC-NSF-HiFiGAN, NSF-HiFiGAN or Vocos vocoder.')
     parser.add_argument('--model-name', required=True)
     parser.add_argument('--kind', choices=sorted(KINDS), default='pc',
                         help='pc trains PC-NSF-HiFiGAN (mini-NSF with pitch-cycle augmentation); nsf trains the '
-                             'classic NSF-HiFiGAN.')
+                             'classic NSF-HiFiGAN; vocos trains Vocos, which takes no F0.')
     parser.add_argument('--pretrained', default='',
-                        help='Fine-tune source for a new experiment: pc_nsf_hifigan_2025_02 or a training checkpoint '
-                             'containing both generator and discriminator weights. Ignored when resuming.')
+                        help='Source for a new experiment. NSF kinds fine-tune from pc_nsf_hifigan_2025_02 or a '
+                             'training checkpoint containing both generator and discriminator weights; vocos '
+                             'initializes its backbone from vocos_mel_24khz or another Vocos checkpoint. Ignored '
+                             'when resuming.')
     parser.add_argument('--discriminator-warmup', type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument('--batch-size', type=int)
     parser.add_argument('--crop-mel-frames', type=int)

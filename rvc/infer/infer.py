@@ -409,7 +409,7 @@ class VoiceConverter:
             return
 
         self.get_vc(model_path, sid)
-        vocoder = self.cpt.get('kind') == 'nsf_hifigan'
+        vocoder = self.cpt.get('kind') == 'vocoder'
         rectified = not vocoder and isinstance(self.cpt.get('config'), dict)
         if rectified:
             self.vc.set_vocoder(kwargs.pop('rectified_vocoder_path', ''))
@@ -662,7 +662,7 @@ class VoiceConverter:
         """
         Cleans up the model and releases resources.
         """
-        if self.cpt is not None and self.cpt.get('kind') == 'nsf_hifigan':
+        if self.cpt is not None and self.cpt.get('kind') == 'vocoder':
             self.net_g = self.vc = self.cpt = self.loaded_model = self.tgt_sr = None
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -708,10 +708,12 @@ class VoiceConverter:
         """
         if self.cpt is not None:
             from nsf_hifigan.infer import VocoderInference, is_nsf_hifigan
+            from rectified_flow.vocos import VocosInference, is_vocos
 
-            if is_nsf_hifigan(self.cpt):
-                self.net_g = VocoderInference(self.model_path, self.cpt, self.config.device)
-                self.cpt = {'kind': 'nsf_hifigan', 'config': {'data': self.net_g.data}}
+            inference = VocosInference if is_vocos(self.cpt) else VocoderInference if is_nsf_hifigan(self.cpt) else None
+            if inference is not None:
+                self.net_g = inference(self.model_path, self.cpt, self.config.device)
+                self.cpt = {'kind': 'vocoder', 'config': {'data': self.net_g.data}}
                 self.tgt_sr = int(self.net_g.data['sample_rate'])
                 self.version, self.use_f0, self.n_spk = 'v2', 1, 1
                 self.hubert_model = self.last_embedder_model = None
@@ -762,7 +764,7 @@ class VoiceConverter:
         Sets up the voice conversion pipeline instance based on the target sampling rate and configuration.
         """
         if self.cpt is not None:
-            if self.cpt.get('kind') == 'nsf_hifigan':
+            if self.cpt.get('kind') == 'vocoder':
                 self.vc = self.net_g
                 return
             previous_vc = self.vc

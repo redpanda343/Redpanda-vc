@@ -4,11 +4,12 @@ from pathlib import Path
 
 import torch
 
-from nsf_hifigan.config import DISCRIMINATOR_PERIODS, EXPORT_ROOT, ROOT, openvpi_config, read_json, write_json
-from nsf_hifigan.resources import FINETUNE_SOURCE, pretrained_path
+from nsf_hifigan.config import DISCRIMINATOR_PERIODS, EXPORT_ROOT, ROOT, export_config, read_json, write_json
+from nsf_hifigan.resources import FINETUNE_SOURCE, VOCOS_SOURCE, pretrained_path, vocos_backbone_path
 from rectified_flow.openvpi import generator_state, openvpi_spec
 from rectified_flow.resources import VOCODERS, vocoder_path
 from rectified_flow.vocoder import mel_mismatch
+from rectified_flow.vocos import vocos_state
 
 CHECKPOINT_PATTERN = re.compile(r'model_ckpt_steps_(\d+)\.ckpt')
 
@@ -21,6 +22,8 @@ def resolve_source(source):
     source = str(source).strip().strip('"')
     if source == FINETUNE_SOURCE:
         return pretrained_path()
+    if source == VOCOS_SOURCE:
+        return vocos_backbone_path()
     if source in VOCODERS:
         return vocoder_path(source)
     path = Path(source)
@@ -73,6 +76,14 @@ def load_source(source, data):
     return dict(path=path, hparams=hparams, generator=state, discriminator=discriminator)
 
 
+def load_vocos_source(source):
+    path = resolve_source(source)
+    state = vocos_state(torch.load(path, map_location='cpu', weights_only=True))
+    if state is None:
+        raise ValueError(f'{path} is not a Vocos vocoder.')
+    return dict(path=path, backbone=state)
+
+
 def checkpoints(output):
     found = []
     for path in Path(output).glob('model_ckpt_steps_*.ckpt'):
@@ -101,7 +112,7 @@ def export_vocoder(checkpoint, destination=None, name=None):
     state = torch.load(checkpoint, map_location='cpu', weights_only=True)
     metadata = state.get('vocoder')
     if not metadata:
-        raise ValueError(f'{checkpoint} is not an NSF-HiFiGAN training checkpoint.')
+        raise ValueError(f'{checkpoint} is not a vocoder training checkpoint.')
     generator = {key[len('generator.'):]: value for key, value in state['state_dict'].items()
                  if key.startswith('generator.')}
     if destination is None:
@@ -111,5 +122,5 @@ def export_vocoder(checkpoint, destination=None, name=None):
     temporary = destination / 'model.ckpt.tmp'
     torch.save({'generator': generator}, temporary)
     os.replace(temporary, destination / 'model.ckpt')
-    write_json(destination / 'config.json', openvpi_config(metadata['config']))
+    write_json(destination / 'config.json', export_config(metadata['config']))
     return destination / 'model.ckpt'

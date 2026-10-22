@@ -8,7 +8,7 @@ from rectified_flow.openvpi import DEFAULT_MEL
 
 ROOT = Path(__file__).resolve().parents[1]
 EXPORT_ROOT = ROOT / 'models' / 'pretraineds' / 'rectified' / 'trained'
-KINDS = {'pc': 'PC-NSF-HiFiGAN', 'nsf': 'NSF-HiFiGAN'}
+KINDS = {'pc': 'PC-NSF-HiFiGAN (F0)', 'nsf': 'NSF-HiFiGAN (F0)', 'vocos': 'Vocos (no F0)'}
 PITCH_EXTRACTORS = ('parselmouth', 'rmvpe')
 PRECISIONS = {'fp32': '32-true', 'fp16': '16-mixed', 'bf16': 'bf16-mixed'}
 DISCRIMINATOR_PERIODS = [3, 5, 7, 11, 17, 23, 37]
@@ -22,6 +22,13 @@ GENERATOR = dict(
     harmonic_num=8,
     noise_sigma=0.0,
 )
+VOCOS = dict(
+    dim=512,
+    intermediate_dim=1536,
+    num_layers=8,
+    padding='same',
+)
+VOCOS_TRAINING = dict(learning_rate=2e-4)
 TRAINING = dict(
     batch_size=10,
     crop_mel_frames=32,
@@ -72,23 +79,29 @@ def default_data():
 
 
 def default_model(kind, data):
+    if kind == 'vocos':
+        return dict(VOCOS, num_mels=int(data['n_mels']), n_fft=int(data['n_fft']), hop_length=int(data['hop_length']))
     return dict(GENERATOR, sample_rate=int(data['sample_rate']), num_mels=int(data['n_mels']), mini_nsf=kind == 'pc')
 
 
 def max_f0(model):
+    if 'mini_nsf' not in model:
+        return float('inf')
     if model['mini_nsf']:
         return model['sample_rate'] / int(np.prod(model['upsample_rates'][2:])) / 2
     return model['sample_rate'] / 2
 
 
-def new_config(kind, data, model=None, pretrained=None):
+def new_config(kind, data, model=None, pretrained=None, warm_start=None):
     if kind not in KINDS:
         raise ValueError(f'Vocoder type must be one of {", ".join(KINDS)}.')
     model = deepcopy(model) if model is not None else default_model(kind, data)
-    if bool(model['mini_nsf']) != (kind == 'pc'):
+    if kind != 'vocos' and bool(model['mini_nsf']) != (kind == 'pc'):
         source = 'PC-NSF (mini-NSF)' if model['mini_nsf'] else 'classic NSF'
         raise ValueError(f'The pretrained vocoder is a {source} model. Choose the matching vocoder type.')
-    return dict(kind=kind, data=dict(data), model=model, train=deepcopy(TRAINING), pretrained=pretrained)
+    train = dict(TRAINING, **(VOCOS_TRAINING if kind == 'vocos' else {}))
+    return dict(kind=kind, data=dict(data), model=model, train=deepcopy(train), pretrained=pretrained,
+                warm_start=warm_start)
 
 
 def apply_overrides(config, overrides):
@@ -115,9 +128,33 @@ def validate(config):
         raise ValueError('pc_aug_rate must be in (0, 1].')
     if not 0 < settings['key_aug_min'] <= settings['key_aug_max']:
         raise ValueError('key_aug_min must be positive and not above key_aug_max.')
-    if int(np.prod(config['model']['upsample_rates'])) != int(config['data']['hop_length']):
+    model, data = config['model'], config['data']
+    if config['kind'] == 'vocos':
+        if int(model['hop_length']) != int(data['hop_length']) or int(model['n_fft']) != int(data['n_fft']):
+            raise ValueError('The Vocos iSTFT does not match the mel hop length and FFT size.')
+    elif int(np.prod(model['upsample_rates'])) != int(data['hop_length']):
         raise ValueError('The generator upsampling does not match the mel hop length.')
     return config
+
+
+def export_config(config):
+    if config['kind'] != 'vocos':
+        return openvpi_config(config)
+    model, data = config['model'], config['data']
+    return dict(
+        vocoder='vocos',
+        sampling_rate=data['sample_rate'],
+        num_mels=data['n_mels'],
+        hop_size=data['hop_length'],
+        n_fft=data['n_fft'],
+        win_size=data['win_length'],
+        fmin=data['mel_fmin'],
+        fmax=data['mel_fmax'],
+        dim=model['dim'],
+        intermediate_dim=model['intermediate_dim'],
+        num_layers=model['num_layers'],
+        padding=model['padding'],
+    )
 
 
 def openvpi_config(config):

@@ -24,16 +24,24 @@ def mel_mismatch(data: dict, vocoder_data: dict):
 
 def load_vocoder(path: str, data: dict):
     from rectified_flow.openvpi import NSFHiFiGAN, generator_state, onnx_generator_state, openvpi_spec
+    from rectified_flow.vocos import build_vocos, is_vocos
 
+    checkpoint = None
     if str(path).lower().endswith(".onnx"):
         state = onnx_generator_state(path)
     else:
-        state = generator_state(torch.load(path, map_location="cpu", weights_only=True))
-    if state is None:
-        raise ValueError(f"{path} is not an NSF-HiFiGAN vocoder.")
-    hparams, vocoder_data, weights = openvpi_spec(path, state)
-    generator = NSFHiFiGAN(**hparams)
-    generator.load_state_dict(weights)
+        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+        state = generator_state(checkpoint)
+    if is_vocos(checkpoint):
+        generator, vocoder_data, native = build_vocos(path, checkpoint)
+        if native:
+            raise ValueError(f"{path} renders Vocos's own mel. Train a Vocos on the flow's mel to use it here.")
+    elif state is None:
+        raise ValueError(f"{path} is not an NSF-HiFiGAN or Vocos vocoder.")
+    else:
+        hparams, vocoder_data, weights = openvpi_spec(path, state)
+        generator = NSFHiFiGAN(**hparams)
+        generator.load_state_dict(weights)
     model = RawMelVocoder(generator, data)
     mismatch = mel_mismatch(data, vocoder_data)
     if mismatch:
