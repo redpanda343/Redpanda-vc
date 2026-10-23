@@ -154,12 +154,13 @@ def experiment_pitch_extractor(experiment):
 
 
 def load_training_config(experiment, pretrained_flow=None, use_fused_kernels=False, preset='standard',
-                         pitch_extractor='parselmouth', variance_embeds=None, mel=None, use_f0=None):
+                         pitch_extractor='parselmouth', variance_embeds=None, mel=None):
     if preset == 'meanflow' and use_fused_kernels:
         raise ValueError('MeanFlow requires unfused operations for its training derivative. Disable fused kernels.')
-    config_path = experiment / 'rectified_config.json'
     info_path = experiment / 'model_info.json'
-    info = json.loads(info_path.read_text(encoding='utf-8')) if info_path.is_file() else {}
+    if info_path.is_file() and json.loads(info_path.read_text(encoding='utf-8')).get('flow_use_f0') is False:
+        raise ValueError('These features were extracted without F0. Preprocess this experiment again.')
+    config_path = experiment / 'rectified_config.json'
     if config_path.exists():
         config = resolve_config(json.loads(config_path.read_text(encoding='utf-8')))
         source = 'This experiment'
@@ -174,14 +175,6 @@ def load_training_config(experiment, pretrained_flow=None, use_fused_kernels=Fal
             pretrained = resolve_config(checkpoint['config'])
             config['data'] = pretrained['data']
             config['flow']['model'] = pretrained['flow']['model']
-        else:
-            enabled = info.get('flow_use_f0', config['flow']['model']['use_f0']) if use_f0 is None else use_f0
-            config['flow']['model']['use_f0'] = enabled
-            if not enabled:
-                config['flow']['model'].update(key_shift=False, use_breathiness_embed=False,
-                                               use_voicing_embed=False, use_tension_embed=False)
-        if not config['flow']['model']['use_f0']:
-            config['flow']['augmentation_args']['random_pitch_shifting']['enabled'] = False
         if variance_embeds is not None:
             config['flow']['model'].update(use_breathiness_embed=bool(variance_embeds),
                                            use_voicing_embed=bool(variance_embeds))
@@ -198,17 +191,11 @@ def load_training_config(experiment, pretrained_flow=None, use_fused_kernels=Fal
         raise ValueError(f'{source} uses the {matches[0]} model size. Set the training model option to match it, '
                          'or start a new experiment.')
     model = config['flow']['model']
-    if use_f0 is not None and model['use_f0'] != use_f0:
-        state = 'enabled' if model['use_f0'] else 'disabled'
-        raise ValueError(f'{source} has F0 {state}. Set Use F0 to match, or start a new experiment '
-                         'without a pretrained checkpoint.')
-    if model['use_f0'] and info.get('flow_use_f0') is False:
-        raise ValueError('These features were prepared without F0. Enable Use F0 and preprocess again.')
     if variance_embeds is not None and (model['use_breathiness_embed'] or model['use_voicing_embed']) != bool(variance_embeds):
         state = 'with' if variance_embeds is False else 'without'
         raise ValueError(f'This experiment was started {state} breathiness/voicing conditioning. Set it to match, '
                          'or start a new experiment.')
-    if model['use_f0'] and config['flow']['pitch_extractor'] != pitch_extractor:
+    if config['flow']['pitch_extractor'] != pitch_extractor:
         raise ValueError(f"This experiment trains on {config['flow']['pitch_extractor']} F0, but its features were "
                          f"extracted for {pitch_extractor}. Re-extract with {config['flow']['pitch_extractor']} "
                          'or start a new experiment.')
@@ -227,17 +214,7 @@ def train(args):
                                   getattr(args, 'preset', 'standard'),
                                   getattr(args, 'pitch_extractor', None) or experiment_pitch_extractor(experiment),
                                   getattr(args, 'variance_embeds', None),
-                                  VOCODERS.get(getattr(args, 'vocoder', ''), {}).get('mel'),
-                                  getattr(args, 'use_f0', None))
-    if not config['flow']['model']['use_f0'] and args.vocoder:
-        from rectified_flow.resources import vocoder_path
-        from rectified_flow.vocoder import load_vocoder
-
-        spec = VOCODERS.get(args.vocoder)
-        if spec is not None and spec['kind'] != 'vocos':
-            raise ValueError('F0-free flow requires a Vocos vocoder without F0 input.')
-        path = vocoder_path(args.vocoder) if spec is not None else args.vocoder
-        load_vocoder(path, config['data'], use_f0=False)
+                                  VOCODERS.get(getattr(args, 'vocoder', ''), {}).get('mel'))
     configure_arguments(args, config['flow'])
     fit(args, config, ROOT)
 
@@ -256,10 +233,8 @@ def configure_flow(config):
         value = settings[name]
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError(f'{name} must be a nonnegative integer.')
-    if settings['model']['use_f0'] and settings['pitch_extractor'] not in PITCH_EXTRACTORS:
+    if settings['pitch_extractor'] not in PITCH_EXTRACTORS:
         raise ValueError(f'pitch_extractor must be one of {PITCH_EXTRACTORS}.')
-    if not settings['model']['use_f0'] and settings['augmentation_args']['random_pitch_shifting']['enabled']:
-        raise ValueError('F0-free flow cannot use random pitch shifting.')
     if settings['hnsep'] not in HNSEP_METHODS:
         raise ValueError(f'hnsep must be one of {HNSEP_METHODS}.')
     for name in VARIANCES:
@@ -307,7 +282,7 @@ def prune_checkpoints(output, model_name, settings):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train Multispeaker Rectified Flow with an optional frozen preview vocoder.')
+    parser = argparse.ArgumentParser(description='Train Multispeaker Rectified Flow with an optional frozen NSF-HiFiGAN preview vocoder.')
     parser.add_argument('--model-name', required=True)
     parser.add_argument('--vocoder', default='',
                         help=f'Preview vocoder: {", ".join(VOCODERS)} or a vocoder file in models/rectified/custom '
@@ -331,8 +306,6 @@ def main():
                         help='Preset file in rectified_flow/presets that new experiments copy their settings from.')
     parser.add_argument('--pitch-extractor', choices=PITCH_EXTRACTORS, default=None,
                         help='F0 extractor for new experiments (default: the one chosen at extraction).')
-    parser.add_argument('--f0', dest='use_f0', action=argparse.BooleanOptionalAction, default=None,
-                        help='Use F0 conditioning. Disable for speech with Vocos when starting a new experiment.')
     parser.add_argument('--variance-embeds', action=argparse.BooleanOptionalAction, default=None,
                         help="Condition the flow on DiffSinger's breathiness and voicing curves. New experiments "
                              'default to on; fine-tunes default to the pretrained setting.')

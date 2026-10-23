@@ -730,8 +730,7 @@ class VoiceConverter:
                 weights = self.cpt['model']
                 self.n_spk = int(self.cpt['speaker_count'])
                 self.tgt_sr = int(self.cpt['config']['data']['sample_rate'])
-                self.version = 'v2'
-                self.use_f0 = int(self.cpt['config']['flow']['model']['use_f0'])
+                self.version, self.use_f0 = 'v2', 1
                 self.text_enc_hidden_dim = int(self.cpt['config']['flow']['model']['content_channels'])
                 self.vocoder = vocoder_title(recorded_vocoder(self.cpt))
                 self.net_g = build_flow(self.cpt['config'], self.n_spk)

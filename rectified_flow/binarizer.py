@@ -35,8 +35,6 @@ def augmentation_plan(entries, settings, seed):
             raise ValueError(f'Invalid augmentation scale: {name}')
     if pitch['enabled']:
         low, high = pitch['range']
-        if not model.get('use_f0', True):
-            raise ValueError('F0-free flow cannot use random pitch shifting.')
         if not model['key_shift'] or not math.isfinite(low + high) or not low < 0 < high:
             raise ValueError('Random pitch shifting requires key-shift conditioning and min < 0 < max.')
     if stretch['enabled']:
@@ -80,7 +78,6 @@ class ItemBuilder:
         self.hop = int(self.data['hop_length'])
         self.sample_rate = int(self.data['sample_rate'])
         self.content_channels = int(config['flow']['model']['content_channels'])
-        self.use_f0 = config['flow']['model'].get('use_f0', True)
         self.pitch_extractor = config['flow']['pitch_extractor']
         self.settings = config['flow']
         self.variances = variance_names(config['flow']['model'])
@@ -110,7 +107,7 @@ class ItemBuilder:
     @torch.no_grad()
     def original(self, audio, content, frames, sid, name):
         f0, uv = self.f0(audio, self.hop, frames)
-        if self.use_f0 and uv.all():
+        if uv.all():
             return None
         clip = audio[: frames * self.hop].to(self.device)
         mel = self.mel(clip.unsqueeze(0), 0.0, self.hop)[0, :, :frames]
@@ -129,8 +126,6 @@ class ItemBuilder:
         return self._item(mel, content, f0, shift, hop / self.hop, sid, variances)
 
     def f0(self, audio, hop, frames):
-        if not self.use_f0:
-            return np.zeros(frames, dtype=np.float32), np.ones(frames, dtype=bool)
         return extract_pitch(self.pitch_extractor, audio.numpy(), self.sample_rate, hop, frames, self.device)
 
     def _item(self, mel, content, f0, key_shift, speed, sid, variances=None):
@@ -149,7 +144,7 @@ _BUILDERS = {}
 
 
 def item_builder(config, device):
-    key = (str(device), json.dumps(config, sort_keys=True))
+    key = str(device)
     if key not in _BUILDERS:
         _BUILDERS[key] = ItemBuilder(config, device)
     return _BUILDERS[key]
@@ -215,8 +210,6 @@ def _recipe(config, training, held, seed):
                   pitch_extractor=config['flow']['pitch_extractor'],
                   augmentation=config['flow']['augmentation_args'], seed=seed,
                   train=sources(training), valid=sources(held))
-    if not model.get('use_f0', True):
-        recipe['use_f0'] = False
     names = variance_names(model)
     if names:
         recipe['variances'] = dict(names=names, hnsep=config['flow']['hnsep'],

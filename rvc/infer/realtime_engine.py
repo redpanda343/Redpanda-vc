@@ -173,8 +173,7 @@ class RealtimeProcessor:
         self.input_wav_res = torch.zeros(
             160 * self.input_wav.shape[0] // self.zc, device=device, dtype=torch.float32
         )
-        pitch_lookahead = self.rvc.pitch_lookahead if self.rvc is not None else RealTimeRVC.pitch_lookahead_frames
-        lookahead = max(pitch_lookahead(method) for method in PITCH_METHODS)
+        lookahead = max(RealTimeRVC.pitch_lookahead_frames(method) for method in PITCH_METHODS)
         self.recent_input = np.zeros(
             self.input_wav.shape[0] - max(0, self.extra_frame - lookahead * self.zc), dtype=np.float32
         )
@@ -304,7 +303,7 @@ class RealtimeProcessor:
 
     def _mix_volume(self, converted, source):
         rate = self.settings["rms_mix_rate"]
-        start = self.extra_frame - self.rvc.pitch_lookahead(self.settings["f0_method"]) * self.zc
+        start = self.extra_frame - self.rvc.pitch_lookahead_frames(self.settings["f0_method"]) * self.zc
         size = converted.shape[0]
         rms_source = self._rms(source[start : start + size], size)
         rms_converted = self._rms(converted, size).clamp_min_(1e-3)
@@ -373,7 +372,7 @@ class RealtimeProcessor:
                 infer_wav = self.tg(infer_wav.unsqueeze(0), self.output_buffer.unsqueeze(0)).squeeze(0)
             output_block = infer_wav[: self.block_frame]
         else:
-            start = max(0, self.extra_frame - self.rvc.pitch_lookahead(settings["f0_method"]) * self.zc)
+            start = max(0, self.extra_frame - self.rvc.pitch_lookahead_frames(settings["f0_method"]) * self.zc)
             quiet = not warm_up and not self.recent_input[start - self.input_wav.shape[0] :].any()
             silent = passthrough or quiet
             if silent:

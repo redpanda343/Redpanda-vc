@@ -66,13 +66,12 @@ class MeanFlow(nn.Module):
         self.mel_std = float(mel_std)
         self.mean_flow = True
         self.use_spk_id = settings['use_spk_id']
-        self.use_f0 = settings.get('use_f0', True)
         self.encoder = ContentConditionEncoder(
             settings['content_channels'], hidden_channels, speaker_count, encoder_layers, content_step,
             key_shift=settings['key_shift'], speed=settings['speed'], use_spk_id=self.use_spk_id,
             enc_ffn_kernel_size=settings['enc_ffn_kernel_size'], use_rope=settings['use_rope'],
             rope_interleaved=settings['rope_interleaved'], rope_theta=settings['rope_theta'],
-            variances=variance_names(settings), use_f0=self.use_f0,
+            variances=variance_names(settings),
         )
         self.backbone = MeanFlowBackbone(n_mels, hidden_channels, **(backbone_args or {}))
         self.mean_flow_args = dict(mean_flow_args)
@@ -144,8 +143,7 @@ class MeanFlow(nn.Module):
         return torch.where(valid, weight * squared, 0.0).sum() / valid.sum()
 
     def forward(self, mel, content, f0, speaker, mask, content_mask=None, key_shift=None, speed=None, variances=None):
-        cond = self.encoder(content.float(), None if f0 is None else f0.float(), speaker, mask,
-                            content_mask, key_shift, speed, variances)
+        cond = self.encoder(content.float(), f0.float(), speaker, mask, content_mask, key_shift, speed, variances)
         return self.loss(mel.float(), cond, mask), None
 
     @torch.no_grad()
@@ -159,8 +157,7 @@ class MeanFlow(nn.Module):
             raise ValueError('MeanFlow samples from noise; source-mel starts are unavailable.')
         steps = int(steps)
         with torch.autocast(device_type=content.device.type, enabled=False):
-            cond = self.encoder(content.float(), None if f0 is None else f0.float(), speaker, mask,
-                                content_mask, key_shift, speed, variances)
+            cond = self.encoder(content.float(), f0.float(), speaker, mask, content_mask, key_shift, speed, variances)
             if start:
                 cond, mask = cond[..., start:], mask[..., start:]
             prepared = self.backbone.prepare_conditioning(cond) if self.backbone.use_conditioner_cache else None

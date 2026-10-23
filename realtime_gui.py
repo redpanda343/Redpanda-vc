@@ -94,19 +94,17 @@ def _rectified_checkpoint(path, modified, size):
     from nsf_hifigan.infer import load_checkpoint
 
     checkpoint = load_checkpoint(path)
-    if not isinstance(checkpoint, dict) or checkpoint.get("kind") != "rectified_flow":
-        return False, True
-    return True, bool(checkpoint["config"]["flow"]["model"].get("use_f0", True))
+    return isinstance(checkpoint, dict) and checkpoint.get("kind") == "rectified_flow"
 
 
-def rectified_model_info(path):
+def is_rectified_model(path):
     if not path.lower().endswith(".pth"):
-        return False, True
+        return False
     try:
         stat = os.stat(path)
         return _rectified_checkpoint(os.path.abspath(path), stat.st_mtime_ns, stat.st_size)
     except Exception:
-        return False, True
+        return False
 
 
 class AudioFrameFifo:
@@ -586,7 +584,7 @@ class AudioEngine(RealtimeProcessor):
             return
         pitch_delay_ms = 0
         if self.rvc is not None:
-            pitch_delay_ms = 10 * self.rvc.pitch_lookahead(self.settings["f0_method"])
+            pitch_delay_ms = 10 * self.rvc.pitch_lookahead_frames(self.settings["f0_method"])
         noise_reduction_ms = 0
         if self.settings["input_noise_reduce"]:
             noise_reduction_ms = 1000 * self.sola_buffer_frame / self.sample_rate
@@ -805,7 +803,6 @@ class RealtimeGUI:
         self.device_names = {}
         self.rvc_widgets = set()
         self.locked_widgets = set()
-        self.pitch_widgets = set()
         self.meter_values = {"input": 0.0, "output": 0.0, "monitor": 0.0}
         self.saved = self._load_config()
         self._make_variables()
@@ -1097,9 +1094,7 @@ class RealtimeGUI:
 
     def _build_voice(self, parent):
         frame = self._card(parent, "Voice")
-        self.pitch_widgets.update(self._slider(
-            frame, 0, "Pitch", self.pitch, -24, 24, 1, tooltip="Shift in semitones. +12 is one octave up.",
-        ))
+        self._slider(frame, 0, "Pitch", self.pitch, -24, 24, 1, tooltip="Shift in semitones. +12 is one octave up.")
         self.rvc_widgets.update(self._slider(
             frame, 1, "Index rate", self.index_rate, 0, 1, 0.01,
             tooltip="How strongly the feature index pulls the voice toward the training data.",
@@ -1155,13 +1150,11 @@ class RealtimeGUI:
         methods = ttk.Frame(frame)
         methods.grid(row=4, column=1, columnspan=2, sticky="w", pady=(6, 3))
         self.rvc_widgets.add(pitch_label)
-        self.pitch_widgets.add(pitch_label)
         self.pitch_radios = {}
         for label, method in PITCH_METHODS.items():
             radio = ttk.Radiobutton(methods, text=label, variable=self.f0_method, value=method)
             radio.pack(side="left", padx=(0, 12))
             self.rvc_widgets.add(radio)
-            self.pitch_widgets.add(radio)
             self.pitch_radios[method] = radio
         return frame
 
@@ -1204,10 +1197,8 @@ class RealtimeGUI:
         if beatrice:
             self.block_time.set(BEATRICE_BLOCK_TIME)
         running = self.engine.running
-        rectified, uses_f0 = (False, True) if beatrice else rectified_model_info(path)
-        for widget in self.rvc_widgets | self.locked_widgets | self.pitch_widgets:
-            disabled = ((beatrice and widget in self.rvc_widgets) or (running and widget in self.locked_widgets)
-                        or (not uses_f0 and widget in self.pitch_widgets))
+        for widget in self.rvc_widgets | self.locked_widgets:
+            disabled = (beatrice and widget in self.rvc_widgets) or (running and widget in self.locked_widgets)
             widget.state(["disabled"] if disabled else ["!disabled"])
         show_flow = not beatrice and self.show_flow_options.get()
         for widget in self.flow_rows:
@@ -1215,6 +1206,7 @@ class RealtimeGUI:
         for widget in self.beatrice_rows:
             widget.grid() if beatrice else widget.grid_remove()
         self.flow_toggle.grid_remove() if beatrice else self.flow_toggle.grid()
+        rectified = not beatrice and is_rectified_model(path)
         parselmouth = self.pitch_radios["pm"]
         parselmouth.pack_forget() if rectified else parselmouth.pack(side="left", padx=(0, 12))
         if rectified and self.f0_method.get() == "pm":

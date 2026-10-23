@@ -243,7 +243,7 @@ class RealTimeRVC:
             raise ValueError(
                 f"Real-time mode supports {supported}; this model uses {self.vocoder}."
             )
-        if not self.converter.use_f0 and not self.is_rectified:
+        if not self.converter.use_f0:
             raise ValueError("Real-time mode currently requires a pitch-guided model.")
         if speaker_id < 0 or speaker_id >= self.converter.n_spk:
             raise ValueError(
@@ -319,7 +319,6 @@ class RealTimeRVC:
         self.synthesizer_graphs = {}
         self.speaker = torch.tensor([speaker_id], device=self.device, dtype=torch.long)
         self.lengths = {}
-        self.flow_inputs = {}
         if self.is_rectified:
             from torchaudio.transforms import Resample
             from rectified_flow.vocoder import load_vocoder
@@ -338,8 +337,7 @@ class RealTimeRVC:
                 )
             self.flow_sampler = RealtimeFlowSampler(self.model, enabled=self.cuda_graph)
             self.pipeline.set_vocoder(rectified_vocoder_path)
-            vocoder, _ = load_vocoder(self.pipeline.resolved_vocoder_path(), self.pipeline.data,
-                                      use_f0=self.model.use_f0)
+            vocoder, _ = load_vocoder(self.pipeline.resolved_vocoder_path(), self.pipeline.data)
             if self.pipeline.vocoder_path:
                 self.vocoder = os.path.basename(self.pipeline.vocoder_path)
             self.pipeline.vocoder_model = vocoder.to(self.device).float()
@@ -362,9 +360,6 @@ class RealTimeRVC:
         if method == "beatrice":
             return BeatricePitch.lookahead_frames
         return 20 if method == "swift" else 0
-
-    def pitch_lookahead(self, method):
-        return self.pitch_lookahead_frames(method) if self.converter.use_f0 else 0
 
     @property
     def speaker_count(self):
@@ -417,23 +412,15 @@ class RealTimeRVC:
             self.lengths[frames] = lengths
         return lengths
 
-    def _flow_inputs(self, frames):
-        inputs = self.flow_inputs.get(frames)
-        if inputs is None:
-            inputs = (torch.zeros(1, frames, device=self.device), torch.ones(1, 1, frames, device=self.device))
-            self.flow_inputs[frames] = inputs
-        return inputs
-
     @torch.inference_mode()
     def skip_block(self, block_frame_16k):
         with self.lock:
-            if self.converter.use_f0:
-                shift = max(1, block_frame_16k // 160)
-                self.cache_pitch[:-shift] = self.cache_pitch[shift:].clone()
-                self.cache_pitchf[:-shift] = self.cache_pitchf[shift:].clone()
-                self.cache_pitch[-shift:] = 1
-                self.cache_pitchf[-shift:] = 0.0
-                self.rmvpe_viterbi.reset()
+            shift = max(1, block_frame_16k // 160)
+            self.cache_pitch[:-shift] = self.cache_pitch[shift:].clone()
+            self.cache_pitchf[:-shift] = self.cache_pitchf[shift:].clone()
+            self.cache_pitch[-shift:] = 1
+            self.cache_pitchf[-shift:] = 0.0
+            self.rmvpe_viterbi.reset()
             self.pitch_sample_count += int(block_frame_16k)
 
     def _extract_features(self, input_wav):
@@ -571,9 +558,6 @@ class RealTimeRVC:
         return self.synthesizer_graphs[key]
 
     def _update_pitch(self, input_wav, block_frame_16k, method):
-        if not self.converter.use_f0:
-            self.pitch_sample_count += int(block_frame_16k)
-            return
         if method != self.last_f0_method:
             self.rmvpe_viterbi.reset()
             self._release_pitch_predictors(method)
@@ -685,33 +669,26 @@ class RealTimeRVC:
                          f0_method, source_wav=None, source_rate=None):
         rate = self.sample_rate
         hop = int(self.pipeline.data["hop_length"])
-        if self.model.use_f0:
-            waveform = self.flow_resampler(input_wav.float()).view(1, -1)
-            length = waveform.shape[-1]
-        else:
-            length = -(-input_wav.shape[0] * rate // 16000)
+        waveform = self.flow_resampler(input_wav.float()).view(1, -1)
+        length = waveform.shape[-1]
         start = round(skip_head * rate / 100)
         count = round(return_length * rate / 100)
         if start < 0 or count < 1 or start + count > length:
             raise ValueError("The requested flow output exceeds the input context.")
         frames = math.ceil(length / hop)
-        f0, mask = self._flow_inputs(frames)
+        f0, uv, source = self._rectified_f0(waveform, input_wav, f0_method, source_wav, source_rate, frames)
         variances = None
-        if self.model.use_f0:
-            f0, uv, source = self._rectified_f0(waveform, input_wav, f0_method, source_wav, source_rate, frames)
-            if self.variance_stream is not None:
-                position = self.pitch_sample_count * rate // 16000
-                curves = self.variance_stream(source.cpu().numpy(), f0, uv, position, frames)
-                variances = torch.from_numpy(curves).to(self.device)[None]
-            f0 = torch.from_numpy(f0).to(self.device)[None] * 2 ** (self.pitch / 12)
+        if self.variance_stream is not None:
+            position = self.pitch_sample_count * rate // 16000
+            curves = self.variance_stream(source.cpu().numpy(), f0, uv, position, frames)
+            variances = torch.from_numpy(curves).to(self.device)[None]
+        f0 = torch.from_numpy(f0).to(waveform.device)[None] * 2 ** (self.pitch / 12)
+        mask = torch.ones(1, 1, frames, device=self.device)
         first_frame = max(0, start // hop - self.vocoder_context_frames)
         window = 0 if self.flow_context_frames is None else max(0, first_frame - self.flow_context_frames)
         mel = self.flow_sampler(features.float(), f0, speaker, mask, steps=self.rectified_steps, variances=variances,
                                 start=window)
-        vocoder_inputs = (mel[..., first_frame - window:],)
-        if self.pipeline.vocoder_model.requires_f0:
-            vocoder_inputs += (f0[..., first_frame:],)
-        audio = self.vocoder_graph(*vocoder_inputs)[0, 0]
+        audio = self.vocoder_graph(mel[..., first_frame - window:], f0[..., first_frame:])[0, 0]
         start -= first_frame * hop
         audio = audio[start:start + count]
         if audio.numel() != count:
@@ -731,7 +708,7 @@ class RealTimeRVC:
         source_wav=None,
         source_rate=None,
     ):
-        lookahead = self.pitch_lookahead(f0_method)
+        lookahead = self.pitch_lookahead_frames(f0_method)
         if skip_head < lookahead:
             raise ValueError(
                 f"Extra context must be at least {lookahead / 100:g} seconds for this pitch method."

@@ -14,7 +14,7 @@ FINETUNE_KEY = 'finetune'
 
 FREE_FORM_KEYS = {('flow', 'strategy')}
 
-REMOVED_SHORTCUT_KEYS = ('shortcut', 'shortcut_steps', 'shortcut_bootstrap_every', 'shortcut_ema')
+REMOVED_MODEL_KEYS = ('shortcut', 'shortcut_steps', 'shortcut_bootstrap_every', 'shortcut_ema', 'use_f0')
 
 
 def preset_path(preset):
@@ -84,9 +84,10 @@ def resolve_config(config):
     if isinstance(model, dict):
         if model.get('shortcut'):
             raise ValueError('Shortcut (few-step) flows are no longer supported. Retrain this voice as a standard flow.')
-        model = {key: value for key, value in model.items() if key not in REMOVED_SHORTCUT_KEYS}
+        if model.get('use_f0') is False:
+            raise ValueError('F0-free flows are no longer supported. Retrain this voice with F0.')
+        model = {key: value for key, value in model.items() if key not in REMOVED_MODEL_KEYS}
         model.setdefault('use_tension_embed', False)
-        model.setdefault('use_f0', True)
         config = dict(config, flow=dict(flow, model=model))
     return _merge(base_config(), config)
 

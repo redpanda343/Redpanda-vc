@@ -26,7 +26,6 @@ class RectifiedPipeline(Pipeline):
         super().__init__(sample_rate, config)
         self.data = checkpoint['config']['data']
         self.settings = checkpoint['config']['flow']
-        self.use_f0 = self.settings['model'].get('use_f0', True)
         self.content_channels = int(checkpoint['config']['flow']['model']['content_channels'])
         self.vocoder_path = vocoder_path
         self.recorded_vocoder = recorded_vocoder(checkpoint)
@@ -59,7 +58,7 @@ class RectifiedPipeline(Pipeline):
     def voice_conversion(self, model, net_g, sid, audio0, pitch, pitchf, index,
                          index_rate, version, protect, inference_rng=None, segment_start=0):
         if self.vocoder_model is None:
-            vocoder, _ = load_vocoder(self.resolved_vocoder_path(), self.data, use_f0=self.use_f0)
+            vocoder, _ = load_vocoder(self.resolved_vocoder_path(), self.data)
             self.vocoder_model = vocoder.to(self.device).float()
         speaker = int(sid.item())
         if net_g.use_spk_id and not 0 <= speaker < net_g.speaker_count:
@@ -73,7 +72,7 @@ class RectifiedPipeline(Pipeline):
         original = content
         if index is not None:
             content = self._retrieve_speaker_embeddings(content, index, index_rate)
-            if protect < .5 and pitchf is not None:
+            if protect < .5:
                 voiced = (pitchf > 0).float()
                 voiced = F.interpolate(voiced.unsqueeze(1), size=content.shape[1], mode='nearest').transpose(1, 2)
                 amount = voiced + (1 - voiced) * float(protect)
@@ -84,7 +83,7 @@ class RectifiedPipeline(Pipeline):
         else:
             waveform = soxr.resample(np.asarray(audio0, dtype=np.float32), self.sample_rate, rate, quality='HQ')
             length = len(waveform)
-        if pitchf is not None and len(audio0) == (pitchf.shape[-1] + 1) * self.window:
+        if len(audio0) == (pitchf.shape[-1] + 1) * self.window:
             length = round(pitchf.shape[-1] * self.window * rate / self.sample_rate)
         if self.source_pad is not None:
             start = round(segment_start * rate / self.sample_rate)
@@ -93,9 +92,7 @@ class RectifiedPipeline(Pipeline):
         else:
             waveform = waveform[:length]
         frames = math.ceil(length / hop)
-        if not self.use_f0:
-            f0, uv = np.zeros(frames, dtype=np.float32), np.ones(frames, dtype=bool)
-        elif self.f0_method in {'pm', 'rmvpe'}:
+        if self.f0_method in {'pm', 'rmvpe'}:
             if self.f0_method == 'pm':
                 f0, uv = parselmouth_pitch(waveform, rate, hop, frames)
             else:

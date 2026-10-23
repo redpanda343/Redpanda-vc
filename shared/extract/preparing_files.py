@@ -41,7 +41,7 @@ def generate_config(sample_rate: int, model_path: str, version: str = "v2"):
         json.dump(config, config_file, indent=4)
 
 
-def generate_filelist(model_path: str, sample_rate: int, include_mutes: int = 2, use_f0=True):
+def generate_filelist(model_path: str, sample_rate: int, include_mutes: int = 2):
     gt_wavs_dir = os.path.join(model_path, "sliced_audios")
     feature_dir = os.path.join(model_path, f"extracted")
 
@@ -71,26 +71,7 @@ def generate_filelist(model_path: str, sample_rate: int, include_mutes: int = 2,
 
     options = []
     sids = []
-    if not use_f0:
-        if include_mutes:
-            raise ValueError('F0-free flow filelists cannot include RVC mute clips.')
-        audio_files = sorted(glob.glob(os.path.join(gt_wavs_dir, f'*.{dataset_format}')))
-        if not audio_files:
-            raise RuntimeError(f'No training slices found in {gt_wavs_dir}')
-        for audio_path in audio_files:
-            audio_file = os.path.basename(audio_path)
-            name = os.path.splitext(audio_file)[0]
-            feature_file = audio_file.replace('wav', 'npy') if dataset_format == 'wav' else f'{audio_file}.npy'
-            feature_path = os.path.join(feature_dir, feature_file)
-            if not os.path.isfile(feature_path):
-                raise RuntimeError(f'Missing content features: {feature_path}')
-            sid = name.split('_')[0]
-            if sid not in sids:
-                sids.append(sid)
-            rel_audio = os.path.relpath(audio_path).replace('\\', '/')
-            rel_feat = os.path.relpath(feature_path).replace('\\', '/')
-            options.append(f'{rel_audio}|{rel_feat}|||{sid}')
-    elif dataset_format == "flac":
+    if dataset_format == "flac":
         audio_files = sorted(
             filename
             for filename in os.listdir(gt_wavs_dir)

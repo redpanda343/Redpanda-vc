@@ -8,16 +8,13 @@ from rectified_flow.mel import MEL_DEFAULTS
 MEL_KEYS = ("sample_rate", "hop_length", "n_fft", "win_length", "n_mels", "mel_fmin", "mel_fmax", *MEL_DEFAULTS)
 
 class RawMelVocoder(nn.Module):
-    def __init__(self, generator: nn.Module, data: dict, requires_f0=True):
+    def __init__(self, generator: nn.Module, data: dict):
         super().__init__()
         self.generator = generator
-        self.requires_f0 = bool(requires_f0)
         self.mel_mean = float(data["mel_mean"])
         self.mel_std = float(data["mel_std"])
 
-    def forward(self, mel, f0=None):
-        if self.requires_f0 and f0 is None:
-            raise ValueError('This vocoder requires F0. Choose Vocos for an F0-free flow.')
+    def forward(self, mel, f0):
         return self.generator(mel * self.mel_std + self.mel_mean, f0)
 
 
@@ -38,7 +35,7 @@ def mel_mismatch(data: dict, vocoder_data: dict):
     return None
 
 
-def load_vocoder(path: str, data: dict, use_f0=True):
+def load_vocoder(path: str, data: dict):
     from rectified_flow.openvpi import NSFHiFiGAN, generator_state, onnx_generator_state, openvpi_spec
     from rectified_flow.vocos import build_vocos, is_vocos
 
@@ -48,10 +45,7 @@ def load_vocoder(path: str, data: dict, use_f0=True):
     else:
         checkpoint = torch.load(path, map_location="cpu", weights_only=True)
         state = generator_state(checkpoint)
-    requires_f0 = not is_vocos(checkpoint)
-    if not use_f0 and requires_f0:
-        raise ValueError('F0-free flow requires a Vocos vocoder without F0 input.')
-    if not requires_f0:
+    if is_vocos(checkpoint):
         generator, vocoder_data, _ = build_vocos(path, checkpoint)
     elif state is None:
         raise ValueError(f"{path} is not an NSF-HiFiGAN or Vocos vocoder.")
@@ -59,7 +53,7 @@ def load_vocoder(path: str, data: dict, use_f0=True):
         hparams, vocoder_data, weights = openvpi_spec(path, state)
         generator = NSFHiFiGAN(**hparams)
         generator.load_state_dict(weights)
-    model = RawMelVocoder(generator, data, requires_f0=requires_f0)
+    model = RawMelVocoder(generator, data)
     mismatch = mel_mismatch(data, vocoder_data)
     if mismatch:
         raise ValueError(f"{path} renders another mel than the flow's: {mismatch}.")
