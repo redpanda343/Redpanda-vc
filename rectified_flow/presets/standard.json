@@ -57,6 +57,21 @@
           2.0
         ],
         "scale": 0.75
+      },
+      "random_gain": {
+        "enabled": true,
+        "range": [
+          -12.0,
+          12.0
+        ]
+      },
+      "random_noise_floor": {
+        "enabled": true,
+        "range": [
+          -70.0,
+          -40.0
+        ],
+        "probability": 0.5
       }
     },
     "augmentation_workers": 0,

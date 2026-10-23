@@ -22,6 +22,7 @@ from rectified_flow.pitch import extract_pitch
 from rectified_flow.variance import extract_variances, resample_variances, variance_names
 
 BINARY_VERSION = 2
+BINARY_AUGMENTATIONS = ('random_pitch_shifting', 'random_time_stretching')
 
 
 def augmentation_plan(entries, settings, seed):
@@ -208,7 +209,8 @@ def _recipe(config, training, held, seed):
     recipe = dict(version=BINARY_VERSION, data=config['data'], content_channels=model['content_channels'],
                   key_shift=model['key_shift'], speed=model['speed'],
                   pitch_extractor=config['flow']['pitch_extractor'],
-                  augmentation=config['flow']['augmentation_args'], seed=seed,
+                  augmentation={name: config['flow']['augmentation_args'][name] for name in BINARY_AUGMENTATIONS},
+                  seed=seed,
                   train=sources(training), valid=sources(held))
     names = variance_names(model)
     if names:
@@ -287,7 +289,7 @@ def binarize(experiment, config, training, held, seed, device, num_workers):
         (binary_dir / f'{prefix}.meta').unlink(missing_ok=True)
     settings = config['flow']
     args = settings['augmentation_args']
-    augment = any(args[name]['enabled'] for name in ('random_pitch_shifting', 'random_time_stretching'))
+    augment = any(args[name]['enabled'] for name in BINARY_AUGMENTATIONS)
     tasks = augmentation_plan(training, settings, seed) if augment else []
     with tqdm(total=len(held) + len(training) + len(tasks), desc='Binarizing', unit='clip', dynamic_ncols=True) as progress:
         valid, _, skipped_valid = process_dataset(binary_dir, 'valid', held, [], config, device, 0, recipe, progress)

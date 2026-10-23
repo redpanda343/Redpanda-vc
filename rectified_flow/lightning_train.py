@@ -31,7 +31,7 @@ from rectified_flow.train_flow import (
     atomic_save, configure_fused_backbone, preview, prune_checkpoints,
     random_state, restore_random_state,
 )
-from rectified_flow.variance import variance_names
+from rectified_flow.variance import augment_levels, validate_level_augmentation, variance_names
 from rectified_flow.vocoder import load_vocoder
 
 torch.multiprocessing.set_sharing_strategy(os.getenv('TORCH_SHARE_STRATEGY', 'file_system'))
@@ -157,6 +157,7 @@ class FlowTask(pl.LightningModule):
         self.config, self.args, self.data_module = config, args, datamodule
         self.settings, self.data = config['flow'], config['data']
         self.finetune = finetune
+        validate_level_augmentation(self.settings['augmentation_args'])
         self.model = build_flow(config, datamodule.speaker_count).float()
         self.model.encoder.init_content_scale(content_rms(datamodule.originals))
         self.base_lr = args.learning_rate or self.settings['finetune_learning_rate' if finetune else 'learning_rate']
@@ -166,8 +167,11 @@ class FlowTask(pl.LightningModule):
         self.resume_random = None
         self.trained_epoch = 1
 
-    def run_model(self, batch):
+    def run_model(self, batch, augment=False):
         mel, content, content_mask, f0, key_shift, speed, speaker, mask, variances = unpack_flow(batch, self.device, True)
+        if augment:
+            mel, variances = augment_levels(mel, variances, self.model.variance_names, self.data,
+                                            self.settings['augmentation_args'])
         flow, auxiliary = self.model(normalize_mel(mel, self.data), content, f0, speaker, mask,
                                      content_mask, key_shift, speed, variances)
         aux = flow.new_zeros(()) if auxiliary is None else auxiliary * self.settings['aux_mel_weight']
@@ -175,7 +179,7 @@ class FlowTask(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         self.trained_epoch = self.current_epoch + 1
-        losses = self.run_model(batch)
+        losses = self.run_model(batch, augment=True)
         log_outputs = dict(mel_loss=losses['mel_loss'], aux_mel_loss=losses['aux_mel_loss'], batch_size=float(batch[0].shape[0]))
         self.log_dict(log_outputs, prog_bar=True, logger=False, on_step=True, on_epoch=False)
         lr = self.lr_schedulers().get_last_lr()[0]

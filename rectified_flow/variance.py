@@ -1,11 +1,17 @@
+import math
+
 import numpy as np
 import soxr
 import torch
 from torch.nn import functional as F
 
+from rectified_flow.mel import MEL_DEFAULTS
 from rectified_flow.pitch import interpolate_f0
 
 VARIANCES = ('breathiness', 'voicing', 'tension')
+LEVEL_VARIANCES = ('breathiness', 'voicing')
+LEVEL_AUGMENTATIONS = ('random_gain', 'random_noise_floor')
+SILENCE_DB = -100.0
 HNSEP_METHODS = ('vr', 'world')
 VARIANCE_SCALES = {'breathiness': 1.0 / 96, 'voicing': 1.0 / 96, 'tension': 0.1}
 BASE_HARMONIC_RADIUS = 3.5
@@ -195,6 +201,39 @@ def resample_variances(curves, speed, length, data):
     positions = np.arange(length) * timestep * speed
     source = np.arange(curves.shape[-1]) * timestep
     return np.stack([np.interp(positions, source, curve) for curve in curves]).astype(np.float32)
+
+
+def validate_level_augmentation(args):
+    for name in LEVEL_AUGMENTATIONS:
+        low, high = args[name]['range']
+        if not math.isfinite(low + high) or low > high:
+            raise ValueError(f'{name} needs a finite range with min <= max.')
+    if not 0 <= args['random_noise_floor']['probability'] <= 1:
+        raise ValueError('random_noise_floor probability must be between 0 and 1.')
+    if args['random_noise_floor']['range'][0] < SILENCE_DB:
+        raise ValueError(f'random_noise_floor cannot go below {SILENCE_DB:g} dB.')
+
+
+def augment_levels(mel, variances, names, data, args):
+    rows = [index for index, name in enumerate(names) if name in LEVEL_VARIANCES]
+    gain, noise = args['random_gain'], args['random_noise_floor']
+    if not rows or not (gain['enabled'] or noise['enabled']):
+        return mel, variances
+    size = mel.shape[0]
+    levels = variances[:, rows]
+    if gain['enabled']:
+        db = torch.empty(size, 1, 1, device=mel.device).uniform_(*gain['range'])
+        floor = math.log(float(data.get('mel_floor', MEL_DEFAULTS['mel_floor'])))
+        mel = torch.where(mel > floor, (mel + db * (math.log(10) / 20)).clamp_min(floor), mel)
+        levels = torch.where(levels > SILENCE_DB, (levels + db).clamp_min(SILENCE_DB), levels)
+    if noise['enabled']:
+        db = torch.empty(size, len(rows), 1, device=mel.device).uniform_(*noise['range'])
+        active = torch.rand(size, 1, 1, device=mel.device) < noise['probability']
+        noisy = 10 * torch.log10(torch.pow(10.0, levels / 10) + torch.pow(10.0, db / 10))
+        levels = torch.where(active, noisy, levels)
+    variances = variances.clone()
+    variances[:, rows] = levels
+    return mel, variances
 
 
 class StreamingVariances:
