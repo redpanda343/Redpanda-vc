@@ -359,5 +359,13 @@ def prequisites_download_pipeline(
                 download_mapping_files(pretraineds_refinegan_list, global_bar)
     if pretraineds_hifigan:
         from nsf_hifigan.resources import pretrained_path
+        from rectified_flow.resources import VOCODERS, vocoder_path
 
         pretrained_path()
+        for name, spec in VOCODERS.items():
+            if spec['kind'] != 'vocos':
+                continue
+            try:
+                vocoder_path(name)
+            except Exception as error:
+                print(f"{spec['title']} download failed: {error}. It is retried when a flow uses it.")
