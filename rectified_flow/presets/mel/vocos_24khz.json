@@ -1,0 +1,17 @@
+{
+  "data": {
+    "sample_rate": 24000,
+    "hop_length": 256,
+    "n_fft": 1024,
+    "win_length": 1024,
+    "n_mels": 100,
+    "mel_fmin": 0.0,
+    "mel_fmax": 12000.0,
+    "mel_floor": 1e-07,
+    "mel_scale": "htk",
+    "mel_norm": null,
+    "mel_center": true,
+    "mel_mean": -6.0,
+    "mel_std": 10.0
+  }
+}

@@ -11,6 +11,7 @@ from torch.nn import functional as F
 from rectified_flow.openvpi import CONFIG_MEL_KEYS, DEFAULT_MEL
 
 PADDINGS = ("center", "same")
+FORK_MEL_ARGS = ("f_min", "f_max", "norm", "mel_scale")
 
 
 class ConvNeXtBlock(nn.Module):
@@ -87,25 +88,30 @@ class Vocos(nn.Module):
         super().__init__()
         self.backbone = VocosBackbone(num_mels, dim, intermediate_dim, num_layers)
         self.head = ISTFTHead(dim, n_fft, hop_length, padding)
+        self.extend = padding == "center"
         self.radius = 3 + 3 * num_layers + n_fft / (2 * hop_length)
 
     def forward(self, mel, f0=None):
+        if self.extend:
+            mel = F.pad(mel, (0, 1), mode="replicate")
         return self.head(self.backbone(mel)).unsqueeze(1)
 
 
 class VocosMel(nn.Module):
-    def __init__(self, sample_rate, n_fft, hop_length, n_mels, padding):
+    def __init__(self, sample_rate, n_fft, hop_length, n_mels, padding, f_min=0.0, f_max=None, norm=None,
+                 mel_scale="htk", floor=1e-7):
         super().__init__()
         self.pad = (n_fft - hop_length) // 2 if padding == "same" else 0
+        self.floor = floor
         self.mel = torchaudio.transforms.MelSpectrogram(
             sample_rate=sample_rate, n_fft=n_fft, hop_length=hop_length, n_mels=n_mels,
-            center=padding == "center", power=1,
+            center=padding == "center", power=1, f_min=f_min, f_max=f_max, norm=norm, mel_scale=mel_scale,
         )
 
     def forward(self, audio):
         if self.pad:
             audio = F.pad(audio.unsqueeze(1), (self.pad, self.pad), mode="reflect").squeeze(1)
-        return torch.log(torch.clamp(self.mel(audio), min=1e-7))
+        return torch.log(torch.clamp(self.mel(audio), min=self.floor))
 
 
 def vocos_state(checkpoint):
@@ -148,10 +154,16 @@ def _read_vocos_config(path, checkpoint):
         if not str(extractor.get("class_path", "")).endswith("MelSpectrogramFeatures"):
             raise ValueError(f"{path} is not a mel-spectrogram Vocos.")
         args = extractor["init_args"]
-        mel = dict(sample_rate=args["sample_rate"], hop_length=args["hop_length"], n_fft=args["n_fft"],
-                   win_length=args["n_fft"], n_mels=args["n_mels"], mel_fmin=0.0, mel_fmax=args["sample_rate"] / 2)
         native = dict(sample_rate=args["sample_rate"], n_fft=args["n_fft"], hop_length=args["hop_length"],
-                      n_mels=args["n_mels"], padding=args.get("padding", "center"))
+                      n_mels=args["n_mels"], padding=args.get("padding", "center"),
+                      f_min=float(args.get("f_min", 0.0)), f_max=args.get("f_max"), norm=args.get("norm"),
+                      mel_scale=args.get("mel_scale", "htk"),
+                      floor=1e-5 if any(key in args for key in FORK_MEL_ARGS) else 1e-7)
+        mel = dict(sample_rate=args["sample_rate"], hop_length=args["hop_length"], n_fft=args["n_fft"],
+                   win_length=args["n_fft"], n_mels=args["n_mels"], mel_fmin=native["f_min"],
+                   mel_fmax=float(native["f_max"] or args["sample_rate"] / 2), mel_floor=native["floor"],
+                   mel_scale=native["mel_scale"], mel_norm=native["norm"],
+                   mel_center=native["padding"] == "center")
         return mel, config.get("head", {}).get("init_args", {}).get("padding", "center"), native
     raise ValueError(f"{path} needs its config.json or config.yaml beside it.")
 

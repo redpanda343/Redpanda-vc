@@ -4,8 +4,11 @@ from pathlib import Path
 
 
 PRESET_DIR = Path(__file__).resolve().parent / 'presets'
+MEL_PRESET_DIR = PRESET_DIR / 'mel'
 
 PRESETS = ('standard', 'smaller', 'meanflow')
+
+MEL_PRESETS = ('openvpi_44khz', 'vocos_44khz', 'vocos_24khz')
 
 FINETUNE_KEY = 'finetune'
 
@@ -20,8 +23,13 @@ def preset_path(preset):
     return PRESET_DIR / f'{preset}.json'
 
 
-def read_preset(preset):
-    path = preset_path(preset)
+def mel_preset_path(mel):
+    if mel not in MEL_PRESETS:
+        raise ValueError(f'Unknown mel preset {mel!r}. Choose one of {sorted(MEL_PRESETS)}.')
+    return MEL_PRESET_DIR / f'{mel}.json'
+
+
+def _read_json(path):
     try:
         config = json.loads(path.read_text(encoding='utf-8'))
     except OSError as error:
@@ -31,6 +39,17 @@ def read_preset(preset):
     if not isinstance(config, dict):
         raise ValueError(f'The rectified-flow preset {path} must hold a JSON object.')
     return config
+
+
+def read_preset(preset):
+    return _read_json(preset_path(preset))
+
+
+def mel_preset(mel):
+    data = _read_json(mel_preset_path(mel)).get('data')
+    if not isinstance(data, dict):
+        raise ValueError(f'The mel preset {mel_preset_path(mel)} must hold a data object.')
+    return data
 
 
 def base_config():
@@ -71,10 +90,12 @@ def resolve_config(config):
     return _merge(base_config(), config)
 
 
-def default_config(finetune=False, preset='standard'):
+def default_config(finetune=False, preset='standard', mel=None):
     config = read_preset(preset)
     overrides = config.pop(FINETUNE_KEY, {})
     config = _merge(base_config(), config)
+    if mel:
+        config = _merge(config, {'data': mel_preset(mel)})
     return _merge(config, overrides) if finetune else config
 
 

@@ -74,9 +74,9 @@ def check_cutting(cutting, chunk_len, choices, chunk_minimum):
 
 def preprocess_step(directory, dataset, workers, cutting, chunk_len, overlap_len, truncate_silence,
                     silence_threshold, silence_minimum, silence_to,
-                    choices=('Skip', 'Simple', 'Automatic'), chunk_minimum=0.5):
+                    choices=('Skip', 'Simple', 'Automatic'), chunk_minimum=0.5, sample_rate=44100):
     check_cutting(cutting, chunk_len, choices, chunk_minimum)
     return ('shared.preprocess.preprocess',
-            [str(directory), dataset, '44100', workers, cutting, 'False', '0.0', str(float(chunk_len)),
+            [str(directory), dataset, str(int(sample_rate)), workers, cutting, 'False', '0.0', str(float(chunk_len)),
              str(float(overlap_len)), 'none', 'WAV', str(bool(truncate_silence)), str(float(silence_threshold)),
              str(float(silence_to)), str(float(silence_minimum))])

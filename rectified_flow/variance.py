@@ -1,4 +1,5 @@
 import numpy as np
+import soxr
 import torch
 from torch.nn import functional as F
 
@@ -12,6 +13,7 @@ STREAMING_CONTEXT = {'vr': 1.0, 'world': 0.3}
 STREAMING_REWRITE = 0.1
 VR_CHUNK = 15.0
 VR_OVERLAP = 1.0
+VR_SAMPLE_RATE = 44100
 _SEPARATORS = {}
 _SMOOTHERS = {}
 
@@ -125,6 +127,12 @@ def _vr_harmonic(model, waveform, device):
 
 
 def vr_separate(waveform, sample_rate, device):
+    if sample_rate != VR_SAMPLE_RATE:
+        source = soxr.resample(waveform, sample_rate, VR_SAMPLE_RATE, quality='HQ').astype(np.float32)
+        harmonic = soxr.resample(vr_separate(source, VR_SAMPLE_RATE, device)[0], VR_SAMPLE_RATE, sample_rate,
+                                 quality='HQ').astype(np.float32)
+        harmonic = np.pad(harmonic[:len(waveform)], (0, max(0, len(waveform) - len(harmonic))))
+        return harmonic, waveform - harmonic
     model = vr_separator(device)
     chunk, overlap = int(VR_CHUNK * sample_rate), int(VR_OVERLAP * sample_rate)
     if len(waveform) <= chunk:

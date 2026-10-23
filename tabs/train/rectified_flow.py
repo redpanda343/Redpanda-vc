@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import gradio as gr
@@ -5,7 +6,7 @@ import gradio as gr
 from tabs.settings.sections.precision import get_precision
 from tabs.train.jobs import ROOT, JobRunner, device_id, experiment_path, positive_integer
 from tabs.train.slicing import preprocess_step, slicing_controls
-from rectified_flow.config import default_config, preset_path
+from rectified_flow.config import default_config, mel_preset, preset_path
 from rectified_flow.resources import (CUSTOM_VOCODER_ROOT, DEFAULT_VOCODER, VOCODERS, custom_vocoder_file,
                                       custom_vocoders, vocoder_path, vocoder_title)
 
@@ -38,22 +39,36 @@ def launch(name, steps, description, finished='done.'):
     return runner.launch(name, steps, description, IDLE_CONTROLS, finished)
 
 
+def registry_mel(vocoder):
+    mel = VOCODERS.get(vocoder, {}).get('mel')
+    return mel_preset(mel) if mel else None
+
+
+def experiment_sample_rate(directory, vocoder):
+    config_path = directory / 'rectified_config.json'
+    if config_path.is_file():
+        return int(json.loads(config_path.read_text(encoding='utf-8'))['data']['sample_rate'])
+    return int((registry_mel(vocoder) or default_config()['data'])['sample_rate'])
+
+
 def preprocess(name, dataset, workers, device, cutting='Simple', chunk_len=MINIMUM_CHUNK, overlap_len=0.3,
-               truncate_silence=False, silence_threshold=-45.0, silence_minimum=0.3, silence_to=0.3):
+               truncate_silence=False, silence_threshold=-45.0, silence_minimum=0.3, silence_to=0.3,
+               vocoder=DEFAULT_VOCODER):
     directory = experiment_path(name)
     dataset = str(dataset).strip().strip('"')
     if not Path(dataset).is_dir():
         raise gr.Error('The dataset folder does not exist.')
     workers = positive_integer(workers, 'CPU workers')
     gpu = device_id(device)
+    rate = experiment_sample_rate(directory, vocoder)
     steps = [
         preprocess_step(directory, dataset, workers, cutting, chunk_len, overlap_len, truncate_silence,
                         silence_threshold, silence_minimum, silence_to,
-                        choices=SLICERS, chunk_minimum=MINIMUM_CHUNK),
+                        choices=SLICERS, chunk_minimum=MINIMUM_CHUNK, sample_rate=rate),
         ('shared.extract.extract',
-         [str(directory), 'rmvpe', workers, gpu, '44100', 'contentvec', '0', 'v2', '--rectified']),
+         [str(directory), 'rmvpe', workers, gpu, str(rate), 'contentvec', '0', 'v2', '--rectified']),
     ]
-    return launch(name, steps, 'Preprocessing', 'done. Ready to train.')
+    return launch(name, steps, f'Preprocessing at {rate / 1000:g} kHz', 'done. Ready to train.')
 
 
 def resolve_vocoder(name=DEFAULT_VOCODER):
@@ -72,6 +87,16 @@ def refresh_vocoders(current):
     choices = vocoder_choices()
     values = {value for _, value in choices}
     return gr.update(choices=choices, value=current if current in values else DEFAULT_VOCODER)
+
+
+def check_registry_vocoder(vocoder, data):
+    from rectified_flow.vocoder import mel_mismatch
+
+    mel = {key: value for key, value in registry_mel(vocoder).items() if key not in ('mel_mean', 'mel_std')}
+    mismatch = mel_mismatch(data, mel)
+    if mismatch:
+        raise gr.Error(f'{vocoder_title(vocoder)} renders another mel than this experiment: {mismatch}. Choose the '
+                       'vocoder the experiment was started with, or start a new experiment.')
 
 
 def check_custom_vocoder(vocoder, data):
@@ -125,13 +150,14 @@ def start(name, batch, max_frames, max_updates, checkpoint_interval, device, use
 
     try:
         selected = load_training_config(directory, pretrained or None, use_fused_kernels, preset, pitch_extractor,
-                                        variance_embeds)
+                                        variance_embeds, VOCODERS.get(vocoder, {}).get('mel'))
     except ValueError as error:
         raise gr.Error(str(error)) from error
     precision = get_precision() or selected['flow']['precision']
     if precision not in {'fp32', 'fp16', 'bf16'}:
         raise gr.Error(f'Unsupported training precision: {precision}')
     if vocoder in VOCODERS:
+        check_registry_vocoder(vocoder, selected['data'])
         if selected['flow']['val_with_vocoder']:
             resolve_vocoder(vocoder)
     elif custom_vocoder_file(vocoder) is not None:
@@ -170,8 +196,11 @@ def rectified_train_tab():
     gr.Markdown('### Rectified Flow')
     gr.Markdown("Trains a voice conversion model with the same architecture as "
                 "[DiffSinger](https://github.com/openvpi/DiffSinger)'s acoustic model, using ContentVec features in "
-                'place of phonemes. It generates 44.1 kHz mel spectrograms from the source voice and its pitch with '
-                'rectified flow, and the selected vocoder turns them into audio. Training from scratch needs a dataset '
+                'place of phonemes. It generates mel spectrograms from the source voice and its pitch with rectified '
+                'flow, and the selected vocoder turns them into audio. The vocoder sets the mel of new experiments '
+                'from `rectified_flow/presets/mel`: 44.1 kHz with 128 bins for the NSF-HiFiGAN vocoders (F0), '
+                '44.1 kHz with 80 bins up to 8 kHz for Vocos 44.1 kHz and 24 kHz for Vocos 24 kHz (no F0), so choose '
+                'it before preprocessing. Training from scratch needs a dataset '
                 'of **1 hour or more** for good results; with less audio, check **Pretrained** to fine-tune instead.')
     with gr.Row():
         name = gr.Textbox(label='Model name', value='my-flow')
@@ -181,7 +210,8 @@ def rectified_train_tab():
         dataset = gr.Textbox(label='Dataset folder')
         workers = gr.Number(label='CPU workers', value=4, minimum=1, precision=0)
         slicing = slicing_controls(choices=SLICERS, value='Simple', chunk_minimum=MINIMUM_CHUNK,
-                                   chunk_value=MINIMUM_CHUNK)
+                                   chunk_value=MINIMUM_CHUNK,
+                                   note='Audio is resampled to the sample rate of the selected vocoder.')
         preprocess_button = gr.Button('Preprocess dataset')
     with gr.Accordion('2. Train rectified flow', open=True):
         use_pretrained = gr.Checkbox(label='Pretrained', value=False)
@@ -197,9 +227,11 @@ def rectified_train_tab():
         refresh_pretrained_button.click(refresh_pretrained, pretrained_path, pretrained_path, queue=False)
         with gr.Row():
             vocoder = gr.Dropdown(label='Vocoder', choices=vocoder_choices(), value=DEFAULT_VOCODER, scale=4,
-                                  info='Renders the training previews and becomes the default vocoder of exported '
-                                       'models. Custom NSF-HiFiGAN (F0) or Vocos (no F0) vocoders (.ckpt, .pth or '
-                                       '.onnx, with any config.json or vocoder.yaml beside them) are listed from '
+                                  info='Sets the mel and sample rate of new experiments, so choose it before '
+                                       'preprocessing. Renders the training previews and becomes the default '
+                                       'vocoder of exported models. Custom NSF-HiFiGAN (F0) or Vocos (no F0) '
+                                       'vocoders (.ckpt, .pth or .onnx, with any config.json or vocoder.yaml beside '
+                                       'them) are listed from '
                                        f'{CUSTOM_VOCODER_ROOT.relative_to(ROOT).as_posix()}.')
             refresh_vocoder_button = gr.Button('Refresh', scale=1)
         refresh_vocoder_button.click(refresh_vocoders, vocoder, vocoder, queue=False)
@@ -230,7 +262,8 @@ def rectified_train_tab():
             stop_button = gr.Button('Stop current rectified job', interactive=False)
     timer = gr.Timer(2)
     outputs = [preprocess_button, train_button, stop_button, timer]
-    preprocess_button.click(preprocess, [name, dataset, workers, device, *slicing.inputs], outputs, queue=False)
+    preprocess_button.click(preprocess, [name, dataset, workers, device, *slicing.inputs, vocoder], outputs,
+                            queue=False)
     train_button.click(start, [name, batch, max_frames, max_updates, checkpoint_interval, device, use_fused_kernels,
                                use_pretrained, pretrained_path, realtime, vocoder], outputs, queue=False)
     stop_button.click(stop, [], outputs, queue=False)

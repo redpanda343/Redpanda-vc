@@ -154,7 +154,7 @@ def experiment_pitch_extractor(experiment):
 
 
 def load_training_config(experiment, pretrained_flow=None, use_fused_kernels=False, preset='standard',
-                         pitch_extractor='parselmouth', variance_embeds=None):
+                         pitch_extractor='parselmouth', variance_embeds=None, mel=None):
     if preset == 'meanflow' and use_fused_kernels:
         raise ValueError('MeanFlow requires unfused operations for its training derivative. Disable fused kernels.')
     config_path = experiment / 'rectified_config.json'
@@ -162,7 +162,7 @@ def load_training_config(experiment, pretrained_flow=None, use_fused_kernels=Fal
         config = resolve_config(json.loads(config_path.read_text(encoding='utf-8')))
         source = 'This experiment'
     else:
-        config = default_config(finetune=bool(pretrained_flow), preset=preset)
+        config = default_config(finetune=bool(pretrained_flow), preset=preset, mel=mel)
         config['flow']['pitch_extractor'] = pitch_extractor
         source = 'The pretrained checkpoint'
         if pretrained_flow:
@@ -210,10 +210,9 @@ def train(args):
     config = load_training_config(experiment, args.pretrained_flow, getattr(args, 'use_fused_kernels', False),
                                   getattr(args, 'preset', 'standard'),
                                   getattr(args, 'pitch_extractor', None) or experiment_pitch_extractor(experiment),
-                                  getattr(args, 'variance_embeds', None))
+                                  getattr(args, 'variance_embeds', None),
+                                  VOCODERS.get(getattr(args, 'vocoder', ''), {}).get('mel'))
     configure_arguments(args, config['flow'])
-    if config['data']['sample_rate'] != 44100:
-        raise ValueError('This recipe requires 44100 Hz audio.')
     fit(args, config, ROOT)
 
 

@@ -1,7 +1,11 @@
+import math
+
 import torch
 from torch import nn
 
-MEL_KEYS = ("sample_rate", "hop_length", "n_fft", "win_length", "n_mels", "mel_fmin", "mel_fmax")
+from rectified_flow.mel import MEL_DEFAULTS
+
+MEL_KEYS = ("sample_rate", "hop_length", "n_fft", "win_length", "n_mels", "mel_fmin", "mel_fmax", *MEL_DEFAULTS)
 
 class RawMelVocoder(nn.Module):
     def __init__(self, generator: nn.Module, data: dict):
@@ -14,11 +18,20 @@ class RawMelVocoder(nn.Module):
         return self.generator(mel * self.mel_std + self.mel_mean, f0)
 
 
+def _same_mel_value(left, right):
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)) and not isinstance(left, bool):
+        return math.isclose(float(left), float(right), rel_tol=1e-9)
+    return left == right
+
+
 def mel_mismatch(data: dict, vocoder_data: dict):
     keys = MEL_KEYS + tuple(k for k in ("mel_mean", "mel_std") if k in vocoder_data)
     for key in keys:
-        if key in vocoder_data and float(vocoder_data[key]) != float(data[key]):
-            return f"{key} ({vocoder_data[key]} vs {data[key]})"
+        if key not in vocoder_data:
+            continue
+        value = data.get(key, MEL_DEFAULTS.get(key))
+        if not _same_mel_value(vocoder_data[key], value):
+            return f"{key} ({vocoder_data[key]} vs {value})"
     return None
 
 
@@ -33,9 +46,7 @@ def load_vocoder(path: str, data: dict):
         checkpoint = torch.load(path, map_location="cpu", weights_only=True)
         state = generator_state(checkpoint)
     if is_vocos(checkpoint):
-        generator, vocoder_data, native = build_vocos(path, checkpoint)
-        if native:
-            raise ValueError(f"{path} renders Vocos's own mel. Train a Vocos on the flow's mel to use it here.")
+        generator, vocoder_data, _ = build_vocos(path, checkpoint)
     elif state is None:
         raise ValueError(f"{path} is not an NSF-HiFiGAN or Vocos vocoder.")
     else:

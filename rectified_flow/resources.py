@@ -19,6 +19,7 @@ VOCODERS = {
     'pc_nsf_hifigan': dict(
         title='OpenVPI PC-NSF-HiFiGAN',
         kind='pc',
+        mel='openvpi_44khz',
         directory='pc_nsf_hifigan_44.1k_hop512_128bin_2025.02',
         filename='model.ckpt',
         url=('https://github.com/openvpi/vocoders/releases/download/'
@@ -37,6 +38,7 @@ VOCODERS = {
     'nsf_hifigan': dict(
         title='OpenVPI NSF-HiFiGAN (2022.12)',
         kind='nsf',
+        mel='openvpi_44khz',
         directory='nsf_hifigan_20221211',
         filename='model.ckpt',
         url='https://github.com/openvpi/vocoders/releases/download/nsf-hifigan-v1/nsf_hifigan_20221211.zip',
@@ -54,6 +56,7 @@ VOCODERS = {
     'tgm_hifigan': dict(
         title='tgm_hifigan (pc100) by tigermeat',
         kind='pc',
+        mel='openvpi_44khz',
         directory='pc_tgm_hifigan_100',
         filename='pc_tgm_hifigan_100.onnx',
         url='https://github.com/mrtigermeat/tgm_hifigan/releases/download/pc100/dsvocoder.zip',
@@ -67,6 +70,33 @@ VOCODERS = {
             'documents/LICENSE.txt': 'eaede9100eb76a99273b6dda37b36ae5d2c3f2495b97dc4ebde12eb69f5e3fd5',
             'documents/readme.txt': '92a87a354e7d1c5de45513d1ec48098b77d6a045803010f02566a39d831041d1',
             'documents/tgm_hifigan Data Credits.xlsx': '626f3180f9be4d2ae666031a6b1e4f796741d36b7d11c06276a664e4dc2b82f5',
+        },
+    ),
+    'vocos_44khz': dict(
+        title='Vocos 44.1 kHz by patriotyk (no F0, speech)',
+        kind='vocos',
+        mel='vocos_44khz',
+        directory='vocos_mel_44100khz',
+        filename='model.pth',
+        base_url=('https://huggingface.co/patriotyk/vocos-mel-hifigan-compat-44100khz/resolve/'
+                  'e7d50512f731887429abfa9ba1e82d1a76f2360d/'),
+        downloads={
+            'model.pth': ('pytorch_model.bin', '310df58f31cd77e56c494df8389f7ebd57bf7b594c585d9221eb9fe888785572',
+                          56324327),
+            'config.yaml': ('config.yaml', '0d970f5cdc1913730c417b49e476bb09bb8b874583d113f71a7f10c8bb3a4b7d', 526),
+        },
+    ),
+    'vocos_24khz': dict(
+        title='Vocos 24 kHz by charactr (no F0, speech)',
+        kind='vocos',
+        mel='vocos_24khz',
+        directory='vocos_mel_24khz',
+        filename='model.pth',
+        base_url='https://huggingface.co/charactr/vocos-mel-24khz/resolve/0feb3fdd929bcd6649e0e7c5a688cf7dd012ef21/',
+        downloads={
+            'model.pth': ('pytorch_model.bin', '97ec976ad1fd67a33ab2682d29c0ac7df85234fae875aefcc5fb215681a91b2a',
+                          54365991),
+            'config.yaml': ('config.yaml', 'da9033922f969a47f0c160010226919e59f27761fd5066f3828d46de6650b0fc', 461),
         },
     ),
 }
@@ -111,6 +141,16 @@ def _install_bundle(destination, url, archive_sha256, archive_size, archive_fold
                 os.replace(temporary / 'files' / name, destination / name)
 
 
+def _install_files(destination, base_url, downloads, description):
+    with _download_lock:
+        if _valid_bundle(destination, {name: checksum for name, (_, checksum, _) in downloads.items()}):
+            return
+        print(f'Downloading the {description}...', flush=True)
+        for name, (remote, checksum, size) in downloads.items():
+            with tqdm(total=size, unit='B', unit_scale=True, desc=f'{description}: {name}') as progress:
+                download_file(base_url + remote, str(destination / name), progress, expected_sha256=checksum)
+
+
 def custom_vocoders():
     if not CUSTOM_VOCODER_ROOT.is_dir():
         return []
@@ -143,8 +183,12 @@ def vocoder_path(name=DEFAULT_VOCODER):
                          f'{CUSTOM_VOCODER_ROOT.relative_to(ROOT).as_posix()}.')
     spec = VOCODERS[name]
     destination = VOCODER_ROOT / spec['directory']
-    _install_bundle(destination, spec['url'], spec['archive_sha256'], spec['archive_size'], spec['archive_folder'],
-                    spec['files'], spec['filename'], f"{spec['title']} vocoder", spec.get('members'))
+    if 'downloads' in spec:
+        _install_files(destination, spec['base_url'], spec['downloads'], f"{spec['title']} vocoder")
+    else:
+        _install_bundle(destination, spec['url'], spec['archive_sha256'], spec['archive_size'],
+                        spec['archive_folder'], spec['files'], spec['filename'], f"{spec['title']} vocoder",
+                        spec.get('members'))
     return str(destination / spec['filename'])
 
 
