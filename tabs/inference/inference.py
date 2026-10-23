@@ -405,6 +405,29 @@ def get_model_info(model):
     return False, 1, False
 
 
+@lru_cache(maxsize=32)
+def read_model_f0(path, modified, size):
+    from nsf_hifigan.infer import load_checkpoint
+
+    if path.lower().endswith('.onnx'):
+        return True
+    model_data = load_checkpoint(path)
+    if model_data.get("kind") != "rectified_flow":
+        return True
+    return bool(model_data["config"]["flow"]["model"].get("use_f0", True))
+
+
+def model_uses_f0(model):
+    if model:
+        try:
+            path = os.path.abspath(os.path.join(now_dir, model))
+            stat = os.stat(path)
+            return read_model_f0(path, stat.st_mtime_ns, stat.st_size)
+        except Exception:
+            pass
+    return True
+
+
 def get_speakers_id(model):
     return list(range(get_model_info(model)[1]))
 
@@ -417,9 +440,9 @@ def pitch_methods(rectified, vocoder):
     return ['rmvpe', 'swift', 'beatrice', ('parselmouth', 'pm')]
 
 
-def pitch_update(choices, value):
+def pitch_update(choices, value, **extra):
     methods = {choice if isinstance(choice, str) else choice[1] for choice in choices}
-    return gr.update(choices=choices, value=value if value in methods else 'rmvpe')
+    return gr.update(choices=choices, value=value if value in methods else 'rmvpe', **extra)
 
 
 default_weight = next(iter(get_files("model")), None)
@@ -2360,24 +2383,27 @@ def inference_tab():
     )
 
     with gr.Tab(i18n("Real-time"), visible=not vocoder_selected) as realtime_panel:
-        realtime_f0_method = realtime_tab(model_file, index_file, rectified_vocoder_path, pitch_choices)
+        realtime_f0_method, realtime_pitch = realtime_tab(model_file, index_file, rectified_vocoder_path,
+                                                          pitch_choices, model_uses_f0(default_weight))
 
     voice_controls = [index_file, index_rate, index_rate_batch, protect, protect_batch,
                       embedder_model, embedder_model_batch, sid, sid_batch]
 
-    def update_model_controls(model, single_pitch, batch_pitch, realtime_pitch):
+    def update_model_controls(model, single_pitch, batch_pitch, realtime_method):
         rectified, _, vocoder = get_model_info(model)
         choices = pitch_methods(rectified, vocoder)
+        uses_f0 = model_uses_f0(model)
         return (gr.update(visible=rectified),
                 *[gr.update(visible=not vocoder) for _ in voice_controls],
                 gr.update(visible=not vocoder),
-                *[pitch_update(choices, value) for value in (single_pitch, batch_pitch, realtime_pitch)])
+                pitch_update(choices, single_pitch), pitch_update(choices, batch_pitch),
+                pitch_update(choices, realtime_method, visible=uses_f0), gr.update(visible=uses_f0))
 
     model_file.change(
         fn=update_model_controls,
         inputs=[model_file, f0_method, f0_method_batch, realtime_f0_method],
         outputs=[rectified_vocoder_path, *voice_controls, realtime_panel, f0_method, f0_method_batch,
-                 realtime_f0_method],
+                 realtime_f0_method, realtime_pitch],
         show_progress=False,
     )
 

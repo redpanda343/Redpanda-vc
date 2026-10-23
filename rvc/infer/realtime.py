@@ -319,6 +319,7 @@ class RealTimeRVC:
         self.synthesizer_graphs = {}
         self.speaker = torch.tensor([speaker_id], device=self.device, dtype=torch.long)
         self.lengths = {}
+        self.flow_inputs = {}
         if self.is_rectified:
             from torchaudio.transforms import Resample
             from rectified_flow.vocoder import load_vocoder
@@ -416,15 +417,23 @@ class RealTimeRVC:
             self.lengths[frames] = lengths
         return lengths
 
+    def _flow_inputs(self, frames):
+        inputs = self.flow_inputs.get(frames)
+        if inputs is None:
+            inputs = (torch.zeros(1, frames, device=self.device), torch.ones(1, 1, frames, device=self.device))
+            self.flow_inputs[frames] = inputs
+        return inputs
+
     @torch.inference_mode()
     def skip_block(self, block_frame_16k):
         with self.lock:
-            shift = max(1, block_frame_16k // 160)
-            self.cache_pitch[:-shift] = self.cache_pitch[shift:].clone()
-            self.cache_pitchf[:-shift] = self.cache_pitchf[shift:].clone()
-            self.cache_pitch[-shift:] = 1
-            self.cache_pitchf[-shift:] = 0.0
-            self.rmvpe_viterbi.reset()
+            if self.converter.use_f0:
+                shift = max(1, block_frame_16k // 160)
+                self.cache_pitch[:-shift] = self.cache_pitch[shift:].clone()
+                self.cache_pitchf[:-shift] = self.cache_pitchf[shift:].clone()
+                self.cache_pitch[-shift:] = 1
+                self.cache_pitchf[-shift:] = 0.0
+                self.rmvpe_viterbi.reset()
             self.pitch_sample_count += int(block_frame_16k)
 
     def _extract_features(self, input_wav):
@@ -676,29 +685,33 @@ class RealTimeRVC:
                          f0_method, source_wav=None, source_rate=None):
         rate = self.sample_rate
         hop = int(self.pipeline.data["hop_length"])
-        waveform = self.flow_resampler(input_wav.float()).view(1, -1)
-        length = waveform.shape[-1]
+        if self.model.use_f0:
+            waveform = self.flow_resampler(input_wav.float()).view(1, -1)
+            length = waveform.shape[-1]
+        else:
+            length = -(-input_wav.shape[0] * rate // 16000)
         start = round(skip_head * rate / 100)
         count = round(return_length * rate / 100)
         if start < 0 or count < 1 or start + count > length:
             raise ValueError("The requested flow output exceeds the input context.")
         frames = math.ceil(length / hop)
+        f0, mask = self._flow_inputs(frames)
+        variances = None
         if self.model.use_f0:
             f0, uv, source = self._rectified_f0(waveform, input_wav, f0_method, source_wav, source_rate, frames)
-        else:
-            f0, uv, source = np.zeros(frames, dtype=np.float32), None, None
-        variances = None
-        if self.variance_stream is not None:
-            position = self.pitch_sample_count * rate // 16000
-            curves = self.variance_stream(source.cpu().numpy(), f0, uv, position, frames)
-            variances = torch.from_numpy(curves).to(self.device)[None]
-        f0 = torch.from_numpy(f0).to(waveform.device)[None] * 2 ** (self.pitch / 12)
-        mask = torch.ones(1, 1, frames, device=self.device)
+            if self.variance_stream is not None:
+                position = self.pitch_sample_count * rate // 16000
+                curves = self.variance_stream(source.cpu().numpy(), f0, uv, position, frames)
+                variances = torch.from_numpy(curves).to(self.device)[None]
+            f0 = torch.from_numpy(f0).to(self.device)[None] * 2 ** (self.pitch / 12)
         first_frame = max(0, start // hop - self.vocoder_context_frames)
         window = 0 if self.flow_context_frames is None else max(0, first_frame - self.flow_context_frames)
         mel = self.flow_sampler(features.float(), f0, speaker, mask, steps=self.rectified_steps, variances=variances,
                                 start=window)
-        audio = self.vocoder_graph(mel[..., first_frame - window:], f0[..., first_frame:])[0, 0]
+        vocoder_inputs = (mel[..., first_frame - window:],)
+        if self.pipeline.vocoder_model.requires_f0:
+            vocoder_inputs += (f0[..., first_frame:],)
+        audio = self.vocoder_graph(*vocoder_inputs)[0, 0]
         start -= first_frame * hop
         audio = audio[start:start + count]
         if audio.numel() != count:

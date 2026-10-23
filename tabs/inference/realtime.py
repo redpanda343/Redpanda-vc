@@ -891,7 +891,7 @@ def update_realtime(
     )
 
 
-def realtime_tab(model_file, index_file, rectified_vocoder_path, pitch_choices):
+def realtime_tab(model_file, index_file, rectified_vocoder_path, pitch_choices, uses_f0=True):
     gr.Markdown(
         i18n(
             "Converts your microphone in real time through this browser, also over a public share link. The browser only allows the microphone on HTTPS pages or on localhost, so open the share link or http://127.0.0.1. Use headphones so the converted voice does not reach the microphone."
@@ -920,6 +920,7 @@ def realtime_tab(model_file, index_file, rectified_vocoder_path, pitch_choices):
             label=i18n("Pitch"),
             info=i18n("Shift in semitones. +12 is one octave up."),
             interactive=True,
+            visible=uses_f0,
         )
         index_rate = gr.Slider(
             minimum=0,
@@ -936,6 +937,7 @@ def realtime_tab(model_file, index_file, rectified_vocoder_path, pitch_choices):
             choices=pitch_choices,
             value="rmvpe",
             interactive=True,
+            visible=uses_f0,
         )
         embedder_model = gr.Radio(
             label=i18n("Embedder Model"),
@@ -1091,4 +1093,4 @@ def realtime_tab(model_file, index_file, rectified_vocoder_path, pitch_choices):
         outputs=None,
         js="(buffer) => { window.redpandaRealtime && window.redpandaRealtime.setBuffer(buffer); }",
     )
-    return f0_method
+    return f0_method, pitch
