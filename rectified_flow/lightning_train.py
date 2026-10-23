@@ -79,7 +79,8 @@ class FlowDataModule(pl.LightningDataModule):
         super().__init__()
         self.experiment, self.root, self.config, self.args = experiment, root, config, args
         self.settings = config['flow']
-        self.originals = read_filelist(experiment / 'filelist.txt', root, originals_only=True)
+        self.originals = read_filelist(experiment / 'filelist.txt', root, originals_only=True,
+                                       use_f0=self.settings['model']['use_f0'])
         self.inventory = speaker_inventory(self.originals)
         self.speaker_count = max(int(entry[4]) for entry in self.originals) + 1
         self.training_entries, self.held = split_holdout(self.originals, int(self.settings['holdout_clips']))
@@ -379,7 +380,7 @@ class FlowPreview(pl.Callback):
     def on_fit_start(self, trainer, task):
         if trainer.is_global_zero and self.args.vocoder and task.settings['val_with_vocoder']:
             path = vocoder_path(self.args.vocoder) if recorded_name(self.args.vocoder) else self.args.vocoder
-            self.vocoder, _ = load_vocoder(path, task.data)
+            self.vocoder, _ = load_vocoder(path, task.data, use_f0=task.model.use_f0)
             self.vocoder = self.vocoder.to(task.device)
 
     def render(self, trainer, task):

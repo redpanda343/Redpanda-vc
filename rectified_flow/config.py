@@ -86,6 +86,7 @@ def resolve_config(config):
             raise ValueError('Shortcut (few-step) flows are no longer supported. Retrain this voice as a standard flow.')
         model = {key: value for key, value in model.items() if key not in REMOVED_SHORTCUT_KEYS}
         model.setdefault('use_tension_embed', False)
+        model.setdefault('use_f0', True)
         config = dict(config, flow=dict(flow, model=model))
     return _merge(base_config(), config)
 

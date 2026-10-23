@@ -235,7 +235,7 @@ def content_rms(entries, limit=64):
     return math.sqrt(total / count)
 
 
-def read_filelist(path, root, originals_only=False):
+def read_filelist(path, root, originals_only=False, use_f0=True):
     rows = []
     for number, line in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), 1):
         if not line.strip():
@@ -245,7 +245,7 @@ def read_filelist(path, root, originals_only=False):
             raise ValueError(f"Invalid filelist row {number}: expected audio|content|f0|f0_hz|speaker_id")
         if originals_only and fields[1].endswith('.flow.npz'):
             continue
-        for column in range(4):
+        for column in range(4 if use_f0 else 2):
             fields[column] = os.path.normpath(os.path.join(root, fields[column]))
             if not os.path.isfile(fields[column]):
                 raise FileNotFoundError(fields[column])

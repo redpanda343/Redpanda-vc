@@ -92,7 +92,7 @@ class ContentEncoderLayer(nn.Module):
 class ContentConditionEncoder(nn.Module):
     def __init__(self, content_channels, hidden_channels, speaker_count, layers, content_step,
                  key_shift=True, speed=True, use_spk_id=False, enc_ffn_kernel_size=3,
-                 use_rope=True, rope_interleaved=False, rope_theta=10000.0, variances=()):
+                 use_rope=True, rope_interleaved=False, rope_theta=10000.0, variances=(), use_f0=True):
         super().__init__()
         if not content_step > 0:
             raise ValueError('Content encoding requires the mel hop in content frames.')
@@ -107,7 +107,7 @@ class ContentConditionEncoder(nn.Module):
         ])
         self.norm = nn.LayerNorm(hidden_channels)
         self.embed_scale = math.sqrt(hidden_channels)
-        self.pitch = adamw_linear(1, hidden_channels)
+        self.pitch = adamw_linear(1, hidden_channels) if use_f0 else None
         self.key_shift = adamw_linear(1, hidden_channels) if key_shift else None
         self.speed = adamw_linear(1, hidden_channels) if speed else None
         self.variance_names = list(variances)
@@ -130,21 +130,24 @@ class ContentConditionEncoder(nn.Module):
         for block in self.blocks:
             x = block(x, padding)
         x = self.norm(x) * content_mask.transpose(1, 2)
-        speeds = (f0.new_ones(f0.shape[0]) if speed is None else speed.reshape(-1)).double()
+        speeds = (content.new_ones(content.shape[0]) if speed is None else speed.reshape(-1)).double()
         lengths = content_mask[:, 0].sum(-1).long()
         x = expand_content(x, mask.shape[-1], speeds * self.content_step, lengths) * mask.transpose(1, 2)
         if self.speaker is not None:
             x = x + self.speaker(speaker).unsqueeze(1)
-        x = x + self.pitch(torch.log1p(f0 * mask[:, 0] / 700.0).unsqueeze(-1))
+        if self.pitch is not None:
+            if f0 is None:
+                raise ValueError('This flow requires F0 conditioning.')
+            x = x + self.pitch(torch.log1p(f0 * mask[:, 0] / 700.0).unsqueeze(-1))
         if self.variance_names:
             if variances is None or variances.shape[1] != len(self.variance_names):
                 raise ValueError(f'This flow needs {", ".join(self.variance_names)} curves.')
             x = x + torch.stack([self.variance_embeds[name](variances[:, index, :, None] * VARIANCE_SCALES[name])
                                  for index, name in enumerate(self.variance_names)], dim=-1).sum(-1)
         if self.key_shift is not None:
-            values = f0.new_zeros(f0.shape[0]) if key_shift is None else key_shift
+            values = content.new_zeros(content.shape[0]) if key_shift is None else key_shift
             x = x + self.key_shift(values.reshape(-1, 1, 1) / 12.0)
         if self.speed is not None:
-            values = f0.new_ones(f0.shape[0]) if speed is None else speed
+            values = content.new_ones(content.shape[0]) if speed is None else speed
             x = x + self.speed(values.reshape(-1, 1, 1))
         return x.transpose(1, 2)

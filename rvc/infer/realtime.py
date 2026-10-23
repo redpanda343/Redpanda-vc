@@ -243,7 +243,7 @@ class RealTimeRVC:
             raise ValueError(
                 f"Real-time mode supports {supported}; this model uses {self.vocoder}."
             )
-        if not self.converter.use_f0:
+        if not self.converter.use_f0 and not self.is_rectified:
             raise ValueError("Real-time mode currently requires a pitch-guided model.")
         if speaker_id < 0 or speaker_id >= self.converter.n_spk:
             raise ValueError(
@@ -337,7 +337,8 @@ class RealTimeRVC:
                 )
             self.flow_sampler = RealtimeFlowSampler(self.model, enabled=self.cuda_graph)
             self.pipeline.set_vocoder(rectified_vocoder_path)
-            vocoder, _ = load_vocoder(self.pipeline.resolved_vocoder_path(), self.pipeline.data)
+            vocoder, _ = load_vocoder(self.pipeline.resolved_vocoder_path(), self.pipeline.data,
+                                      use_f0=self.model.use_f0)
             if self.pipeline.vocoder_path:
                 self.vocoder = os.path.basename(self.pipeline.vocoder_path)
             self.pipeline.vocoder_model = vocoder.to(self.device).float()
@@ -360,6 +361,9 @@ class RealTimeRVC:
         if method == "beatrice":
             return BeatricePitch.lookahead_frames
         return 20 if method == "swift" else 0
+
+    def pitch_lookahead(self, method):
+        return self.pitch_lookahead_frames(method) if self.converter.use_f0 else 0
 
     @property
     def speaker_count(self):
@@ -558,6 +562,9 @@ class RealTimeRVC:
         return self.synthesizer_graphs[key]
 
     def _update_pitch(self, input_wav, block_frame_16k, method):
+        if not self.converter.use_f0:
+            self.pitch_sample_count += int(block_frame_16k)
+            return
         if method != self.last_f0_method:
             self.rmvpe_viterbi.reset()
             self._release_pitch_predictors(method)
@@ -676,7 +683,10 @@ class RealTimeRVC:
         if start < 0 or count < 1 or start + count > length:
             raise ValueError("The requested flow output exceeds the input context.")
         frames = math.ceil(length / hop)
-        f0, uv, source = self._rectified_f0(waveform, input_wav, f0_method, source_wav, source_rate, frames)
+        if self.model.use_f0:
+            f0, uv, source = self._rectified_f0(waveform, input_wav, f0_method, source_wav, source_rate, frames)
+        else:
+            f0, uv, source = np.zeros(frames, dtype=np.float32), None, None
         variances = None
         if self.variance_stream is not None:
             position = self.pitch_sample_count * rate // 16000
@@ -708,7 +718,7 @@ class RealTimeRVC:
         source_wav=None,
         source_rate=None,
     ):
-        lookahead = self.pitch_lookahead_frames(f0_method)
+        lookahead = self.pitch_lookahead(f0_method)
         if skip_head < lookahead:
             raise ValueError(
                 f"Extra context must be at least {lookahead / 100:g} seconds for this pitch method."

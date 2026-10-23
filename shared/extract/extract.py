@@ -255,8 +255,9 @@ if __name__ == "__main__":
     include_mutes = int(sys.argv[7]) if len(sys.argv) > 7 else 2
     version = sys.argv[8] if len(sys.argv) > 8 else "v2"
     rectified = len(sys.argv) > 9 and sys.argv[9] == "--rectified"
-    if rectified and (version != "v2" or f0_method not in ("pm", "rmvpe")):
-        raise ValueError("Rectified flow extraction requires v2 features and Parselmouth or RMVPE F0.")
+    if rectified and (version != "v2" or f0_method not in ("pm", "rmvpe", "none")):
+        raise ValueError("Rectified flow extraction requires v2 features and Parselmouth, RMVPE or no F0.")
+    use_f0 = not (rectified and f0_method == "none")
 
     wav_path = os.path.join(exp_dir, "sliced_audios")
 
@@ -266,8 +267,9 @@ if __name__ == "__main__":
         )
         sys.exit(1)
 
-    os.makedirs(os.path.join(exp_dir, "f0"), exist_ok=True)
-    os.makedirs(os.path.join(exp_dir, "f0_voiced"), exist_ok=True)
+    if use_f0:
+        os.makedirs(os.path.join(exp_dir, "f0"), exist_ok=True)
+        os.makedirs(os.path.join(exp_dir, "f0_voiced"), exist_ok=True)
     os.makedirs(os.path.join(exp_dir, "extracted"), exist_ok=True)
 
     metadata = get_embedding_metadata(embedder_model, version)
@@ -363,17 +365,21 @@ if __name__ == "__main__":
     devices = ["cpu"] if gpus == "-" else [f"cuda:{idx}" for idx in gpus.split("-")]
 
     with mp.Manager() as manager, tqdm.tqdm(
-        total=2 * len(files), desc=f"Extracting F0 ({f0_method})", unit="file",
+        total=(2 if use_f0 else 1) * len(files),
+        desc=f"Extracting F0 ({f0_method})" if use_f0 else "Extracting content features", unit="file",
         dynamic_ncols=True,
     ) as progress:
         updates = manager.Queue()
-        run_pitch_extraction(
-            files, devices, f0_method, num_processes, progress, updates,
-            force=force_pitch_extraction,
-            rectified=rectified,
-        )
+        if use_f0:
+            run_pitch_extraction(
+                files, devices, f0_method, num_processes, progress, updates,
+                force=force_pitch_extraction,
+                rectified=rectified,
+            )
         data["f0_method"] = f0_method
         data["f0_model"] = f0_model
+        if rectified:
+            data["flow_use_f0"] = use_f0
         with open(file_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4)
 
@@ -382,7 +388,7 @@ if __name__ == "__main__":
         )
 
     if rectified:
-        generate_filelist(exp_dir, sample_rate, 0)
+        generate_filelist(exp_dir, sample_rate, 0, use_f0=use_f0)
     else:
         generate_config(sample_rate, exp_dir, version)
         generate_filelist(exp_dir, sample_rate, include_mutes)

@@ -97,6 +97,7 @@
       "rope_interleaved": false,
       "rope_theta": 10000.0,
       "use_spk_id": false,
+      "use_f0": true,
       "key_shift": true,
       "speed": true,
       "use_breathiness_embed": true,

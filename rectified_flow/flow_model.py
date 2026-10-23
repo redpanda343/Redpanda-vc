@@ -211,6 +211,7 @@ class RectifiedFlow(nn.Module):
         train_aux_decoder: bool = True,
         train_diffusion: bool = True,
         val_gt_start: bool = False,
+        use_f0: bool = True,
     ):
         super().__init__()
         if not train_diffusion and not train_aux_decoder:
@@ -225,10 +226,12 @@ class RectifiedFlow(nn.Module):
         self.mel_mean = float(mel_mean)
         self.mel_std = float(mel_std)
         self.use_spk_id = bool(use_spk_id)
+        self.use_f0 = bool(use_f0)
         self.encoder = ContentConditionEncoder(
             content_channels, hidden_channels, speaker_count, encoder_layers, content_step,
             key_shift=key_shift, speed=speed, use_spk_id=self.use_spk_id, enc_ffn_kernel_size=enc_ffn_kernel_size,
             use_rope=use_rope, rope_interleaved=rope_interleaved, rope_theta=rope_theta,
+            use_f0=self.use_f0,
             variances=variance_names(dict(use_breathiness_embed=use_breathiness_embed,
                                           use_voicing_embed=use_voicing_embed,
                                           use_tension_embed=use_tension_embed)),
@@ -351,11 +354,13 @@ class RectifiedFlow(nn.Module):
 def validate_model_config(model: dict):
     if not isinstance(model.get('mean_flow', False), bool):
         raise ValueError('mean_flow must be a boolean.')
-    for name in ('use_rope', 'rope_interleaved', 'use_spk_id', 'key_shift', 'speed', 'dual_timestep',
+    for name in ('use_rope', 'rope_interleaved', 'use_spk_id', 'use_f0', 'key_shift', 'speed', 'dual_timestep',
                  'train_aux_decoder', 'train_diffusion', 'val_gt_start', 'use_breathiness_embed',
                  'use_voicing_embed', 'use_tension_embed'):
         if not isinstance(model[name], bool):
             raise ValueError(f'{name} must be a boolean.')
+    if not model['use_f0'] and (model['key_shift'] or variance_names(model)):
+        raise ValueError('F0-free flow cannot use key-shift, breathiness, voicing or tension conditioning.')
     for section, key in ((model, 'enc_ffn_kernel_size'), (model['aux_decoder'], 'kernel_size'),
                          (model['backbone_args'], 'kernel_size')):
         value = section[key]
