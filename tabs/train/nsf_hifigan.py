@@ -163,7 +163,7 @@ def nsf_hifigan_train_tab():
     with gr.Accordion('2. Extract features', open=True):
         gr.Markdown('Saves the audio, mel and F0 of every sliced clip to `logs/<model>/vocoder/data` for training. '
                     'It needs about 1.25 times the space of the sliced audio as 32-bit WAV, and can be deleted '
-                    'after training.')
+                    'after training. Running it again after a stop keeps the clips already extracted.')
         with gr.Row():
             pitch_extractor = gr.Radio(label='Pitch extractor', choices=['rmvpe'], value='rmvpe',
                                        info='RMVPE matches the F0 Rectified Flow extracts at inference. Vocos '

@@ -1,4 +1,6 @@
 import argparse
+import hashlib
+import os
 import random
 import shutil
 from collections import deque
@@ -10,7 +12,7 @@ import soundfile as sf
 import torch
 from tqdm import tqdm
 
-from nsf_hifigan.config import PITCH_EXTRACTORS, default_data, experiment_paths, write_json
+from nsf_hifigan.config import PITCH_EXTRACTORS, default_data, experiment_paths, read_json, write_json
 from nsf_hifigan.losses import FEATURE_MEL_FLOOR, vocoder_mel
 from rectified_flow.distributed import parse_devices
 from rectified_flow.pitch import extract_pitch, interpolate_f0, parselmouth_contour
@@ -21,6 +23,7 @@ _MEL = {}
 PARSELMOUTH_SILENCE_THRESHOLD = 0.01
 RMVPE_BATCH_SAMPLES = 4096 * 160
 RMVPE_PENDING_CLIPS = 512
+MANIFEST = 'extraction.json'
 
 
 def read_audio(path, sample_rate):
@@ -58,19 +61,43 @@ def clip_features(path, data, extractor, device):
     return dict(audio=audio, mel=mel, f0=np.asarray(f0, dtype=np.float32))
 
 
+def file_digest(path):
+    with open(path, 'rb') as handle:
+        return hashlib.file_digest(handle, 'sha256').hexdigest()
+
+
+def save_features(target, digest, audio, mel, f0):
+    temporary = target.with_name(f'.{target.name}.partial')
+    with open(temporary, 'wb') as handle:
+        np.savez(handle, audio=audio, mel=mel, f0=np.asarray(f0, dtype=np.float32), source=np.array(digest))
+    os.replace(temporary, target)
+    return target.name, len(mel)
+
+
+def reusable_clip(target, digest):
+    try:
+        with np.load(target, allow_pickle=False) as item:
+            if str(item['source']) != digest:
+                return None
+            frames = len(item['mel'])
+            if len(item['f0']) != frames or not len(item['audio']):
+                return None
+    except Exception:
+        return None
+    return target.name, frames
+
+
 def write_clip(job):
-    source, target, data, extractor, device = job
+    source, target, data, extractor, device, digest = job
     torch.set_num_threads(1)
     features = clip_features(source, data, extractor, device)
     if features is None:
         return None
-    np.savez(target, **features)
-    return target.name, len(features['mel'])
+    return save_features(target, digest, **features)
 
 
-def save_clip(target, audio, mel, f0):
-    np.savez(target, audio=audio, mel=mel, f0=np.asarray(f0, dtype=np.float32))
-    return target.name, len(mel)
+def save_clip(target, digest, audio, mel, f0):
+    return save_features(target, digest, audio, mel, f0)
 
 
 def run_rmvpe_jobs(jobs, workers, device):
@@ -99,7 +126,7 @@ def run_rmvpe_jobs(jobs, workers, device):
                                             [len(mel) for _, _, mel in items], hop_size=data['hop_length'],
                                             interp_uv=True)
             for (job, audio, mel), (f0, _) in zip(items, pitches):
-                saving.append((job[0], savers.submit(save_clip, job[1], audio, mel, f0)))
+                saving.append((job[0], savers.submit(save_clip, job[1], job[5], audio, mel, f0)))
             collect(8 * workers)
 
         queued = iter(jobs)
@@ -154,17 +181,35 @@ def binarize(experiment, extractor, device, workers, valid_clips, seed=1234):
     if not clips:
         raise SystemExit(f"No sliced audio found in {paths['experiment'] / 'sliced_audios'}. Slice the dataset first.")
     data = default_data()
-    if paths['data'].is_dir():
-        shutil.rmtree(paths['data'])
-    paths['data'].mkdir(parents=True)
+    contract = dict(data=data, pitch_extractor=extractor)
+    if read_json(paths['data'] / MANIFEST) != contract:
+        if paths['data'].is_dir():
+            shutil.rmtree(paths['data'])
+        paths['data'].mkdir(parents=True)
+        write_json(paths['data'] / MANIFEST, contract)
+    for stale in paths['data'].glob('.*.partial'):
+        stale.unlink()
     held = []
     if not validation:
         count = min(int(valid_clips), len(clips) // 10)
         held = random.Random(seed).sample(clips, count) if count > 0 else []
-    jobs = [(path, paths['data'] / f'{path.stem}.npz', data, extractor, device) for path in clips]
-    jobs += [(path, paths['data'] / f'validation_{index}.npz', data, extractor, device)
-             for index, path in enumerate(validation)]
-    results = dict(zip([job[0] for job in jobs], run_jobs(jobs, workers, device)))
+    targets = [(path, paths['data'] / f'{path.stem}.npz') for path in clips]
+    targets += [(path, paths['data'] / f'validation_{index}.npz') for index, path in enumerate(validation)]
+    jobs = [(path, target, data, extractor, device, file_digest(path)) for path, target in targets]
+    results, pending = {}, []
+    for job in jobs:
+        reused = reusable_clip(job[1], job[5])
+        if reused is None:
+            pending.append(job)
+        else:
+            results[job[0]] = reused
+    if results:
+        print(f'Keeping {len(results)} clip(s) extracted before; extracting {len(pending)}.', flush=True)
+    results.update(zip([job[0] for job in pending], run_jobs(pending, workers, device)))
+    kept = {target.name for _, target in targets}
+    for path in paths['data'].glob('*.npz'):
+        if path.name not in kept:
+            path.unlink()
     valid_sources = validation or held
     train = [list(results[path]) for path in clips if path not in held and results[path]]
     valid = [list(results[path]) for path in valid_sources if results[path]]

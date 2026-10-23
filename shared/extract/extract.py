@@ -5,6 +5,7 @@ import multiprocessing as mp
 import os
 import queue
 import sys
+import tempfile
 
 import numpy as np
 import parselmouth
@@ -27,6 +28,26 @@ from shared.utils import (
     load_embedding,
 )
 from shared.extract.preparing_files import generate_config, generate_filelist
+
+
+def readable_npy(path):
+    try:
+        np.load(path, mmap_mode="r", allow_pickle=False)
+    except Exception:
+        return False
+    return True
+
+
+def save_npy(path, array):
+    directory = os.path.dirname(os.path.dirname(os.path.abspath(path)))
+    handle, temporary = tempfile.mkstemp(dir=directory, prefix=".", suffix=".partial")
+    try:
+        with os.fdopen(handle, "wb") as file:
+            np.save(file, array, allow_pickle=False)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
 
 # Load config
 config = Config()
@@ -109,7 +130,7 @@ class FeatureInput:
 
     def process_file(self, file_info, force=False):
         inp_path, opt_path_coarse, opt_path_full, _ = file_info
-        if not force and os.path.exists(opt_path_coarse) and os.path.exists(opt_path_full):
+        if not force and readable_npy(opt_path_coarse) and readable_npy(opt_path_full):
             return
 
         try:
@@ -120,8 +141,8 @@ class FeatureInput:
             if not np.isfinite(feature_pit).all() or np.any(feature_pit < 0):
                 raise ValueError("Pitch extraction returned invalid frequencies.")
             coarse_pit = self.coarse_f0(feature_pit)
-            np.save(opt_path_full, feature_pit, allow_pickle=False)
-            np.save(opt_path_coarse, coarse_pit, allow_pickle=False)
+            save_npy(opt_path_full, feature_pit)
+            save_npy(opt_path_coarse, coarse_pit)
         except Exception as error:
             raise RuntimeError(
                 f"An error occurred extracting file {inp_path} on {self.device}: {error}"
@@ -200,7 +221,7 @@ def process_file_embedding(
 
     def worker(file_info):
         wav_file_path, _, _, out_file_path = file_info
-        if os.path.exists(out_file_path):
+        if readable_npy(out_file_path):
             return
         feats = torch.from_numpy(load_audio_16k(wav_file_path)).float()
         if getattr(model, "audio_requires_normalization", False):
@@ -218,7 +239,7 @@ def process_file_embedding(
             )
         if not np.isfinite(feats_out).all():
             raise RuntimeError(f"{wav_file_path} produced non-finite values.")
-        np.save(out_file_path, feats_out, allow_pickle=False)
+        save_npy(out_file_path, feats_out)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=n_threads) as executor:
         futures = [executor.submit(worker, f) for f in files]
@@ -303,7 +324,10 @@ if __name__ == "__main__":
             and previous_fingerprint != metadata["feature_fingerprint"]
         )
     )
+    for stale_path in glob.glob(os.path.join(exp_dir, ".*.partial")):
+        os.remove(stale_path)
     if not feature_contract_changed:
+        unreadable = 0
         for existing_feature_path in glob.glob(
             os.path.join(exp_dir, "extracted", "*.npy")
         ):
@@ -312,11 +336,14 @@ if __name__ == "__main__":
                     existing_feature_path, mmap_mode="r", allow_pickle=False
                 ).shape
             except Exception:
-                feature_contract_changed = True
-                break
+                os.remove(existing_feature_path)
+                unreadable += 1
+                continue
             if len(existing_shape) != 2 or existing_shape[1] != metadata["feature_dim"]:
                 feature_contract_changed = True
                 break
+        if unreadable:
+            print(f"Removed {unreadable} unreadable feature file(s); they are extracted again.")
     if feature_contract_changed:
         generator_checkpoints = glob.glob(os.path.join(exp_dir, "G_*.pth"))
         if generator_checkpoints:
