@@ -31,6 +31,9 @@ def is_nsf_hifigan(checkpoint):
 
 
 class VocoderInference:
+    name = 'NSF-HiFiGAN'
+    zero_unvoiced = False
+
     def __init__(self, path, checkpoint, device):
         metadata = checkpoint.get('vocoder')
         saved = metadata.get('config') if isinstance(metadata, dict) else None
@@ -49,7 +52,7 @@ class VocoderInference:
             raise ValueError('Select non-empty audio with finite samples.')
         extractor = 'parselmouth' if f0_method == 'pm' else f0_method
         if extractor not in {'rmvpe', 'parselmouth'}:
-            raise ValueError('NSF-HiFiGAN supports RMVPE or parselmouth pitch extraction.')
+            raise ValueError(f'{self.name} supports RMVPE or parselmouth pitch extraction.')
         rate, hop = int(self.data['sample_rate']), int(self.data['hop_length'])
         length = len(waveform)
         frames = math.ceil(length / hop)
@@ -57,7 +60,9 @@ class VocoderInference:
         padded = np.pad(np.clip(waveform, -1.0, 1.0), (0, padded_length - length))
         source = torch.from_numpy(padded).to(self.device)[None]
         mel = self.mel(source)[..., :frames]
-        f0, _ = extract_pitch(extractor, waveform, rate, hop, frames, self.device)
+        f0, uv = extract_pitch(extractor, waveform, rate, hop, frames, self.device)
+        if self.zero_unvoiced:
+            f0 = f0 * ~uv
         f0 = torch.from_numpy(f0).to(self.device)[None] * 2 ** (float(pitch) / 12)
         devices = []
         if self.device.type == 'cuda':
@@ -71,5 +76,18 @@ class VocoderInference:
                         torch.cuda.manual_seed(int(seed))
             audio = self.generator(mel, f0)[0, 0, :length]
         if not torch.isfinite(audio).all():
-            raise FloatingPointError('Non-finite NSF-HiFiGAN audio output.')
+            raise FloatingPointError(f'Non-finite {self.name} audio output.')
         return audio.float().cpu().numpy()
+
+
+class NSFBigVGANInference(VocoderInference):
+    name = 'NSF-BigVGAN'
+    zero_unvoiced = True
+
+    def __init__(self, path, checkpoint, device):
+        from rectified_flow.nsf_bigvgan import build_nsf_bigvgan
+
+        generator, self.data = build_nsf_bigvgan(path, checkpoint)
+        self.device = torch.device(device)
+        self.generator = generator.to(self.device).float().eval().requires_grad_(False)
+        self.mel = LogMel.from_config(self.data).to(self.device).eval()

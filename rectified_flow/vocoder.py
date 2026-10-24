@@ -72,6 +72,7 @@ def mel_mismatch(data: dict, vocoder_data: dict):
 
 def load_vocoder(path: str, data: dict):
     from rectified_flow.bigvgan import build_bigvgan, is_bigvgan
+    from rectified_flow.nsf_bigvgan import build_nsf_bigvgan, is_nsf_bigvgan
     from rectified_flow.openvpi import NSFHiFiGAN, generator_state, onnx_generator_state, openvpi_spec
     from rectified_flow.pupu import build_pupu, is_pupu
     from rectified_flow.vocos import build_vocos, is_vocos
@@ -93,8 +94,10 @@ def load_vocoder(path: str, data: dict):
         generator, vocoder_data = build_pupu(path, checkpoint)
     elif is_bigvgan(checkpoint):
         generator, vocoder_data = build_bigvgan(path, checkpoint)
+    elif is_nsf_bigvgan(checkpoint):
+        generator, vocoder_data = build_nsf_bigvgan(path, checkpoint)
     elif state is None:
-        raise ValueError(f"{path} is not an NSF-HiFiGAN, Vocos, Pupu-Vocoder or BigVGAN vocoder.")
+        raise ValueError(f"{path} is not an NSF-HiFiGAN, Vocos, Pupu-Vocoder, BigVGAN or NSF-BigVGAN vocoder.")
     else:
         hparams, vocoder_data, weights = openvpi_spec(path, state)
         generator = NSFHiFiGAN(**hparams)

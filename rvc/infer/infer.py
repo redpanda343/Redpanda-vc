@@ -707,13 +707,14 @@ class VoiceConverter:
         Sets up the network configuration based on the loaded checkpoint.
         """
         if self.cpt is not None:
-            from nsf_hifigan.infer import VocoderInference, is_nsf_hifigan
+            from nsf_hifigan.infer import NSFBigVGANInference, VocoderInference, is_nsf_hifigan
+            from rectified_flow.nsf_bigvgan import is_nsf_bigvgan
             from rectified_flow.vocos import VocosInference, is_vocos
             from rectified_flow.pupu import PupuInference, is_pupu
             from rectified_flow.bigvgan import BigVGANInference, is_bigvgan
 
             inferences = ((is_vocos, VocosInference), (is_pupu, PupuInference), (is_bigvgan, BigVGANInference),
-                          (is_nsf_hifigan, VocoderInference))
+                          (is_nsf_bigvgan, NSFBigVGANInference), (is_nsf_hifigan, VocoderInference))
             inference = next((inference for match, inference in inferences if match(self.cpt)), None)
             if inference is not None:
                 self.net_g = inference(self.model_path, self.cpt, self.config.device)

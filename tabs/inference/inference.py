@@ -381,6 +381,7 @@ def read_model_info(path, modified, size):
     from nsf_hifigan.infer import is_nsf_hifigan, load_checkpoint
     from rectified_flow.vocos import is_vocos
     from rectified_flow.pupu import is_pupu
+    from rectified_flow.nsf_bigvgan import is_nsf_bigvgan
 
     if path.lower().endswith('.onnx'):
         from rectified_flow.openvpi import onnx_generator_state
@@ -388,7 +389,7 @@ def read_model_info(path, modified, size):
         state = onnx_generator_state(path)
         return False, 1, is_nsf_hifigan({'generator': state})
     model_data = load_checkpoint(path)
-    if is_nsf_hifigan(model_data) or is_vocos(model_data) or is_pupu(model_data):
+    if is_nsf_hifigan(model_data) or is_vocos(model_data) or is_pupu(model_data) or is_nsf_bigvgan(model_data):
         return False, 1, True
     rectified = model_data.get("kind") == "rectified_flow"
     speakers = model_data.get("speaker_count", model_data.get("speakers_id")) or 1
@@ -479,7 +480,7 @@ def inference_tab():
         rectified_vocoder_path = gr.Dropdown(
             label=i18n("Rectified Flow Vocoder"),
             info=i18n(
-                "Optional: select a compatible NSF-HiFiGAN, Vocos, Pupu-Vocoder or BigVGAN vocoder or enter its .pth/.ckpt/.onnx/.safetensors path. Leave empty to use the model's recorded vocoder or the default. Keep any config.json or vocoder.yaml beside the vocoder."
+                "Optional: select a compatible NSF-HiFiGAN, NSF-BigVGAN, Vocos, Pupu-Vocoder or BigVGAN vocoder or enter its .pth/.ckpt/.onnx/.safetensors path. Leave empty to use the model's recorded vocoder or the default. Keep any config.json or vocoder.yaml beside the vocoder."
             ),
             choices=get_vocoders(),
             value=None,

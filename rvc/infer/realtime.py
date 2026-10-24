@@ -338,6 +338,9 @@ class RealTimeRVC:
             self.flow_sampler = RealtimeFlowSampler(self.model, enabled=self.cuda_graph)
             self.pipeline.set_vocoder(rectified_vocoder_path)
             vocoder, _ = load_vocoder(self.pipeline.resolved_vocoder_path(), self.pipeline.data)
+            if getattr(vocoder.generator, "offline_only", False):
+                raise ValueError("This flow vocoder supports offline conversion only. Choose another vocoder for "
+                                 "real-time conversion.")
             if self.pipeline.vocoder_path:
                 self.vocoder = os.path.basename(self.pipeline.vocoder_path)
             self.pipeline.vocoder_model = vocoder.to(self.device).float()

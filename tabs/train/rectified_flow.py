@@ -201,10 +201,11 @@ def rectified_train_tab():
                 'flow, and the selected vocoder turns them into audio. The vocoder sets the mel of new experiments '
                 'from `rectified_flow/presets/mel`: 44.1 kHz with 128 bins for the NSF-HiFiGAN vocoders (F0), '
                 '44.1 kHz with 80 bins up to 8 kHz for Vocos 44.1 kHz, 24 kHz for Vocos 24 kHz, 44.1 kHz with 128 '
-                'bins up to 22.05 kHz for Pupu-Vocoder and 24 kHz with 100 Slaney bins for BigVGAN (no F0), so choose '
-                'it before preprocessing. Training from scratch needs a dataset of **1 hour or more** for good '
-                'results; with less audio, check **Pretrained** to fine-tune instead, or try **EXPERIMENTAL: Small '
-                'dataset model** with 10 minutes or more.')
+                'bins up to 22.05 kHz for Pupu-Vocoder and 24 kHz with 100 Slaney bins for BigVGAN (no F0), and 32 kHz '
+                'with 100 bins for NSF-BigVGAN (F0, offline conversion only), so choose it before preprocessing. '
+                'Training from scratch needs a dataset of **1 hour or more** for good results; with less audio, check '
+                '**Pretrained** to fine-tune instead, or try **EXPERIMENTAL: Small dataset model** with 10 minutes or '
+                'more.')
     with gr.Row():
         name = gr.Textbox(label='Model name', value='my-flow')
         device = gr.Textbox(label='Device', value='auto',

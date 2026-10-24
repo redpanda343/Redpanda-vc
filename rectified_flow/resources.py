@@ -141,6 +141,18 @@ VOCODERS = {
             'config.json': ('config.json', 'd77e2c96583ca2296ac112a56ec7cc6bd5da4bf7681ceff18448bedc4fcf6512', 1402),
         },
     ),
+    'nsf_bigvgan_32khz': dict(
+        title='NSF-BigVGAN 32 kHz by PlayVoice (F0, offline only)',
+        kind='nsf_bigvgan',
+        mel='nsf_bigvgan_32khz',
+        directory='nsf_bigvgan_32khz',
+        filename='model.pth',
+        base_url='https://github.com/PlayVoice/BigVGAN/releases/download/augment/',
+        downloads={
+            'model.pth': ('nsf_bigvgan_pretrain_32K.pth',
+                          '0e32aaea5fd26bcba47c18d3b0a44f5371dfce25a099aa468420d9d605eda225', 116020827),
+        },
+    ),
 }
 HNSEP_URL = 'https://github.com/yxlllc/vocal-remover/releases/download/hnsep_240512/hnsep_240512.zip'
 HNSEP_ARCHIVE_SHA256 = '3d353d6a14005690819210ad0cb8134326caa286e30f329da266049ed9cdff13'

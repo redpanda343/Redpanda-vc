@@ -1660,7 +1660,8 @@ def download(**kwargs):
 @click.option(
     "--pretraineds-hifigan/--no-pretraineds-hifigan",
     default=True,
-    help="Download pretrained HiFi-GAN models and the pretrained Vocos, Pupu-Vocoder and BigVGAN flow vocoders.",
+    help="Download pretrained HiFi-GAN models and the pretrained Vocos, Pupu-Vocoder, BigVGAN and NSF-BigVGAN flow "
+    "vocoders.",
 )
 @click.option("--models/--no-models", default=True, help="Download additional models.")
 @click.option("--exe/--no-exe", default=True, help="Download required executables.")
