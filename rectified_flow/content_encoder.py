@@ -29,6 +29,23 @@ def expand_content(x, frames, step, lengths):
     return gather(left) * (1 - weight) + gather(right) * weight
 
 
+def interpolate_content(x, frames, step, lengths):
+    last = (lengths - 1)[:, None]
+    positions = torch.arange(frames, device=x.device, dtype=torch.float64)[None] * (step.double()[:, None] / 2) - 0.25
+    positions = torch.minimum(positions.clamp(min=0.0), last.double())
+    left = positions.floor().long()
+    right = torch.minimum(left + 1, last)
+    weight = (positions - left).to(x.dtype).unsqueeze(-1)
+
+    def gather(index):
+        return x.gather(1, index.unsqueeze(-1).expand(-1, -1, x.shape[-1]))
+
+    return gather(left) * (1 - weight) + gather(right) * weight
+
+
+CONTENT_UPSAMPLING = {'repeat': expand_content, 'linear': interpolate_content}
+
+
 class ContentAttention(nn.Module):
     def __init__(self, channels, heads=2, use_rope=True, rope_interleaved=False, rope_theta=10000.0):
         super().__init__()
@@ -92,11 +109,14 @@ class ContentEncoderLayer(nn.Module):
 class ContentConditionEncoder(nn.Module):
     def __init__(self, content_channels, hidden_channels, speaker_count, layers, content_step,
                  key_shift=True, speed=True, use_spk_id=False, enc_ffn_kernel_size=3,
-                 use_rope=True, rope_interleaved=False, rope_theta=10000.0, variances=()):
+                 use_rope=True, rope_interleaved=False, rope_theta=10000.0, variances=(), content_upsampling='repeat'):
         super().__init__()
         if not content_step > 0:
             raise ValueError('Content encoding requires the mel hop in content frames.')
+        if content_upsampling not in CONTENT_UPSAMPLING:
+            raise ValueError(f'content_upsampling must be one of {sorted(CONTENT_UPSAMPLING)}.')
         self.content_step = float(content_step)
+        self.upsample = CONTENT_UPSAMPLING[content_upsampling]
         self.speaker_count = int(speaker_count) if use_spk_id else 1
         self.content = nn.Linear(content_channels, hidden_channels)
         nn.init.xavier_uniform_(self.content.weight)
@@ -132,7 +152,7 @@ class ContentConditionEncoder(nn.Module):
         x = self.norm(x) * content_mask.transpose(1, 2)
         speeds = (f0.new_ones(f0.shape[0]) if speed is None else speed.reshape(-1)).double()
         lengths = content_mask[:, 0].sum(-1).long()
-        x = expand_content(x, mask.shape[-1], speeds * self.content_step, lengths) * mask.transpose(1, 2)
+        x = self.upsample(x, mask.shape[-1], speeds * self.content_step, lengths) * mask.transpose(1, 2)
         if self.speaker is not None:
             x = x + self.speaker(speaker).unsqueeze(1)
         x = x + self.pitch(torch.log1p(f0 * mask[:, 0] / 700.0).unsqueeze(-1))

@@ -71,7 +71,7 @@ class MeanFlow(nn.Module):
             key_shift=settings['key_shift'], speed=settings['speed'], use_spk_id=self.use_spk_id,
             enc_ffn_kernel_size=settings['enc_ffn_kernel_size'], use_rope=settings['use_rope'],
             rope_interleaved=settings['rope_interleaved'], rope_theta=settings['rope_theta'],
-            variances=variance_names(settings),
+            variances=variance_names(settings), content_upsampling=settings['content_upsampling'],
         )
         self.backbone = MeanFlowBackbone(n_mels, hidden_channels, **(backbone_args or {}))
         self.mean_flow_args = dict(mean_flow_args)

@@ -88,6 +88,7 @@ def resolve_config(config):
             raise ValueError('F0-free flows are no longer supported. Retrain this voice with F0.')
         model = {key: value for key, value in model.items() if key not in REMOVED_MODEL_KEYS}
         model.setdefault('use_tension_embed', False)
+        model.setdefault('content_upsampling', 'repeat')
         config = dict(config, flow=dict(flow, model=model))
     return _merge(base_config(), config)
 

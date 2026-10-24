@@ -121,6 +121,7 @@
       "use_breathiness_embed": true,
       "use_voicing_embed": true,
       "use_tension_embed": false,
+      "content_upsampling": "linear",
       "backbone_args": {
         "channels": 1024,
         "layers": 6,

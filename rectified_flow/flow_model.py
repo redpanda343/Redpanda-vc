@@ -6,7 +6,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from rectified_flow.config import resolve_config
-from rectified_flow.content_encoder import ContentConditionEncoder
+from rectified_flow.content_encoder import CONTENT_UPSAMPLING, ContentConditionEncoder
 from rectified_flow.source_filter import HarmonicTemplate, SourceFilterDecoder, validate_source_filter_config
 from rectified_flow.variance import variance_names
 
@@ -201,6 +201,7 @@ class RectifiedFlow(nn.Module):
         use_breathiness_embed: bool = False,
         use_voicing_embed: bool = False,
         use_tension_embed: bool = False,
+        content_upsampling: str = 'repeat',
         backbone_args: Optional[dict] = None,
         aux_decoder: Optional[dict] = None,
         aux_grad: float = 0.1,
@@ -238,6 +239,7 @@ class RectifiedFlow(nn.Module):
             variances=variance_names(dict(use_breathiness_embed=use_breathiness_embed,
                                           use_voicing_embed=use_voicing_embed,
                                           use_tension_embed=use_tension_embed)),
+            content_upsampling=content_upsampling,
         )
         self.harmonics = HarmonicTemplate(data) if source_filter else None
         cond_channels = hidden_channels + (n_mels if source_filter else 0)
@@ -380,6 +382,8 @@ def validate_model_config(model: dict):
         value = section[key]
         if isinstance(value, bool) or not isinstance(value, int) or value < 1 or value % 2 == 0:
             raise ValueError(f'{key} must be a positive odd integer.')
+    if model['content_upsampling'] not in CONTENT_UPSAMPLING:
+        raise ValueError(f'content_upsampling must be one of {sorted(CONTENT_UPSAMPLING)}.')
     if not math.isfinite(model['rope_theta']) or model['rope_theta'] <= 0:
         raise ValueError('rope_theta must be finite and positive.')
     if model['backbone_args']['glu_type'] not in {'atanglu', 'softsign_glu'}:
