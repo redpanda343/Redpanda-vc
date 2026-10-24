@@ -1,4 +1,5 @@
 import math
+from contextlib import contextmanager
 
 import numpy as np
 import soxr
@@ -124,8 +125,18 @@ def vr_separator(device):
     return _SEPARATORS[key]
 
 
+@contextmanager
+def _without_cudnn_autotune():
+    previous = torch.backends.cudnn.benchmark
+    torch.backends.cudnn.benchmark = False
+    try:
+        yield
+    finally:
+        torch.backends.cudnn.benchmark = previous
+
+
 def _vr_harmonic(model, waveform, device):
-    with torch.no_grad():
+    with torch.no_grad(), _without_cudnn_autotune():
         x = torch.from_numpy(np.ascontiguousarray(waveform, dtype=np.float32)).to(device).reshape(1, 1, -1)
         if not model.is_mono:
             x = x.repeat(1, 2, 1)
