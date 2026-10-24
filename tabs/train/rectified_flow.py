@@ -260,7 +260,8 @@ def rectified_train_tab():
         small_dataset = gr.Checkbox(label='EXPERIMENTAL: Small dataset model', value=False,
                                     info="Source-filter flow for 10 minutes of audio or more at DiffSinger's model "
                                          'size: it places harmonics from the F0 and trains with pitch and speed '
-                                         'augmentation and backbone dropout.')
+                                         'augmentation, ContentVec taken from formant- and pitch-perturbed copies of '
+                                         'the dataset, and backbone dropout.')
         use_fused_kernels = gr.Checkbox(label='Fused Linear + SoftSignGLU kernels', value=False,
                                        info='Set it when starting a new experiment: the experiment then trains with SoftSignGLU so the '
                                             'kernels can run. Experiments and pretrained checkpoints that use ATanGLU cannot enable it. '

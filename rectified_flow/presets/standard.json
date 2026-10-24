@@ -72,6 +72,10 @@
           -40.0
         ],
         "probability": 0.5
+      },
+      "random_content_perturbation": {
+        "enabled": false,
+        "scale": 1.0
       }
     },
     "augmentation_workers": 0,

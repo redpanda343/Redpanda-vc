@@ -16,6 +16,9 @@
       },
       "random_time_stretching": {
         "enabled": true
+      },
+      "random_content_perturbation": {
+        "enabled": true
       }
     },
     "model": {
