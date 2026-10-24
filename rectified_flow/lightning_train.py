@@ -322,6 +322,7 @@ class FlowTask(pl.LightningModule):
             if f'encoder.variance_embeds.{name}.weight' in missing:
                 torch.nn.init.zeros_(layer.weight)
                 torch.nn.init.zeros_(layer.bias)
+        print(f'Loaded pretrained flow {path} ({state["step"]} steps).', flush=True)
 
 
 class FlowCheckpoint(ModelCheckpoint):

@@ -145,11 +145,13 @@
   },
   "finetune": {
     "flow": {
-      "finetune_learning_rate": 5e-05,
-      "finetune_warmup_steps": 500,
+      "finetune_learning_rate": 0.0001,
+      "finetune_warmup_steps": 0,
       "min_learning_rate": 1e-05,
-      "decay_step": 2000,
+      "lr_schedule": "cosine",
+      "max_updates": 10000,
       "eval_interval": 500,
+      "checkpoint_interval": 2000,
       "augmentation_args": {
         "random_pitch_shifting": {
           "enabled": false
