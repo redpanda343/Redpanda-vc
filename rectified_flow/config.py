@@ -96,7 +96,6 @@ def default_config(finetune=False, preset='standard', mel=None):
     config = read_preset(preset)
     overrides = config.pop(FINETUNE_KEY, {})
     config = _merge(base_config(), config)
-    config['flow']['training_preset'] = preset
     if mel:
         config = _merge(config, {'data': mel_preset(mel)})
     return _merge(config, overrides) if finetune else config

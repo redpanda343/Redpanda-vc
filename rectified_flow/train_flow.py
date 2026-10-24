@@ -163,10 +163,10 @@ def require_fused_activation(config, enabled):
                          'Enable them only when starting a new experiment, or turn them off.')
 
 
-def training_method(model, preset=None):
+def training_method(model):
     if model.get('mean_flow', False):
         return 'meanflow'
-    return 'small_dataset' if model.get('source_filter', False) or preset == 'small_dataset' else None
+    return 'small_dataset' if model.get('source_filter', False) else None
 
 
 def experiment_pitch_extractor(experiment):
@@ -202,7 +202,7 @@ def load_training_config(experiment, pretrained_flow=None, use_fused_kernels=Fal
                                            use_voicing_embed=bool(variance_embeds))
         if use_fused_kernels and not pretrained_flow:
             config['flow']['model']['backbone_args']['glu_type'] = 'softsign_glu'
-    method = training_method(config['flow']['model'], config['flow']['training_preset'])
+    method = training_method(config['flow']['model'])
     if method != (preset if preset in TRAINING_METHODS else None):
         selected = TRAINING_METHODS.get(method, 'standard rectified flow')
         raise ValueError(f'{source} uses {selected}. Select the matching training method or use a new experiment.')
@@ -223,9 +223,6 @@ def load_training_config(experiment, pretrained_flow=None, use_fused_kernels=Fal
                          'or start a new experiment.')
     require_fused_activation(config, use_fused_kernels)
     configure_flow(config)
-    if preset == 'small_dataset' and config['flow']['model']['source_filter']:
-        print('This experiment uses the previous compact source-filter model. Resuming keeps that architecture. '
-              'Start a new experiment to use the full-size small dataset recipe.', flush=True)
     return config
 
 
@@ -247,8 +244,6 @@ def train(args):
 def configure_flow(config):
     settings = config['flow']
     validate_model_config(settings['model'])
-    if settings['training_preset'] not in PRESETS:
-        raise ValueError(f'training_preset must be one of {PRESETS}.')
     for name in ('dataloader_prefetch_factor', 'log_interval', 'accumulate_grad_batches', 'num_nodes',
                  'max_val_batch_frames', 'max_val_batch_size', 'sampler_frame_count_grid',
                  'max_updates', 'checkpoint_interval', 'num_ckpt_keep', 'permanent_ckpt_interval'):

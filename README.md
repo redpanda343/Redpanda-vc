@@ -8,8 +8,6 @@ A fork of [Applio](https://github.com/IAHispano/Applio) that adds the option to 
 
 The Rectified Flow model uses the same architecture as [DiffSinger](https://github.com/openvpi/DiffSinger)'s acoustic model, with ContentVec features in place of phonemes.
 
-The experimental small dataset preset targets datasets of at least 10 minutes. It uses the full standard encoder, flow backbone and mel decoder, with gentler augmentation, a lower learning rate with warmup and smaller batches. Checkpoints are saved every 2,000 updates. Start a new experiment to use this recipe; existing compact source-filter checkpoints remain loadable and resume with their original architecture.
-
 The realtime GUI (`run-realtime-gui.bat`) supports RVC, Beatrice and Rectified Flow models.
 
 The WebUI realtime tab supports multiple GPUs through isolated inference workers. Set Inference Device to Automatic to assign each new stream to an available GPU, or select a specific GPU. Separate browser tabs or users can run streams on different GPUs. Each stream stays on one GPU to preserve its audio state; additional GPUs increase concurrent capacity. Beatrice uses the CPU.
