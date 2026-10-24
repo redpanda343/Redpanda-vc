@@ -13,7 +13,7 @@ from shared.tools.prerequisites_download import _sha256, download_file
 ROOT = Path(__file__).resolve().parents[1]
 VOCODER_ROOT = ROOT / 'models' / 'pretraineds' / 'rectified'
 CUSTOM_VOCODER_ROOT = ROOT / 'models' / 'rectified' / 'custom'
-VOCODER_EXTENSIONS = ('.ckpt', '.pth', '.onnx')
+VOCODER_EXTENSIONS = ('.ckpt', '.pth', '.onnx', '.safetensors')
 DEFAULT_VOCODER = 'pc_nsf_hifigan'
 VOCODERS = {
     'pc_nsf_hifigan': dict(
@@ -97,6 +97,20 @@ VOCODERS = {
             'model.pth': ('pytorch_model.bin', '97ec976ad1fd67a33ab2682d29c0ac7df85234fae875aefcc5fb215681a91b2a',
                           54365991),
             'config.yaml': ('config.yaml', 'da9033922f969a47f0c160010226919e59f27761fd5066f3828d46de6650b0fc', 461),
+        },
+    ),
+    'pupu_vocoder': dict(
+        title='Pupu-Vocoder Small by spellbrush (no F0)',
+        kind='pupu',
+        mel='pupu_44khz',
+        directory='pupu_vocoder_small',
+        filename='model.safetensors',
+        base_url=('https://huggingface.co/spellbrush/AliasingFreeNeuralAudioSynthesis/resolve/'
+                  '2a180a639566f45f0d005627ebce21f2b658264a/pupuvocoder/checkpoint/'
+                  'epoch-0051_step-2553605_loss-62.135194/'),
+        downloads={
+            'model.safetensors': ('model.safetensors',
+                                  '62320716a66f7312584a41b48e5e87bf7969cc88a44cdafed46eb2c6129f9dfe', 60989884),
         },
     ),
 }

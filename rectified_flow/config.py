@@ -8,7 +8,7 @@ MEL_PRESET_DIR = PRESET_DIR / 'mel'
 
 PRESETS = ('standard', 'smaller', 'meanflow', 'small_dataset')
 
-MEL_PRESETS = ('openvpi_44khz', 'vocos_44khz', 'vocos_24khz')
+MEL_PRESETS = ('openvpi_44khz', 'vocos_44khz', 'vocos_24khz', 'pupu_44khz')
 
 FINETUNE_KEY = 'finetune'
 

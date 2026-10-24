@@ -37,18 +37,26 @@ def mel_mismatch(data: dict, vocoder_data: dict):
 
 def load_vocoder(path: str, data: dict):
     from rectified_flow.openvpi import NSFHiFiGAN, generator_state, onnx_generator_state, openvpi_spec
+    from rectified_flow.pupu import build_pupu, is_pupu
     from rectified_flow.vocos import build_vocos, is_vocos
 
     checkpoint = None
     if str(path).lower().endswith(".onnx"):
         state = onnx_generator_state(path)
     else:
-        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+        if str(path).lower().endswith(".safetensors"):
+            from safetensors.torch import load_file
+
+            checkpoint = load_file(path)
+        else:
+            checkpoint = torch.load(path, map_location="cpu", weights_only=True)
         state = generator_state(checkpoint)
     if is_vocos(checkpoint):
         generator, vocoder_data, _ = build_vocos(path, checkpoint)
+    elif is_pupu(checkpoint):
+        generator, vocoder_data = build_pupu(path, checkpoint)
     elif state is None:
-        raise ValueError(f"{path} is not an NSF-HiFiGAN or Vocos vocoder.")
+        raise ValueError(f"{path} is not an NSF-HiFiGAN, Vocos or Pupu-Vocoder vocoder.")
     else:
         hparams, vocoder_data, weights = openvpi_spec(path, state)
         generator = NSFHiFiGAN(**hparams)

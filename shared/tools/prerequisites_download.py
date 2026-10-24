@@ -363,7 +363,7 @@ def prequisites_download_pipeline(
 
         pretrained_path()
         for name, spec in VOCODERS.items():
-            if spec['kind'] != 'vocos':
+            if spec['kind'] not in ('vocos', 'pupu'):
                 continue
             try:
                 vocoder_path(name)

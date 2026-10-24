@@ -23,6 +23,7 @@ Browser realtime audio uses a binary WebSocket connection, including with `--sha
 - [FireRedVAD](https://github.com/FireRedTeam/FireRedVAD)
 - [MeanVC2](https://github.com/ASLP-lab/MeanVC2) by ASLP-lab for the optional MeanFlow training method.
 - [OpenVPI PC-NSF-HiFiGAN](https://github.com/openvpi/vocoders)
+- [Pupu-Vocoder](https://github.com/sizigi/AliasingFreeNeuralAudioSynthesis) by Yicheng Gu et al. (MIT), with the sinc filters of [julius](https://github.com/adefossez/julius) (MIT)
 - [Retrieval-based-Voice-Conversion-WebUI](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI)
 - [RMVPE](https://github.com/yxlllc/RMVPE)
 - [RVC-Realtime-GUI](https://github.com/niel-blue/RVC-Realtime-GUI/)
