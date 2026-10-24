@@ -2,6 +2,8 @@
   "flow": {
     "decay_step": 3000,
     "max_updates": 30000,
+    "max_batch_frames": 50000,
+    "max_batch_size": 64,
     "holdout_clips": 8,
     "eval_interval": 2000,
     "preview_interval": 2000,
@@ -18,16 +20,16 @@
     },
     "model": {
       "source_filter": true,
-      "hidden_channels": 256,
+      "hidden_channels": 384,
       "encoder_layers": 4,
       "backbone_args": {
-        "channels": 512,
+        "channels": 1024,
         "layers": 6,
         "dropout_rate": 0.1
       },
       "aux_decoder": {
-        "channels": 256,
-        "layers": 4
+        "channels": 512,
+        "layers": 6
       }
     }
   },
