@@ -7,6 +7,7 @@ from torch.nn import functional as F
 
 from rectified_flow.config import resolve_config
 from rectified_flow.content_encoder import ContentConditionEncoder
+from rectified_flow.source_filter import HarmonicTemplate, SourceFilterDecoder, validate_source_filter_config
 from rectified_flow.variance import variance_names
 
 SAMPLERS = ("euler", "rk2", "rk4", "rk5")
@@ -211,10 +212,15 @@ class RectifiedFlow(nn.Module):
         train_aux_decoder: bool = True,
         train_diffusion: bool = True,
         val_gt_start: bool = False,
+        source_filter: bool = False,
+        source_filter_args: Optional[dict] = None,
+        data: Optional[dict] = None,
     ):
         super().__init__()
         if not train_diffusion and not train_aux_decoder:
             raise ValueError('Enable at least one training objective.')
+        if source_filter and (data is None or source_filter_args is None):
+            raise ValueError('The source-filter flow needs the mel settings and source_filter_args.')
         if not 0.0 <= t_start < 1.0 or not 0.0 <= t_start_infer <= 1.0:
             raise ValueError('Shallow flow start times must be between 0 and 1.')
         if sampling_method not in SAMPLERS or int(sampling_steps) != sampling_steps or sampling_steps < 1:
@@ -233,8 +239,15 @@ class RectifiedFlow(nn.Module):
                                           use_voicing_embed=use_voicing_embed,
                                           use_tension_embed=use_tension_embed)),
         )
-        self.backbone = LYNXNet2Backbone(n_mels, hidden_channels, **(backbone_args or {}))
-        self.aux = AuxDecoder(hidden_channels, n_mels, **(aux_decoder or {}))
+        self.harmonics = HarmonicTemplate(data) if source_filter else None
+        cond_channels = hidden_channels + (n_mels if source_filter else 0)
+        self.backbone = LYNXNet2Backbone(n_mels, cond_channels, **(backbone_args or {}))
+        if source_filter:
+            trunk = AuxDecoder(cond_channels, source_filter_args['envelope_coefficients'] +
+                               source_filter_args['aperiodicity_coefficients'], **(aux_decoder or {}))
+            self.aux = SourceFilterDecoder(trunk, n_mels, data, **source_filter_args)
+        else:
+            self.aux = AuxDecoder(cond_channels, n_mels, **(aux_decoder or {}))
         self.t_start = float(t_start)
         self.t_start_infer = float(t_start_infer)
         self.train_aux_decoder = bool(train_aux_decoder)
@@ -260,8 +273,14 @@ class RectifiedFlow(nn.Module):
     def _uniform_times(self, batch, device):
         return self.t_start + (1.0 - self.t_start) * torch.rand(batch, device=device)
 
-    def forward(self, mel, content, f0, speaker, mask, content_mask=None, key_shift=None, speed=None, variances=None):
+    def condition(self, content, f0, speaker, mask, content_mask=None, key_shift=None, speed=None, variances=None):
         cond = self.encoder(content, f0, speaker, mask, content_mask, key_shift, speed, variances)
+        if self.harmonics is None:
+            return cond
+        return torch.cat((cond, (self.harmonics(f0) * mask).to(cond.dtype)), dim=1)
+
+    def forward(self, mel, content, f0, speaker, mask, content_mask=None, key_shift=None, speed=None, variances=None):
+        cond = self.condition(content, f0, speaker, mask, content_mask, key_shift, speed, variances)
         t = self._uniform_times(mel.shape[0], mel.device)
         backbone_times, timestep_mask = t, None
         if self.dual_timestep:
@@ -284,7 +303,7 @@ class RectifiedFlow(nn.Module):
         return flow, aux
 
     def predict_mel(self, content, f0, speaker, mask, content_mask=None, key_shift=None, speed=None, variances=None):
-        return self.aux(self.encoder(content, f0, speaker, mask, content_mask, key_shift, speed, variances)) * mask
+        return self.aux(self.condition(content, f0, speaker, mask, content_mask, key_shift, speed, variances)) * mask
 
     @torch.no_grad()
     def sample(
@@ -308,7 +327,7 @@ class RectifiedFlow(nn.Module):
         if method not in SAMPLERS:
             raise ValueError(f"method must be one of {SAMPLERS}, not {method!r}.")
         batch = content.shape[0]
-        cond =self.encoder(content, f0, speaker, mask, content_mask, key_shift, speed, variances)
+        cond =self.condition(content, f0, speaker, mask, content_mask, key_shift, speed, variances)
         if start:
             cond, mask = cond[..., start:], mask[..., start:]
             source_mel = None if source_mel is None else source_mel[..., start:]
@@ -353,7 +372,7 @@ def validate_model_config(model: dict):
         raise ValueError('mean_flow must be a boolean.')
     for name in ('use_rope', 'rope_interleaved', 'use_spk_id', 'key_shift', 'speed', 'dual_timestep',
                  'train_aux_decoder', 'train_diffusion', 'val_gt_start', 'use_breathiness_embed',
-                 'use_voicing_embed', 'use_tension_embed'):
+                 'use_voicing_embed', 'use_tension_embed', 'source_filter'):
         if not isinstance(model[name], bool):
             raise ValueError(f'{name} must be a boolean.')
     for section, key in ((model, 'enc_ffn_kernel_size'), (model['aux_decoder'], 'kernel_size'),
@@ -365,6 +384,8 @@ def validate_model_config(model: dict):
         raise ValueError('rope_theta must be finite and positive.')
     if model['backbone_args']['glu_type'] not in {'atanglu', 'softsign_glu'}:
         raise ValueError(f"Unsupported flow activation: {model['backbone_args']['glu_type']!r}.")
+    if model['source_filter']:
+        validate_source_filter_config(model)
     if model.get('mean_flow', False):
         from rectified_flow.mean_flow import validate_mean_flow_config
 
@@ -388,6 +409,8 @@ def build_flow(config: dict, speaker_count: int) -> RectifiedFlow:
 
         model_class = MeanFlow
         model['mean_flow_args'] = mean_flow_args
+    else:
+        model['data'] = data
     return model_class(
         n_mels=data["n_mels"], speaker_count=speaker_count,
         content_step=data['hop_length'] * 100 / data['sample_rate'],

@@ -18,6 +18,7 @@ from rectified_flow.resources import VOCODERS
 from rectified_flow.variance import HNSEP_METHODS, VARIANCES
 
 ROOT = Path(__file__).resolve().parents[1]
+TRAINING_METHODS = {'meanflow': 'EXPERIMENTAL: Realtime model', 'small_dataset': 'EXPERIMENTAL: Small dataset model'}
 
 
 def atomic_save(state, path):
@@ -147,6 +148,12 @@ def require_fused_activation(config, enabled):
                          'Enable them only when starting a new experiment, or turn them off.')
 
 
+def training_method(model):
+    if model.get('mean_flow', False):
+        return 'meanflow'
+    return 'small_dataset' if model.get('source_filter', False) else None
+
+
 def experiment_pitch_extractor(experiment):
     path = Path(experiment) / 'model_info.json'
     info = json.loads(path.read_text(encoding='utf-8')) if path.is_file() else {}
@@ -180,9 +187,9 @@ def load_training_config(experiment, pretrained_flow=None, use_fused_kernels=Fal
                                            use_voicing_embed=bool(variance_embeds))
         if use_fused_kernels and not pretrained_flow:
             config['flow']['model']['backbone_args']['glu_type'] = 'softsign_glu'
-    mean_flow = config['flow']['model'].get('mean_flow', False)
-    if mean_flow != (preset == 'meanflow'):
-        selected = 'EXPERIMENTAL: Realtime model' if mean_flow else 'standard rectified flow'
+    method = training_method(config['flow']['model'])
+    if method != (preset if preset in TRAINING_METHODS else None):
+        selected = TRAINING_METHODS.get(method, 'standard rectified flow')
         raise ValueError(f'{source} uses {selected}. Select the matching training method or use a new experiment.')
     sizes = {name: architecture(default_config(preset=name)['flow']['model']) for name in PRESETS}
     size = architecture(config['flow']['model'])
