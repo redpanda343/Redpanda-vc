@@ -200,11 +200,11 @@ def rectified_train_tab():
                 'place of phonemes. It generates mel spectrograms from the source voice and its pitch with rectified '
                 'flow, and the selected vocoder turns them into audio. The vocoder sets the mel of new experiments '
                 'from `rectified_flow/presets/mel`: 44.1 kHz with 128 bins for the NSF-HiFiGAN vocoders (F0), '
-                '44.1 kHz with 80 bins up to 8 kHz for Vocos 44.1 kHz, 24 kHz for Vocos 24 kHz and 44.1 kHz with 128 '
-                'bins up to 22.05 kHz for Pupu-Vocoder (no F0), so choose it before preprocessing. Training from '
-                'scratch needs a dataset of **1 hour or more** for good results; with less audio, check **Pretrained** '
-                'to fine-tune instead, '
-                'or try **EXPERIMENTAL: Small dataset model** with 10 minutes or more.')
+                '44.1 kHz with 80 bins up to 8 kHz for Vocos 44.1 kHz, 24 kHz for Vocos 24 kHz, 44.1 kHz with 128 '
+                'bins up to 22.05 kHz for Pupu-Vocoder and 24 kHz with 100 Slaney bins for BigVGAN (no F0), so choose '
+                'it before preprocessing. Training from scratch needs a dataset of **1 hour or more** for good '
+                'results; with less audio, check **Pretrained** to fine-tune instead, or try **EXPERIMENTAL: Small '
+                'dataset model** with 10 minutes or more.')
     with gr.Row():
         name = gr.Textbox(label='Model name', value='my-flow')
         device = gr.Textbox(label='Device', value='auto',
@@ -232,9 +232,9 @@ def rectified_train_tab():
             vocoder = gr.Dropdown(label='Vocoder', choices=vocoder_choices(), value=DEFAULT_VOCODER, scale=4,
                                   info='Sets the mel and sample rate of new experiments, so choose it before '
                                        'preprocessing. Renders the training previews and becomes the default '
-                                       'vocoder of exported models. Custom NSF-HiFiGAN (F0), Vocos or Pupu-Vocoder '
-                                       '(no F0) vocoders (.ckpt, .pth, .onnx or .safetensors, with any config.json or '
-                                       'vocoder.yaml beside them) are listed from '
+                                       'vocoder of exported models. Custom NSF-HiFiGAN (F0), Vocos, Pupu-Vocoder or '
+                                       'BigVGAN (no F0) vocoders (.ckpt, .pth, .onnx or .safetensors, with any '
+                                       'config.json or vocoder.yaml beside them) are listed from '
                                        f'{CUSTOM_VOCODER_ROOT.relative_to(ROOT).as_posix()}.')
             refresh_vocoder_button = gr.Button('Refresh', scale=1)
         refresh_vocoder_button.click(refresh_vocoders, vocoder, vocoder, queue=False)

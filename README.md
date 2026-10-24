@@ -17,6 +17,7 @@ Browser realtime audio uses a binary WebSocket connection, including with `--sha
 ## Credits
 
 - [Applio](https://github.com/IAHispano/Applio)
+- [BigVGAN](https://github.com/NVIDIA/BigVGAN) by NVIDIA (MIT)
 - [Beatrice Trainer](https://huggingface.co/fierce-cats/beatrice-trainer)
 - [ContentVec](https://github.com/auspicious3000/contentvec/)
 - [DiffSinger](https://github.com/openvpi/DiffSinger)

@@ -1,11 +1,13 @@
 import math
 
+import numpy as np
 import torch
 from torch import nn
 
-from rectified_flow.mel import MEL_DEFAULTS
+from rectified_flow.mel import MEL_DEFAULTS, LogMel
 
 MEL_KEYS = ("sample_rate", "hop_length", "n_fft", "win_length", "n_mels", "mel_fmin", "mel_fmax", *MEL_DEFAULTS)
+CHUNK_FRAMES = 1024
 
 class RawMelVocoder(nn.Module):
     def __init__(self, generator: nn.Module, data: dict):
@@ -16,6 +18,39 @@ class RawMelVocoder(nn.Module):
 
     def forward(self, mel, f0):
         return self.generator(mel * self.mel_std + self.mel_mean, f0)
+
+
+class ChunkedInference:
+    name = "vocoder"
+    build = None
+
+    def __init__(self, path, checkpoint, device):
+        self.device = torch.device(device)
+        generator, self.data = self.build(path, checkpoint)
+        self.generator = generator.to(self.device).float().eval().requires_grad_(False)
+        self.context = math.ceil(self.generator.radius)
+        self.mel = LogMel.from_config(self.data).to(self.device).eval()
+
+    @torch.inference_mode()
+    def infer(self, waveform, pitch=0, f0_method="rmvpe", seed=None):
+        if float(pitch):
+            raise ValueError(f"{self.name} has no pitch input. Set Pitch to 0.")
+        waveform = np.asarray(waveform, dtype=np.float32)
+        if waveform.ndim != 1 or not len(waveform) or not np.isfinite(waveform).all():
+            raise ValueError("Select non-empty audio with finite samples.")
+        hop, length = int(self.data["hop_length"]), len(waveform)
+        padded_length = max(math.ceil(length / hop), math.ceil(self.data["n_fft"] / hop)) * hop
+        padded = np.pad(np.clip(waveform, -1.0, 1.0), (0, padded_length - length))
+        mel = self.mel(torch.from_numpy(padded).to(self.device)[None])
+        frames, pieces = mel.shape[-1], []
+        for start in range(0, frames, CHUNK_FRAMES):
+            end = min(start + CHUNK_FRAMES, frames)
+            left, right = max(0, start - self.context), min(frames, end + self.context)
+            pieces.append(self.generator(mel[..., left:right])[0, 0, (start - left) * hop:(end - left) * hop])
+        audio = torch.cat(pieces)[:length]
+        if not torch.isfinite(audio).all():
+            raise FloatingPointError(f"Non-finite {self.name} audio output.")
+        return audio.float().cpu().numpy()
 
 
 def _same_mel_value(left, right):
@@ -36,6 +71,7 @@ def mel_mismatch(data: dict, vocoder_data: dict):
 
 
 def load_vocoder(path: str, data: dict):
+    from rectified_flow.bigvgan import build_bigvgan, is_bigvgan
     from rectified_flow.openvpi import NSFHiFiGAN, generator_state, onnx_generator_state, openvpi_spec
     from rectified_flow.pupu import build_pupu, is_pupu
     from rectified_flow.vocos import build_vocos, is_vocos
@@ -55,8 +91,10 @@ def load_vocoder(path: str, data: dict):
         generator, vocoder_data, _ = build_vocos(path, checkpoint)
     elif is_pupu(checkpoint):
         generator, vocoder_data = build_pupu(path, checkpoint)
+    elif is_bigvgan(checkpoint):
+        generator, vocoder_data = build_bigvgan(path, checkpoint)
     elif state is None:
-        raise ValueError(f"{path} is not an NSF-HiFiGAN, Vocos or Pupu-Vocoder vocoder.")
+        raise ValueError(f"{path} is not an NSF-HiFiGAN, Vocos, Pupu-Vocoder or BigVGAN vocoder.")
     else:
         hparams, vocoder_data, weights = openvpi_spec(path, state)
         generator = NSFHiFiGAN(**hparams)

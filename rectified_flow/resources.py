@@ -113,6 +113,20 @@ VOCODERS = {
                                   '62320716a66f7312584a41b48e5e87bf7969cc88a44cdafed46eb2c6129f9dfe', 60989884),
         },
     ),
+    'bigvgan_24khz': dict(
+        title='BigVGAN 24 kHz 100-band by NVIDIA (no F0)',
+        kind='bigvgan',
+        mel='bigvgan_24khz',
+        directory='bigvgan_base_24khz_100band',
+        filename='model.pth',
+        base_url=('https://huggingface.co/nvidia/bigvgan_base_24khz_100band/resolve/'
+                  '0f6305d0e010eaafdbf649978f46c3b5af099343/'),
+        downloads={
+            'model.pth': ('bigvgan_generator.pt', 'ca8bced4d3ef588e654742f732455c16abb004e49d7d3bf03edade84d3e982f2',
+                          56297637),
+            'config.json': ('config.json', '885553969751bfd87f1980017364e968917cd34347376ed08238db673ea5b46b', 1034),
+        },
+    ),
 }
 HNSEP_URL = 'https://github.com/yxlllc/vocal-remover/releases/download/hnsep_240512/hnsep_240512.zip'
 HNSEP_ARCHIVE_SHA256 = '3d353d6a14005690819210ad0cb8134326caa286e30f329da266049ed9cdff13'

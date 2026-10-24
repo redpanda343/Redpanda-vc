@@ -1,37 +1,17 @@
 import math
 
-import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
 
+from rectified_flow.alias_free import ACTIVATION_RADIUS, Activation, AMPBlock, amp_radius, depthwise
 from rectified_flow.openvpi import _fold_weight_norm
+from rectified_flow.vocoder import ChunkedInference
 
 MEL_PRESET = 'pupu_44khz'
 UPSAMPLE_RATES = (8, 8, 2, 2, 2)
 RESBLOCK_DILATIONS = (1, 3, 5)
 FILTER_ZEROS = 8
-ACTIVATION_KERNEL = 12
-ACTIVATION_RADIUS = 6.5
-CHUNK_FRAMES = 1024
-
-
-def kaiser_sinc_filter(cutoff, half_width, kernel_size):
-    half_size = kernel_size // 2
-    attenuation = 2.285 * (half_size - 1) * math.pi * 4 * half_width + 7.95
-    if attenuation > 50.0:
-        beta = 0.1102 * (attenuation - 8.7)
-    elif attenuation >= 21.0:
-        beta = 0.5842 * (attenuation - 21) ** 0.4 + 0.07886 * (attenuation - 21.0)
-    else:
-        beta = 0.0
-    window = torch.kaiser_window(kernel_size, beta=beta, periodic=False)
-    if kernel_size % 2 == 0:
-        time = torch.arange(-half_size, half_size) + 0.5
-    else:
-        time = torch.arange(kernel_size) - half_size
-    taps = 2 * cutoff * window * torch.sinc(2 * cutoff * time)
-    return (taps / taps.sum()).view(1, 1, kernel_size)
 
 
 def sinc_lowpass(cutoff):
@@ -42,50 +22,10 @@ def sinc_lowpass(cutoff):
     return (taps / taps.sum()).view(1, 1, -1)
 
 
-def depthwise(x, taps, stride=1):
-    return F.conv1d(x, taps.expand(x.shape[1], -1, -1), stride=stride, groups=x.shape[1])
-
-
 def zero_stuff(x, factor):
     y = x.new_zeros(*x.shape[:-1], x.shape[-1] * factor)
     y[..., ::factor] = x
     return y
-
-
-class UpSample(nn.Module):
-    def __init__(self, ratio=2, kernel_size=ACTIVATION_KERNEL):
-        super().__init__()
-        self.ratio = ratio
-        self.pad = kernel_size // ratio - 1
-        self.pad_left = self.pad * ratio + (kernel_size - ratio) // 2
-        self.pad_right = self.pad * ratio + (kernel_size - ratio + 1) // 2
-        self.register_buffer('filter', kaiser_sinc_filter(0.5 / ratio, 0.6 / ratio, kernel_size))
-
-    def forward(self, x):
-        x = F.pad(x, (self.pad, self.pad), mode='replicate')
-        x = self.ratio * F.conv_transpose1d(x, self.filter.expand(x.shape[1], -1, -1), stride=self.ratio,
-                                            groups=x.shape[1])
-        return x[..., self.pad_left:-self.pad_right]
-
-
-class LowPass(nn.Module):
-    def __init__(self, ratio=2, kernel_size=ACTIVATION_KERNEL):
-        super().__init__()
-        self.ratio = ratio
-        self.padding = (kernel_size // 2 - int(kernel_size % 2 == 0), kernel_size // 2)
-        self.register_buffer('filter', kaiser_sinc_filter(0.5 / ratio, 0.6 / ratio, kernel_size))
-
-    def forward(self, x):
-        return depthwise(F.pad(x, self.padding, mode='replicate'), self.filter, self.ratio)
-
-
-class DownSample(nn.Module):
-    def __init__(self, ratio=2, kernel_size=ACTIVATION_KERNEL):
-        super().__init__()
-        self.lowpass = LowPass(ratio, kernel_size)
-
-    def forward(self, x):
-        return self.lowpass(x)
 
 
 class ADAASnakeBeta(nn.Module):
@@ -101,32 +41,6 @@ class ADAASnakeBeta(nn.Module):
         total = x + previous
         smooth = torch.cos(alpha * total) * torch.sinc(alpha * (x - previous) / math.pi)
         return total / 2.0 + (1.0 - smooth) / (2.0 * (beta + 1e-9))
-
-
-class Activation(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.act = ADAASnakeBeta(channels)
-        self.upsample = UpSample()
-        self.downsample = DownSample()
-
-    def forward(self, x):
-        return self.downsample(self.act(self.upsample(x)))
-
-
-class ResBlock(nn.Module):
-    def __init__(self, channels, kernel_size, dilations=RESBLOCK_DILATIONS):
-        super().__init__()
-        self.convs1 = nn.ModuleList(nn.Conv1d(channels, channels, kernel_size, dilation=dilation,
-                                              padding=(kernel_size - 1) * dilation // 2) for dilation in dilations)
-        self.convs2 = nn.ModuleList(nn.Conv1d(channels, channels, kernel_size, padding=(kernel_size - 1) // 2)
-                                    for _ in dilations)
-        self.activations = nn.ModuleList(Activation(channels) for _ in range(2 * len(dilations)))
-
-    def forward(self, x):
-        for first, second, act1, act2 in zip(self.convs1, self.convs2, self.activations[::2], self.activations[1::2]):
-            x = x + second(act2(first(act1(x))))
-        return x
 
 
 class ResampleUpsampler(nn.Module):
@@ -157,12 +71,11 @@ class PupuVocoder(nn.Module):
         self.conv_pre = nn.Conv1d(num_mels, channels, 7, padding=3)
         self.ups = nn.ModuleList(ResampleUpsampler(channels, rate, channels >> index, channels >> (index + 1))
                                  for index, rate in enumerate(upsample_rates))
-        self.resblocks = nn.ModuleList(ResBlock(channels >> (index + 1), kernel_size, resblock_dilations)
+        self.resblocks = nn.ModuleList(AMPBlock(channels >> (index + 1), kernel_size, resblock_dilations, ADAASnakeBeta)
                                        for index in range(len(upsample_rates)) for kernel_size in resblock_kernel_sizes)
-        self.activation_post = Activation(channels >> len(upsample_rates))
+        self.activation_post = Activation(ADAASnakeBeta(channels >> len(upsample_rates)))
         self.conv_post = nn.Conv1d(channels >> len(upsample_rates), 1, 7, padding=3, bias=False)
-        block = max(sum((kernel_size - 1) * (dilation + 1) / 2 for dilation in resblock_dilations)
-                    for kernel_size in resblock_kernel_sizes) + 2 * len(resblock_dilations) * ACTIVATION_RADIUS
+        block = amp_radius(resblock_kernel_sizes, [resblock_dilations] * self.num_kernels)
         stages = sum((FILTER_ZEROS * rate + block) / factor for rate, factor in zip(upsample_rates, self.factors))
         self.radius = 3 + stages + (ACTIVATION_RADIUS + 3) / self.factors[-1]
 
@@ -208,33 +121,6 @@ def build_pupu(path, checkpoint):
     return generator, mel
 
 
-class PupuInference:
-    def __init__(self, path, checkpoint, device):
-        from rectified_flow.mel import LogMel
-
-        self.device = torch.device(device)
-        generator, self.data = build_pupu(path, checkpoint)
-        self.generator = generator.to(self.device).float().eval().requires_grad_(False)
-        self.context = math.ceil(self.generator.radius)
-        self.mel = LogMel.from_config(self.data).to(self.device).eval()
-
-    @torch.inference_mode()
-    def infer(self, waveform, pitch=0, f0_method='rmvpe', seed=None):
-        if float(pitch):
-            raise ValueError('Pupu-Vocoder has no pitch input. Set Pitch to 0.')
-        waveform = np.asarray(waveform, dtype=np.float32)
-        if waveform.ndim != 1 or not len(waveform) or not np.isfinite(waveform).all():
-            raise ValueError('Select non-empty audio with finite samples.')
-        hop, length = int(self.data['hop_length']), len(waveform)
-        padded_length = max(math.ceil(length / hop), math.ceil(self.data['n_fft'] / hop)) * hop
-        padded = np.pad(np.clip(waveform, -1.0, 1.0), (0, padded_length - length))
-        mel = self.mel(torch.from_numpy(padded).to(self.device)[None])
-        frames, pieces = mel.shape[-1], []
-        for start in range(0, frames, CHUNK_FRAMES):
-            end = min(start + CHUNK_FRAMES, frames)
-            left, right = max(0, start - self.context), min(frames, end + self.context)
-            pieces.append(self.generator(mel[..., left:right])[0, 0, (start - left) * hop:(end - left) * hop])
-        audio = torch.cat(pieces)[:length]
-        if not torch.isfinite(audio).all():
-            raise FloatingPointError('Non-finite Pupu-Vocoder audio output.')
-        return audio.float().cpu().numpy()
+class PupuInference(ChunkedInference):
+    name = 'Pupu-Vocoder'
+    build = staticmethod(build_pupu)

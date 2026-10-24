@@ -479,7 +479,7 @@ def inference_tab():
         rectified_vocoder_path = gr.Dropdown(
             label=i18n("Rectified Flow Vocoder"),
             info=i18n(
-                "Optional: select a compatible NSF-HiFiGAN, Vocos or Pupu-Vocoder vocoder or enter its .pth/.ckpt/.onnx/.safetensors path. Leave empty to use the model's recorded vocoder or the default. Keep any config.json or vocoder.yaml beside the vocoder."
+                "Optional: select a compatible NSF-HiFiGAN, Vocos, Pupu-Vocoder or BigVGAN vocoder or enter its .pth/.ckpt/.onnx/.safetensors path. Leave empty to use the model's recorded vocoder or the default. Keep any config.json or vocoder.yaml beside the vocoder."
             ),
             choices=get_vocoders(),
             value=None,
