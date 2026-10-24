@@ -15,6 +15,7 @@
     "mel_std": 6.0
   },
   "flow": {
+    "training_preset": "standard",
     "optimizer": "muon",
     "learning_rate": 0.0006,
     "min_learning_rate": 0.0,

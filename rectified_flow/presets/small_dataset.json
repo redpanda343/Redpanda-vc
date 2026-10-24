@@ -1,34 +1,40 @@
 {
   "flow": {
-    "decay_step": 3000,
+    "learning_rate": 0.0003,
+    "min_learning_rate": 1e-05,
+    "warmup_steps": 500,
+    "lr_schedule": "cosine",
+    "max_batch_frames": 20000,
+    "max_batch_size": 8,
     "max_updates": 30000,
     "holdout_clips": 8,
     "eval_interval": 2000,
     "preview_interval": 2000,
     "checkpoint_interval": 2000,
+    "num_valid_plots": 4,
     "permanent_ckpt_start": 10000,
     "permanent_ckpt_interval": 5000,
     "augmentation_args": {
       "random_pitch_shifting": {
-        "enabled": true
+        "enabled": true,
+        "range": [-3.0, 3.0],
+        "scale": 1.0
       },
       "random_time_stretching": {
-        "enabled": true
+        "enabled": true,
+        "range": [0.85, 1.15],
+        "scale": 1.0
+      },
+      "random_gain": {
+        "range": [-6.0, 6.0]
+      },
+      "random_noise_floor": {
+        "range": [-80.0, -55.0],
+        "probability": 0.25
       }
     },
     "model": {
-      "source_filter": true,
-      "hidden_channels": 256,
-      "encoder_layers": 4,
-      "backbone_args": {
-        "channels": 512,
-        "layers": 6,
-        "dropout_rate": 0.1
-      },
-      "aux_decoder": {
-        "channels": 256,
-        "layers": 4
-      }
+      "source_filter": false
     }
   },
   "finetune": {
@@ -39,7 +45,15 @@
       "lr_schedule": "cosine",
       "max_updates": 10000,
       "eval_interval": 500,
-      "checkpoint_interval": 2000
+      "checkpoint_interval": 2000,
+      "augmentation_args": {
+        "random_pitch_shifting": {
+          "enabled": false
+        },
+        "random_time_stretching": {
+          "enabled": false
+        }
+      }
     }
   }
 }

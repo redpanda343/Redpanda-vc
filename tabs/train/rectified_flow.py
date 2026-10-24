@@ -258,8 +258,9 @@ def rectified_train_tab():
         realtime = gr.Checkbox(label='EXPERIMENTAL: Realtime model', value=False,
                                info='Compact MeanFlow model trained for one or two inference steps.')
         small_dataset = gr.Checkbox(label='EXPERIMENTAL: Small dataset model', value=False,
-                                    info='Source-filter flow for 10 minutes of audio or more: a smaller model that '
-                                         'places harmonics from the F0, trained with pitch and speed augmentation.')
+                                    info='Full-size standard flow for 10 minutes of audio or more, with gentle '
+                                         'augmentation and checkpoints every 2,000 updates. '
+                                         'Start a new experiment to use this recipe; existing runs keep their architecture.')
         use_fused_kernels = gr.Checkbox(label='Fused Linear + SoftSignGLU kernels', value=False,
                                        info='Set it when starting a new experiment: the experiment then trains with SoftSignGLU so the '
                                             'kernels can run. Experiments and pretrained checkpoints that use ATanGLU cannot enable it. '
