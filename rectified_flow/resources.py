@@ -114,7 +114,7 @@ VOCODERS = {
         },
     ),
     'bigvgan_24khz': dict(
-        title='BigVGAN 24 kHz 100-band by NVIDIA (no F0)',
+        title='BigVGAN base 24 kHz 100-band by NVIDIA (no F0)',
         kind='bigvgan',
         mel='bigvgan_24khz',
         directory='bigvgan_base_24khz_100band',
@@ -125,6 +125,20 @@ VOCODERS = {
             'model.pth': ('bigvgan_generator.pt', 'ca8bced4d3ef588e654742f732455c16abb004e49d7d3bf03edade84d3e982f2',
                           56297637),
             'config.json': ('config.json', '885553969751bfd87f1980017364e968917cd34347376ed08238db673ea5b46b', 1034),
+        },
+    ),
+    'bigvgan_v2_24khz': dict(
+        title='BigVGAN-v2 24 kHz 100-band by NVIDIA (no F0)',
+        kind='bigvgan',
+        mel='bigvgan_24khz',
+        directory='bigvgan_v2_24khz_100band_256x',
+        filename='model.pth',
+        base_url=('https://huggingface.co/nvidia/bigvgan_v2_24khz_100band_256x/resolve/'
+                  'c329ede9e9bbc100ddf5c91e2330a61921262370/'),
+        downloads={
+            'model.pth': ('bigvgan_generator.pt', '6f9c5715550c9d0f11159ceb8935638da5aeb19e27d1e63677632df095e376f5',
+                          450088331),
+            'config.json': ('config.json', 'd77e2c96583ca2296ac112a56ec7cc6bd5da4bf7681ceff18448bedc4fcf6512', 1402),
         },
     ),
 }
