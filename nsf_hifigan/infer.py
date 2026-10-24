@@ -11,6 +11,10 @@ from rectified_flow.pitch import extract_pitch
 
 
 def load_checkpoint(path):
+    if str(path).lower().endswith('.safetensors'):
+        from safetensors.torch import load_file
+
+        return load_file(path)
     try:
         return torch.load(path, map_location='cpu', weights_only=True, mmap=True)
     except RuntimeError as error:

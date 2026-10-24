@@ -1,5 +1,6 @@
 import math
 
+import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -12,6 +13,7 @@ RESBLOCK_DILATIONS = (1, 3, 5)
 FILTER_ZEROS = 8
 ACTIVATION_KERNEL = 12
 ACTIVATION_RADIUS = 6.5
+CHUNK_FRAMES = 1024
 
 
 def kaiser_sinc_filter(cutoff, half_width, kernel_size):
@@ -204,3 +206,35 @@ def build_pupu(path, checkpoint):
         raise ValueError(f'{path} takes {generator.conv_pre.in_channels} mel bins, not {mel["n_mels"]}.')
     generator.load_state_dict(state, strict=True)
     return generator, mel
+
+
+class PupuInference:
+    def __init__(self, path, checkpoint, device):
+        from rectified_flow.mel import LogMel
+
+        self.device = torch.device(device)
+        generator, self.data = build_pupu(path, checkpoint)
+        self.generator = generator.to(self.device).float().eval().requires_grad_(False)
+        self.context = math.ceil(self.generator.radius)
+        self.mel = LogMel.from_config(self.data).to(self.device).eval()
+
+    @torch.inference_mode()
+    def infer(self, waveform, pitch=0, f0_method='rmvpe', seed=None):
+        if float(pitch):
+            raise ValueError('Pupu-Vocoder has no pitch input. Set Pitch to 0.')
+        waveform = np.asarray(waveform, dtype=np.float32)
+        if waveform.ndim != 1 or not len(waveform) or not np.isfinite(waveform).all():
+            raise ValueError('Select non-empty audio with finite samples.')
+        hop, length = int(self.data['hop_length']), len(waveform)
+        padded_length = max(math.ceil(length / hop), math.ceil(self.data['n_fft'] / hop)) * hop
+        padded = np.pad(np.clip(waveform, -1.0, 1.0), (0, padded_length - length))
+        mel = self.mel(torch.from_numpy(padded).to(self.device)[None])
+        frames, pieces = mel.shape[-1], []
+        for start in range(0, frames, CHUNK_FRAMES):
+            end = min(start + CHUNK_FRAMES, frames)
+            left, right = max(0, start - self.context), min(frames, end + self.context)
+            pieces.append(self.generator(mel[..., left:right])[0, 0, (start - left) * hop:(end - left) * hop])
+        audio = torch.cat(pieces)[:length]
+        if not torch.isfinite(audio).all():
+            raise FloatingPointError('Non-finite Pupu-Vocoder audio output.')
+        return audio.float().cpu().numpy()
