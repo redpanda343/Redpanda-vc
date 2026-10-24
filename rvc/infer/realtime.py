@@ -338,9 +338,6 @@ class RealTimeRVC:
             self.flow_sampler = RealtimeFlowSampler(self.model, enabled=self.cuda_graph)
             self.pipeline.set_vocoder(rectified_vocoder_path)
             vocoder, _ = load_vocoder(self.pipeline.resolved_vocoder_path(), self.pipeline.data)
-            if getattr(vocoder.generator, "offline_only", False):
-                raise ValueError("This flow vocoder supports offline conversion only. Choose another vocoder for "
-                                 "real-time conversion.")
             if self.pipeline.vocoder_path:
                 self.vocoder = os.path.basename(self.pipeline.vocoder_path)
             self.pipeline.vocoder_model = vocoder.to(self.device).float()
@@ -691,6 +688,8 @@ class RealTimeRVC:
         window = 0 if self.flow_context_frames is None else max(0, first_frame - self.flow_context_frames)
         mel = self.flow_sampler(features.float(), f0, speaker, mask, steps=self.rectified_steps, variances=variances,
                                 start=window)
+        if getattr(self.pipeline.vocoder_model.generator, "zero_unvoiced", False):
+            f0 = f0 * torch.from_numpy(~np.asarray(uv, dtype=bool)).to(f0)
         audio = self.vocoder_graph(mel[..., first_frame - window:], f0[..., first_frame:])[0, 0]
         start -= first_frame * hop
         audio = audio[start:start + count]

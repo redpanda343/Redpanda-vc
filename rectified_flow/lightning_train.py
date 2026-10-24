@@ -29,7 +29,7 @@ from rectified_flow.resources import recorded_name, vocoder_path
 from rectified_flow.schedule import learning_rate
 from rectified_flow.train_flow import (
     atomic_save, configure_fused_backbone, preview, prune_checkpoints,
-    random_state, restore_random_state,
+    random_state, reference_voicing, restore_random_state,
 )
 from rectified_flow.variance import augment_levels, validate_level_augmentation, variance_names
 from rectified_flow.vocoder import load_vocoder
@@ -379,6 +379,7 @@ class FlowPreview(pl.Callback):
     def __init__(self, args):
         self.args = args
         self.vocoder = None
+        self.voicing = []
         self.last_step = -1
 
     def on_fit_start(self, trainer, task):
@@ -386,13 +387,17 @@ class FlowPreview(pl.Callback):
             path = vocoder_path(self.args.vocoder) if recorded_name(self.args.vocoder) else self.args.vocoder
             self.vocoder, _ = load_vocoder(path, task.data)
             self.vocoder = self.vocoder.to(task.device)
+            if getattr(self.vocoder.generator, 'zero_unvoiced', False):
+                self.voicing = reference_voicing(task.data_module.references, task.data,
+                                                 task.settings['pitch_extractor'], task.device)
 
     def render(self, trainer, task):
         if not trainer.is_global_zero or self.last_step == trainer.global_step:
             return
         with torch.autocast(task.device.type, enabled=False):
             for index, reference in enumerate(task.data_module.references):
-                preview(task.model, self.vocoder, reference, task.data, trainer.logger.experiment, trainer.global_step, index)
+                preview(task.model, self.vocoder, reference, task.data, trainer.logger.experiment, trainer.global_step,
+                        index, self.voicing[index] if self.voicing else None)
         self.last_step = trainer.global_step
 
     def on_validation_epoch_end(self, trainer, task):

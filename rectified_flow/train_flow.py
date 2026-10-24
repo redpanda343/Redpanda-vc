@@ -105,8 +105,21 @@ def warmup_fused_backbone(backbone, device, dtype, max_frames):
     torch.cuda.empty_cache()
 
 
+def reference_voicing(references, data, extractor, device):
+    from rectified_flow.pitch import extract_pitch, release_rmvpe_model
+
+    voicing = []
+    for _, _, f0, audio, *_ in references:
+        _, uv = extract_pitch(extractor, audio[0].numpy(), int(data['sample_rate']), int(data['hop_length']),
+                              f0.shape[1], device)
+        voicing.append(torch.from_numpy(~uv).float()[None])
+    if extractor == 'rmvpe':
+        release_rmvpe_model(device)
+    return voicing
+
+
 @torch.no_grad()
-def preview(model, vocoder, reference, data, writer, step, index=None):
+def preview(model, vocoder, reference, data, writer, step, index=None, voiced=None):
     if reference is None:
         return
     device = next(model.parameters()).device
@@ -129,6 +142,8 @@ def preview(model, vocoder, reference, data, writer, step, index=None):
         writer.add_image(f'mel/{name}{suffix}', (value / 6.0 + 0.5).clamp(0, 1).cpu(), step, dataformats='HW')
     if vocoder is None:
         return
+    if voiced is not None:
+        f0 = f0 * voiced.to(device)
     previews = [('flow', vocoder(generated, f0)[0]), ('reference', audio[0]),
                 ('vocoder_on_real_mel', vocoder(normalize_mel(mel.to(device), data), f0)[0])]
     if predicted is not None:

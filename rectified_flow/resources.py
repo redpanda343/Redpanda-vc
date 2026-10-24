@@ -142,7 +142,7 @@ VOCODERS = {
         },
     ),
     'nsf_bigvgan_32khz': dict(
-        title='NSF-BigVGAN 32 kHz by PlayVoice (F0, offline only)',
+        title='NSF-BigVGAN 32 kHz by PlayVoice (F0)',
         kind='nsf_bigvgan',
         mel='nsf_bigvgan_32khz',
         directory='nsf_bigvgan_32khz',

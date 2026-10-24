@@ -4,7 +4,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from rectified_flow.alias_free import Activation, AMPBlock
+from rectified_flow.alias_free import ACTIVATION_RADIUS, Activation, AMPBlock, amp_radius
 from rectified_flow.bigvgan import SnakeBeta
 from rectified_flow.openvpi import _fold_weight_norm
 
@@ -39,7 +39,6 @@ class SineSource(nn.Module):
 
 
 class NSFBigVGAN(nn.Module):
-    offline_only = True
     zero_unvoiced = True
 
     def __init__(self, sample_rate, num_mels, channels, upsample_rates=UPSAMPLE_RATES,
@@ -69,6 +68,10 @@ class NSFBigVGAN(nn.Module):
         )
         self.activation_post = Activation(SnakeBeta(channels >> len(upsample_rates)))
         self.conv_post = nn.Conv1d(channels >> len(upsample_rates), 1, 7, padding=3, bias=False)
+        factors = [math.prod(upsample_rates[:index + 1]) for index in range(len(upsample_rates))]
+        block = amp_radius(resblock_kernel_sizes, [resblock_dilations] * self.num_kernels)
+        stages = sum((kernel_size / 2 + block) / factor for kernel_size, factor in zip(upsample_kernel_sizes, factors))
+        self.radius = 3 + stages + (ACTIVATION_RADIUS + 3) / factors[-1]
 
     def forward(self, mel, f0):
         source = self.m_source(f0.float().repeat_interleave(self.hop, dim=-1)).transpose(1, 2)
