@@ -293,11 +293,12 @@ def process_dataset(binary_dir, prefix, entries, tasks, config, device, num_work
         results = (process_item(*a) for a in args)
     try:
         for index, item in enumerate(results):
-            progress.update(1 + len(grouped.get(index, [])))
             if item is None:
+                progress.update(1 + len(grouped.get(index, [])))
                 skipped += 1
                 continue
             add(item, index, False)
+            progress.update(1)
             if index in grouped:
                 audio, content, _ = builder.source(entries[index])
                 for task in grouped[index]:
@@ -305,6 +306,7 @@ def process_dataset(binary_dir, prefix, entries, tasks, config, device, num_work
                         add(builder.perturbed(audio, task, item, embedder), index, True)
                     else:
                         add(builder.augmented(audio, content, task, int(entries[index][4]), item), index, True)
+                    progress.update(1)
     finally:
         writer.finalize()
     os.replace(temporary, data_path)
