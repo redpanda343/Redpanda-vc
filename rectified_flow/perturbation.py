@@ -1,4 +1,5 @@
 import math
+import multiprocessing
 
 import numpy as np
 from scipy.signal import sosfilt
@@ -12,6 +13,7 @@ PEAKING_FILTERS = 8
 SHELF_FREQUENCIES = (60.0, 10000.0)
 EQ_GAIN_DB = 12.0
 Q_RANGE = (2.0, 5.0)
+PRAAT_TIMEOUT = 10.0
 
 
 def _ratio(rng, high):
@@ -62,18 +64,69 @@ def change_gender(audio, sample_rate, formant, pitch, pitch_range):
 
     sound = parselmouth.Sound(np.asarray(audio, dtype=np.float64), sample_rate)
     contour = sound.to_pitch_ac(pitch_floor=PARSELMOUTH_F0_MIN, pitch_ceiling=PARSELMOUTH_F0_MAX)
-    median = call(contour, 'Get quantile', 0.0, 0.0, 0.5, 'Hertz')
-    target = median * pitch if math.isfinite(median) else 0.0
+    lowest, median, highest = (call(contour, 'Get quantile', 0.0, 0.0, quantile, 'Hertz') for quantile in (0.0, 0.5, 1.0))
+    if math.isfinite(median):
+        floor, ceiling = PARSELMOUTH_F0_MIN * max(formant, 1.0), PARSELMOUTH_F0_MAX * min(formant, 1.0)
+        target = min(max(median * pitch, floor), ceiling)
+        pitch_range = max(0.0, min(pitch_range, (target - floor) / max(median - lowest, 1e-6),
+                                   (ceiling - target) / max(highest - median, 1e-6)))
+    else:
+        target, pitch_range = 0.0, 1.0
     shifted = call(sound, 'Change gender', PARSELMOUTH_F0_MIN, PARSELMOUTH_F0_MAX, formant, target, pitch_range, 1.0)
     values = shifted.values[0].astype(np.float32)
     return np.pad(values, (0, max(0, len(audio) - len(values))))[:len(audio)]
+
+
+def _praat_worker(connection):
+    while True:
+        job = connection.recv()
+        try:
+            connection.send(change_gender(*job))
+        except Exception as error:
+            connection.send(error)
+
+
+class PraatWorker:
+    def __init__(self):
+        context = multiprocessing.get_context('spawn')
+        self.connection, child = context.Pipe()
+        self.process = context.Process(target=_praat_worker, args=(child,), daemon=True)
+        self.process.start()
+
+    def run(self, job, timeout=PRAAT_TIMEOUT):
+        self.connection.send(job)
+        if self.connection.poll(timeout):
+            result = self.connection.recv()
+            if isinstance(result, Exception):
+                raise result
+            return result
+        self.process.kill()
+        self.process.join()
+        return None
+
+
+_WORKER = None
+
+
+def shift_voice(audio, sample_rate, formant, pitch, pitch_range):
+    global _WORKER
+    if _WORKER is None or not _WORKER.process.is_alive():
+        _WORKER = PraatWorker()
+    return _WORKER.run((audio, sample_rate, formant, pitch, pitch_range))
 
 
 def perturb(audio, sample_rate, parameters):
     audio = np.asarray(audio, dtype=np.float32)
     peak = float(np.abs(audio).max())
     shaped = random_equalizer(audio, sample_rate, parameters['gains'], parameters['qs'])
-    shifted = change_gender(shaped, sample_rate, parameters['formant'], parameters['pitch'], parameters['pitch_range'])
+    try:
+        shifted = shift_voice(shaped, sample_rate, parameters['formant'], parameters['pitch'], parameters['pitch_range'])
+        reason = None if shifted is not None else f'did not finish within {PRAAT_TIMEOUT:g} s'
+    except Exception as error:
+        shifted, reason = None, str(error).splitlines()[0]
+    if shifted is None:
+        print(f'Praat could not shift a clip ({reason}); that perturbed copy keeps only the EQ.', flush=True)
+        shifted = shaped
     shifted = np.nan_to_num(shifted)
     level = float(np.abs(shifted).max())
     return shifted * (peak / level) if level > 0 else shifted
