@@ -6,7 +6,7 @@ from pathlib import Path
 PRESET_DIR = Path(__file__).resolve().parent / 'presets'
 MEL_PRESET_DIR = PRESET_DIR / 'mel'
 
-PRESETS = ('standard', 'smaller', 'meanflow', 'small_dataset')
+PRESETS = ('standard', 'smaller', 'meanflow')
 
 MEL_PRESETS = ('openvpi_44khz', 'vocos_44khz', 'vocos_24khz', 'pupu_44khz', 'bigvgan_24khz', 'nsf_bigvgan_32khz')
 
@@ -14,7 +14,10 @@ FINETUNE_KEY = 'finetune'
 
 FREE_FORM_KEYS = {('flow', 'strategy')}
 
-REMOVED_MODEL_KEYS = ('shortcut', 'shortcut_steps', 'shortcut_bootstrap_every', 'shortcut_ema', 'use_f0')
+REMOVED_MODEL_KEYS = ('shortcut', 'shortcut_steps', 'shortcut_bootstrap_every', 'shortcut_ema', 'use_f0',
+                      'source_filter', 'source_filter_args')
+
+REMOVED_AUGMENTATIONS = ('random_content_perturbation',)
 
 
 def preset_path(preset):
@@ -58,7 +61,7 @@ def base_config():
     config['flow']['model'].update(mean_flow=False, mean_flow_args=dict(
         flow_ratio=0.75, time_mu=-0.4, time_sigma=1.0, cfg_ratio=0.2,
         cfg_scale=2.0, loss_p=0.5, loss_eps=1e-3,
-    ), source_filter=False, source_filter_args=dict(envelope_coefficients=20, aperiodicity_coefficients=8))
+    ))
     return config
 
 
@@ -86,10 +89,17 @@ def resolve_config(config):
             raise ValueError('Shortcut (few-step) flows are no longer supported. Retrain this voice as a standard flow.')
         if model.get('use_f0') is False:
             raise ValueError('F0-free flows are no longer supported. Retrain this voice with F0.')
+        if model.get('source_filter'):
+            raise ValueError('Small dataset (source-filter) flows are no longer supported. Retrain this voice as a '
+                             'standard flow.')
         model = {key: value for key, value in model.items() if key not in REMOVED_MODEL_KEYS}
         model.setdefault('use_tension_embed', False)
         model.setdefault('content_upsampling', 'repeat')
         config = dict(config, flow=dict(flow, model=model))
+    augmentation = config['flow'].get('augmentation_args') if isinstance(flow, dict) else None
+    if isinstance(augmentation, dict):
+        augmentation = {key: value for key, value in augmentation.items() if key not in REMOVED_AUGMENTATIONS}
+        config = dict(config, flow=dict(config['flow'], augmentation_args=augmentation))
     return _merge(base_config(), config)
 
 
@@ -103,8 +113,8 @@ def default_config(finetune=False, preset='standard', mel=None):
 
 
 def architecture(model):
-    size = (model.get('mean_flow', False), model.get('source_filter', False), model['hidden_channels'],
-            model['encoder_layers'], model['backbone_args']['channels'], model['backbone_args']['layers'])
+    size = (model.get('mean_flow', False), model['hidden_channels'], model['encoder_layers'],
+            model['backbone_args']['channels'], model['backbone_args']['layers'])
     return size if model.get('mean_flow', False) else size + (
         model['aux_decoder']['channels'], model['aux_decoder']['layers'],
     )

@@ -11,7 +11,6 @@ from pathlib import Path
 
 import numpy as np
 import soundfile as sf
-import soxr
 import torch
 from torch.multiprocessing import Manager, Process, get_context
 from tqdm import tqdm
@@ -19,14 +18,11 @@ from tqdm import tqdm
 from rectified_flow.data import CONTENT_RATE, mel_frames
 from rectified_flow.indexed_dataset import IndexedDatasetBuilder
 from rectified_flow.mel import LogMel
-from rectified_flow.perturbation import perturb, perturbation_parameters
 from rectified_flow.pitch import extract_pitch
 from rectified_flow.variance import extract_variances, resample_variances, variance_names
 
 BINARY_VERSION = 2
 BINARY_AUGMENTATIONS = ('random_pitch_shifting', 'random_time_stretching')
-CONTENT_PERTURBATION = 'random_content_perturbation'
-EMBEDDER_RATE = 16000
 
 
 def augmentation_plan(entries, settings, seed):
@@ -35,9 +31,7 @@ def augmentation_plan(entries, settings, seed):
     args = settings['augmentation_args']
     model = settings['model']
     pitch, stretch = args['random_pitch_shifting'], args['random_time_stretching']
-    perturbation = args[CONTENT_PERTURBATION]
-    for name, spec in (('random_pitch_shifting', pitch), ('random_time_stretching', stretch),
-                       (CONTENT_PERTURBATION, perturbation)):
+    for name, spec in (('random_pitch_shifting', pitch), ('random_time_stretching', stretch)):
         if not math.isfinite(float(spec['scale'])) or spec['scale'] < 0:
             raise ValueError(f'Invalid augmentation scale: {name}')
     if pitch['enabled']:
@@ -76,9 +70,6 @@ def augmentation_plan(entries, settings, seed):
                 tasks.append(item)
             else:
                 chosen_item['speed'] = speed
-    if perturbation['enabled']:
-        for index in rng.choices(names, k=int(perturbation['scale'] * len(names))):
-            tasks.append({'index': index, 'perturbation': perturbation_parameters(rng)})
     return tasks
 
 
@@ -93,7 +84,6 @@ class ItemBuilder:
         self.variances = variance_names(config['flow']['model'])
         self.device = torch.device(device)
         self.mel = LogMel.from_config(self.data).to(self.device)
-        self.embedder = None
 
     def source(self, entry):
         wav_path, content_path = entry[0], entry[1]
@@ -135,23 +125,6 @@ class ItemBuilder:
         curves = np.stack([original[name] for name in self.variances]) if self.variances else None
         variances = resample_variances(curves, hop / self.hop, mel.shape[-1], self.data) if self.variances else None
         return self._item(mel, content, f0, shift, hop / self.hop, sid, variances)
-
-    @torch.no_grad()
-    def perturbed(self, audio, task, original, embedder):
-        from shared.utils import extract_embedding_features, load_embedding
-
-        if self.embedder is None:
-            self.embedder = load_embedding(embedder, 'v2').to(self.device).float().eval()
-        waveform = perturb(audio.numpy(), self.sample_rate, task['perturbation'])
-        source = torch.from_numpy(soxr.resample(waveform, self.sample_rate, EMBEDDER_RATE, quality='HQ')).float()
-        if getattr(self.embedder, 'audio_requires_normalization', False):
-            source = torch.nn.functional.layer_norm(source, source.shape)
-        content = extract_embedding_features(self.embedder, source.to(self.device)[None], 'v2')[0].float().cpu().numpy()
-        length = original['content'].shape[0]
-        content = np.pad(content, ((0, max(0, length - len(content))), (0, 0)), mode='edge')[:length]
-        if not np.isfinite(content).all():
-            raise ValueError('Invalid perturbed content features.')
-        return dict(original, content=content.astype(np.float32))
 
     def f0(self, audio, hop, frames):
         return extract_pitch(self.pitch_extractor, audio.numpy(), self.sample_rate, hop, frames, self.device)
@@ -224,13 +197,7 @@ def chunked_multiprocess_run(map_func, args, num_workers, q_max_size=1000):
         worker.close()
 
 
-def experiment_embedder(experiment):
-    path = Path(experiment) / 'model_info.json'
-    info = json.loads(path.read_text(encoding='utf-8')) if path.is_file() else {}
-    return info.get('embedder_model', 'contentvec')
-
-
-def _recipe(config, training, held, seed, embedder):
+def _recipe(config, training, held, seed):
     def sources(entries):
         result = []
         for entry in entries:
@@ -245,9 +212,6 @@ def _recipe(config, training, held, seed, embedder):
                   augmentation={name: config['flow']['augmentation_args'][name] for name in BINARY_AUGMENTATIONS},
                   seed=seed,
                   train=sources(training), valid=sources(held))
-    perturbation = config['flow']['augmentation_args'][CONTENT_PERTURBATION]
-    if perturbation['enabled']:
-        recipe['content_perturbation'] = dict(perturbation, embedder=embedder)
     names = variance_names(model)
     if names:
         recipe['variances'] = dict(names=names, hnsep=config['flow']['hnsep'],
@@ -263,7 +227,7 @@ def _read_meta(path):
         return None
 
 
-def process_dataset(binary_dir, prefix, entries, tasks, config, device, num_workers, recipe, progress, embedder):
+def process_dataset(binary_dir, prefix, entries, tasks, config, device, num_workers, recipe, progress):
     grouped = {}
     for task in tasks:
         grouped.setdefault(task['index'], []).append(task)
@@ -302,10 +266,7 @@ def process_dataset(binary_dir, prefix, entries, tasks, config, device, num_work
             if index in grouped:
                 audio, content, _ = builder.source(entries[index])
                 for task in grouped[index]:
-                    if 'perturbation' in task:
-                        add(builder.perturbed(audio, task, item, embedder), index, True)
-                    else:
-                        add(builder.augmented(audio, content, task, int(entries[index][4]), item), index, True)
+                    add(builder.augmented(audio, content, task, int(entries[index][4]), item), index, True)
                     progress.update(1)
     finally:
         writer.finalize()
@@ -319,8 +280,7 @@ def process_dataset(binary_dir, prefix, entries, tasks, config, device, num_work
 
 def binarize(experiment, config, training, held, seed, device, num_workers):
     binary_dir = Path(experiment) / 'binary'
-    embedder = experiment_embedder(experiment)
-    recipe = _recipe(config, training, held, seed, embedder)
+    recipe = _recipe(config, training, held, seed)
     metas = [_read_meta(binary_dir / f'{prefix}.meta') for prefix in ('valid', 'train')]
     if all(meta is not None and meta.get('recipe') == recipe and (binary_dir / f'{prefix}.data').is_file()
            for meta, prefix in zip(metas, ('valid', 'train'))):
@@ -331,13 +291,12 @@ def binarize(experiment, config, training, held, seed, device, num_workers):
         (binary_dir / f'{prefix}.meta').unlink(missing_ok=True)
     settings = config['flow']
     args = settings['augmentation_args']
-    augment = any(args[name]['enabled'] for name in (*BINARY_AUGMENTATIONS, CONTENT_PERTURBATION))
+    augment = any(args[name]['enabled'] for name in BINARY_AUGMENTATIONS)
     tasks = augmentation_plan(training, settings, seed) if augment else []
     with tqdm(total=len(held) + len(training) + len(tasks), desc='Binarizing', unit='clip', dynamic_ncols=True) as progress:
-        valid, _, skipped_valid = process_dataset(binary_dir, 'valid', held, [], config, device, 0, recipe, progress,
-                                                  embedder)
+        valid, _, skipped_valid = process_dataset(binary_dir, 'valid', held, [], config, device, 0, recipe, progress)
         train, seconds, skipped_train = process_dataset(binary_dir, 'train', training, tasks, config, device,
-                                                        int(num_workers), recipe, progress, embedder)
+                                                        int(num_workers), recipe, progress)
     skipped = skipped_valid + skipped_train
     print(f'| binary data ready: {train:,} train, {valid:,} valid, {seconds / 60:.1f} min of training audio'
           + (f', skipped {skipped} clip(s) without voiced frames' if skipped else ''), flush=True)

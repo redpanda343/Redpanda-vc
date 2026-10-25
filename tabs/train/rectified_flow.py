@@ -14,7 +14,7 @@ IDLE_CONTROLS = 2
 SLICERS = ('Skip', 'Simple')
 MINIMUM_CHUNK = 5.0
 PRETRAINED_ROOT = ROOT / 'models' / 'pretraineds' / 'rectified'
-TRAINING_PRESETS = ('standard', 'meanflow', 'small_dataset')
+TRAINING_PRESETS = ('standard', 'meanflow')
 runner = JobRunner('rectified-flow')
 
 
@@ -137,14 +137,14 @@ def resolve_pretrained(directory, enabled, preferred=''):
 
 
 def start(name, batch, max_frames, max_updates, checkpoint_interval, device, use_fused_kernels=False,
-          use_pretrained=False, pretrained_path='', realtime=False, vocoder=DEFAULT_VOCODER, small_dataset=False):
+          use_pretrained=False, pretrained_path='', realtime=False, vocoder=DEFAULT_VOCODER):
     directory = experiment_path(name)
     device_id(device)
     if not (directory / 'filelist.txt').is_file():
         raise gr.Error('Extract features for this experiment first.')
     variance_embeds = None if (directory / 'rectified_config.json').is_file() else True
     pretrained = resolve_pretrained(directory, use_pretrained, pretrained_path)
-    preset = 'meanflow' if realtime else 'small_dataset' if small_dataset else 'standard'
+    preset = 'meanflow' if realtime else 'standard'
     from rectified_flow.train_flow import experiment_pitch_extractor, load_training_config
 
     pitch_extractor = experiment_pitch_extractor(directory)
@@ -204,8 +204,7 @@ def rectified_train_tab():
                 'bins up to 22.05 kHz for Pupu-Vocoder and 24 kHz with 100 Slaney bins for BigVGAN (no F0), and 32 kHz '
                 'with 100 bins for NSF-BigVGAN (F0), so choose it before preprocessing. '
                 'Training from scratch needs a dataset of **1 hour or more** for good results; with less audio, check '
-                '**Pretrained** to fine-tune instead, or try **EXPERIMENTAL: Small dataset model** with 10 minutes or '
-                'more.')
+                '**Pretrained** to fine-tune instead.')
     with gr.Row():
         name = gr.Textbox(label='Model name', value='my-flow')
         device = gr.Textbox(label='Device', value='auto',
@@ -241,8 +240,7 @@ def rectified_train_tab():
         refresh_vocoder_button.click(refresh_vocoders, vocoder, vocoder, queue=False)
         gr.Markdown('Training precision follows **Settings → Training → Precision**. New experiments copy their '
                     f'training settings from `{preset_path("standard").relative_to(ROOT).as_posix()}`, or '
-                    f'`{preset_path("meanflow").relative_to(ROOT).as_posix()}` with **EXPERIMENTAL: Realtime model**, or '
-                    f'`{preset_path("small_dataset").relative_to(ROOT).as_posix()}` with **EXPERIMENTAL: Small dataset model**; edit those '
+                    f'`{preset_path("meanflow").relative_to(ROOT).as_posix()}` with **EXPERIMENTAL: Realtime model**; edit those '
                     'files to train with custom settings. A started experiment keeps its own copy in '
                     '`logs/<model>/rectified_config.json`.')
         with gr.Row():
@@ -257,18 +255,11 @@ def rectified_train_tab():
                                    info=preset_info('checkpoint_interval', ' updates'))
         realtime = gr.Checkbox(label='EXPERIMENTAL: Realtime model', value=False,
                                info='Compact MeanFlow model trained for one or two inference steps.')
-        small_dataset = gr.Checkbox(label='EXPERIMENTAL: Small dataset model', value=False,
-                                    info="Source-filter flow for 10 minutes of audio or more at DiffSinger's model "
-                                         'size: it places harmonics from the F0 and trains with pitch and speed '
-                                         'augmentation, ContentVec taken from formant- and pitch-perturbed copies of '
-                                         'the dataset, and backbone dropout.')
         use_fused_kernels = gr.Checkbox(label='Fused Linear + SoftSignGLU kernels', value=False,
                                        info='Set it when starting a new experiment: the experiment then trains with SoftSignGLU so the '
                                             'kernels can run. Experiments and pretrained checkpoints that use ATanGLU cannot enable it. '
                                             'Requires Triton and CUDA FP16 or BF16 for acceleration.')
         realtime.change(exclusive_option, realtime, use_fused_kernels, queue=False)
-        realtime.change(exclusive_option, realtime, small_dataset, queue=False)
-        small_dataset.change(exclusive_option, small_dataset, realtime, queue=False)
         with gr.Row():
             train_button = gr.Button('Start / resume rectified training', variant='primary')
             stop_button = gr.Button('Stop current rectified job', interactive=False)
@@ -277,6 +268,6 @@ def rectified_train_tab():
     preprocess_button.click(preprocess, [name, dataset, workers, device, *slicing.inputs, vocoder], outputs,
                             queue=False)
     train_button.click(start, [name, batch, max_frames, max_updates, checkpoint_interval, device, use_fused_kernels,
-                               use_pretrained, pretrained_path, realtime, vocoder, small_dataset], outputs, queue=False)
+                               use_pretrained, pretrained_path, realtime, vocoder], outputs, queue=False)
     stop_button.click(stop, [], outputs, queue=False)
     timer.tick(status, [], outputs, queue=False, show_progress='hidden')
