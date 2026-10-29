@@ -197,7 +197,7 @@ class SineGenerator(torch.nn.Module):
     def forward(self, f0: torch.Tensor, upsampling_factor: int):
         with torch.no_grad():
             # Expand `f0` to include waveform dimensions
-            f0 = f0.unsqueeze(-1)
+            f0 = f0.float().unsqueeze(-1)
 
             # Generate sine waves
             sine_waves = (
