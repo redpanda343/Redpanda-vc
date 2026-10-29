@@ -10,7 +10,7 @@ def feature_loss(fmap_r, fmap_g):
         fmap_g (list of torch.Tensor): List of generated feature maps.
     """
     return 2 * sum(
-        torch.mean(torch.abs(rl - gl))
+        torch.mean(torch.abs(rl - gl), dtype=torch.float32)
         for dr, dg in zip(fmap_r, fmap_g)
         for rl, gl in zip(dr, dg)
     )
