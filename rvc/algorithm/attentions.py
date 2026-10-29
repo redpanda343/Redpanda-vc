@@ -83,10 +83,11 @@ class MultiHeadAttention(torch.nn.Module):
         q, k, v = self.conv_q(x), self.conv_k(c), self.conv_v(c)
 
         # Compute attention
-        x, _ = self.attention(q, k, v, mask=attn_mask)
+        with torch.autocast(q.device.type, enabled=False):
+            x, _ = self.attention(q.float(), k.float(), v.float(), mask=attn_mask)
 
         # Final output projection
-        return self.conv_o(x)
+        return self.conv_o(x.to(q.dtype))
 
     def attention(self, query, key, value, mask=None):
         # Reshape and compute scaled dot-product attention
@@ -101,7 +102,7 @@ class MultiHeadAttention(torch.nn.Module):
         if self.window_size is not None:
             assert t_s == t_t, "Relative attention only supports self-attention."
             window = min(self.window_size, t_s - 1)
-            rel_keys = self._relative_embeddings(self.emb_rel_k, window)
+            rel_keys = self._relative_embeddings(self.emb_rel_k, window).to(query.dtype)
             scores += self._band_to_absolute(
                 torch.matmul(query, rel_keys.transpose(-2, -1)), window
             )
@@ -127,7 +128,7 @@ class MultiHeadAttention(torch.nn.Module):
         output = torch.matmul(p_attn, value)
 
         if self.window_size is not None:
-            rel_values = self._relative_embeddings(self.emb_rel_v, window)
+            rel_values = self._relative_embeddings(self.emb_rel_v, window).to(p_attn.dtype)
             output += torch.matmul(self._absolute_to_band(p_attn, window), rel_values)
 
         return output.transpose(2, 3).contiguous().view(b, d, t_t), p_attn
