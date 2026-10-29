@@ -291,6 +291,13 @@ def parse_arguments(argv=None):
     args.export_dtype = (
         torch.float32 if args.train_dtype == torch.float32 else torch.float16
     )
+    if args.train_dtype == torch.float16:
+        unreliable = fp16_unreliable_gpus(args.gpus)
+        if unreliable:
+            print(
+                f"FP16 training is unreliable on {', '.join(unreliable)}, so this run trains in FP32."
+            )
+            args.train_dtype = torch.float32
     args.disc_version = "v3" if args.vocoder == "RefineGAN" else args.version
     args.multiscale_mel_loss = args.vocoder == "RefineGAN"
     return args
@@ -309,6 +316,11 @@ def configured_train_dtype():
     if precision == "fp16" and torch.cuda.is_available():
         return torch.float16
     return torch.float32
+
+
+def fp16_unreliable_gpus(gpus):
+    names = [torch.cuda.get_device_name(int(index)) for index in gpus.split("-")]
+    return [name for name in names if "GTX16" in name.upper().replace(" ", "")]
 
 
 def load_experiment_config(args):
