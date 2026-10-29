@@ -660,13 +660,15 @@ def rvc_train_tab():
                 ),
                 interactive=True,
             )
-            save_every_epoch = gr.Slider(
+            save_every_steps = gr.Slider(
                 1,
-                100,
-                10,
+                100000,
+                1000,
                 step=1,
-                label=i18n("Save Every Epoch"),
-                info=i18n("Determine at how many epochs the model will saved at."),
+                label=i18n("Save Every X Steps"),
+                info=i18n(
+                    "Saves the G and D checkpoints, and an inference model when Save Every Weights is on, every X training steps. Training resumes from the latest G and D checkpoints."
+                ),
                 interactive=True,
             )
             total_steps = gr.Slider(
@@ -676,7 +678,7 @@ def rvc_train_tab():
                 step=1,
                 label=i18n("Total Steps"),
                 info=i18n(
-                    "Stops training after this many training steps. G and D checkpoints are only saved at the end of an epoch, as set by Save Every Epoch, and the last step saves only the inference model."
+                    "Stops training after this many training steps. The last step always saves the G and D checkpoints and an inference model."
                 ),
                 interactive=True,
             )
@@ -694,20 +696,9 @@ def rvc_train_tab():
                     save_every_weights = gr.Checkbox(
                         label=i18n("Save Every Weights"),
                         info=i18n(
-                            "Saves an inference model at each epoch checkpoint interval when step-based inference saving is disabled."
+                            "Saves an inference model with every G and D checkpoint. When off, only the last step saves one."
                         ),
                         value=True,
-                        interactive=True,
-                    )
-                    save_every_steps = gr.Slider(
-                        0,
-                        100000,
-                        0,
-                        step=1,
-                        label=i18n("Save Inference Model Every X Steps"),
-                        info=i18n(
-                            "Saves an inference-only model every X training steps. Values above 0 disable epoch-based inference model saves."
-                        ),
                         interactive=True,
                     )
                     pretrained = gr.Checkbox(
@@ -1183,7 +1174,6 @@ def rvc_train_tab():
                 fn=start_training,
                 inputs=[
                     model_name,
-                    save_every_epoch,
                     save_only_latest,
                     save_every_weights,
                     total_steps,

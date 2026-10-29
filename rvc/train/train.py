@@ -139,7 +139,7 @@ class AsyncInferenceExporter:
                 snapshot,
                 copy_event,
                 staging_future,
-                export_args,
+                dict(export_args, export_dtype=export_dtype),
             )
         except Exception:
             if copy_event is not None:
@@ -222,8 +222,12 @@ def parse_arguments(argv=None):
     parser.add_argument("--model-name", required=True)
     parser.add_argument("--sample-rate", type=int, required=True)
     parser.add_argument("--total-steps", type=int, required=True)
-    parser.add_argument("--save-every-epoch", type=int, required=True)
-    parser.add_argument("--save-every-steps", type=int, default=0)
+    parser.add_argument(
+        "--save-every-steps",
+        type=int,
+        required=True,
+        help="Save the G and D checkpoints every this many steps. The last step always saves them.",
+    )
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--gpus", default="0", help="CUDA device indices joined by -, such as 0-1.")
     parser.add_argument("--pretrained-g", default="")
@@ -231,7 +235,11 @@ def parse_arguments(argv=None):
     parser.add_argument("--vocoder", choices=VOCODERS, default="HiFi-GAN")
     parser.add_argument("--version", choices=("v1", "v2"), default="v2")
     parser.add_argument("--save-only-latest", action="store_true")
-    parser.add_argument("--save-every-weights", action="store_true")
+    parser.add_argument(
+        "--save-every-weights",
+        action="store_true",
+        help="Save an inference model with every G and D checkpoint. The last step always saves one.",
+    )
     parser.add_argument("--cache-data-in-gpu", action="store_true")
     parser.add_argument("--cleanup", action="store_true")
     parser.add_argument("--checkpointing", action="store_true")
@@ -273,7 +281,7 @@ def parse_arguments(argv=None):
     )
     args = parser.parse_args(argv)
 
-    for name in ("total_steps", "save_every_epoch", "batch_size"):
+    for name in ("total_steps", "save_every_steps", "batch_size"):
         if getattr(args, name) < 1:
             parser.error(f"--{name.replace('_', '-')} must be at least 1.")
     for name in ("warmup_steps", "lr_decay_steps", "max_batch_seconds"):
@@ -283,7 +291,6 @@ def parse_arguments(argv=None):
         parser.error("--ema-decay must be at least 0 and below 1.")
     if not 0 < args.lr_final_ratio <= 1:
         parser.error("--lr-final-ratio must be above 0 and at most 1.")
-    args.save_every_steps = max(0, args.save_every_steps)
     if args.version == "v1" and (args.sample_rate != 40000 or args.vocoder != "HiFi-GAN"):
         parser.error("RVC v1 training requires HiFi-GAN at 40000 Hz.")
 
@@ -380,7 +387,7 @@ def remove_previous_attempt(experiment_dir):
             file_name, file_extension = os.path.splitext(name)
             if (
                 file_extension in (".0", ".pth")
-                or name.endswith(".spec.pt")
+                or name.endswith((".spec.pt", ".pth.tmp"))
                 or (file_name.startswith("added") and file_extension == ".index")
             ):
                 os.remove(os.path.join(root, name))
@@ -494,13 +501,14 @@ class Trainer:
         self.lr_schedule = None
         self.progress = None
         self.epoch = 0
+        self.epoch_step = 0
         self.logged_losses = None
 
     def fit(self):
         self.build_data()
         last_g, last_d = latest_checkpoint_pair(self.args.experiment_dir)
         self.build_models(last_g)
-        epoch_str, extra = self.restore(last_g, last_d)
+        epoch, start_batch, extra = self.restore(last_g, last_d)
         for optimizer in (self.optim_g, self.optim_d):
             for group in optimizer.param_groups:
                 group.setdefault("initial_lr", group["lr"])
@@ -515,11 +523,10 @@ class Trainer:
                 purge_step=self.global_step + 1 if self.global_step else 0,
                 max_queue=1000,
             )
-            if self.args.save_every_steps > 0:
-                self.exporter = AsyncInferenceExporter(self.device)
+            self.exporter = AsyncInferenceExporter(self.device)
 
         if self.rank == 0:
-            print(self.summary(epoch_str, last_g))
+            print(self.summary(epoch, start_batch, last_g))
         total_steps = self.args.total_steps
         finished = self.global_step >= total_steps
         if finished and self.rank == 0:
@@ -535,27 +542,22 @@ class Trainer:
             dynamic_ncols=True,
             disable=self.rank != 0 or finished,
         )
-        completed = None
-        epoch = epoch_str
         try:
             while self.global_step < total_steps:
-                complete = self.train_epoch(epoch)
-                if self.finish_epoch(epoch, complete):
-                    completed = epoch
-                    break
-                epoch += 1
+                self.train_epoch(epoch, start_batch)
+                epoch, start_batch = epoch + 1, 0
         finally:
             self.progress.close()
             if self.exporter is not None:
                 self.exporter.close()
             if self.writer is not None:
                 self.writer.close()
-        if completed is not None:
+        if self.rank == 0 and not finished:
             print(
-                f"{self.args.model_name} | training completed at epoch {completed}, step {self.global_step}"
+                f"{self.args.model_name} | training completed at epoch {self.epoch}, step {self.global_step}"
             )
 
-    def summary(self, epoch_str, last_g):
+    def summary(self, epoch, start_batch, last_g):
         args, data = self.args, self.config.data
         precision = (
             {torch.float16: "FP16", torch.bfloat16: "BF16"}[args.train_dtype]
@@ -571,6 +573,7 @@ class Trainer:
             f"{device} {precision}",
             f"batch {args.batch_size}, {len(self.sampler)} steps per epoch",
             f"{args.total_steps} total steps (~{math.ceil(args.total_steps / len(self.sampler))} epochs)",
+            f"saving every {args.save_every_steps} steps",
         ]
         options = []
         if args.max_batch_seconds:
@@ -602,7 +605,9 @@ class Trainer:
             if path not in ("", "None")
         ]
         if last_g:
-            parts.append(f"resuming at epoch {epoch_str}, step {self.global_step}")
+            parts.append(
+                f"resuming at step {self.global_step}, epoch {epoch} batch {start_batch + 1} of {len(self.sampler)}"
+            )
         elif pretrained:
             parts.append(f"from {' and '.join(pretrained)}")
         else:
@@ -737,10 +742,10 @@ class Trainer:
                     raise FileNotFoundError(
                         "resuming needs a G_*.pth and a D_*.pth checkpoint with the same suffix"
                     )
-                _, _, _, epoch_str, scaler_dict, _ = load_checkpoint(
+                _, _, _, _, scaler_dict, d_extra = load_checkpoint(
                     last_d, self.net_d, self.optim_d
                 )
-                _, _, _, epoch_str, _, extra = load_checkpoint(
+                _, _, _, epoch, _, extra = load_checkpoint(
                     last_g, self.net_g, self.optim_g
                 )
             except Exception as e:
@@ -749,16 +754,42 @@ class Trainer:
                 sys.exit(1)
             if scaler_dict:
                 self.scaler.load_state_dict(scaler_dict)
-            epoch_str += 1
             step = extra.get("step")
+            if d_extra.get("step") not in (None, step):
+                print(
+                    f"{os.path.basename(last_d)} was saved at step {d_extra['step']}, "
+                    f"but {os.path.basename(last_g)} at step {step}."
+                )
+            start_batch = extra.get("epoch_step")
+            if start_batch is None or start_batch >= len(self.sampler):
+                epoch, start_batch = epoch + 1, 0
             self.global_step = (
-                int(step) if step is not None else (epoch_str - 1) * len(self.sampler)
+                int(step)
+                if step is not None
+                else (epoch - 1) * len(self.sampler) + start_batch
             )
-            return epoch_str, extra
+            self.restore_rng(extra.get("rng"))
+            return epoch, int(start_batch), extra
 
         self.load_pretrained(self.net_g, self.args.pretrained_g, "G", match_speakers=True)
         self.load_pretrained(self.net_d, self.args.pretrained_d, "D")
-        return 1, {}
+        return 1, 0, {}
+
+    def rng_state(self):
+        state = {"cpu": torch.get_rng_state()}
+        if self.device.type == "cuda":
+            state["cuda"] = torch.cuda.get_rng_state(self.device)
+        return state
+
+    def restore_rng(self, state):
+        if not state:
+            return
+        try:
+            torch.set_rng_state(state["cpu"])
+            if self.device.type == "cuda" and "cuda" in state:
+                torch.cuda.set_rng_state(state["cuda"], self.device)
+        except (KeyError, RuntimeError, TypeError) as e:
+            print(f"Could not restore the random number generator state: {e}")
 
     def build_lr_schedule(self, saved):
         target = {
@@ -838,22 +869,23 @@ class Trainer:
             batch = self.collate([self.cache[index] for index in indices])
             yield [tensor.to(self.device, non_blocking=True) for tensor in batch]
 
-    def train_epoch(self, epoch):
-        self.sampler.set_epoch(epoch)
+    def train_epoch(self, epoch, start_batch):
+        self.sampler.set_epoch(epoch, start_batch)
         self.net_g.train()
         self.net_d.train()
         self.epoch = epoch
+        self.epoch_step = start_batch
         self.update_postfix()
-        steps = 0
         for batch in self.batches():
             self.set_learning_rate(epoch)
             self.train_step(batch)
-            self.export_step_weights(epoch)
+            self.epoch_step += 1
             self.progress.update(1)
-            steps += 1
-            if self.global_step >= self.args.total_steps:
+            final = self.global_step >= self.args.total_steps
+            if final or self.global_step % self.args.save_every_steps == 0:
+                self.save(epoch, final)
+            if final:
                 break
-        return steps == len(self.sampler)
 
     def warmup_ramp(self, step):
         warmup = self.args.warmup_steps
@@ -1043,19 +1075,7 @@ class Trainer:
             verbose=False,
         )
 
-    def export_step_weights(self, epoch):
-        if self.exporter is None or self.global_step % self.args.save_every_steps != 0:
-            return
-        path = self.weights_path(epoch)
-        if not os.path.exists(path):
-            self.exporter.submit(
-                state_dict=self.export_state_dict(),
-                export_dtype=self.args.export_dtype,
-                model_path=path,
-                **self.export_arguments(epoch),
-            )
-
-    def summarize_epoch(self, spec, ids_slice, y_hat):
+    def summarize_mels(self, spec, ids_slice, y_hat):
         config = self.config
         mel = spec_to_mel_torch(
             spec,
@@ -1090,55 +1110,50 @@ class Trainer:
             },
         )
 
-    def finish_epoch(self, epoch, complete):
+    def save(self, epoch, final):
         if self.rank != 0:
-            return False
+            return
         args = self.args
-        spec, ids_slice, y_hat = self.last_batch
-        save_epoch = complete and epoch % args.save_every_epoch == 0
-        done = self.global_step >= args.total_steps
-        if save_epoch:
-            self.summarize_epoch(spec, ids_slice, y_hat)
+        self.summarize_mels(*self.last_batch)
+        weights = self.weights_path(epoch)
+        if (args.save_every_weights or final) and not os.path.exists(weights):
+            self.exporter.submit(
+                state_dict=self.export_state_dict(),
+                export_dtype=args.export_dtype,
+                model_path=weights,
+                **self.export_arguments(epoch),
+            )
 
-        weights = []
-        if save_epoch:
-            suffix = LATEST_CHECKPOINT_SUFFIX if args.save_only_latest else self.global_step
-            generator_extra = {"step": self.global_step}
-            if self.ema is not None:
-                generator_extra["ema"] = self.ema.state_dict()
-            if self.lr_schedule is not None:
-                generator_extra["lr_schedule"] = self.lr_schedule
-            for prefix, net, optimizer, extra in (
-                ("G", self.net_g, self.optim_g, generator_extra),
-                ("D", self.net_d, self.optim_d, None),
-            ):
-                save_checkpoint(
-                    net,
-                    optimizer,
-                    self.config.train.learning_rate,
-                    epoch,
-                    os.path.join(args.experiment_dir, f"{prefix}_{suffix}.pth"),
-                    self.scaler,
-                    extra,
-                )
-            if args.save_every_weights and args.save_every_steps == 0:
-                weights.append(self.weights_path(epoch))
-
-        if done:
-            weights.append(self.weights_path(epoch))
-            if self.exporter is not None:
-                self.exporter.wait_for_completion()
-
-        state_dict = self.export_state_dict() if weights else None
-        for path in weights:
-            if not os.path.exists(path):
-                extract_model(
-                    ckpt=state_dict,
-                    model_path=path,
-                    export_dtype=args.export_dtype,
-                    **self.export_arguments(epoch),
-                )
-        return done
+        suffix = LATEST_CHECKPOINT_SUFFIX if args.save_only_latest else self.global_step
+        generator_extra = {
+            "step": self.global_step,
+            "epoch_step": self.epoch_step,
+            "rng": self.rng_state(),
+        }
+        if self.ema is not None:
+            generator_extra["ema"] = self.ema.state_dict()
+        if self.lr_schedule is not None:
+            generator_extra["lr_schedule"] = self.lr_schedule
+        paths = []
+        for prefix, net, optimizer, extra in (
+            ("D", self.net_d, self.optim_d, {"step": self.global_step}),
+            ("G", self.net_g, self.optim_g, generator_extra),
+        ):
+            path = os.path.join(args.experiment_dir, f"{prefix}_{suffix}.pth")
+            save_checkpoint(
+                net,
+                optimizer,
+                self.config.train.learning_rate,
+                epoch,
+                f"{path}.tmp",
+                self.scaler,
+                extra,
+            )
+            paths.append(path)
+        for path in paths:
+            os.replace(f"{path}.tmp", path)
+        if final:
+            self.exporter.wait_for_completion()
 
 
 if __name__ == "__main__":

@@ -124,7 +124,6 @@ def save_checkpoint(
     }
 
     # Create a backwards-compatible checkpoint
-    temporary_path = f"{checkpoint_path}.tmp"
     torch.save(
         replace_keys_in_dict(
             replace_keys_in_dict(
@@ -133,9 +132,8 @@ def save_checkpoint(
             ".parametrizations.weight.original0",
             ".weight_g",
         ),
-        temporary_path,
+        checkpoint_path,
     )
-    os.replace(temporary_path, checkpoint_path)
 
 
 def summarize(

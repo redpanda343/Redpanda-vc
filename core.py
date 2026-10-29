@@ -635,7 +635,6 @@ def append_data_shutdown_log(
 
 def _build_train_command(
     model_name: str,
-    save_every_epoch: int,
     save_only_latest: bool,
     save_every_weights: bool,
     total_steps: int,
@@ -651,7 +650,7 @@ def _build_train_command(
     d_pretrained_path: str = None,
     vocoder: str = "HiFi-GAN",
     checkpointing: bool = False,
-    save_every_steps: int = 0,
+    save_every_steps: int = 1000,
     version: str = "v2",
     warmup_steps: int = 0,
     lr_decay_steps: int = 0,
@@ -704,8 +703,6 @@ def _build_train_command(
         str(sample_rate),
         "--total-steps",
         str(total_steps),
-        "--save-every-epoch",
-        str(save_every_epoch),
         "--save-every-steps",
         str(save_every_steps),
         "--batch-size",
@@ -748,7 +745,6 @@ def _build_train_command(
 # Train
 def run_train_script(
     model_name: str,
-    save_every_epoch: int,
     save_only_latest: bool,
     save_every_weights: bool,
     total_steps: int,
@@ -765,7 +761,7 @@ def run_train_script(
     vocoder: str = "HiFi-GAN",
     checkpointing: bool = False,
     shutdown_check: bool = False,
-    save_every_steps: int = 0,
+    save_every_steps: int = 1000,
     version: str = "v2",
     warmup_steps: int = 0,
     lr_decay_steps: int = 0,
@@ -776,7 +772,6 @@ def run_train_script(
 ):
     command = _build_train_command(
         model_name,
-        save_every_epoch,
         save_only_latest,
         save_every_weights,
         total_steps,
@@ -828,7 +823,6 @@ def run_train_script(
 
 def start_train_script(
     model_name: str,
-    save_every_epoch: int,
     save_only_latest: bool,
     save_every_weights: bool,
     total_steps: int,
@@ -845,7 +839,7 @@ def start_train_script(
     vocoder: str = "HiFi-GAN",
     checkpointing: bool = False,
     shutdown_check: bool = False,
-    save_every_steps: int = 0,
+    save_every_steps: int = 1000,
     version: str = "v2",
     generate_index: bool = False,
     warmup_steps: int = 0,
@@ -857,7 +851,6 @@ def start_train_script(
 ):
     command = _build_train_command(
         model_name,
-        save_every_epoch,
         save_only_latest,
         save_every_weights,
         total_steps,
@@ -1451,12 +1444,6 @@ def extract(**kwargs):
     help="Enable memory-efficient checkpointing.",
 )
 @click.option(
-    "--save-every-epoch",
-    required=True,
-    type=click.IntRange(1, 100),
-    help="Save checkpoint every N epochs.",
-)
-@click.option(
     "--save-only-latest",
     is_flag=True,
     default=False,
@@ -1466,13 +1453,13 @@ def extract(**kwargs):
     "--save-every-weights",
     is_flag=True,
     default=True,
-    help="Save model weights every epoch.",
+    help="Save an inference model with every G and D checkpoint.",
 )
 @click.option(
     "--save-every-steps",
-    type=click.IntRange(min=0),
-    default=0,
-    help="Save an inference-only model every N training steps (0 disables it).",
+    type=click.IntRange(min=1),
+    default=1000,
+    help="Save the G and D checkpoints every N training steps. The last step always saves them.",
 )
 @click.option(
     "--total-steps",
@@ -1571,7 +1558,6 @@ def train(**kwargs):
     """Train an RVC model."""
     result = run_train_script(
         model_name=kwargs["model_name"],
-        save_every_epoch=kwargs["save_every_epoch"],
         save_only_latest=kwargs["save_only_latest"],
         save_every_weights=kwargs["save_every_weights"],
         total_steps=kwargs["total_steps"],
