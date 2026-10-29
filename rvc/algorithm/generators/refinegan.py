@@ -399,14 +399,14 @@ class RefineGANGenerator(nn.Module):
             downs.append(x)
             # attempt to cancel spectral aliasing
             x = torchaudio.functional.resample(
-                x.contiguous(),
+                x.float().contiguous(),
                 orig_freq=int(f0_size * old_size),
                 new_freq=int(f0_size * new_size),
                 lowpass_filter_width=64,
                 rolloff=0.9475937167399596,
                 resampling_method="sinc_interp_kaiser",
                 beta=14.769656459379492,
-            )
+            ).to(x.dtype)
             x = block(x)
 
         # expanding spectrogram from 192 to 256 channels
