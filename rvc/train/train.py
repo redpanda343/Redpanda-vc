@@ -198,7 +198,8 @@ class GeneratorEMA:
     @torch.no_grad()
     def update(self):
         self.updates += 1
-        decay = min(self.decay, (1 + self.updates) / (10 + self.updates))
+        beta = self.decay
+        decay = beta * (1 - beta ** (self.updates - 1)) / (1 - beta**self.updates)
         torch._foreach_lerp_(self.ema_floats, self.live_floats, 1 - decay)
         for target, value in self.copied:
             target.copy_(value)
