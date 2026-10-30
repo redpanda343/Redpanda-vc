@@ -966,11 +966,13 @@ def run_prerequisites_script(
     models: bool,
     exe: bool,
     beatrice: bool = False,
+    vocoders: bool = False,
 ):
     prequisites_download_pipeline(
         pretraineds_hifigan,
         models,
         exe,
+        vocoders,
     )
     if beatrice:
         from beatrice.resources import ensure_trainer
@@ -1646,8 +1648,7 @@ def download(**kwargs):
 @click.option(
     "--pretraineds-hifigan/--no-pretraineds-hifigan",
     default=True,
-    help="Download pretrained HiFi-GAN models and the pretrained Vocos, Pupu-Vocoder, BigVGAN and NSF-BigVGAN flow "
-    "vocoders.",
+    help="Download the pretrained HiFi-GAN and RefineGAN RVC models.",
 )
 @click.option("--models/--no-models", default=True, help="Download additional models.")
 @click.option("--exe/--no-exe", default=True, help="Download required executables.")
@@ -1656,6 +1657,12 @@ def download(**kwargs):
     default=True,
     help="Download Beatrice Trainer with its pretrained models.",
 )
+@click.option(
+    "--vocoders/--no-vocoders",
+    default=True,
+    help="Download the pretrained PC-NSF-HiFiGAN vocoder and the Vocos, Pupu-Vocoder, BigVGAN and NSF-BigVGAN flow "
+    "vocoders.",
+)
 def prerequisites(**kwargs):
     """Install prerequisites for RVC."""
     result = run_prerequisites_script(
@@ -1663,6 +1670,7 @@ def prerequisites(**kwargs):
         kwargs["models"],
         kwargs["exe"],
         kwargs["beatrice"],
+        kwargs["vocoders"],
     )
     click.echo(result)
 

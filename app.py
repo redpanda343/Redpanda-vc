@@ -112,7 +112,6 @@ run_prerequisites_script(
     pretraineds_hifigan=True,
     models=True,
     exe=True,
-    beatrice=True,
 )
 
 # Initialize i18n

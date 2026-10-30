@@ -146,8 +146,8 @@ def beatrice_train_tab():
                 '[Beatrice Trainer](https://huggingface.co/fierce-cats/beatrice-trainer) 2.0.0-rc.0 (MIT). '
                 '`logs/<model>` keeps only the latest `paraphernalia_*` model folder, which loads in the realtime GUI, '
                 'the Beatrice VST, VCClient or beatrice-client, and `checkpoint_latest.pt.gz` to resume training. The '
-                'app downloads the trainer with its pretrained models, noise and impulse-response sets (about 440 MB) '
-                'at startup, and training retries an interrupted download.')
+                'trainer with its pretrained models, noise and impulse-response sets (about 440 MB) downloads when you '
+                'first start training, and the next start retries an interrupted download.')
     with gr.Row():
         name = gr.Textbox(label='Model name', value='my-beatrice')
         device = gr.Textbox(label='Device', value='auto', info='auto, cpu or cuda:N. Beatrice trains on one GPU.')

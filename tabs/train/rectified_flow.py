@@ -159,8 +159,7 @@ def start(name, batch, max_frames, max_updates, checkpoint_interval, device, use
         raise gr.Error(f'Unsupported training precision: {precision}')
     if vocoder in VOCODERS:
         check_registry_vocoder(vocoder, selected['data'])
-        if selected['flow']['val_with_vocoder']:
-            resolve_vocoder(vocoder)
+        resolve_vocoder(vocoder)
     elif custom_vocoder_file(vocoder) is not None:
         check_custom_vocoder(vocoder, selected['data'])
     else:

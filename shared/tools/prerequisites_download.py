@@ -306,6 +306,7 @@ def prequisites_download_pipeline(
     pretraineds_hifigan,
     models,
     exe,
+    vocoders=False,
 ):
     """
     Manage the download pipeline for different categories of files.
@@ -357,7 +358,7 @@ def prequisites_download_pipeline(
             if pretraineds_hifigan:
                 download_mapping_files(pretraineds_hifigan_list, global_bar)
                 download_mapping_files(pretraineds_refinegan_list, global_bar)
-    if pretraineds_hifigan:
+    if vocoders:
         from nsf_hifigan.resources import pretrained_path
         from rectified_flow.resources import VOCODERS, vocoder_path
 
