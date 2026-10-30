@@ -3,6 +3,7 @@ import sys
 
 os.environ["USE_LIBUV"] = "0" if sys.platform == "win32" else "1"
 import argparse
+import faulthandler
 import glob
 import json
 import logging
@@ -15,7 +16,6 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 now_dir = os.getcwd()
@@ -401,6 +401,17 @@ def remove_previous_attempt(experiment_dir):
                 os.rmdir(folder_path)
 
 
+def cpu_allreduce_hook(group, bucket):
+    buffer = bucket.buffer()
+    work = dist.all_reduce(buffer.cpu(), group=group, async_op=True)
+    world_size = dist.get_world_size(group)
+
+    def unstage(future):
+        return buffer.copy_(future.value()[0].div_(world_size))
+
+    return work.get_future().then(unstage)
+
+
 def latest_checkpoint_pair(experiment_dir):
     generators = sorted(
         glob.glob(os.path.join(experiment_dir, "G_*.pth")),
@@ -452,6 +463,7 @@ def main():
 
 
 def run(rank, world_size, args, config, device_type, device_ids):
+    faulthandler.enable()
     device_id = device_ids[rank]
     if world_size > 1:
         dist.init_process_group(
@@ -518,6 +530,8 @@ class Trainer:
             self.build_ema(last_g, extra.get("ema"))
 
         if self.rank == 0:
+            from torch.utils.tensorboard import SummaryWriter
+
             self.writer = SummaryWriter(
                 log_dir=os.path.join(self.args.experiment_dir, "eval"),
                 purge_step=self.global_step + 1 if self.global_step else 0,
@@ -725,6 +739,9 @@ class Trainer:
         if self.world_size > 1 and self.device.type == "cuda":
             net_g = DDP(net_g, device_ids=[self.device.index])
             net_d = DDP(net_d, device_ids=[self.device.index])
+            if dist.get_backend() == "gloo":
+                net_g.register_comm_hook(None, cpu_allreduce_hook)
+                net_d.register_comm_hook(None, cpu_allreduce_hook)
         self.net_g, self.net_d = net_g, net_d
         self.freeze_discriminator = self.device.type == "cuda"
         self.net_d_for_generator = (
