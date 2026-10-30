@@ -473,7 +473,7 @@ def run(rank, world_size, args, config, device_type, device_ids):
             rank=rank,
         )
     try:
-        torch.manual_seed(config.train.seed)
+        torch.manual_seed(config.train.seed + rank)
         if device_type == "cuda":
             torch.cuda.set_device(device_id)
             device = torch.device("cuda", device_id)
@@ -501,6 +501,8 @@ class Trainer:
             torch.float16,
         )
         self.cache_in_gpu = device.type == "cuda" and args.cache_data_in_gpu
+        self.workers = max(1, min(4, (os.cpu_count() or 1) // world_size))
+        self.pending_rng = None
         self.global_step = 0
         self.loss_sums = torch.zeros(6, device=device, dtype=torch.float32)
         self.batch_count = 0
@@ -663,7 +665,7 @@ class Trainer:
         if not self.cache_in_gpu:
             self.loader = DataLoader(
                 self.dataset,
-                num_workers=4,
+                num_workers=self.workers,
                 shuffle=False,
                 pin_memory=self.device.type == "cuda",
                 collate_fn=self.collate,
@@ -737,8 +739,8 @@ class Trainer:
             self.fn_mel_loss = torch.nn.L1Loss()
 
         if self.world_size > 1 and self.device.type == "cuda":
-            net_g = DDP(net_g, device_ids=[self.device.index])
-            net_d = DDP(net_d, device_ids=[self.device.index])
+            net_g = DDP(net_g, device_ids=[self.device.index], gradient_as_bucket_view=True)
+            net_d = DDP(net_d, device_ids=[self.device.index], gradient_as_bucket_view=True)
             if dist.get_backend() == "gloo":
                 net_g.register_comm_hook(None, cpu_allreduce_hook)
                 net_d.register_comm_hook(None, cpu_allreduce_hook)
@@ -785,7 +787,7 @@ class Trainer:
                 if step is not None
                 else (epoch - 1) * len(self.sampler) + start_batch
             )
-            self.restore_rng(extra.get("rng"))
+            self.pending_rng = extra.get("rng")
             return epoch, int(start_batch), extra
 
         self.load_pretrained(self.net_g, self.args.pretrained_g, "G", match_speakers=True)
@@ -799,6 +801,10 @@ class Trainer:
         return state
 
     def restore_rng(self, state):
+        if isinstance(state, list):
+            state = state[self.rank] if self.rank < len(state) else None
+        elif self.rank:
+            state = None
         if not state:
             return
         try:
@@ -876,7 +882,7 @@ class Trainer:
             return
         if self.cache is None:
             loader = DataLoader(
-                self.dataset, batch_size=None, num_workers=4, pin_memory=True
+                self.dataset, batch_size=None, num_workers=self.workers, pin_memory=True
             )
             self.cache = [
                 tuple(tensor.to(self.device, non_blocking=True) for tensor in item)
@@ -894,6 +900,9 @@ class Trainer:
         self.epoch_step = start_batch
         self.update_postfix()
         for batch in self.batches():
+            if self.pending_rng is not None:
+                self.restore_rng(self.pending_rng)
+                self.pending_rng = None
             self.set_learning_rate(epoch)
             self.train_step(batch)
             self.epoch_step += 1
@@ -1128,6 +1137,11 @@ class Trainer:
         )
 
     def save(self, epoch, final):
+        rng = [self.rng_state()]
+        if self.world_size > 1:
+            gathered = [None] * self.world_size if self.rank == 0 else None
+            dist.gather_object(rng[0], gathered, dst=0)
+            rng = gathered
         if self.rank != 0:
             return
         args = self.args
@@ -1145,7 +1159,7 @@ class Trainer:
         generator_extra = {
             "step": self.global_step,
             "epoch_step": self.epoch_step,
-            "rng": self.rng_state(),
+            "rng": rng,
         }
         if self.ema is not None:
             generator_extra["ema"] = self.ema.state_dict()
