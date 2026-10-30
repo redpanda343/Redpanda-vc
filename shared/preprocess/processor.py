@@ -120,13 +120,13 @@ class PreProcess:
     ):
         if normalized_audio is not None and normalization_mode == "chunk":
             normalized_audio = self._normalize_audio(normalized_audio)
-        if normalized_audio is None:
-            print(f"{sid}-{idx0}-{idx1}-filtered")
-            return 0
-        if normalization_mode == "post":
+        if normalized_audio is not None and normalization_mode == "post":
             normalized_audio = self._peak_normalize_audio(
                 normalized_audio, normalization_gain
             )
+        if normalized_audio is None:
+            print(f"{sid}-{idx0}-{idx1}-filtered")
+            return 0
         args = (
             self.gt_wavs_dir,
             f"{sid}_{idx0}_{idx1}",
@@ -511,8 +511,10 @@ class PreProcess:
                 reduction_strength,
                 normalization_mode,
             )
+            if audio is None:
+                return audio_length, skipped_short
             normalization_gain = 1.0
-            if normalization_mode == "post" and audio is not None:
+            if normalization_mode == "post":
                 normalization_gain = self._detect_post_normalization_gain(audio)
             if cut_preprocess == "Skip":
 
