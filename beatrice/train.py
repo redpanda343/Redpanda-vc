@@ -28,7 +28,9 @@ LAUNCHER_PATCHES = (
     (REPO_ROOT_SOURCE, 'def repo_root() -> Path:\n    return Path(__file__).resolve().parents[1]\n'),
     ('import torchaudio\n', 'import torchaudio\nfrom beatrice.compat import patch_torchaudio\n\npatch_torchaudio()\n'),
     (RUN_FILES_SOURCE, ''),
+    ('from torch.utils.tensorboard import SummaryWriter\n', ''),
     ('        writer = SummaryWriter(out_dir)\n',
+     '        from torch.utils.tensorboard import SummaryWriter\n\n'
      '        writer = SummaryWriter(out_dir / "events")\n'),
     ('                shutil.copy(checkpoint_file_save, out_dir / "checkpoint_latest.pt.gz")\n',
      '                os.replace(checkpoint_file_save, out_dir / "checkpoint_latest.pt.gz")\n'),
