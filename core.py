@@ -658,6 +658,7 @@ def _build_train_command(
     ema_decay: float = 0.999,
     lr_schedule: str = "exponential",
     lr_final_ratio: float = 0.1,
+    reset_optimizer: bool = False,
 ):
     if version not in {"v1", "v2"}:
         raise ValueError(f"Unsupported RVC version: {version}")
@@ -735,6 +736,7 @@ def _build_train_command(
         ("--save-every-weights", save_every_weights),
         ("--cache-data-in-gpu", cache_data_in_gpu),
         ("--cleanup", cleanup),
+        ("--reset-optimizer", reset_optimizer),
         ("--checkpointing", checkpointing),
     ):
         if enabled:
@@ -769,6 +771,7 @@ def run_train_script(
     ema_decay: float = 0.999,
     lr_schedule: str = "exponential",
     lr_final_ratio: float = 0.1,
+    reset_optimizer: bool = False,
 ):
     command = _build_train_command(
         model_name,
@@ -795,6 +798,7 @@ def run_train_script(
         ema_decay,
         lr_schedule,
         lr_final_ratio,
+        reset_optimizer,
     )
     result = subprocess.run(command)
     if result.returncode != 0:
@@ -848,6 +852,7 @@ def start_train_script(
     ema_decay: float = 0.999,
     lr_schedule: str = "exponential",
     lr_final_ratio: float = 0.1,
+    reset_optimizer: bool = False,
 ):
     command = _build_train_command(
         model_name,
@@ -874,6 +879,7 @@ def start_train_script(
         ema_decay,
         lr_schedule,
         lr_final_ratio,
+        reset_optimizer,
     )
 
     on_success = None
@@ -1556,6 +1562,12 @@ def extract(**kwargs):
     default=0.1,
     help="Fraction of the starting learning rate that the cosine schedule reaches at the last step.",
 )
+@click.option(
+    "--reset-optimizer",
+    is_flag=True,
+    default=False,
+    help="When resuming from G_*.pth and D_*.pth, start the optimizers without their saved moments.",
+)
 def train(**kwargs):
     """Train an RVC model."""
     result = run_train_script(
@@ -1583,6 +1595,7 @@ def train(**kwargs):
         ema_decay=kwargs["ema_decay"],
         lr_schedule=kwargs["lr_schedule"],
         lr_final_ratio=kwargs["lr_final_ratio"],
+        reset_optimizer=kwargs["reset_optimizer"],
     )
     click.echo(result)
 

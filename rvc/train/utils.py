@@ -31,7 +31,7 @@ def replace_keys_in_dict(d, old_key_part, new_key_part):
     return updated_dict
 
 
-def load_checkpoint(checkpoint_path, model, optimizer=None, load_opt=1):
+def load_checkpoint(checkpoint_path, model, optimizer=None, load_opt=1, reset_state=False):
     """
     Load a checkpoint into a model and optionally the optimizer.
 
@@ -40,6 +40,7 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, load_opt=1):
         model (torch.nn.Module): The model to load the checkpoint into.
         optimizer (torch.optim.Optimizer, optional): The optimizer to load the state from. Defaults to None.
         load_opt (int, optional): Whether to load the optimizer state. Defaults to 1.
+        reset_state (bool, optional): Load only the optimizer's param groups, not its moments. Defaults to False.
     """
     assert os.path.isfile(
         checkpoint_path
@@ -69,6 +70,8 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, load_opt=1):
 
     if optimizer and load_opt == 1:
         optimizer_state = checkpoint_dict["optimizer"]
+        if reset_state:
+            optimizer_state = dict(optimizer_state, state={})
         overrides = {
             key: optimizer.defaults[key]
             for key in ("fused", "foreach")

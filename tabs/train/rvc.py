@@ -709,6 +709,14 @@ def rvc_train_tab():
                         value=True,
                         interactive=True,
                     )
+                    reset_optimizer = gr.Checkbox(
+                        label=i18n("Reset Optimizer State"),
+                        info=i18n(
+                            "When resuming from the G and D checkpoints in the logs folder, starts the optimizer without its saved state. The weights, step count and learning rate schedule carry over. Pretrained models, including custom ones, always start with a fresh optimizer."
+                        ),
+                        value=False,
+                        interactive=True,
+                    )
                 with gr.Column():
                     cleanup = gr.Checkbox(
                         label=i18n("Fresh Training"),
@@ -859,7 +867,7 @@ def rvc_train_tab():
             )
 
         def start_training(*args):
-            *arguments, warmup, decay_steps, batch_seconds, ema, schedule, final_ratio = args
+            *arguments, warmup, decay_steps, batch_seconds, ema, schedule, final_ratio, reset = args
             message = start_train_script(
                 *arguments,
                 warmup_steps=warmup,
@@ -868,6 +876,7 @@ def rvc_train_tab():
                 ema_decay=ema,
                 lr_schedule=schedule,
                 lr_final_ratio=final_ratio,
+                reset_optimizer=reset,
             )
             gr.Info(message)
             return training_ui_state(args[0])
@@ -1198,6 +1207,7 @@ def rvc_train_tab():
                     ema_decay,
                     lr_schedule,
                     lr_final_ratio,
+                    reset_optimizer,
                 ],
                 outputs=training_outputs,
             ).then(**wake_training_timer)

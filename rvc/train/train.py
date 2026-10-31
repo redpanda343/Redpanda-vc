@@ -242,6 +242,11 @@ def parse_arguments(argv=None):
     )
     parser.add_argument("--cache-data-in-gpu", action="store_true")
     parser.add_argument("--cleanup", action="store_true")
+    parser.add_argument(
+        "--reset-optimizer",
+        action="store_true",
+        help="When resuming from G_*.pth and D_*.pth, start the optimizers without their saved moments. The learning rate schedule continues.",
+    )
     parser.add_argument("--checkpointing", action="store_true")
     parser.add_argument(
         "--warmup-steps",
@@ -623,6 +628,7 @@ class Trainer:
         if last_g:
             parts.append(
                 f"resuming at step {self.global_step}, epoch {epoch} batch {start_batch + 1} of {len(self.sampler)}"
+                + (" with a fresh optimizer state" if args.reset_optimizer else "")
             )
         elif pretrained:
             parts.append(f"from {' and '.join(pretrained)}")
@@ -761,11 +767,12 @@ class Trainer:
                     raise FileNotFoundError(
                         "resuming needs a G_*.pth and a D_*.pth checkpoint with the same suffix"
                     )
+                reset = self.args.reset_optimizer
                 _, _, _, _, scaler_dict, d_extra = load_checkpoint(
-                    last_d, self.net_d, self.optim_d
+                    last_d, self.net_d, self.optim_d, reset_state=reset
                 )
                 _, _, _, epoch, _, extra = load_checkpoint(
-                    last_g, self.net_g, self.optim_g
+                    last_g, self.net_g, self.optim_g, reset_state=reset
                 )
             except Exception as e:
                 print(f"Could not resume from the checkpoints in {self.args.experiment_dir}: {e}")
