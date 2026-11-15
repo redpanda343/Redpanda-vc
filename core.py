@@ -4,6 +4,8 @@ import secrets
 import subprocess
 import sys
 
+os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
+
 import click
 
 from functools import lru_cache

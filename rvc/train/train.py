@@ -2,6 +2,7 @@ import os
 import sys
 
 os.environ["USE_LIBUV"] = "0" if sys.platform == "win32" else "1"
+os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
 import argparse
 import faulthandler
 import glob

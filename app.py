@@ -3,6 +3,8 @@ import os
 import shutil
 import sys
 
+os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
+
 
 if __name__ == "__main__":
     from shared.updater import update_and_restart

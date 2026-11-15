@@ -2,6 +2,8 @@ import glob
 import importlib.util
 import os
 
+os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
+
 import torch
 
 INSTALL_HINT = (
