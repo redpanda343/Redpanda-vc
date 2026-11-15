@@ -290,7 +290,7 @@ class SineGenerator(nn.Module):
             sine_waves = sine_waves * uv + noise
 
         # merge with grad
-        return self.merge(sine_waves)
+        return self.merge(sine_waves.to(dtype=self.merge[0].weight.dtype))
 
 
 class RefineGANGenerator(nn.Module):

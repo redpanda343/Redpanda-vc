@@ -37,6 +37,15 @@ OUTPUT_NORMALIZATION_MAX_GAIN = 4.0
 OUTPUT_NORMALIZATION_OFF_DB = -12.0
 OUTPUT_PEAK_CEILING = 0.99
 
+if hasattr(torch, "set_float32_matmul_precision"):
+    torch.set_float32_matmul_precision("highest")
+if hasattr(torch.backends.cuda.matmul, "fp32_precision"):
+    torch.backends.cuda.matmul.fp32_precision = "ieee"
+    torch.backends.cudnn.conv.fp32_precision = "ieee"
+else:
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+
 
 @contextmanager
 def _deterministic_torch(enabled):
@@ -762,7 +771,10 @@ class VoiceConverter:
             self.net_g.load_state_dict(self.cpt["weight"], strict=False)
             self.net_g = self.net_g.to(self.config.device).float()
             self.net_g.eval()
-            self.net_g.remove_weight_norm()
+            with torch.amp.autocast(
+                device_type=torch.device(self.config.device).type, enabled=False
+            ):
+                self.net_g.remove_weight_norm()
 
     def setup_vc_instance(self):
         """

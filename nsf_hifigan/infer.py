@@ -47,37 +47,38 @@ class VocoderInference:
 
     @torch.inference_mode()
     def infer(self, waveform, pitch=0, f0_method='rmvpe', seed=None):
-        waveform = np.asarray(waveform, dtype=np.float32)
-        if waveform.ndim != 1 or not len(waveform) or not np.isfinite(waveform).all():
-            raise ValueError('Select non-empty audio with finite samples.')
-        extractor = 'parselmouth' if f0_method == 'pm' else f0_method
-        if extractor not in {'rmvpe', 'parselmouth'}:
-            raise ValueError(f'{self.name} supports RMVPE or parselmouth pitch extraction.')
-        rate, hop = int(self.data['sample_rate']), int(self.data['hop_length'])
-        length = len(waveform)
-        frames = math.ceil(length / hop)
-        padded_length = max(frames, math.ceil(self.data['n_fft'] / hop)) * hop
-        padded = np.pad(np.clip(waveform, -1.0, 1.0), (0, padded_length - length))
-        source = torch.from_numpy(padded).to(self.device)[None]
-        mel = self.mel(source)[..., :frames]
-        f0, uv = extract_pitch(extractor, waveform, rate, hop, frames, self.device)
-        if self.zero_unvoiced:
-            f0 = f0 * ~uv
-        f0 = torch.from_numpy(f0).to(self.device)[None] * 2 ** (float(pitch) / 12)
-        devices = []
-        if self.device.type == 'cuda':
-            devices = [self.device.index if self.device.index is not None else torch.cuda.current_device()]
-        scope = torch.random.fork_rng(devices=devices) if seed is not None else nullcontext()
-        with scope:
-            if seed is not None:
-                torch.random.default_generator.manual_seed(int(seed))
-                if self.device.type == 'cuda':
-                    with torch.cuda.device(self.device):
-                        torch.cuda.manual_seed(int(seed))
-            audio = self.generator(mel, f0)[0, 0, :length]
-        if not torch.isfinite(audio).all():
-            raise FloatingPointError(f'Non-finite {self.name} audio output.')
-        return audio.float().cpu().numpy()
+        with torch.amp.autocast(device_type=self.device.type, enabled=False):
+            waveform = np.asarray(waveform, dtype=np.float32)
+            if waveform.ndim != 1 or not len(waveform) or not np.isfinite(waveform).all():
+                raise ValueError('Select non-empty audio with finite samples.')
+            extractor = 'parselmouth' if f0_method == 'pm' else f0_method
+            if extractor not in {'rmvpe', 'parselmouth'}:
+                raise ValueError(f'{self.name} supports RMVPE or parselmouth pitch extraction.')
+            rate, hop = int(self.data['sample_rate']), int(self.data['hop_length'])
+            length = len(waveform)
+            frames = math.ceil(length / hop)
+            padded_length = max(frames, math.ceil(self.data['n_fft'] / hop)) * hop
+            padded = np.pad(np.clip(waveform, -1.0, 1.0), (0, padded_length - length))
+            source = torch.from_numpy(padded).to(self.device).float()[None]
+            mel = self.mel(source)[..., :frames]
+            f0, uv = extract_pitch(extractor, waveform, rate, hop, frames, self.device)
+            if self.zero_unvoiced:
+                f0 = f0 * ~uv
+            f0 = torch.from_numpy(f0).to(self.device).float()[None] * 2 ** (float(pitch) / 12)
+            devices = []
+            if self.device.type == 'cuda':
+                devices = [self.device.index if self.device.index is not None else torch.cuda.current_device()]
+            scope = torch.random.fork_rng(devices=devices) if seed is not None else nullcontext()
+            with scope:
+                if seed is not None:
+                    torch.random.default_generator.manual_seed(int(seed))
+                    if self.device.type == 'cuda':
+                        with torch.cuda.device(self.device):
+                            torch.cuda.manual_seed(int(seed))
+                audio = self.generator(mel.float(), f0.float())[0, 0, :length]
+            if not torch.isfinite(audio).all():
+                raise FloatingPointError(f'Non-finite {self.name} audio output.')
+            return audio.float().cpu().numpy()
 
 
 class NSFBigVGANInference(VocoderInference):

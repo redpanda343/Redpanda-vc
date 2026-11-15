@@ -36,30 +36,32 @@ class LogMel(nn.Module):
         )
 
     def forward(self, audio: torch.Tensor, key_shift: float = 0.0, hop_length=None) -> torch.Tensor:
-        hop_length = int(hop_length or self.hop_length)
-        factor = 2.0 ** (key_shift / 12.0)
-        n_fft = int(round(self.n_fft * factor))
-        win_length = int(round(self.win_length * factor))
-        window = self.window
-        if win_length != self.win_length:
-            window = torch.hann_window(win_length, device=audio.device)
-        pad = win_length - hop_length
-        padding = (n_fft // 2, n_fft // 2) if self.center else (pad // 2, (pad + 1) // 2)
-        audio = F.pad(audio.float().unsqueeze(1), padding, mode="reflect").squeeze(1)
-        spec = torch.stft(
-            audio,
-            n_fft,
-            hop_length=hop_length,
-            win_length=win_length,
-            window=window,
-            center=False,
-            return_complex=True,
-        ).abs()
-        if n_fft != self.n_fft:
-            bins = self.n_fft // 2 + 1
-            spec = F.pad(spec, (0, 0, 0, max(0, bins - spec.shape[1])))[:, :bins]
-            spec = spec * (self.win_length / win_length)
-        return torch.log(torch.clamp(self.basis @ spec, min=self.floor))
+        with torch.amp.autocast(device_type=audio.device.type, enabled=False):
+            audio = audio.float()
+            hop_length = int(hop_length or self.hop_length)
+            factor = 2.0 ** (key_shift / 12.0)
+            n_fft = int(round(self.n_fft * factor))
+            win_length = int(round(self.win_length * factor))
+            window = self.window.float()
+            if win_length != self.win_length:
+                window = torch.hann_window(win_length, device=audio.device, dtype=torch.float32)
+            pad = win_length - hop_length
+            padding = (n_fft // 2, n_fft // 2) if self.center else (pad // 2, (pad + 1) // 2)
+            audio = F.pad(audio.unsqueeze(1), padding, mode="reflect").squeeze(1)
+            spec = torch.stft(
+                audio,
+                n_fft,
+                hop_length=hop_length,
+                win_length=win_length,
+                window=window,
+                center=False,
+                return_complex=True,
+            ).abs()
+            if n_fft != self.n_fft:
+                bins = self.n_fft // 2 + 1
+                spec = F.pad(spec, (0, 0, 0, max(0, bins - spec.shape[1])))[:, :bins]
+                spec = spec * (self.win_length / win_length)
+            return torch.log(torch.clamp(self.basis.float() @ spec, min=self.floor))
 
 
 def normalize_mel(mel: torch.Tensor, data: dict) -> torch.Tensor:

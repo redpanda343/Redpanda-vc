@@ -88,18 +88,21 @@ class SourceModuleHnNSF(nn.Module):
         self.l_linear = nn.Linear(self.dim, 1)
 
     def forward(self, f0, upp):
-        f0 = f0.unsqueeze(-1)
-        rad = f0 / self.sample_rate * torch.arange(1, upp + 1, device=f0.device)
-        rad2 = torch.fmod(rad[..., -1:].float() + 0.5, 1.0) - 0.5
-        rad_acc = rad2.cumsum(dim=1).fmod(1.0).to(f0)
-        rad = rad + F.pad(rad_acc[:, :-1, :], (0, 0, 1, 0))
-        rad = rad.reshape(f0.shape[0], -1, 1) * torch.arange(1, self.dim + 1, device=f0.device)
-        start = torch.rand(1, 1, self.dim, device=f0.device)
-        start[..., 0] = 0
-        sines = torch.sin(2 * np.pi * (rad + start)) * self.sine_amp
-        uv = F.interpolate((f0 > 0).float().transpose(2, 1), scale_factor=upp, mode="nearest").transpose(2, 1)
-        noise = (uv * self.noise_std + (1 - uv) * self.sine_amp / 3) * torch.randn_like(sines)
-        return torch.tanh(self.l_linear(sines * uv + noise))
+        with torch.amp.autocast(device_type=f0.device.type, enabled=False):
+            f0 = f0.float().unsqueeze(-1)
+            rad = f0 / self.sample_rate * torch.arange(1, upp + 1, device=f0.device, dtype=torch.float32)
+            rad2 = torch.fmod(rad[..., -1:].float() + 0.5, 1.0) - 0.5
+            rad_acc = rad2.cumsum(dim=1).fmod(1.0).to(f0)
+            rad = rad + F.pad(rad_acc[:, :-1, :], (0, 0, 1, 0))
+            rad = rad.reshape(f0.shape[0], -1, 1) * torch.arange(
+                1, self.dim + 1, device=f0.device, dtype=torch.float32
+            )
+            start = torch.rand(1, 1, self.dim, device=f0.device, dtype=torch.float32)
+            start[..., 0] = 0
+            sines = torch.sin(2 * np.pi * (rad + start)) * self.sine_amp
+            uv = F.interpolate((f0 > 0).float().transpose(2, 1), scale_factor=upp, mode="nearest").transpose(2, 1)
+            noise = (uv * self.noise_std + (1 - uv) * self.sine_amp / 3) * torch.randn_like(sines)
+            return torch.tanh(self.l_linear(sines * uv + noise))
 
 
 class NSFHiFiGAN(nn.Module):
@@ -141,30 +144,34 @@ class NSFHiFiGAN(nn.Module):
         self.conv_post = nn.Conv1d(ch, 1, 7, 1, padding=3)
 
     def _fast_sine(self, f0):
-        n = torch.arange(1, self.upp + 1, device=f0.device)
-        s0 = f0.unsqueeze(-1) / self.source_sr
-        ds0 = F.pad(s0[:, 1:, :] - s0[:, :-1, :], (0, 0, 0, 1))
-        rad = s0 * n + 0.5 * ds0 * n * (n - 1) / self.upp
-        rad2 = torch.fmod(rad[..., -1:].float() + 0.5, 1.0) - 0.5
-        rad_acc = rad2.cumsum(dim=1).fmod(1.0).to(f0)
-        rad = rad + F.pad(rad_acc[:, :-1, :], (0, 0, 1, 0))
-        return torch.sin(2 * np.pi * rad.reshape(f0.shape[0], 1, -1))
+        with torch.amp.autocast(device_type=f0.device.type, enabled=False):
+            f0 = f0.float()
+            n = torch.arange(1, self.upp + 1, device=f0.device, dtype=torch.float32)
+            s0 = f0.unsqueeze(-1) / self.source_sr
+            ds0 = F.pad(s0[:, 1:, :] - s0[:, :-1, :], (0, 0, 0, 1))
+            rad = s0 * n + 0.5 * ds0 * n * (n - 1) / self.upp
+            rad2 = torch.fmod(rad[..., -1:].float() + 0.5, 1.0) - 0.5
+            rad_acc = rad2.cumsum(dim=1).fmod(1.0).to(f0)
+            rad = rad + F.pad(rad_acc[:, :-1, :], (0, 0, 1, 0))
+            return torch.sin(2 * np.pi * rad.reshape(f0.shape[0], 1, -1))
 
     def forward(self, mel, f0):
-        f0 = f0.float()
-        source = self._fast_sine(f0) if self.mini_nsf else self.m_source(f0, self.upp).transpose(1, 2)
-        x = self.conv_pre(mel)
-        if self.noise_sigma > 0:
-            x = x + self.noise_sigma * torch.randn_like(x)
-        for i, up in enumerate(self.ups):
-            x = up(F.leaky_relu(x, LRELU_SLOPE))
-            if not self.mini_nsf:
-                x = x + self.noise_convs[i](source)
-            elif i == 1:
-                x = x + self.source_conv(source)
-            blocks = self.resblocks[i * self.num_kernels:(i + 1) * self.num_kernels]
-            x = sum(block(x) for block in blocks) / self.num_kernels
-        return torch.tanh(self.conv_post(F.leaky_relu(x)))
+        with torch.amp.autocast(device_type=mel.device.type, enabled=False):
+            mel = mel.float()
+            f0 = f0.float()
+            source = self._fast_sine(f0) if self.mini_nsf else self.m_source(f0, self.upp).transpose(1, 2)
+            x = self.conv_pre(mel)
+            if self.noise_sigma > 0:
+                x = x + self.noise_sigma * torch.randn_like(x)
+            for i, up in enumerate(self.ups):
+                x = up(F.leaky_relu(x, LRELU_SLOPE))
+                if not self.mini_nsf:
+                    x = x + self.noise_convs[i](source)
+                elif i == 1:
+                    x = x + self.source_conv(source)
+                blocks = self.resblocks[i * self.num_kernels:(i + 1) * self.num_kernels]
+                x = sum(block(x) for block in blocks) / self.num_kernels
+            return torch.tanh(self.conv_post(F.leaky_relu(x)))
 
 
 def generator_state(checkpoint: dict):
@@ -183,11 +190,12 @@ def _fold_weight_norm(state: dict) -> dict:
             continue
         if key.endswith(".weight_v"):
             base = key[: -len("_v")]
-            g = state[base + "_g"]
-            norm = value.flatten(1).norm(dim=1).view(-1, *([1] * (value.dim() - 1)))
-            folded[base] = value * (g / norm)
+            v = value.float()
+            g = state[base + "_g"].float()
+            norm = v.flatten(1).norm(dim=1).view(-1, *([1] * (v.dim() - 1)))
+            folded[base] = v * (g / norm)
         else:
-            folded[key] = value
+            folded[key] = value.float() if torch.is_floating_point(value) else value
     return folded
 
 

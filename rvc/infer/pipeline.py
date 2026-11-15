@@ -190,7 +190,9 @@ class Pipeline:
             protect: Protection level for preserving the original pitch.
             inference_rng: Seed sequence shared by all segments in the input audio.
         """
-        with torch.inference_mode():
+        with torch.inference_mode(), torch.amp.autocast(
+            device_type=torch.device(self.device).type, enabled=False
+        ):
             pitch_guidance = pitch != None and pitchf != None
             # prepare source audio
             feats = torch.from_numpy(audio0).float()
@@ -198,9 +200,9 @@ class Pipeline:
             assert feats.dim() == 1, feats.dim()
             if getattr(model, "audio_requires_normalization", False):
                 feats = F.layer_norm(feats, feats.shape)
-            feats = feats.view(1, -1).to(self.device)
+            feats = feats.view(1, -1).to(self.device).float()
             # extract features
-            feats = extract_embedding_features(model, feats, version)
+            feats = extract_embedding_features(model, feats, version).float()
             expected_dim = int(net_g.enc_p.emb_phone.in_features)
             if feats.shape[-1] != expected_dim:
                 raise RuntimeError(

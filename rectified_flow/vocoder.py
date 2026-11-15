@@ -33,24 +33,25 @@ class ChunkedInference:
 
     @torch.inference_mode()
     def infer(self, waveform, pitch=0, f0_method="rmvpe", seed=None):
-        if float(pitch):
-            raise ValueError(f"{self.name} has no pitch input. Set Pitch to 0.")
-        waveform = np.asarray(waveform, dtype=np.float32)
-        if waveform.ndim != 1 or not len(waveform) or not np.isfinite(waveform).all():
-            raise ValueError("Select non-empty audio with finite samples.")
-        hop, length = int(self.data["hop_length"]), len(waveform)
-        padded_length = max(math.ceil(length / hop), math.ceil(self.data["n_fft"] / hop)) * hop
-        padded = np.pad(np.clip(waveform, -1.0, 1.0), (0, padded_length - length))
-        mel = self.mel(torch.from_numpy(padded).to(self.device)[None])
-        frames, pieces = mel.shape[-1], []
-        for start in range(0, frames, CHUNK_FRAMES):
-            end = min(start + CHUNK_FRAMES, frames)
-            left, right = max(0, start - self.context), min(frames, end + self.context)
-            pieces.append(self.generator(mel[..., left:right])[0, 0, (start - left) * hop:(end - left) * hop])
-        audio = torch.cat(pieces)[:length]
-        if not torch.isfinite(audio).all():
-            raise FloatingPointError(f"Non-finite {self.name} audio output.")
-        return audio.float().cpu().numpy()
+        with torch.amp.autocast(device_type=self.device.type, enabled=False):
+            if float(pitch):
+                raise ValueError(f"{self.name} has no pitch input. Set Pitch to 0.")
+            waveform = np.asarray(waveform, dtype=np.float32)
+            if waveform.ndim != 1 or not len(waveform) or not np.isfinite(waveform).all():
+                raise ValueError("Select non-empty audio with finite samples.")
+            hop, length = int(self.data["hop_length"]), len(waveform)
+            padded_length = max(math.ceil(length / hop), math.ceil(self.data["n_fft"] / hop)) * hop
+            padded = np.pad(np.clip(waveform, -1.0, 1.0), (0, padded_length - length))
+            mel = self.mel(torch.from_numpy(padded).to(self.device).float()[None])
+            frames, pieces = mel.shape[-1], []
+            for start in range(0, frames, CHUNK_FRAMES):
+                end = min(start + CHUNK_FRAMES, frames)
+                left, right = max(0, start - self.context), min(frames, end + self.context)
+                pieces.append(self.generator(mel[..., left:right].float())[0, 0, (start - left) * hop:(end - left) * hop])
+            audio = torch.cat(pieces)[:length]
+            if not torch.isfinite(audio).all():
+                raise FloatingPointError(f"Non-finite {self.name} audio output.")
+            return audio.float().cpu().numpy()
 
 
 def _same_mel_value(left, right):
