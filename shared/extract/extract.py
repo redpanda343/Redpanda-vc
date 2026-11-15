@@ -7,6 +7,8 @@ import queue
 import sys
 import tempfile
 
+os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
+
 import numpy as np
 import parselmouth
 import torch
@@ -18,6 +20,7 @@ sys.path.append(os.path.join(now_dir))
 # Zluda hijack
 import shared.zluda
 from rvc.configs.config import Config
+from rvc.train.tpu import device as tpu_device, tpu_available
 from beatrice.resources import ensure_pitch_estimator
 from shared.predictors.f0 import RMVPE, RVCRMVPE, BeatricePitch, Swift
 from shared.predictors.swift_dependencies import ensure_swift_f0
@@ -174,23 +177,36 @@ def run_pitch_extraction(files, devices, f0_method, threads, progress, updates, 
         return
     if not devices:
         raise ValueError("No pitch extraction devices were selected.")
-    if f0_method == "swift" and (
-        not torch.cuda.is_available()
-        or any(torch.device(device).type != "cuda" for device in devices)
-    ):
-        raise RuntimeError("SwiftF0 training extraction requires a CUDA GPU. Select a GPU or use RMVPE.")
+    using_tpu = devices == ["xla"]
     if f0_method == "swift":
-        ensure_swift_f0()
+        if using_tpu:
+            ensure_swift_f0(require_cuda=False)
+        elif not torch.cuda.is_available() or any(
+            torch.device(device).type != "cuda" for device in devices
+        ):
+            raise RuntimeError(
+                "SwiftF0 training extraction requires a CUDA GPU or TPU. Select a GPU/TPU or use RMVPE."
+            )
+        else:
+            ensure_swift_f0(require_cuda=True)
     if f0_method == "beatrice":
         ensure_pitch_estimator()
     threads = max(1, int(threads))
-    if f0_method == "pm":
+    progress.set_description(f"Extracting F0 ({f0_method})")
+
+    if using_tpu and f0_method in ("rmvpe", "swift"):
+        fe = FeatureInput(f0_method=f0_method, device=tpu_device(), rectified=rectified)
+        for file_info in files:
+            fe.process_file(file_info, force=force)
+            progress.update(1)
+        return
+
+    if f0_method == "pm" or (using_tpu and f0_method == "beatrice"):
         worker_count = min(threads, len(files))
         worker_devices = ["cpu"] * worker_count
     else:
         worker_count = min(len(devices), len(files))
         worker_devices = devices[:worker_count]
-    progress.set_description(f"Extracting F0 ({f0_method})")
 
     with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count) as executor:
         tasks = [
@@ -215,9 +231,38 @@ def process_file_embedding(
 
     transformers_logging.disable_progress_bar()
     transformers_logging.set_verbosity_error()
+    is_xla = torch.device(device).type == "xla"
     model = load_embedding(embedder_model, version).to(device).float()
     model.eval()
     n_threads = max(1, n_threads)
+
+    if is_xla:
+        for file_info in files:
+            wav_file_path, _, _, out_file_path = file_info
+            if not readable_npy(out_file_path):
+                feats = torch.from_numpy(load_audio_16k(wav_file_path)).float()
+                if getattr(model, "audio_requires_normalization", False):
+                    feats = torch.nn.functional.layer_norm(feats, feats.shape)
+                orig_len = int(feats.shape[-1])
+                orig_frames = int(model._get_feat_extract_output_lengths(orig_len))
+                pad_len = max(400, ((orig_len + 10239) // 10240) * 10240)
+                if pad_len > orig_len:
+                    feats = torch.nn.functional.pad(feats, (0, pad_len - orig_len))
+                feats = feats.view(1, -1).to(device)
+                with torch.no_grad():
+                    result = extract_embedding_features(model, feats, version)
+                feats_out = result.squeeze(0).float().cpu().numpy()[:orig_frames]
+                expected_dim = int(getattr(model, "feature_dim", feats_out.shape[-1]))
+                if feats_out.ndim != 2 or feats_out.shape[1] != expected_dim:
+                    raise RuntimeError(
+                        f"{wav_file_path} produced shape {feats_out.shape}; expected "
+                        f"[frames, {expected_dim}]."
+                    )
+                if not np.isfinite(feats_out).all():
+                    raise RuntimeError(f"{wav_file_path} produced non-finite values.")
+                save_npy(out_file_path, feats_out)
+            updates.put(1)
+        return
 
     def worker(file_info):
         wav_file_path, _, _, out_file_path = file_info
@@ -250,6 +295,20 @@ def process_file_embedding(
 
 def run_embedding_extraction(files, devices, embedder_model, version, threads, progress, updates):
     progress.set_description(f"Extracting features ({embedder_model})")
+    if devices == ["xla"]:
+        class _DirectProgressQueue:
+            def put(self, n):
+                progress.update(n)
+
+        process_file_embedding(
+            files,
+            embedder_model,
+            version,
+            tpu_device(),
+            threads,
+            _DirectProgressQueue(),
+        )
+        return
     with concurrent.futures.ProcessPoolExecutor(max_workers=len(devices)) as executor:
         tasks = [
             executor.submit(
@@ -387,7 +446,10 @@ if __name__ == "__main__":
         )
         sys.exit(1)
 
-    devices = ["cpu"] if gpus == "-" else [f"cuda:{idx}" for idx in gpus.split("-")]
+    if gpus == "-":
+        devices = ["xla"] if tpu_available() else ["cpu"]
+    else:
+        devices = [f"cuda:{idx}" for idx in gpus.split("-")]
 
     with mp.Manager() as manager, tqdm.tqdm(
         total=2 * len(files), desc=f"Extracting F0 ({f0_method})", unit="file",

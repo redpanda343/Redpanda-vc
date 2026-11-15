@@ -1,27 +1,33 @@
 import importlib
+import importlib.util
+import shutil
 import subprocess
 import sys
 import threading
+import types
 
 
 SWIFT_REQUIREMENT = "swift-f0==0.3.0"
 _INSTALL_LOCK = threading.Lock()
 
 
-def ensure_swift_f0():
-    try:
-        import onnxruntime as ort
-    except ModuleNotFoundError as error:
-        if error.name != "onnxruntime":
-            raise
-        raise RuntimeError(
-            "SwiftF0 requires onnxruntime-gpu. Install the project's requirements first."
-        ) from error
-    if "CUDAExecutionProvider" not in ort.get_available_providers():
-        raise RuntimeError(
-            "SwiftF0 requires onnxruntime-gpu with CUDAExecutionProvider. "
-            "If onnxruntime CPU is installed, remove it and reinstall onnxruntime-gpu."
-        )
+def ensure_swift_f0(require_cuda=True):
+    if require_cuda:
+        try:
+            import onnxruntime as ort
+        except ModuleNotFoundError as error:
+            if error.name != "onnxruntime":
+                raise
+            raise RuntimeError(
+                "SwiftF0 requires onnxruntime-gpu. Install the project's requirements first."
+            ) from error
+        if "CUDAExecutionProvider" not in ort.get_available_providers():
+            raise RuntimeError(
+                "SwiftF0 requires onnxruntime-gpu with CUDAExecutionProvider. "
+                "If onnxruntime CPU is installed, remove it and reinstall onnxruntime-gpu."
+            )
+    elif "onnxruntime" not in sys.modules and importlib.util.find_spec("onnxruntime") is None:
+        sys.modules["onnxruntime"] = types.ModuleType("onnxruntime")
 
     with _INSTALL_LOCK:
         try:
@@ -36,16 +42,34 @@ def ensure_swift_f0():
         ]
         print(
             "SwiftF0 is missing. Installing swift-f0==0.3.0 with --no-deps; "
-            "the existing ONNX Runtime GPU installation will be preserved.",
+            "the existing runtime installation will be preserved.",
             flush=True,
         )
         try:
             subprocess.run(command, check=True, timeout=180)
         except (subprocess.SubprocessError, OSError) as error:
-            raise RuntimeError(
-                "Could not safely install SwiftF0. Run "
-                f'"{sys.executable}" -m pip install --no-deps {SWIFT_REQUIREMENT} '
-                "in the training environment, then retry extraction."
-            ) from error
+            uv_path = shutil.which("uv")
+            if uv_path:
+                try:
+                    subprocess.run(
+                        [
+                            uv_path, "pip", "install", "--python", sys.executable,
+                            "--system", "--no-deps", "--only-binary=:all:", SWIFT_REQUIREMENT,
+                        ],
+                        check=True,
+                        timeout=180,
+                    )
+                except (subprocess.SubprocessError, OSError):
+                    raise RuntimeError(
+                        "Could not safely install SwiftF0. Run "
+                        f'"{sys.executable}" -m pip install --no-deps {SWIFT_REQUIREMENT} '
+                        "in the training environment, then retry extraction."
+                    ) from error
+            else:
+                raise RuntimeError(
+                    "Could not safely install SwiftF0. Run "
+                    f'"{sys.executable}" -m pip install --no-deps {SWIFT_REQUIREMENT} '
+                    "in the training environment, then retry extraction."
+                ) from error
         importlib.invalidate_caches()
         return importlib.import_module("swift_f0")

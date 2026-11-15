@@ -379,7 +379,8 @@ def rvc_train_tab():
                         interactive=True,
                     )
 
-                with gr.Column():
+                is_tpu = tpu_available()
+                with gr.Column(visible=not is_tpu) as gpu_column:
                     gpu = gr.Textbox(
                         label=i18n("GPU Number"),
                         info=i18n(
@@ -388,12 +389,14 @@ def rvc_train_tab():
                         placeholder=i18n("0 to ∞ separated by -"),
                         value=str(get_number_of_gpus()),
                         interactive=True,
+                        visible=not is_tpu,
                     )
-                    gr.Textbox(
+                    gpu_info = gr.Textbox(
                         label=i18n("GPU Information"),
                         info=i18n("The GPU information will be displayed here."),
                         value=get_gpu_info(),
                         interactive=False,
+                        visible=not is_tpu,
                     )
     # Preprocess section
     with gr.Accordion(i18n("Preprocess")):
@@ -734,6 +737,7 @@ def rvc_train_tab():
                         ),
                         value=False,
                         interactive=True,
+                        visible=not is_tpu,
                     )
                     checkpointing = gr.Checkbox(
                         label=i18n("Checkpointing"),
@@ -1133,9 +1137,15 @@ def rvc_train_tab():
                 outputs=[lr_decay_steps, lr_final_ratio],
             )
             accelerator.change(
-                fn=lambda selected: gr.update(visible=selected == "TPU"),
+                fn=lambda selected: (
+                    gr.update(visible=selected == "TPU"),
+                    gr.update(visible=selected != "TPU"),
+                    gr.update(visible=selected != "TPU"),
+                    gr.update(visible=selected != "TPU"),
+                    gr.update(visible=selected != "TPU"),
+                ),
                 inputs=[accelerator],
-                outputs=[tpu_cores],
+                outputs=[tpu_cores, gpu_column, gpu, gpu_info, cache_dataset_in_gpu],
             )
             cut_preprocess.change(
                 fn=update_truncate_silence_visibility,

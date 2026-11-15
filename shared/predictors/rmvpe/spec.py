@@ -2,6 +2,7 @@ import torch
 import numpy as np
 import torch.nn.functional as F
 from librosa.filters import mel
+from rvc.algorithm.commons import stft_real_imag
 
 
 class MelSpectrogram(torch.nn.Module):
@@ -45,16 +46,26 @@ class MelSpectrogram(torch.nn.Module):
         if keyshift_key not in self.hann_window:
             self.hann_window[keyshift_key] = torch.hann_window(win_length_new).to(audio.device)
 
-        fft = torch.stft(
-            audio,
-            n_fft=n_fft_new,
-            hop_length=hop_length_new,
-            win_length=win_length_new,
-            window=self.hann_window[keyshift_key],
-            center=center,
-            return_complex=True
-        )
-        magnitude = fft.abs()
+        if audio.device.type == "xla" and n_fft_new == win_length_new:
+            real, imag = stft_real_imag(
+                audio,
+                n_fft_new,
+                hop_length_new,
+                self.hann_window[keyshift_key],
+                center=center,
+            )
+            magnitude = torch.sqrt(real.pow(2) + imag.pow(2))
+        else:
+            fft = torch.stft(
+                audio,
+                n_fft=n_fft_new,
+                hop_length=hop_length_new,
+                win_length=win_length_new,
+                window=self.hann_window[keyshift_key],
+                center=center,
+                return_complex=True
+            )
+            magnitude = fft.abs()
 
         if keyshift != 0:
             size = self.n_fft // 2 + 1

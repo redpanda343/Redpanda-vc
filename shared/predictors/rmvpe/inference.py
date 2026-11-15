@@ -31,16 +31,19 @@ class RMVPE:
     def __init__(self, model_path, hop_length=160, device=None):
         self.resample_kernel = {}
         self.device = torch.device(device or ('cuda' if torch.cuda.is_available() else 'cpu'))
-        self.model = E2E0(4, 1, (2, 2)).eval().to(self.device)
-        ckpt = torch.load(model_path, map_location=self.device, weights_only=True)
+        self.is_xla = self.device.type == 'xla'
+        self.model = E2E0(4, 1, (2, 2)).eval()
+        ckpt = torch.load(model_path, map_location='cpu', weights_only=True)
         if 'model' not in ckpt:
             raise ValueError(f'{model_path} is not the RMVPE 230917 checkpoint. Delete it and restart to download it.')
         self.model.load_state_dict(ckpt['model'], strict=False)
+        self.model = self.model.to(self.device)
         self.hop_length = hop_length
-        self.seg_length = 32 * hop_length
+        self.seg_length = (64 if self.is_xla else 32) * hop_length
+        mel_device = torch.device('cpu') if self.is_xla else self.device
         self.mel_extractor = MelSpectrogram(
             N_MELS, SAMPLE_RATE, WINDOW_LENGTH, hop_length, None, MEL_FMIN, MEL_FMAX
-        ).to(self.device)
+        ).to(mel_device)
 
     @torch.no_grad()
     def mel2hidden(self, mel):
@@ -57,13 +60,14 @@ class RMVPE:
         return f0
 
     def _resample(self, audio, sample_rate):
-        audio = torch.from_numpy(np.asarray(audio)).float().unsqueeze(0).to(self.device)
+        target_device = torch.device('cpu') if self.is_xla else self.device
+        audio = torch.from_numpy(np.asarray(audio)).float().unsqueeze(0).to(target_device)
         if sample_rate == 16000:
             return audio
         key_str = str(sample_rate)
         if key_str not in self.resample_kernel:
             self.resample_kernel[key_str] = Resample(sample_rate, 16000, lowpass_filter_width=128)
-        self.resample_kernel[key_str] = self.resample_kernel[key_str].to(self.device)
+        self.resample_kernel[key_str] = self.resample_kernel[key_str].to(target_device)
         return self.resample_kernel[key_str](audio)
 
     def _padded_length(self, length):
@@ -79,7 +83,11 @@ class RMVPE:
         n_frames = T // self.hop_length + 1
         audio_res = F.pad(audio_res, (0, self._padded_length(T) - T))
         mel = self.mel_extractor(audio_res, center=True)
+        if mel.device != self.device:
+            mel = mel.to(self.device)
         hidden = (self.model if network is None else network)(mel)
+        if self.is_xla:
+            hidden = hidden.cpu()
         return hidden[:, :n_frames]
 
     def infer_from_audio(self, audio, sample_rate=16000, thred=0.03, use_viterbi=False):

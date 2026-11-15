@@ -17,6 +17,7 @@ from beatrice.resources import ensure_pitch_estimator
 from shared.predictors.rmvpe import N_CLASS, RMVPE as RMVPEModel, to_local_average_f0
 from shared.predictors.RMVPE import RMVPE0Predictor
 from shared.predictors.swift_dependencies import ensure_swift_f0
+from shared.predictors.swift_torch import SwiftF0Torch
 import numpy as np
 
 
@@ -64,8 +65,14 @@ class Swift:
         self.device = torch.device(device)
         self.sample_rate = sample_rate
         self.hop_size = hop_size
+        if self.device.type == "xla":
+            swift_f0 = ensure_swift_f0(require_cuda=False)
+            model_path = os.path.join(os.path.dirname(swift_f0.__file__), "model.onnx")
+            self.model = object.__new__(swift_f0.SwiftF0)
+            self.model._run = SwiftF0Torch(model_path, self.device).run
+            return
         if self.device.type != "cuda" or not torch.cuda.is_available():
-            raise RuntimeError("SwiftF0 inference requires a CUDA device.")
+            raise RuntimeError("SwiftF0 inference requires a CUDA or TPU device.")
         SwiftF0 = ensure_swift_f0().SwiftF0
         self.model = SwiftF0(threads=threads, spin=spin)
         self.model.session.set_providers(

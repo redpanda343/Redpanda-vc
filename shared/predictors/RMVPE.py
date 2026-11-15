@@ -5,6 +5,7 @@ import numpy as np
 
 from librosa.filters import mel
 from typing import List
+from rvc.algorithm.commons import stft_real_imag
 
 N_MELS = 128
 N_CLASS = 360
@@ -395,17 +396,26 @@ class MelSpectrogram(torch.nn.Module):
             self.hann_window[keyshift_key] = torch.hann_window(win_length_new).to(
                 audio.device
             )
-        fft = torch.stft(
-            audio,
-            n_fft=n_fft_new,
-            hop_length=hop_length_new,
-            win_length=win_length_new,
-            window=self.hann_window[keyshift_key],
-            center=center,
-            return_complex=True,
-        )
-
-        magnitude = torch.sqrt(fft.real.pow(2) + fft.imag.pow(2))
+        if audio.device.type == "xla" and n_fft_new == win_length_new:
+            real, imag = stft_real_imag(
+                audio,
+                n_fft_new,
+                hop_length_new,
+                self.hann_window[keyshift_key],
+                center=center,
+            )
+            magnitude = torch.sqrt(real.pow(2) + imag.pow(2))
+        else:
+            fft = torch.stft(
+                audio,
+                n_fft=n_fft_new,
+                hop_length=hop_length_new,
+                win_length=win_length_new,
+                window=self.hann_window[keyshift_key],
+                center=center,
+                return_complex=True,
+            )
+            magnitude = torch.sqrt(fft.real.pow(2) + fft.imag.pow(2))
         if keyshift != 0:
             size = self.n_fft // 2 + 1
             resize = magnitude.size(1)
@@ -435,9 +445,11 @@ class RMVPE0Predictor:
         self.model = model
         self.resample_kernel = {}
         self.device = device
+        self.is_xla = device is not None and torch.device(device).type == "xla"
+        mel_device = "cpu" if self.is_xla else device
         self.mel_extractor = MelSpectrogram(
             N_MELS, 16000, 1024, 160, None, 30, 8000
-        ).to(device)
+        ).to(mel_device)
         self.model = self.model.to(device)
         cents_mapping = 20 * np.arange(N_CLASS) + 1997.3794084376191
         self.cents_mapping = np.pad(cents_mapping, (4, 4))
@@ -452,34 +464,28 @@ class RMVPE0Predictor:
         with torch.no_grad():
             mel = mel.to(dtype=next(self.model.parameters()).dtype)
             n_frames = mel.shape[-1]
-            # print('n_frames', n_frames)
-            # print('mel shape before padding', mel.shape)
-            mel = F.pad(
-                mel, (0, 32 * ((n_frames - 1) // 32 + 1) - n_frames), mode="reflect"
-            )
-            # print('mel shape after padding', mel.shape)
+            pad_step = 64 if self.is_xla else 32
+            pad_len = pad_step * ((n_frames - 1) // pad_step + 1) - n_frames
+            pad_mode = "reflect" if pad_len < n_frames else "replicate"
+            mel = F.pad(mel, (0, pad_len), mode=pad_mode)
 
             output_chunks = []
             pad_frames = mel.shape[-1]
             for start in range(0, pad_frames, chunk_size):
-                # print('chunk @', start)
                 end = min(start + chunk_size, pad_frames)
                 mel_chunk = mel[..., start:end]
+                if self.device is not None and mel_chunk.device != torch.device(self.device):
+                    mel_chunk = mel_chunk.to(self.device)
                 assert (
                     mel_chunk.shape[-1] % 32 == 0
                 ), "chunk_size must be divisible by 32"
-                # print(' before padding', mel_chunk.shape)
-                # mel_chunk = F.pad(mel_chunk, (320, 320), mode="reflect")
-                # print(' after padding', mel_chunk.shape)
 
                 out_chunk = (self.model if network is None else network)(mel_chunk)
-                # print(' result chunk', out_chunk.shape)
-                # out_chunk = out_chunk[:, 320:-320, :]
-                # print(' trimmed chunk', out_chunk.shape)
                 output_chunks.append(out_chunk)
 
             hidden = torch.cat(output_chunks, dim=1)
-        # print('output', hidden[:, :n_frames].shape)
+            if self.is_xla:
+                hidden = hidden.cpu()
         return hidden[:, :n_frames]
 
     def decode(self, hidden, thred=0.03, center=None):
@@ -503,8 +509,12 @@ class RMVPE0Predictor:
             audio (np.ndarray): Audio signal.
             thred (float, optional): Threshold for salience. Defaults to 0.03.
         """
-        audio = torch.as_tensor(audio, device=self.device, dtype=torch.float32).unsqueeze(0)
-        with torch.autocast("cuda", enabled=False):
+        mel_device = "cpu" if self.is_xla and mel_network is None else self.device
+        audio = torch.as_tensor(audio, device=mel_device, dtype=torch.float32).unsqueeze(0)
+        if mel_device is not None and torch.device(mel_device).type == "cuda":
+            with torch.autocast("cuda", enabled=False):
+                mel = (self.mel_extractor if mel_network is None else mel_network)(audio)
+        else:
             mel = (self.mel_extractor if mel_network is None else mel_network)(audio)
         hidden = self.mel2hidden(mel, network=network)
         hidden = hidden.squeeze(0).float().cpu().numpy()
