@@ -37,11 +37,25 @@ def tpu_available():
     return bool(glob.glob("/dev/accel*") or glob.glob("/dev/vfio/[0-9]*"))
 
 
+_PRECISION_CONFIGURED = False
+
+
 def require_torch_xla():
+    global _PRECISION_CONFIGURED
     if not torch_xla_installed():
         raise RuntimeError(INSTALL_HINT)
     os.environ.setdefault("PJRT_DEVICE", "TPU")
+    os.environ.pop("XLA_USE_BF16", None)
+    os.environ.pop("XLA_DOWNCAST_BF16", None)
     import torch_xla
+
+    if not _PRECISION_CONFIGURED:
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("highest")
+        xlac = getattr(torch_xla, "_XLAC", None)
+        if xlac is not None and hasattr(xlac, "_xla_set_mat_mul_precision"):
+            xlac._xla_set_mat_mul_precision("highest")
+        _PRECISION_CONFIGURED = True
 
     return torch_xla
 
@@ -84,26 +98,27 @@ def patch_xla_ops():
     def _xla_weight_norm_forward(self, weight_g, weight_v):
         if weight_v.device.type != "xla":
             return orig_forward(self, weight_g, weight_v)
-        v_fp32 = weight_v.float()
-        g_fp32 = weight_g.float()
-        if self.dim == -1:
-            norm = torch.linalg.vector_norm(v_fp32)
-        else:
-            target_dim = self.dim if self.dim >= 0 else v_fp32.ndim + self.dim
-            dims = tuple(i for i in range(v_fp32.ndim) if i != target_dim)
-            norm = (
-                torch.linalg.vector_norm(v_fp32, dim=dims, keepdim=True)
-                if dims
-                else v_fp32.abs()
-            )
-        return (v_fp32 * (g_fp32 / norm.clamp_min(1e-12))).to(weight_v.dtype)
+        with torch.amp.autocast(device_type="xla", enabled=False):
+            v_fp32 = weight_v.float()
+            g_fp32 = weight_g.float()
+            if self.dim == -1:
+                norm = torch.linalg.vector_norm(v_fp32)
+            else:
+                target_dim = self.dim if self.dim >= 0 else v_fp32.ndim + self.dim
+                dims = tuple(i for i in range(v_fp32.ndim) if i != target_dim)
+                norm = (
+                    torch.linalg.vector_norm(v_fp32, dim=dims, keepdim=True)
+                    if dims
+                    else v_fp32.abs()
+                )
+            return (v_fp32 * (g_fp32 / norm.clamp_min(1e-12))).to(weight_v.dtype)
 
     _WeightNorm.forward = _xla_weight_norm_forward
     _XLA_OPS_PATCHED = True
 
 
 def device():
-    import torch_xla
+    torch_xla = require_torch_xla()
 
     if hasattr(torch_xla, "device"):
         return torch_xla.device()
