@@ -39,7 +39,7 @@ class RMVPE:
         self.model.load_state_dict(ckpt['model'], strict=False)
         self.model = self.model.to(self.device)
         self.hop_length = hop_length
-        self.seg_length = (64 if self.is_xla else 32) * hop_length
+        self.seg_length = 32 * hop_length
         mel_device = torch.device('cpu') if self.is_xla else self.device
         self.mel_extractor = MelSpectrogram(
             N_MELS, SAMPLE_RATE, WINDOW_LENGTH, hop_length, None, MEL_FMIN, MEL_FMAX

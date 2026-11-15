@@ -464,8 +464,7 @@ class RMVPE0Predictor:
         with torch.no_grad():
             mel = mel.to(dtype=next(self.model.parameters()).dtype)
             n_frames = mel.shape[-1]
-            pad_step = 64 if self.is_xla else 32
-            pad_len = pad_step * ((n_frames - 1) // pad_step + 1) - n_frames
+            pad_len = 32 * ((n_frames - 1) // 32 + 1) - n_frames
             pad_mode = "reflect" if pad_len < n_frames else "replicate"
             mel = F.pad(mel, (0, pad_len), mode=pad_mode)
 

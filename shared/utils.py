@@ -203,6 +203,68 @@ def extract_embedding_features(model, source, version):
     raise ValueError(f"Unsupported RVC version: {version}")
 
 
+def extract_embedding_features_xla(model, source, orig_len, orig_frames, version):
+    device = source.device
+    dtype = source.dtype
+    if getattr(model.config, "feat_extract_norm", "group") == "group":
+        conv0 = model.feature_extractor.conv_layers[0]
+        hidden = conv0.conv(source.unsqueeze(1))
+        t0_valid = max(1, (orig_len - 10) // 5 + 1)
+        t0_total = hidden.shape[-1]
+        m0 = torch.zeros((1, 1, t0_total), dtype=dtype)
+        m0[..., :t0_valid] = 1.0
+        m0 = m0.to(device)
+        mean = (hidden * m0).sum(dim=-1, keepdim=True) / float(t0_valid)
+        var = (((hidden - mean) * m0) ** 2).sum(dim=-1, keepdim=True) / float(t0_valid)
+        hidden = (hidden - mean) / torch.sqrt(var + conv0.layer_norm.eps)
+        hidden = (
+            hidden * conv0.layer_norm.weight[:, None] + conv0.layer_norm.bias[:, None]
+        )
+        hidden = conv0.activation(hidden)
+        for conv_layer in model.feature_extractor.conv_layers[1:]:
+            hidden = conv_layer(hidden)
+        extract_features = hidden
+    else:
+        extract_features = model.feature_extractor(source)
+
+    extract_features = extract_features.transpose(1, 2)
+    pad_frames = extract_features.shape[1]
+    proj = model.feature_projection(extract_features)
+    hidden_states = proj[0] if isinstance(proj, tuple) else proj
+
+    frame_mask = torch.zeros((1, pad_frames, 1), dtype=dtype)
+    frame_mask[:, :orig_frames, :] = 1.0
+    frame_mask = frame_mask.to(device)
+
+    attn_bias = torch.zeros((1, 1, pad_frames, pad_frames), dtype=dtype)
+    attn_bias[:, :, :, orig_frames:] = torch.finfo(dtype).min
+    attn_bias = attn_bias.to(device)
+
+    hidden_states = hidden_states * frame_mask
+    position_embeddings = model.encoder.pos_conv_embed(hidden_states)
+    hidden_states = hidden_states + position_embeddings
+    if not getattr(model.config, "do_stable_layer_norm", False):
+        hidden_states = model.encoder.layer_norm(hidden_states)
+    hidden_states = model.encoder.dropout(hidden_states)
+    hidden_states = hidden_states * frame_mask
+
+    all_hidden_states = () if version == "v1" else None
+    for layer in model.encoder.layers:
+        if version == "v1":
+            all_hidden_states = all_hidden_states + (hidden_states,)
+        layer_outputs = layer(hidden_states, attention_mask=attn_bias)
+        hidden_states = layer_outputs[0]
+
+    if getattr(model.config, "do_stable_layer_norm", False):
+        hidden_states = model.encoder.layer_norm(hidden_states)
+    if version == "v1":
+        all_hidden_states = all_hidden_states + (hidden_states,)
+        return model.final_proj(all_hidden_states[V1_FEATURE_LAYER])
+    if version == "v2":
+        return hidden_states
+    raise ValueError(f"Unsupported RVC version: {version}")
+
+
 def load_embedding(embedder_model, version="v2"):
     embedder_root = os.path.join(now_dir, "models", "embedders")
     rvc_contentvec_base_url = (

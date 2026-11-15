@@ -26,6 +26,7 @@ from shared.predictors.f0 import RMVPE, RVCRMVPE, BeatricePitch, Swift
 from shared.predictors.swift_dependencies import ensure_swift_f0
 from shared.utils import (
     extract_embedding_features,
+    extract_embedding_features_xla,
     get_embedding_metadata,
     load_audio_16k,
     load_embedding,
@@ -250,7 +251,9 @@ def process_file_embedding(
                     feats = torch.nn.functional.pad(feats, (0, pad_len - orig_len))
                 feats = feats.view(1, -1).to(device)
                 with torch.no_grad():
-                    result = extract_embedding_features(model, feats, version)
+                    result = extract_embedding_features_xla(
+                        model, feats, orig_len, orig_frames, version
+                    )
                 feats_out = result.squeeze(0).float().cpu().numpy()[:orig_frames]
                 expected_dim = int(getattr(model, "feature_dim", feats_out.shape[-1]))
                 if feats_out.ndim != 2 or feats_out.shape[1] != expected_dim:
