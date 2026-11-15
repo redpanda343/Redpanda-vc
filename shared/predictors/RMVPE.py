@@ -449,12 +449,17 @@ class RMVPE0Predictor:
         ckpt = torch.load(model_path, map_location="cpu", weights_only=True)
         model.load_state_dict(ckpt)
         model.eval()
-        self.model = model
+        self.model = model.float()
         mel_device = "cpu" if self.is_xla else device
         self.mel_extractor = MelSpectrogram(
             N_MELS, 16000, 1024, 160, None, 30, 8000
         ).float().to(mel_device)
-        self.model = self.model.float().to(device)
+        if self.is_xla:
+            self.model.unet = self.model.unet.to(device)
+            self.model.cnn = self.model.cnn.to(device)
+            self.model.fc = self.model.fc.to("cpu")
+        else:
+            self.model = self.model.to(device)
         cents_mapping = 20 * np.arange(N_CLASS) + 1997.3794084376191
         self.cents_mapping = np.pad(cents_mapping, (4, 4))
 
@@ -482,13 +487,23 @@ class RMVPE0Predictor:
             for start in range(0, pad_frames, chunk_size):
                 end = min(start + chunk_size, pad_frames)
                 mel_chunk = mel[..., start:end]
-                if self.device is not None and mel_chunk.device != torch.device(self.device):
-                    mel_chunk = mel_chunk.to(self.device)
                 assert (
                     mel_chunk.shape[-1] % 32 == 0
                 ), "chunk_size must be divisible by 32"
-
-                out_chunk = (self.model if network is None else network)(mel_chunk)
+                if self.is_xla and network is None:
+                    c_frames = mel_chunk.shape[-1]
+                    bucket_frames = max(512, ((c_frames + 511) // 512) * 512)
+                    if bucket_frames > c_frames:
+                        mel_chunk = F.pad(mel_chunk, (0, bucket_frames - c_frames))
+                    mel_xla = mel_chunk.to(self.device).transpose(-1, -2).unsqueeze(1)
+                    x = self.model.cnn(self.model.unet(mel_xla)).transpose(1, 2).flatten(-2)
+                    x_cpu = x[:, :c_frames, :].float().cpu()
+                    with torch.amp.autocast(device_type="cpu", enabled=False):
+                        out_chunk = self.model.fc(x_cpu)
+                else:
+                    if self.device is not None and mel_chunk.device != torch.device(self.device):
+                        mel_chunk = mel_chunk.to(self.device)
+                    out_chunk = (self.model if network is None else network)(mel_chunk)
                 output_chunks.append(out_chunk)
 
             hidden = torch.cat(output_chunks, dim=1)
@@ -578,65 +593,5 @@ class BiGRU(nn.Module):
             bidirectional=True,
         )
 
-    def _get_xla_grus(self):
-        pairs = self.__dict__.get("_xla_grus")
-        if pairs is None:
-            pairs = []
-            for layer_idx in range(self.gru.num_layers):
-                in_dim = (
-                    self.gru.input_size
-                    if layer_idx == 0
-                    else self.gru.hidden_size * 2
-                )
-                fwd = nn.GRU(
-                    in_dim,
-                    self.gru.hidden_size,
-                    num_layers=1,
-                    batch_first=True,
-                    bidirectional=False,
-                )
-                rev = nn.GRU(
-                    in_dim,
-                    self.gru.hidden_size,
-                    num_layers=1,
-                    batch_first=True,
-                    bidirectional=False,
-                )
-                fwd.eval()
-                rev.eval()
-                pairs.append((fwd, rev))
-            self.__dict__["_xla_grus"] = pairs
-        for layer_idx, (fwd, rev) in enumerate(pairs):
-            fwd.training = self.training
-            rev.training = self.training
-            fwd.weight_ih_l0 = getattr(self.gru, f"weight_ih_l{layer_idx}")
-            fwd.weight_hh_l0 = getattr(self.gru, f"weight_hh_l{layer_idx}")
-            fwd.bias_ih_l0 = getattr(self.gru, f"bias_ih_l{layer_idx}")
-            fwd.bias_hh_l0 = getattr(self.gru, f"bias_ih_l{layer_idx}")
-            fwd._flat_weights = [
-                fwd.weight_ih_l0,
-                fwd.weight_hh_l0,
-                fwd.bias_ih_l0,
-                fwd.bias_hh_l0,
-            ]
-            rev.weight_ih_l0 = getattr(self.gru, f"weight_ih_l{layer_idx}_reverse")
-            rev.weight_hh_l0 = getattr(self.gru, f"weight_hh_l{layer_idx}_reverse")
-            rev.bias_ih_l0 = getattr(self.gru, f"bias_ih_l{layer_idx}_reverse")
-            rev.bias_hh_l0 = getattr(self.gru, f"bias_hh_l{layer_idx}_reverse")
-            rev._flat_weights = [
-                rev.weight_ih_l0,
-                rev.weight_hh_l0,
-                rev.bias_ih_l0,
-                rev.bias_hh_l0,
-            ]
-        return pairs
-
     def forward(self, x):
-        if x.device.type == "xla":
-            out = x
-            for fwd, rev in self._get_xla_grus():
-                out_fwd = fwd(out)[0]
-                out_rev = torch.flip(rev(torch.flip(out, dims=[1]))[0], dims=[1])
-                out = torch.cat([out_fwd, out_rev], dim=-1)
-            return out
         return self.gru(x)[0]

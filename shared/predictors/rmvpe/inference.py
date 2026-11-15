@@ -40,7 +40,13 @@ class RMVPE:
         if 'model' not in ckpt:
             raise ValueError(f'{model_path} is not the RMVPE 230917 checkpoint. Delete it and restart to download it.')
         self.model.load_state_dict(ckpt['model'], strict=False)
-        self.model = self.model.float().to(self.device)
+        self.model = self.model.float()
+        if self.is_xla:
+            self.model.unet = self.model.unet.to(self.device)
+            self.model.cnn = self.model.cnn.to(self.device)
+            self.model.fc = self.model.fc.to('cpu')
+        else:
+            self.model = self.model.to(self.device)
         self.hop_length = hop_length
         self.seg_length = 32 * hop_length
         mel_device = torch.device('cpu') if self.is_xla else self.device
@@ -53,6 +59,16 @@ class RMVPE:
         with torch.amp.autocast(device_type=self.device.type, enabled=False):
             n_frames = mel.shape[-1]
             mel = F.pad(mel.float(), (0, 32 * ((n_frames - 1) // 32 + 1) - n_frames), mode='reflect')
+            if self.is_xla:
+                c_frames = mel.shape[-1]
+                bucket_frames = max(512, ((c_frames + 511) // 512) * 512)
+                mel_padded = F.pad(mel, (0, bucket_frames - c_frames)) if bucket_frames > c_frames else mel
+                mel_xla = mel_padded.to(self.device).transpose(-1, -2).unsqueeze(1)
+                x = self.model.cnn(self.model.unet(mel_xla)).transpose(1, 2).flatten(-2)
+                x_cpu = x[:, :c_frames, :].float().cpu()
+                with torch.amp.autocast(device_type='cpu', enabled=False):
+                    hidden = self.model.fc(x_cpu)
+                return hidden[:, :n_frames]
             hidden = self.model(mel)
             return hidden[:, :n_frames]
 
@@ -88,6 +104,16 @@ class RMVPE:
             n_frames = T // self.hop_length + 1
             audio_res = F.pad(audio_res, (0, self._padded_length(T) - T))
             mel = self.mel_extractor(audio_res, center=True).float()
+            if self.is_xla and network is None:
+                c_frames = mel.shape[-1]
+                bucket_frames = max(512, ((c_frames + 511) // 512) * 512)
+                mel_padded = F.pad(mel, (0, bucket_frames - c_frames)) if bucket_frames > c_frames else mel
+                mel_xla = mel_padded.to(self.device).transpose(-1, -2).unsqueeze(1)
+                x = self.model.cnn(self.model.unet(mel_xla)).transpose(1, 2).flatten(-2)
+                x_cpu = x[:, :c_frames, :].float().cpu()
+                with torch.amp.autocast(device_type='cpu', enabled=False):
+                    hidden = self.model.fc(x_cpu)
+                return hidden[:, :n_frames]
             if mel.device != self.device:
                 mel = mel.to(self.device)
             hidden = (self.model if network is None else network)(mel)

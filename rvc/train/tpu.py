@@ -39,6 +39,7 @@ def tpu_available():
 
 _PRECISION_CONFIGURED_PID = None
 _MATMUL_PRECISION_STATE = None
+_ORIG_NN_GRU = torch.nn.GRU
 
 
 def require_torch_xla():
@@ -55,6 +56,9 @@ def require_torch_xla():
     xla_logger.setLevel(logging.ERROR)
     try:
         import torch_xla
+
+        if getattr(torch.nn, "GRU", None) is not _ORIG_NN_GRU:
+            torch.nn.GRU = _ORIG_NN_GRU
 
         pid = os.getpid()
         if _PRECISION_CONFIGURED_PID != pid:

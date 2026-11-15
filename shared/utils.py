@@ -14,6 +14,7 @@ import numpy as np
 import re
 import unicodedata
 import wget
+import torch
 from torch import nn
 
 import logging
@@ -218,10 +219,9 @@ def extract_embedding_features_xla(model, source, orig_len, orig_frames, version
             m0 = torch.zeros((1, 1, t0_total), dtype=dtype)
             m0[..., :t0_valid] = 1.0
             m0 = m0.to(device)
-            mean = (hidden * m0).sum(dim=-1, keepdim=True) / float(t0_valid)
-            var = (((hidden - mean) * m0) ** 2).sum(dim=-1, keepdim=True) / float(
-                t0_valid
-            )
+            denom = m0.sum(dim=-1, keepdim=True).clamp_min(1.0)
+            mean = (hidden * m0).sum(dim=-1, keepdim=True) / denom
+            var = (((hidden - mean) * m0) ** 2).sum(dim=-1, keepdim=True) / denom
             hidden = (hidden - mean) / torch.sqrt(var + conv0.layer_norm.eps)
             hidden = (
                 hidden * conv0.layer_norm.weight[:, None]

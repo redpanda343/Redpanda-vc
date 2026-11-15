@@ -20,7 +20,7 @@ sys.path.append(os.path.join(now_dir))
 # Zluda hijack
 import shared.zluda
 from rvc.configs.config import Config
-from rvc.train.tpu import device as tpu_device, tpu_available
+from rvc.train.tpu import device as tpu_device, initialize_cache, tpu_available
 from beatrice.resources import ensure_pitch_estimator
 from shared.predictors.f0 import RMVPE, RVCRMVPE, BeatricePitch, Swift
 from shared.predictors.swift_dependencies import ensure_swift_f0
@@ -453,6 +453,9 @@ if __name__ == "__main__":
         devices = ["xla"] if tpu_available() else ["cpu"]
     else:
         devices = [f"cuda:{idx}" for idx in gpus.split("-")]
+
+    if devices == ["xla"]:
+        initialize_cache(os.path.join(now_dir, "logs", ".xla_cache"), 0)
 
     with mp.Manager() as manager, tqdm.tqdm(
         total=2 * len(files), desc=f"Extracting F0 ({f0_method})", unit="file",
