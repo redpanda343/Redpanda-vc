@@ -1,9 +1,8 @@
 import torch
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
 from torch.nn.utils.parametrizations import spectral_norm, weight_norm
 
-from rvc.algorithm.commons import get_padding
+from rvc.algorithm.commons import activation_checkpoint, get_padding, stft_real_imag
 from rvc.algorithm.residuals import LRELU_SLOPE
 
 
@@ -53,8 +52,8 @@ class MultiPeriodDiscriminator(torch.nn.Module):
         y_d_rs, y_d_gs, fmap_rs, fmap_gs = [], [], [], []
         for d in self.discriminators:
             if self.training and self.checkpointing:
-                y_d_r, fmap_r = checkpoint(d, y, use_reentrant=False)
-                y_d_g, fmap_g = checkpoint(d, y_hat, use_reentrant=False)
+                y_d_r, fmap_r = activation_checkpoint(d, y, tuple_with_list=True)
+                y_d_g, fmap_g = activation_checkpoint(d, y_hat, tuple_with_list=True)
             else:
                 y_d_r, fmap_r = d(y)
                 y_d_g, fmap_g = d(y_hat)
@@ -247,12 +246,16 @@ class DiscriminatorR(torch.nn.Module):
             (pad, pad),
             mode="reflect",
         ).squeeze(1)
+        window = torch.ones(win_length, device=x.device)
+        if x.device.type == "xla":
+            real, imag = stft_real_imag(x, n_fft, hop_length, window, center=False)
+            return torch.sqrt(real.pow(2) + imag.pow(2) + 1e-9).to(x.dtype)
         x = torch.stft(
             x,
             n_fft=n_fft,
             hop_length=hop_length,
             win_length=win_length,
-            window=torch.ones(win_length, device=x.device),
+            window=window,
             center=False,
             return_complex=True,
         )

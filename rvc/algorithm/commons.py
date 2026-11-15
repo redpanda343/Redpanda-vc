@@ -1,5 +1,8 @@
+import math
 import torch
 from typing import Optional
+
+_fourier_bases = {}
 
 
 def init_weights(m, mean=0.0, std=0.01):
@@ -92,9 +95,12 @@ def rand_slice_segments(x, x_lengths=None, segment_size=4):
     if x_lengths is None:
         x_lengths = t
     ids_str_max = x_lengths - segment_size + 1
-    ids_str = (
-        torch.rand([b]).to(device=x.device, non_blocking=True) * ids_str_max
-    ).to(dtype=torch.long)
+    rand_vals = (
+        torch.rand([b], device=x.device)
+        if x.device.type == "xla"
+        else torch.rand([b]).to(device=x.device, non_blocking=True)
+    )
+    ids_str = (rand_vals * ids_str_max).to(dtype=torch.long)
     ret = slice_segments(x, ids_str, segment_size, dim=3)
     return ret, ids_str
 
@@ -128,6 +134,150 @@ def sequence_mask(length: torch.Tensor, max_length: Optional[int] = None):
         max_length = length.max()
     x = torch.arange(max_length, dtype=length.dtype, device=length.device)
     return x.unsqueeze(0) < length.unsqueeze(1)
+
+
+def _fourier_basis(n_fft: int, device):
+    key = (n_fft, str(device))
+    if key not in _fourier_bases:
+        n = torch.arange(n_fft, dtype=torch.float64)
+        k = torch.arange(n_fft // 2 + 1, dtype=torch.float64)
+        angle = 2 * math.pi * k.unsqueeze(1) * n.unsqueeze(0) / n_fft
+        basis = torch.cat((torch.cos(angle), -torch.sin(angle)), dim=0)
+        _fourier_bases[key] = basis.to(dtype=torch.float32).to(device)
+    return _fourier_bases[key]
+
+
+def stft_real_imag(
+    x: torch.Tensor,
+    n_fft: int,
+    hop_length: int,
+    window: torch.Tensor,
+    center: bool = False,
+):
+    with torch.amp.autocast(device_type=x.device.type, enabled=False):
+        win_length = window.shape[-1]
+        window = window.float()
+        if win_length < n_fft:
+            left = (n_fft - win_length) // 2
+            window = torch.nn.functional.pad(window, (left, n_fft - win_length - left))
+        x = x.float().unsqueeze(1)
+        if center:
+            x = torch.nn.functional.pad(x, (n_fft // 2, n_fft // 2), mode="reflect")
+        basis = _fourier_basis(n_fft, x.device) * window
+        frames = torch.nn.functional.conv1d(x, basis.unsqueeze(1), stride=hop_length)
+        return frames.chunk(2, dim=1)
+
+
+def upsample_nearest_1d(x: torch.Tensor, factor: int) -> torch.Tensor:
+    if x.device.type == "xla":
+        return (
+            x.unsqueeze(-1)
+            .expand(*x.shape, factor)
+            .reshape(*x.shape[:-1], x.shape[-1] * factor)
+        )
+    return torch.nn.functional.interpolate(
+        x, scale_factor=float(factor), mode="nearest"
+    )
+
+
+def upsample_linear_1d(
+    x: torch.Tensor,
+    size: int | None = None,
+    scale_factor: int | float | None = None,
+) -> torch.Tensor:
+    if x.device.type == "xla":
+        target = int(size if size is not None else x.shape[-1] * scale_factor)
+        return torch.nn.functional.interpolate(
+            x.unsqueeze(2),
+            size=(1, target),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(2)
+    return torch.nn.functional.interpolate(
+        x, size=size, scale_factor=scale_factor, mode="linear"
+    )
+
+
+class UpsampleLinear1d(torch.nn.Module):
+    def __init__(self, scale_factor: int):
+        super().__init__()
+        self.scale_factor = scale_factor
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return upsample_linear_1d(x, scale_factor=self.scale_factor)
+
+
+_XLA_CHECKPOINT_FN = None
+
+
+def _get_xla_checkpoint():
+    global _XLA_CHECKPOINT_FN
+    if _XLA_CHECKPOINT_FN is None:
+        from torch_xla.utils.checkpoint import checkpoint as xla_checkpoint
+
+        _XLA_CHECKPOINT_FN = xla_checkpoint
+    return _XLA_CHECKPOINT_FN
+
+
+def _get_xla_autocast_state() -> tuple[bool, torch.dtype]:
+    try:
+        return (
+            bool(torch.is_autocast_enabled("xla")),
+            torch.get_autocast_dtype("xla"),
+        )
+    except TypeError:
+        return (
+            bool(torch.is_autocast_xla_enabled()),
+            torch.get_autocast_xla_dtype(),
+        )
+
+
+def activation_checkpoint(
+    module: torch.nn.Module,
+    x: torch.Tensor,
+    *,
+    tuple_with_list: bool = False,
+):
+    if not isinstance(x, torch.Tensor) or x.device.type != "xla":
+        return torch.utils.checkpoint.checkpoint(module, x, use_reentrant=False)
+
+    needs_grad = torch.is_grad_enabled() and (
+        x.requires_grad or any(p.requires_grad for p in module.parameters())
+    )
+    if not needs_grad:
+        return module(x)
+
+    xla_checkpoint = _get_xla_checkpoint()
+    autocast_enabled, autocast_dtype = _get_xla_autocast_state()
+
+    if tuple_with_list:
+
+        def _run(inp, _dummy=None):
+            with torch.amp.autocast(
+                device_type="xla", enabled=autocast_enabled, dtype=autocast_dtype
+            ):
+                score, fmap = module(inp)
+                return (score, *fmap)
+
+    else:
+
+        def _run(inp, _dummy=None):
+            with torch.amp.autocast(
+                device_type="xla", enabled=autocast_enabled, dtype=autocast_dtype
+            ):
+                return module(inp)
+
+    if x.requires_grad:
+        out = xla_checkpoint(_run, x, use_reentrant=True, preserve_rng_state=True)
+    else:
+        dummy = torch.zeros((), device=x.device, dtype=x.dtype, requires_grad=True)
+        out = xla_checkpoint(
+            _run, x, dummy, use_reentrant=True, preserve_rng_state=True
+        )
+
+    if tuple_with_list:
+        return out[0], list(out[1:])
+    return out
 
 
 def grad_norm(parameters, norm_type: float = 2.0):

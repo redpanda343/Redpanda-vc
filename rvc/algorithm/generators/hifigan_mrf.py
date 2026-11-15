@@ -5,9 +5,8 @@ import numpy as np
 import torch
 from torch.nn.utils import remove_weight_norm
 from torch.nn.utils.parametrizations import weight_norm
-from torch.utils.checkpoint import checkpoint
 
-from rvc.algorithm.commons import leaky_relu
+from rvc.algorithm.commons import activation_checkpoint, leaky_relu, upsample_nearest_1d
 
 LRELU_SLOPE = 0.1
 
@@ -341,7 +340,11 @@ class HiFiGANMRFGenerator(torch.nn.Module):
     def forward(
         self, x: torch.Tensor, f0: torch.Tensor, g: Optional[torch.Tensor] = None
     ):
-        f0 = self.f0_upsample(f0[:, None, :]).transpose(-1, -2)
+        f0 = (
+            upsample_nearest_1d(f0[:, None, :], int(self.f0_upsample.scale_factor))
+            if f0.device.type == "xla"
+            else self.f0_upsample(f0[:, None, :])
+        ).transpose(-1, -2)
         har_source, _, _ = self.m_source(f0)
         har_source = har_source.transpose(-1, -2)
         x = self.conv_pre(x)
@@ -353,11 +356,11 @@ class HiFiGANMRFGenerator(torch.nn.Module):
             x = torch.nn.functional.leaky_relu(x, LRELU_SLOPE, inplace=True)
 
             checkpointed = self.training and self.checkpointing
-            x = checkpoint(ups, x, use_reentrant=False) if checkpointed else ups(x)
+            x = activation_checkpoint(ups, x) if checkpointed else ups(x)
             x = x + noise_conv(har_source)
             xs = None
             for layer in mrf:
-                y = checkpoint(layer, x, use_reentrant=False) if checkpointed else layer(x)
+                y = activation_checkpoint(layer, x) if checkpointed else layer(x)
                 xs = y if xs is None else xs + y
             x = xs / self.num_kernels
 

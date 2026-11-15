@@ -109,7 +109,9 @@ class MultiHeadAttention(torch.nn.Module):
 
         if self.proximal_bias:
             assert t_s == t_t, "Proximal bias only supports self-attention."
-            scores += self._attention_bias_proximal(t_s).to(scores.device, scores.dtype)
+            scores += self._attention_bias_proximal(
+                t_s, device=scores.device, dtype=scores.dtype
+            )
 
         if mask is not None:
             scores = scores.masked_fill(mask == 0, -1e4)
@@ -157,10 +159,10 @@ class MultiHeadAttention(torch.nn.Module):
             :, :, :, : 2 * window + 1
         ].contiguous()
 
-    def _attention_bias_proximal(self, length):
-        r = torch.arange(length, dtype=torch.float32)
+    def _attention_bias_proximal(self, length, device=None, dtype=torch.float32):
+        r = torch.arange(length, dtype=torch.float32, device=device)
         diff = r.unsqueeze(0) - r.unsqueeze(1)
-        return -torch.log1p(torch.abs(diff)).unsqueeze(0).unsqueeze(0)
+        return (-torch.log1p(torch.abs(diff)).unsqueeze(0).unsqueeze(0)).to(dtype)
 
 
 class FFN(torch.nn.Module):

@@ -14,6 +14,7 @@ from core import (
     start_train_script,
 )
 from rvc.configs.config import get_gpu_info, get_number_of_gpus, max_vram_gpu
+from rvc.train.tpu import tpu_available
 from shared.utils import format_title
 from tabs.settings.sections.restart import (
     get_train_state,
@@ -750,6 +751,29 @@ def rvc_train_tab():
                         value=False,
                         interactive=True,
                     )
+            default_accelerator = (
+                "TPU" if tpu_available() and get_number_of_gpus() == "-" else "GPU"
+            )
+            with gr.Row():
+                accelerator = gr.Radio(
+                    label=i18n("Training Device"),
+                    info=i18n(
+                        "GPU trains on CUDA, MPS, or CPU. TPU trains on Cloud TPU via PyTorch/XLA and ignores GPU Number and Cache Dataset in GPU."
+                    ),
+                    choices=["GPU", "TPU"],
+                    value=default_accelerator,
+                    interactive=True,
+                )
+                tpu_cores = gr.Radio(
+                    label=i18n("TPU Cores"),
+                    info=i18n(
+                        "Use all TPU cores on this host for data-parallel training, or a single core."
+                    ),
+                    choices=["All", "1"],
+                    value="All",
+                    visible=default_accelerator == "TPU",
+                    interactive=True,
+                )
             with gr.Row():
                 lr_schedule = gr.Radio(
                     label=i18n("Learning Rate Schedule"),
@@ -867,7 +891,18 @@ def rvc_train_tab():
             )
 
         def start_training(*args):
-            *arguments, warmup, decay_steps, batch_seconds, ema, schedule, final_ratio, reset = args
+            (
+                *arguments,
+                warmup,
+                decay_steps,
+                batch_seconds,
+                ema,
+                schedule,
+                final_ratio,
+                reset,
+                accel,
+                cores,
+            ) = args
             message = start_train_script(
                 *arguments,
                 warmup_steps=warmup,
@@ -877,6 +912,8 @@ def rvc_train_tab():
                 lr_schedule=schedule,
                 lr_final_ratio=final_ratio,
                 reset_optimizer=reset,
+                accelerator=accel.lower(),
+                tpu_cores=cores.lower(),
             )
             gr.Info(message)
             return training_ui_state(args[0])
@@ -1095,6 +1132,11 @@ def rvc_train_tab():
                 inputs=[lr_schedule],
                 outputs=[lr_decay_steps, lr_final_ratio],
             )
+            accelerator.change(
+                fn=lambda selected: gr.update(visible=selected == "TPU"),
+                inputs=[accelerator],
+                outputs=[tpu_cores],
+            )
             cut_preprocess.change(
                 fn=update_truncate_silence_visibility,
                 inputs=[
@@ -1208,6 +1250,8 @@ def rvc_train_tab():
                     lr_schedule,
                     lr_final_ratio,
                     reset_optimizer,
+                    accelerator,
+                    tpu_cores,
                 ],
                 outputs=training_outputs,
             ).then(**wake_training_timer)

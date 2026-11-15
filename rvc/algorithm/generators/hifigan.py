@@ -5,7 +5,7 @@ from torch.nn.utils.parametrizations import weight_norm
 from typing import Optional
 
 from rvc.algorithm.residuals import LRELU_SLOPE, ResBlock
-from rvc.algorithm.commons import init_weights
+from rvc.algorithm.commons import init_weights, upsample_nearest_1d
 
 
 class HiFiGANGenerator(torch.nn.Module):
@@ -208,10 +208,8 @@ class SineGenerator(torch.nn.Module):
             voiced_mask = self._compute_voiced_unvoiced(f0)
 
             # Upsample voiced/unvoiced mask
-            voiced_mask = torch.nn.functional.interpolate(
-                voiced_mask.transpose(2, 1),
-                scale_factor=float(upsampling_factor),
-                mode="nearest",
+            voiced_mask = upsample_nearest_1d(
+                voiced_mask.transpose(2, 1), int(upsampling_factor)
             ).transpose(2, 1)
 
             # Compute noise amplitude

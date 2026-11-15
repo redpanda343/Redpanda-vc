@@ -1,6 +1,10 @@
+import math
+
 import torch
 import torch.utils.data
 from librosa.filters import mel as librosa_mel_fn
+
+from rvc.algorithm.commons import stft_real_imag
 
 mel_basis = {}
 hann_window = {}
@@ -31,6 +35,12 @@ def spectrogram_torch(y, n_fft, hop_size, win_size, center=False):
         mode="reflect",
     )
     y = y.squeeze(1)
+
+    if y.device.type == "xla":
+        real, imag = stft_real_imag(
+            y, n_fft, hop_size, hann_window[wnsize_dtype_device], center=center
+        )
+        return torch.sqrt(real.pow(2) + imag.pow(2) + 2e-7)
 
     spec = torch.stft(
         y,
@@ -122,7 +132,7 @@ class MultiScaleMelSpectrogramLoss(torch.nn.Module):
         super().__init__()
         self.sample_rate = sample_rate
         self.loss_fn = loss_fn
-        self.log_base = torch.log(torch.tensor(10.0))
+        self.log_base = math.log(10.0)
         self.stft_params: list[tuple] = []
         self.hann_window: dict[int, torch.Tensor] = {}
         self.mel_banks: dict[int, torch.Tensor] = {}
@@ -147,15 +157,25 @@ class MultiScaleMelSpectrogramLoss(torch.nn.Module):
 
         wav = wav.squeeze(1)  # -> torch(B, T)
 
-        stft = torch.stft(
-            wav.float(),
-            n_fft=window_length,
-            hop_length=window_length // 4,
-            window=self.hann_window[win_dtype_device],
-            return_complex=True,
-        )  # -> torch (B, window_length // 2 + 1, (T - window_length)/hop_length + 1)
+        if wav.device.type == "xla":
+            real, imag = stft_real_imag(
+                wav.float(),
+                window_length,
+                window_length // 4,
+                self.hann_window[win_dtype_device],
+                center=True,
+            )
+            magnitude = torch.sqrt(real.pow(2) + imag.pow(2) + 1e-6)
+        else:
+            stft = torch.stft(
+                wav.float(),
+                n_fft=window_length,
+                hop_length=window_length // 4,
+                window=self.hann_window[win_dtype_device],
+                return_complex=True,
+            )  # -> torch (B, window_length // 2 + 1, (T - window_length)/hop_length + 1)
 
-        magnitude = torch.sqrt(stft.real.pow(2) + stft.imag.pow(2) + 1e-6)
+            magnitude = torch.sqrt(stft.real.pow(2) + stft.imag.pow(2) + 1e-6)
 
         # caching mel filter
         if mel_dtype_device not in self.mel_banks:

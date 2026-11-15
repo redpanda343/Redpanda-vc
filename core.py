@@ -659,7 +659,20 @@ def _build_train_command(
     lr_schedule: str = "exponential",
     lr_final_ratio: float = 0.1,
     reset_optimizer: bool = False,
+    accelerator: str = "gpu",
+    tpu_cores: str = "all",
 ):
+    accelerator = str(accelerator).lower()
+    tpu_cores = str(tpu_cores).lower()
+    if accelerator not in {"gpu", "tpu"}:
+        raise ValueError(f"Unsupported accelerator: {accelerator}")
+    if tpu_cores not in {"all", "1"}:
+        raise ValueError(f"Unsupported TPU core selection: {tpu_cores}")
+    if accelerator == "tpu":
+        from rvc.train.tpu import INSTALL_HINT, torch_xla_installed
+
+        if not torch_xla_installed():
+            raise ValueError(INSTALL_HINT)
     if version not in {"v1", "v2"}:
         raise ValueError(f"Unsupported RVC version: {version}")
     if version == "v1" and (int(sample_rate) != 40000 or vocoder != "HiFi-GAN"):
@@ -710,6 +723,10 @@ def _build_train_command(
         str(batch_size),
         "--gpus",
         str(gpu),
+        "--accelerator",
+        accelerator,
+        "--tpu-cores",
+        tpu_cores,
         "--vocoder",
         vocoder,
         "--version",
@@ -772,6 +789,8 @@ def run_train_script(
     lr_schedule: str = "exponential",
     lr_final_ratio: float = 0.1,
     reset_optimizer: bool = False,
+    accelerator: str = "gpu",
+    tpu_cores: str = "all",
 ):
     command = _build_train_command(
         model_name,
@@ -799,6 +818,8 @@ def run_train_script(
         lr_schedule,
         lr_final_ratio,
         reset_optimizer,
+        accelerator,
+        tpu_cores,
     )
     result = subprocess.run(command)
     if result.returncode != 0:
@@ -853,6 +874,8 @@ def start_train_script(
     lr_schedule: str = "exponential",
     lr_final_ratio: float = 0.1,
     reset_optimizer: bool = False,
+    accelerator: str = "gpu",
+    tpu_cores: str = "all",
 ):
     command = _build_train_command(
         model_name,
@@ -880,6 +903,8 @@ def start_train_script(
         lr_schedule,
         lr_final_ratio,
         reset_optimizer,
+        accelerator,
+        tpu_cores,
     )
 
     on_success = None
@@ -1492,6 +1517,18 @@ def extract(**kwargs):
 )
 @click.option("--gpu", type=str, default="0", help="GPU device to use.")
 @click.option(
+    "--accelerator",
+    type=click.Choice(["gpu", "tpu"]),
+    default="gpu",
+    help="Accelerator to train RVC on (gpu or tpu via PyTorch/XLA).",
+)
+@click.option(
+    "--tpu-cores",
+    type=click.Choice(["all", "1"]),
+    default="all",
+    help="With --accelerator tpu, train on all TPU devices of this host or on 1.",
+)
+@click.option(
     "--pretrained/--no-pretrained",
     default=True,
     help="Use pretrained model for initialisation.",
@@ -1596,6 +1633,8 @@ def train(**kwargs):
         lr_schedule=kwargs["lr_schedule"],
         lr_final_ratio=kwargs["lr_final_ratio"],
         reset_optimizer=kwargs["reset_optimizer"],
+        accelerator=kwargs["accelerator"],
+        tpu_cores=kwargs["tpu_cores"],
     )
     click.echo(result)
 

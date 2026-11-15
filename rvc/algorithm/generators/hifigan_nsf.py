@@ -4,9 +4,8 @@ from typing import Optional
 import torch
 from torch.nn.utils import remove_weight_norm
 from torch.nn.utils.parametrizations import weight_norm
-from torch.utils.checkpoint import checkpoint
 
-from rvc.algorithm.commons import init_weights
+from rvc.algorithm.commons import activation_checkpoint, init_weights
 from rvc.algorithm.generators.hifigan import SineGenerator
 from rvc.algorithm.residuals import LRELU_SLOPE, ResBlock
 
@@ -185,11 +184,11 @@ class HiFiGANNSFGenerator(torch.nn.Module):
             x = torch.nn.functional.leaky_relu(x, self.lrelu_slope, inplace=True)
             # Apply upsampling layer
             checkpointed = self.training and self.checkpointing
-            x = checkpoint(ups, x, use_reentrant=False) if checkpointed else ups(x)
+            x = activation_checkpoint(ups, x) if checkpointed else ups(x)
             x = x + noise_convs(har_source)
             xs = None
             for resblock in self.resblocks[i * self.num_kernels : (i + 1) * self.num_kernels]:
-                y = checkpoint(resblock, x, use_reentrant=False) if checkpointed else resblock(x)
+                y = activation_checkpoint(resblock, x) if checkpointed else resblock(x)
                 xs = y if xs is None else xs + y
             x = xs / self.num_kernels
 

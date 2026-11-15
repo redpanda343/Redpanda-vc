@@ -5,9 +5,34 @@ from torch import nn
 from torch.nn import functional as F
 from torch.nn.utils.parametrizations import weight_norm
 from torch.nn.utils import remove_weight_norm
-from torch.utils.checkpoint import checkpoint
 
-from rvc.algorithm.commons import init_weights, get_padding, leaky_relu
+from rvc.algorithm.commons import (
+    UpsampleLinear1d,
+    activation_checkpoint,
+    get_padding,
+    init_weights,
+    leaky_relu,
+    upsample_linear_1d,
+)
+
+_xla_resamplers = {}
+
+
+def _xla_resample(x: torch.Tensor, orig_freq: int, new_freq: int) -> torch.Tensor:
+    key = (orig_freq, new_freq, str(x.device))
+    resampler = _xla_resamplers.get(key)
+    if resampler is None:
+        resampler = torchaudio.transforms.Resample(
+            orig_freq=orig_freq,
+            new_freq=new_freq,
+            resampling_method="sinc_interp_kaiser",
+            lowpass_filter_width=64,
+            rolloff=0.9475937167399596,
+            beta=14.769656459379492,
+        ).to(x.device)
+        _xla_resamplers[key] = resampler
+    with torch.amp.autocast(device_type=x.device.type, enabled=False):
+        return resampler(x.float())
 
 
 class ResBlock(nn.Module):
@@ -365,7 +390,7 @@ class RefineGANGenerator(nn.Module):
         for rate in upsample_rates:
             new_channels = channels // 2
 
-            self.upsample_blocks.append(nn.Upsample(scale_factor=rate, mode="linear"))
+            self.upsample_blocks.append(UpsampleLinear1d(scale_factor=rate))
 
             self.upsample_conv_blocks.append(
                 ParallelResBlock(
@@ -387,7 +412,7 @@ class RefineGANGenerator(nn.Module):
     def forward(self, mel: torch.Tensor, f0: torch.Tensor, g: torch.Tensor = None):
         f0_size = mel.shape[-1]
         # change f0 helper to full size
-        f0 = F.interpolate(f0.unsqueeze(1), size=f0_size * self.upp, mode="linear")
+        f0 = upsample_linear_1d(f0.unsqueeze(1), size=f0_size * self.upp)
         # get f0 turned into sines harmonics
         har_source = self.m_source(f0.transpose(1, 2)).transpose(1, 2)
         # prepare for fusion to mel
@@ -398,15 +423,18 @@ class RefineGANGenerator(nn.Module):
             x = F.leaky_relu(x, self.leaky_relu_slope, inplace=True)
             downs.append(x)
             # attempt to cancel spectral aliasing
-            x = torchaudio.functional.resample(
-                x.float().contiguous(),
-                orig_freq=int(f0_size * old_size),
-                new_freq=int(f0_size * new_size),
-                lowpass_filter_width=64,
-                rolloff=0.9475937167399596,
-                resampling_method="sinc_interp_kaiser",
-                beta=14.769656459379492,
-            ).to(x.dtype)
+            if x.device.type == "xla":
+                x = _xla_resample(x.float().contiguous(), old_size, new_size).to(x.dtype)
+            else:
+                x = torchaudio.functional.resample(
+                    x.float().contiguous(),
+                    orig_freq=int(f0_size * old_size),
+                    new_freq=int(f0_size * new_size),
+                    lowpass_filter_width=64,
+                    rolloff=0.9475937167399596,
+                    resampling_method="sinc_interp_kaiser",
+                    beta=14.769656459379492,
+                ).to(x.dtype)
             x = block(x)
 
         # expanding spectrogram from 192 to 256 channels
@@ -425,9 +453,9 @@ class RefineGANGenerator(nn.Module):
             x = F.leaky_relu(x, self.leaky_relu_slope, inplace=True)
 
             if self.training and self.checkpointing:
-                x = checkpoint(ups, x, use_reentrant=False)
+                x = activation_checkpoint(ups, x)
                 x = torch.cat([x, down], dim=1)
-                x = checkpoint(res, x, use_reentrant=False)
+                x = activation_checkpoint(res, x)
             else:
                 x = ups(x)
                 x = torch.cat([x, down], dim=1)

@@ -39,12 +39,17 @@ from rvc.train.utils import (
 # Zluda hijack
 import shared.zluda
 from rvc.algorithm import commons
+from rvc.train import tpu
 from rvc.train.process.extract_model import extract_model
 
 VOCODERS = ("HiFi-GAN", "MRF HiFi-GAN", "RefineGAN")
 LR_SCHEDULES = ("exponential", "cosine")
+ACCELERATORS = ("gpu", "tpu")
 BUCKET_BOUNDARIES = (100, 200, 300, 400, 500, 600, 700, 800, 900)
 LATEST_CHECKPOINT_SUFFIX = 2333333
+XLA_CACHE_DIR = os.environ.get(
+    "RVC_XLA_CACHE_DIR", os.path.join(now_dir, "assets", "xla_cache")
+)
 
 # experimental settings
 randomized = True
@@ -111,9 +116,9 @@ class AsyncInferenceExporter:
         return snapshot, copy_event
 
     @staticmethod
-    def _stage_synchronous(state_dict, export_dtype):
+    def _stage_synchronous(state_dict, export_dtype, xla=False):
         return {
-            key: value.detach().to(
+            key: (value.detach().cpu() if xla else value.detach()).to(
                 device="cpu",
                 dtype=export_dtype if value.is_floating_point() else value.dtype,
                 copy=True,
@@ -128,7 +133,9 @@ class AsyncInferenceExporter:
             snapshot, copy_event = self._stage_cuda(state_dict, export_dtype)
             staging_future = Future()
         else:
-            snapshot = self._stage_synchronous(state_dict, export_dtype)
+            snapshot = self._stage_synchronous(
+                state_dict, export_dtype, xla=self.device.type == "xla"
+            )
             copy_event = None
             staging_future = Future()
             staging_future.set_result(None)
@@ -200,7 +207,11 @@ class GeneratorEMA:
         self.updates += 1
         beta = self.decay
         decay = beta * (1 - beta ** (self.updates - 1)) / (1 - beta**self.updates)
-        torch._foreach_lerp_(self.ema_floats, self.live_floats, 1 - decay)
+        if self.ema_floats and self.ema_floats[0].device.type == "xla":
+            for target, value in zip(self.ema_floats, self.live_floats):
+                target.lerp_(value, 1 - decay)
+        else:
+            torch._foreach_lerp_(self.ema_floats, self.live_floats, 1 - decay)
         for target, value in self.copied:
             target.copy_(value)
 
@@ -230,6 +241,18 @@ def parse_arguments(argv=None):
     )
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--gpus", default="0", help="CUDA device indices joined by -, such as 0-1.")
+    parser.add_argument(
+        "--accelerator",
+        choices=ACCELERATORS,
+        default="gpu",
+        help="gpu trains on CUDA, MPS or the CPU, whichever is available. tpu trains on Cloud TPU through PyTorch/XLA and ignores --gpus.",
+    )
+    parser.add_argument(
+        "--tpu-cores",
+        choices=("all", "1"),
+        default="all",
+        help="With --accelerator tpu, train data-parallel on every TPU device of this host (all) or on a single one (1).",
+    )
     parser.add_argument("--pretrained-g", default="")
     parser.add_argument("--pretrained-d", default="")
     parser.add_argument("--vocoder", choices=VOCODERS, default="HiFi-GAN")
@@ -300,11 +323,11 @@ def parse_arguments(argv=None):
         parser.error("RVC v1 training requires HiFi-GAN at 40000 Hz.")
 
     args.experiment_dir = os.path.join(now_dir, "logs", args.model_name)
-    args.train_dtype = configured_train_dtype()
+    args.train_dtype = configured_train_dtype(args.accelerator)
     args.export_dtype = (
         torch.float32 if args.train_dtype == torch.float32 else torch.float16
     )
-    if args.train_dtype == torch.float16:
+    if args.train_dtype == torch.float16 and args.accelerator == "gpu":
         unreliable = fp16_unreliable_gpus(args.gpus)
         if unreliable:
             print(
@@ -313,10 +336,13 @@ def parse_arguments(argv=None):
             args.train_dtype = torch.float32
     args.disc_version = "v3" if args.vocoder == "RefineGAN" else args.version
     args.multiscale_mel_loss = args.vocoder == "RefineGAN"
+    if args.accelerator == "tpu" and args.cache_data_in_gpu:
+        print("Caching the dataset in device memory only works on GPUs, so the TPU run loads it from disk.")
+        args.cache_data_in_gpu = False
     return args
 
 
-def configured_train_dtype():
+def configured_train_dtype(accelerator="gpu"):
     try:
         with open(
             os.path.join(now_dir, "assets", "config.json"), "r", encoding="utf-8"
@@ -324,6 +350,10 @@ def configured_train_dtype():
             precision = json.load(f)["precision"]
     except (FileNotFoundError, json.JSONDecodeError, KeyError):
         return torch.float32
+    if accelerator == "tpu":
+        if precision == "fp16":
+            print("TPUs do not train in FP16, so this run uses BF16 instead.")
+        return torch.bfloat16 if precision in ("bf16", "fp16") else torch.float32
     if precision == "bf16" and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
         return torch.bfloat16
     if precision == "fp16" and torch.cuda.is_available():
@@ -440,6 +470,17 @@ def main():
     config = load_experiment_config(args)
     check_dataset_sample_rate(args, config)
 
+    if args.accelerator == "tpu":
+        try:
+            tpu.require_torch_xla()
+        except (RuntimeError, ImportError) as error:
+            print(error)
+            sys.exit(1)
+        if args.cleanup:
+            remove_previous_attempt(args.experiment_dir)
+        tpu.spawn(run_tpu, args=(args, config), single_core=args.tpu_cores == "1")
+        return
+
     if torch.cuda.is_available():
         device_type = "cuda"
         device_ids = [int(item) for item in args.gpus.split("-")]
@@ -490,6 +531,19 @@ def run(rank, world_size, args, config, device_type, device_ids):
             dist.destroy_process_group()
 
 
+def run_tpu(index, args, config):
+    faulthandler.enable()
+    tpu.initialize_cache(XLA_CACHE_DIR, index)
+    tpu.patch_xla_ops()
+    if args.train_dtype == torch.float32:
+        tpu.set_matmul_precision("high")
+    device = tpu.device()
+    rank, world_size = tpu.rank(), tpu.world_size()
+    torch.manual_seed(config.train.seed + rank)
+    tpu.manual_seed(config.train.seed + rank)
+    Trainer(rank, world_size, args, config, device).fit()
+
+
 class Trainer:
     def __init__(self, rank, world_size, args, config, device):
         self.rank = rank
@@ -497,16 +551,18 @@ class Trainer:
         self.args = args
         self.config = config
         self.device = device
+        self.xla = device.type == "xla"
         self.segment_frames = config.train.segment_size // config.data.hop_length
         self.log_interval = int(config.train.log_interval)
         if self.log_interval < 1:
             raise ValueError("train.log_interval must be at least 1")
-        self.use_amp = device.type == "cuda" and args.train_dtype in (
+        self.use_amp = device.type in ("cuda", "xla") and args.train_dtype in (
             torch.bfloat16,
             torch.float16,
         )
         self.cache_in_gpu = device.type == "cuda" and args.cache_data_in_gpu
-        self.workers = max(1, min(4, (os.cpu_count() or 1) // world_size))
+        max_workers = 2 if (self.xla and world_size > 1) else 4
+        self.workers = max(1, min(max_workers, (os.cpu_count() or 1) // world_size))
         self.pending_rng = None
         self.global_step = 0
         self.loss_sums = torch.zeros(6, device=device, dtype=torch.float32)
@@ -528,12 +584,15 @@ class Trainer:
         last_g, last_d = latest_checkpoint_pair(self.args.experiment_dir)
         self.build_models(last_g)
         epoch, start_batch, extra = self.restore(last_g, last_d)
+        if self.xla and self.world_size > 1:
+            tpu.broadcast_master_params(self.net_g)
+            tpu.broadcast_master_params(self.net_d)
         for optimizer in (self.optim_g, self.optim_d):
             for group in optimizer.param_groups:
                 group.setdefault("initial_lr", group["lr"])
         if self.args.lr_schedule == "cosine":
             self.build_lr_schedule(extra.get("lr_schedule"))
-        if self.rank == 0 and self.args.ema_decay > 0:
+        if self.args.ema_decay > 0 and (self.rank == 0 or self.xla):
             self.build_ema(last_g, extra.get("ema"))
 
         if self.rank == 0:
@@ -585,7 +644,12 @@ class Trainer:
             if self.use_amp
             else "FP32"
         )
-        device = f"GPU {args.gpus}" if self.device.type == "cuda" else self.device.type.upper()
+        if self.xla:
+            device = f"TPU x{self.world_size}"
+        elif self.device.type == "cuda":
+            device = f"GPU {args.gpus}"
+        else:
+            device = self.device.type.upper()
         speakers = self.config.model.spk_embed_dim
         parts = [
             args.model_name,
@@ -653,7 +717,10 @@ class Trainer:
         data = self.config.data
         max_frames = int(self.args.max_batch_seconds * data.sample_rate / data.hop_length)
         self.dataset = TextAudioLoaderMultiNSFsid(data)
-        self.collate = TextAudioCollateMultiNSFsid()
+        self.collate = TextAudioCollateMultiNSFsid(
+            frame_buckets=BUCKET_BOUNDARIES if self.xla else None,
+            hop_length=data.hop_length,
+        )
         self.sampler = DistributedBucketSampler(
             self.dataset,
             self.args.batch_size,
@@ -677,7 +744,7 @@ class Trainer:
                 collate_fn=self.collate,
                 batch_sampler=self.sampler,
                 persistent_workers=True,
-                prefetch_factor=8,
+                prefetch_factor=2 if self.xla else 8,
             )
 
     def build_models(self, last_g):
@@ -723,6 +790,8 @@ class Trainer:
         else:
             optimizer = torch.optim.AdamW
             options = {"fused": self.device.type == "cuda"}
+            if self.xla:
+                options["foreach"] = False
         self.optim_g = optimizer(
             net_g.parameters(),
             config.train.learning_rate * g_lr_coeff,
@@ -751,7 +820,7 @@ class Trainer:
                 net_g.register_comm_hook(None, cpu_allreduce_hook)
                 net_d.register_comm_hook(None, cpu_allreduce_hook)
         self.net_g, self.net_d = net_g, net_d
-        self.freeze_discriminator = self.device.type == "cuda"
+        self.freeze_discriminator = self.device.type in ("cuda", "xla")
         self.net_d_for_generator = (
             net_d.module if self.freeze_discriminator and hasattr(net_d, "module") else net_d
         )
@@ -778,7 +847,7 @@ class Trainer:
                 print(f"Could not resume from the checkpoints in {self.args.experiment_dir}: {e}")
                 print("Fix or remove them, or enable cleanup to start over from the pretrained models.")
                 sys.exit(1)
-            if scaler_dict:
+            if scaler_dict and self.scaler.is_enabled():
                 self.scaler.load_state_dict(scaler_dict)
             step = extra.get("step")
             if d_extra.get("step") not in (None, step):
@@ -805,6 +874,8 @@ class Trainer:
         state = {"cpu": torch.get_rng_state()}
         if self.device.type == "cuda":
             state["cuda"] = torch.cuda.get_rng_state(self.device)
+        elif self.xla:
+            state["xla"] = tpu.get_rng_state()
         return state
 
     def restore_rng(self, state):
@@ -818,6 +889,8 @@ class Trainer:
             torch.set_rng_state(state["cpu"])
             if self.device.type == "cuda" and "cuda" in state:
                 torch.cuda.set_rng_state(state["cuda"], self.device)
+            elif self.xla and "xla" in state:
+                tpu.set_rng_state(state["xla"])
         except (KeyError, RuntimeError, TypeError) as e:
             print(f"Could not restore the random number generator state: {e}")
 
@@ -875,12 +948,16 @@ class Trainer:
             sys.exit(1)
 
     def autocast(self):
+        device_type = self.device.type if self.device.type in ("cuda", "xla") else "cuda"
         return torch.amp.autocast(
-            device_type="cuda", enabled=self.use_amp, dtype=self.args.train_dtype
+            device_type=device_type, enabled=self.use_amp, dtype=self.args.train_dtype
         )
 
     def batches(self):
         if not self.cache_in_gpu:
+            if self.xla:
+                yield from tpu.iter_batches(self.loader, self.device)
+                return
             for batch in self.loader:
                 if self.device.type == "cuda":
                     yield [tensor.to(self.device, non_blocking=True) for tensor in batch]
@@ -952,6 +1029,8 @@ class Trainer:
     def optimizer_step(self, optimizer, net, loss, log_grad_norm, update_scaler, before_step=None):
         optimizer.zero_grad()
         self.scaler.scale(loss).backward()
+        if self.xla and self.world_size > 1:
+            tpu.reduce_gradients(optimizer)
         norm = None
         if log_grad_norm:
             self.scaler.unscale_(optimizer)
@@ -991,7 +1070,10 @@ class Trainer:
         config = self.config
         self.last_batch = None
         phone, phone_lengths, pitch, pitchf, spec, spec_lengths, wave, _, sid = batch
-        log_grad_norms = self.rank == 0 and (self.global_step + 1) % self.log_interval == 0
+        log_grad_norms = (
+            (self.rank == 0 or self.xla)
+            and (self.global_step + 1) % self.log_interval == 0
+        )
 
         with self.autocast():
             y_hat, ids_slice, _, z_mask, (_, z_p, m_p, logs_p, _, logs_q) = self.net_g(
@@ -1049,6 +1131,8 @@ class Trainer:
             (loss_gen_all, loss_disc, loss_gen, loss_fm, loss_mel, loss_kl),
             (grad_norm_d, grad_norm_g),
         )
+        if self.xla and self.global_step % self.log_interval != 0:
+            tpu.sync()
         self.last_batch = (spec, ids_slice, y_hat)
 
     def record_losses(self, losses, grad_norms):
@@ -1057,7 +1141,14 @@ class Trainer:
         if self.global_step % self.log_interval != 0:
             return
         totals = torch.cat((self.loss_sums, self.loss_sums.new_tensor([self.batch_count])))
-        if self.world_size > 1:
+        if self.xla:
+            self.loss_sums.zero_()
+            self.batch_count = 0
+            tpu.sync()
+            totals = totals.cpu()
+            if self.world_size > 1:
+                totals = tpu.sum_tensors(f"rvc_losses_{self.global_step}", totals)
+        elif self.world_size > 1:
             if dist.get_backend() == "gloo" and totals.is_cuda:
                 totals = totals.cpu()
             dist.reduce(totals, dst=0, op=dist.ReduceOp.SUM)
@@ -1081,8 +1172,9 @@ class Trainer:
                     "grad/norm_g": gradient_values[1],
                 },
             )
-        self.loss_sums.zero_()
-        self.batch_count = 0
+        if not self.xla:
+            self.loss_sums.zero_()
+            self.batch_count = 0
 
     def generator(self):
         return self.net_g.module if hasattr(self.net_g, "module") else self.net_g
@@ -1146,54 +1238,65 @@ class Trainer:
     def save(self, epoch, final):
         rng = [self.rng_state()]
         if self.world_size > 1:
-            gathered = [None] * self.world_size if self.rank == 0 else None
-            dist.gather_object(rng[0], gathered, dst=0)
-            rng = gathered
-        if self.rank != 0:
-            return
-        args = self.args
-        self.summarize_mels(*self.last_batch)
-        weights = self.weights_path(epoch)
-        if (args.save_every_weights or final) and not os.path.exists(weights):
-            self.exporter.submit(
-                state_dict=self.export_state_dict(),
-                export_dtype=args.export_dtype,
-                model_path=weights,
-                **self.export_arguments(epoch),
-            )
+            if self.xla:
+                rng = tpu.gather_objects(f"rvc_rng_{self.global_step}", rng[0])
+            else:
+                gathered = [None] * self.world_size if self.rank == 0 else None
+                dist.gather_object(rng[0], gathered, dst=0)
+                rng = gathered
+        if self.rank == 0:
+            args = self.args
+            spec, ids_slice, y_hat = self.last_batch
+            if self.xla:
+                spec = spec[:1].detach().cpu()
+                ids_slice = ids_slice[:1].detach().cpu() if ids_slice is not None else None
+                y_hat = y_hat[:1].detach().cpu()
+            self.summarize_mels(spec, ids_slice, y_hat)
+            weights = self.weights_path(epoch)
+            if (args.save_every_weights or final) and not os.path.exists(weights):
+                self.exporter.submit(
+                    state_dict=self.export_state_dict(),
+                    export_dtype=args.export_dtype,
+                    model_path=weights,
+                    **self.export_arguments(epoch),
+                )
 
-        suffix = LATEST_CHECKPOINT_SUFFIX if args.save_only_latest else self.global_step
-        generator_extra = {
-            "step": self.global_step,
-            "epoch_step": self.epoch_step,
-            "rng": rng,
-        }
-        if self.ema is not None:
-            generator_extra["ema"] = self.ema.state_dict()
-        if self.lr_schedule is not None:
-            generator_extra["lr_schedule"] = self.lr_schedule
-        paths = []
-        for prefix, net, optimizer, extra in (
-            ("D", self.net_d, self.optim_d, {"step": self.global_step}),
-            ("G", self.net_g, self.optim_g, generator_extra),
-        ):
-            path = os.path.join(args.experiment_dir, f"{prefix}_{suffix}.pth")
-            save_checkpoint(
-                net,
-                optimizer,
-                self.config.train.learning_rate,
-                epoch,
-                f"{path}.tmp",
-                self.scaler,
-                extra,
-            )
-            paths.append(path)
-        for path in paths:
-            os.replace(f"{path}.tmp", path)
-        if final:
-            self.exporter.wait_for_completion()
+            suffix = LATEST_CHECKPOINT_SUFFIX if args.save_only_latest else self.global_step
+            generator_extra = {
+                "step": self.global_step,
+                "epoch_step": self.epoch_step,
+                "rng": rng,
+            }
+            if self.ema is not None:
+                generator_extra["ema"] = self.ema.state_dict()
+            if self.lr_schedule is not None:
+                generator_extra["lr_schedule"] = self.lr_schedule
+            paths = []
+            for prefix, net, optimizer, extra in (
+                ("D", self.net_d, self.optim_d, {"step": self.global_step}),
+                ("G", self.net_g, self.optim_g, generator_extra),
+            ):
+                path = os.path.join(args.experiment_dir, f"{prefix}_{suffix}.pth")
+                save_checkpoint(
+                    net,
+                    optimizer,
+                    self.config.train.learning_rate,
+                    epoch,
+                    f"{path}.tmp",
+                    self.scaler,
+                    extra,
+                    move_to_cpu=self.xla,
+                )
+                paths.append(path)
+            for path in paths:
+                os.replace(f"{path}.tmp", path)
+            if final:
+                self.exporter.wait_for_completion()
+        if self.xla and self.world_size > 1:
+            tpu.rendezvous(f"rvc_save_done_{self.global_step}")
 
 
 if __name__ == "__main__":
-    torch.multiprocessing.set_start_method("spawn")
+    if torch.multiprocessing.get_start_method(allow_none=True) is None:
+        torch.multiprocessing.set_start_method("spawn")
     main()

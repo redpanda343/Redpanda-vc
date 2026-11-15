@@ -164,8 +164,18 @@ class TextAudioCollateMultiNSFsid:
         return_ids (bool, optional): Whether to return sample IDs. Defaults to False.
     """
 
-    def __init__(self, return_ids=False):
+    def __init__(self, return_ids=False, frame_buckets=None, hop_length=None):
         self.return_ids = return_ids
+        self.frame_buckets = sorted(frame_buckets) if frame_buckets else None
+        if self.frame_buckets and not hop_length:
+            raise ValueError("frame_buckets requires hop_length")
+        self.hop_length = hop_length
+
+    def _bucket_frames(self, frames):
+        for bucket in self.frame_buckets:
+            if frames <= bucket:
+                return bucket
+        return frames
 
     def __call__(self, batch):
         """
@@ -182,14 +192,19 @@ class TextAudioCollateMultiNSFsid:
 
         max_spec_len = max([x[0].size(1) for x in rows])
         max_wave_len = max([x[1].size(1) for x in rows])
+        max_phone_len = max([x[2].size(0) for x in rows])
+        if self.frame_buckets:
+            max_spec_len = max_phone_len = self._bucket_frames(
+                max(max_spec_len, max_phone_len)
+            )
+            max_wave_len = max_spec_len * self.hop_length
         spec_lengths = torch.LongTensor([x[0].size(1) for x in rows])
-        wave_lengths = torch.LongTensor([x[1].size(1) for x in rows])
+        wave_lengths = torch.LongTensor([min(x[1].size(1), max_wave_len) for x in rows])
         spec_padded = torch.zeros(
             len(rows), rows[0][0].size(0), max_spec_len, device=device
         )
         wave_padded = torch.zeros(len(rows), 1, max_wave_len, device=device)
 
-        max_phone_len = max([x[2].size(0) for x in rows])
         phone_lengths = torch.LongTensor([x[2].size(0) for x in rows])
         phone_padded = torch.zeros(
             len(rows), max_phone_len, rows[0][2].shape[1], device=device
@@ -201,6 +216,7 @@ class TextAudioCollateMultiNSFsid:
         sid = torch.cat([row[5] for row in rows])
 
         for i, (spec, wave, phone, pitch, pitchf, _) in enumerate(rows):
+            wave = wave[:, :max_wave_len]
             spec_padded[i, :, : spec.size(1)] = spec
             wave_padded[i, :, : wave.size(1)] = wave
             phone_padded[i, : phone.size(0), :] = phone

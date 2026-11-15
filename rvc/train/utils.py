@@ -102,7 +102,14 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, load_opt=1, reset_st
 
 
 def save_checkpoint(
-    model, optimizer, learning_rate, iteration, checkpoint_path, scaler, extra=None
+    model,
+    optimizer,
+    learning_rate,
+    iteration,
+    checkpoint_path,
+    scaler,
+    extra=None,
+    move_to_cpu=False,
 ):
     """
     Save the model and optimizer state to a checkpoint file.
@@ -125,6 +132,10 @@ def save_checkpoint(
         "scaler": scaler.state_dict(),
         **(extra or {}),
     }
+    if move_to_cpu:
+        from rvc.train.tpu import to_cpu
+
+        checkpoint_data = to_cpu(checkpoint_data)
 
     # Create a backwards-compatible checkpoint
     torch.save(
