@@ -270,7 +270,10 @@ class SineGenerator(nn.Module):
         return sines
 
     def forward(self, f0):
-        with torch.no_grad():
+        with torch.no_grad(), torch.amp.autocast(
+            device_type=f0.device.type, enabled=False
+        ):
+            f0 = f0.float()
             f0_buf = torch.zeros(f0.shape[0], f0.shape[1], self.dim, device=f0.device)
             # fundamental component
             f0_buf[:, :, 0] = f0[:, :, 0]

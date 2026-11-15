@@ -20,8 +20,13 @@ class LayerNorm(torch.nn.Module):
     def forward(self, x):
         # Transpose to (batch_size, time_steps, channels) for layer_norm
         x = x.transpose(1, -1)
-        x = torch.nn.functional.layer_norm(
-            x, (self.channels,), self.gamma, self.beta, self.eps
-        )
+        with torch.amp.autocast(device_type=x.device.type, enabled=False):
+            x = torch.nn.functional.layer_norm(
+                x.float(),
+                (self.channels,),
+                self.gamma.float(),
+                self.beta.float(),
+                self.eps,
+            )
         # Transpose back to (batch_size, channels, time_steps)
         return x.transpose(1, -1)

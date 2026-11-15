@@ -240,23 +240,27 @@ class ResidualCouplingLayer(torch.nn.Module):
         x0, x1 = torch.split(x, [self.half_channels] * 2, 1)
         h = self.pre(x0) * x_mask
         h = self.enc(h, x_mask, g=g)
-        stats = self.post(h) * x_mask
+        stats = (self.post(h) * x_mask).float()
+        x0 = x0.float()
+        x1 = x1.float()
+        mask_f = x_mask.float()
         if self.mean_only:
             if not reverse:
-                x = torch.cat([x0, stats + x1 * x_mask], 1)
+                x = torch.cat([x0, stats + x1 * mask_f], 1)
                 return x, torch.zeros(x.size(0), dtype=x.dtype, device=x.device)
-            return torch.cat([x0, (x1 - stats) * x_mask], 1)
+            return torch.cat([x0, (x1 - stats) * mask_f], 1)
 
         m, logs = torch.split(stats, [self.half_channels] * 2, 1)
-        if not reverse:
-            x1 = m + x1 * torch.exp(logs) * x_mask
-            x = torch.cat([x0, x1], 1)
-            logdet = torch.sum(logs, [1, 2])
-            return x, logdet
-        else:
-            x1 = (x1 - m) * torch.exp(-logs) * x_mask
-            x = torch.cat([x0, x1], 1)
-            return x
+        with torch.amp.autocast(device_type=x.device.type, enabled=False):
+            if not reverse:
+                x1 = m + x1 * torch.exp(logs) * mask_f
+                x = torch.cat([x0, x1], 1)
+                logdet = torch.sum(logs, [1, 2])
+                return x, logdet
+            else:
+                x1 = (x1 - m) * torch.exp(-logs) * mask_f
+                x = torch.cat([x0, x1], 1)
+                return x
 
     def remove_weight_norm(self):
         self.enc.remove_weight_norm()

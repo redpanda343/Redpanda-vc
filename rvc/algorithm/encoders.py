@@ -147,7 +147,7 @@ class TextEncoder(torch.nn.Module):
             x_mask = x_mask[:, :, skip_head:]
         stats = self.proj(x) * x_mask
 
-        m, logs = torch.split(stats, self.out_channels, dim=1)
+        m, logs = torch.split(stats.float(), self.out_channels, dim=1)
         return m, logs, x_mask
 
 
@@ -196,10 +196,10 @@ class PosteriorEncoder(torch.nn.Module):
         x = self.enc(x, x_mask, g=g)
 
         stats = self.proj(x) * x_mask
-        m, logs = torch.split(stats, self.out_channels, dim=1)
+        m, logs = torch.split(stats.float(), self.out_channels, dim=1)
 
-        z = m + torch.randn_like(m) * torch.exp(logs)
-        z *= x_mask
+        with torch.amp.autocast(device_type=x.device.type, enabled=False):
+            z = (m + torch.randn_like(m) * torch.exp(logs)) * x_mask.float()
 
         return z, m, logs, x_mask
 
