@@ -190,7 +190,7 @@ class SwiftF0Torch:
         mel_spec, n_frames = self._compute_log_mel(audio)
         is_xla = self.device.type == "xla"
         if is_xla:
-            pad_frames = ((n_frames + 63) // 64) * 64
+            pad_frames = max(256, ((n_frames + 255) // 256) * 256)
             if pad_frames > n_frames:
                 mel_spec = F.pad(mel_spec, (0, pad_frames - n_frames))
             mask = torch.zeros((1, 1, 1, pad_frames), dtype=torch.float32)
