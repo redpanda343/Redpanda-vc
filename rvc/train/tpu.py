@@ -5,9 +5,8 @@ import os
 import torch
 
 INSTALL_HINT = (
-    "TPU training needs PyTorch/XLA. On a TPU VM, install the torch build that "
-    "matches it, for example:\n"
-    "    pip install torch==2.9.0 torchaudio==2.9.0 'torch_xla[tpu]==2.9.0'\n"
+    "TPU training needs PyTorch/XLA. On a TPU VM, install the TPU requirements:\n"
+    "    pip install -r requirements-tpu.txt\n"
     "See https://github.com/pytorch/xla for the current release."
 )
 
@@ -29,6 +28,7 @@ def tpu_available():
             "TPU_ACCELERATOR_TYPE",
             "TPU_CHIPS_PER_HOST_BOUNDS",
             "TPU_WORKER_ID",
+            "KAGGLE_TPU_NAME",
         )
     ):
         return True

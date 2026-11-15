@@ -23,7 +23,10 @@ fireredvad==0.0.2
 torch==2.9.0
 torchaudio==2.9.0
 torchvision==0.24.0
-torch_xla[tpu]==2.9.0; sys_platform == "linux"
+torch_xla[tpu]==2.9.0; sys_platform == "linux" and python_version < "3.13"
+torch_xla==2.9.0; sys_platform == "linux" and python_version >= "3.13"
+libtpu==0.0.21.1; sys_platform == "linux" and python_version >= "3.13"
+tpu-info; sys_platform == "linux" and python_version >= "3.13"
 lightning~=2.3.0
 setuptools<82
 praat-parselmouth
