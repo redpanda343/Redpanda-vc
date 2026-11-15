@@ -7,6 +7,7 @@ from .constants import *
 from .model import E2E0
 from .spec import MelSpectrogram
 from .utils import to_local_average_f0, to_viterbi_f0
+from rvc.train.tpu import require_torch_xla
 
 
 def interp_f0(f0, uv=None):
@@ -32,25 +33,28 @@ class RMVPE:
         self.resample_kernel = {}
         self.device = torch.device(device or ('cuda' if torch.cuda.is_available() else 'cpu'))
         self.is_xla = self.device.type == 'xla'
+        if self.is_xla:
+            require_torch_xla()
         self.model = E2E0(4, 1, (2, 2)).eval()
         ckpt = torch.load(model_path, map_location='cpu', weights_only=True)
         if 'model' not in ckpt:
             raise ValueError(f'{model_path} is not the RMVPE 230917 checkpoint. Delete it and restart to download it.')
         self.model.load_state_dict(ckpt['model'], strict=False)
-        self.model = self.model.to(self.device)
+        self.model = self.model.float().to(self.device)
         self.hop_length = hop_length
         self.seg_length = 32 * hop_length
         mel_device = torch.device('cpu') if self.is_xla else self.device
         self.mel_extractor = MelSpectrogram(
             N_MELS, SAMPLE_RATE, WINDOW_LENGTH, hop_length, None, MEL_FMIN, MEL_FMAX
-        ).to(mel_device)
+        ).float().to(mel_device)
 
     @torch.no_grad()
     def mel2hidden(self, mel):
-        n_frames = mel.shape[-1]
-        mel = F.pad(mel, (0, 32 * ((n_frames - 1) // 32 + 1) - n_frames), mode='reflect')
-        hidden = self.model(mel)
-        return hidden[:, :n_frames]
+        with torch.amp.autocast(device_type=self.device.type, enabled=False):
+            n_frames = mel.shape[-1]
+            mel = F.pad(mel.float(), (0, 32 * ((n_frames - 1) // 32 + 1) - n_frames), mode='reflect')
+            hidden = self.model(mel)
+            return hidden[:, :n_frames]
 
     def decode(self, hidden, thred=0.03, use_viterbi=False):
         if use_viterbi:
@@ -78,17 +82,18 @@ class RMVPE:
 
     @torch.no_grad()
     def infer_hidden(self, audio, sample_rate=16000, network=None):
-        audio_res = self._resample(audio, sample_rate)
-        B, T = audio_res.shape
-        n_frames = T // self.hop_length + 1
-        audio_res = F.pad(audio_res, (0, self._padded_length(T) - T))
-        mel = self.mel_extractor(audio_res, center=True)
-        if mel.device != self.device:
-            mel = mel.to(self.device)
-        hidden = (self.model if network is None else network)(mel)
-        if self.is_xla:
-            hidden = hidden.cpu()
-        return hidden[:, :n_frames]
+        with torch.amp.autocast(device_type=self.device.type, enabled=False):
+            audio_res = self._resample(audio, sample_rate)
+            B, T = audio_res.shape
+            n_frames = T // self.hop_length + 1
+            audio_res = F.pad(audio_res, (0, self._padded_length(T) - T))
+            mel = self.mel_extractor(audio_res, center=True).float()
+            if mel.device != self.device:
+                mel = mel.to(self.device)
+            hidden = (self.model if network is None else network)(mel)
+            if self.is_xla:
+                hidden = hidden.cpu()
+            return hidden[:, :n_frames]
 
     def infer_from_audio(self, audio, sample_rate=16000, thred=0.03, use_viterbi=False):
         hidden = self.infer_hidden(audio, sample_rate)

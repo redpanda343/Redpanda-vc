@@ -6,6 +6,7 @@ import numpy as np
 from librosa.filters import mel
 from typing import List
 from rvc.algorithm.commons import stft_real_imag
+from rvc.train.tpu import require_torch_xla
 
 N_MELS = 128
 N_CLASS = 360
@@ -446,11 +447,13 @@ class RMVPE0Predictor:
         self.resample_kernel = {}
         self.device = device
         self.is_xla = device is not None and torch.device(device).type == "xla"
+        if self.is_xla:
+            require_torch_xla()
         mel_device = "cpu" if self.is_xla else device
         self.mel_extractor = MelSpectrogram(
             N_MELS, 16000, 1024, 160, None, 30, 8000
-        ).to(mel_device)
-        self.model = self.model.to(device)
+        ).float().to(mel_device)
+        self.model = self.model.float().to(device)
         cents_mapping = 20 * np.arange(N_CLASS) + 1997.3794084376191
         self.cents_mapping = np.pad(cents_mapping, (4, 4))
 
@@ -461,8 +464,13 @@ class RMVPE0Predictor:
         Args:
             mel (torch.Tensor): Mel-spectrogram features.
         """
-        with torch.no_grad():
-            mel = mel.to(dtype=next(self.model.parameters()).dtype)
+        dev_type = (
+            torch.device(self.device).type
+            if self.device is not None
+            else mel.device.type
+        )
+        with torch.no_grad(), torch.amp.autocast(device_type=dev_type, enabled=False):
+            mel = mel.float()
             n_frames = mel.shape[-1]
             pad_len = 32 * ((n_frames - 1) // 32 + 1) - n_frames
             pad_mode = "reflect" if pad_len < n_frames else "replicate"

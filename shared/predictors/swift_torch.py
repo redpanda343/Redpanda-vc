@@ -2,6 +2,7 @@ import struct
 import numpy as np
 import torch
 import torch.nn.functional as F
+from rvc.train.tpu import require_torch_xla
 
 
 _DTYPES = {
@@ -126,6 +127,8 @@ def _load_onnx_initializers(model_path):
 class SwiftF0Torch:
     def __init__(self, model_path, device):
         self.device = torch.device(device)
+        if self.device.type == "xla":
+            require_torch_xla()
         inits = _load_onnx_initializers(model_path)
         self.eps = float(inits["v129"])
         self.scales = []
@@ -196,42 +199,43 @@ class SwiftF0Torch:
         else:
             mask = None
 
-        x_in = mel_spec.to(self.device)
-        w0, b0 = self.stem
-        x = F.relu(F.conv2d(x_in, w0, b0, padding=(1, 1)))
-        if mask is not None:
-            x = x * mask
-
-        for w1, b1, w2, b2, pad, dil, temporal in self.blocks:
-            if temporal and mask is not None:
+        x_in = mel_spec.float().to(self.device)
+        with torch.amp.autocast(device_type=self.device.type, enabled=False):
+            w0, b0 = self.stem
+            x = F.relu(F.conv2d(x_in, w0, b0, padding=(1, 1)))
+            if mask is not None:
                 x = x * mask
-            h = F.relu(F.conv2d(x, w1, b1, padding=pad, dilation=dil))
-            if temporal and mask is not None:
-                h = h * mask
-            h = F.conv2d(h, w2, b2, padding=pad, dilation=dil)
-            x = F.relu(x + h)
 
-        if mask is not None:
-            x = x * mask
-        x_slice = x[:, :, :96, :]
-        wh, bh = self.head_conv
-        feat = F.relu(F.conv2d(F.pad(x_slice, (1, 1, 1, 0)), wh, bh))
-        if mask is not None:
-            feat = feat * mask
+            for w1, b1, w2, b2, pad, dil, temporal in self.blocks:
+                if temporal and mask is not None:
+                    x = x * mask
+                h = F.relu(F.conv2d(x, w1, b1, padding=pad, dilation=dil))
+                if temporal and mask is not None:
+                    h = h * mask
+                h = F.conv2d(h, w2, b2, padding=pad, dilation=dil)
+                x = F.relu(x + h)
 
-        wp, bp = self.pitch_conv2d
-        pitch_logits = F.conv2d(feat, wp, bp).squeeze(1).transpose(1, 2)
+            if mask is not None:
+                x = x * mask
+            x_slice = x[:, :, :96, :]
+            wh, bh = self.head_conv
+            feat = F.relu(F.conv2d(F.pad(x_slice, (1, 1, 1, 0)), wh, bh))
+            if mask is not None:
+                feat = feat * mask
 
-        wv, bv = self.voicing_conv2d
-        v_max = F.conv2d(feat, wv, bv, padding=(2, 0)).amax(dim=2)
-        v_mean = x_in.mean(dim=(1, 2), keepdim=True).squeeze(1)
-        v_cat = torch.cat([v_max, v_mean], dim=1)
-        if mask is not None:
-            v_cat = v_cat * mask.squeeze(2)
-        wc1, bc1 = self.voicing_conv1d_1
-        wc2, bc2 = self.voicing_conv1d_2
-        v_hidden = F.relu(F.conv1d(v_cat, wc1, bc1, padding=1))
-        voicing_logits = F.conv1d(v_hidden, wc2, bc2).squeeze(1)
+            wp, bp = self.pitch_conv2d
+            pitch_logits = F.conv2d(feat, wp, bp).squeeze(1).transpose(1, 2)
+
+            wv, bv = self.voicing_conv2d
+            v_max = F.conv2d(feat, wv, bv, padding=(2, 0)).amax(dim=2)
+            v_mean = x_in.mean(dim=(1, 2), keepdim=True).squeeze(1)
+            v_cat = torch.cat([v_max, v_mean], dim=1)
+            if mask is not None:
+                v_cat = v_cat * mask.squeeze(2)
+            wc1, bc1 = self.voicing_conv1d_1
+            wc2, bc2 = self.voicing_conv1d_2
+            v_hidden = F.relu(F.conv1d(v_cat, wc1, bc1, padding=1))
+            voicing_logits = F.conv1d(v_hidden, wc2, bc2).squeeze(1)
 
         logits = pitch_logits[0].float().cpu().numpy()[:n_frames]
         v_logits = voicing_logits[0].float().cpu().numpy()[:n_frames]
