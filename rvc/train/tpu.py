@@ -38,6 +38,7 @@ def tpu_available():
 
 
 _PRECISION_CONFIGURED_PID = None
+_MATMUL_PRECISION_STATE = None
 
 
 def require_torch_xla():
@@ -47,13 +48,21 @@ def require_torch_xla():
     os.environ.setdefault("PJRT_DEVICE", "TPU")
     os.environ.pop("XLA_USE_BF16", None)
     os.environ.pop("XLA_DOWNCAST_BF16", None)
-    import torch_xla
+    import logging
 
-    pid = os.getpid()
-    if _PRECISION_CONFIGURED_PID != pid:
-        set_matmul_precision("highest")
-        patch_xla_ops()
-        _PRECISION_CONFIGURED_PID = pid
+    xla_logger = logging.getLogger("torch_xla.backends")
+    prev_level = xla_logger.level
+    xla_logger.setLevel(logging.ERROR)
+    try:
+        import torch_xla
+
+        pid = os.getpid()
+        if _PRECISION_CONFIGURED_PID != pid:
+            set_matmul_precision("highest")
+            patch_xla_ops()
+            _PRECISION_CONFIGURED_PID = pid
+    finally:
+        xla_logger.setLevel(prev_level)
 
     return torch_xla
 
@@ -164,22 +173,38 @@ def initialize_cache(path, index):
 
 
 def set_matmul_precision(precision="highest"):
-    if hasattr(torch, "set_float32_matmul_precision"):
-        torch.set_float32_matmul_precision(precision)
-    try:
-        import torch_xla.backends
+    global _MATMUL_PRECISION_STATE
+    state = (os.getpid(), precision)
+    if _MATMUL_PRECISION_STATE == state:
+        return
+    import logging
 
-        torch_xla.backends.set_mat_mul_precision(precision)
-    except (ImportError, AttributeError):
-        pass
+    xla_logger = logging.getLogger("torch_xla.backends")
+    prev_level = xla_logger.level
+    xla_logger.setLevel(logging.ERROR)
     try:
-        import torch_xla
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision(precision)
+        try:
+            import torch_xla.backends
 
-        xlac = getattr(torch_xla, "_XLAC", None)
-        if xlac is not None and hasattr(xlac, "_xla_set_mat_mul_precision"):
-            xlac._xla_set_mat_mul_precision(precision)
-    except Exception as error:
-        print(f"Could not set the TPU matmul precision to {precision}: {error}")
+            torch_xla.backends.set_mat_mul_precision(precision)
+        except (ImportError, AttributeError):
+            pass
+        try:
+            import torch_xla
+
+            xlac = getattr(torch_xla, "_XLAC", None)
+            if xlac is not None:
+                if hasattr(xlac, "_xla_set_mat_mul_precision"):
+                    xlac._xla_set_mat_mul_precision(precision)
+                if hasattr(xlac, "_xla_set_use_full_mat_mul_precision"):
+                    xlac._xla_set_use_full_mat_mul_precision(precision == "highest")
+        except Exception as error:
+            print(f"Could not set the TPU matmul precision to {precision}: {error}")
+    finally:
+        xla_logger.setLevel(prev_level)
+    _MATMUL_PRECISION_STATE = state
 
 
 def manual_seed(seed):
