@@ -247,7 +247,7 @@ def process_file_embedding(
                     feats = torch.nn.functional.layer_norm(feats, feats.shape)
                 orig_len = int(feats.shape[-1])
                 orig_frames = int(model._get_feat_extract_output_lengths(orig_len))
-                pad_len = max(400, ((orig_len + 10239) // 10240) * 10240)
+                pad_len = max(400, ((orig_len + 63999) // 64000) * 64000)
                 if pad_len > orig_len:
                     feats = torch.nn.functional.pad(feats, (0, pad_len - orig_len))
                 feats = feats.view(1, -1).to(device)
