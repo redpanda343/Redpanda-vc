@@ -7,6 +7,7 @@ from nsf_hifigan.config import (
     FINETUNE, KINDS, PITCH_EXTRACTORS, PRECISIONS, TRAINING, VOCOS_TRAINING, experiment_paths, read_json,
 )
 from nsf_hifigan.resources import FINETUNE_SOURCE, FINETUNE_TITLE, VOCOS_SOURCE, VOCOS_TITLE
+from rvc.train.tpu import tpu_available
 from tabs.train.jobs import JobRunner, device_id, experiment_path, positive_integer
 from tabs.train.slicing import preprocess_step, slicing_controls
 
@@ -179,7 +180,9 @@ def nsf_hifigan_train_tab():
                                   'discriminator weights; the Vocos backbone initializes all but the Vocos input and '
                                   'output layers, and trains with the from-scratch schedule. Only used for new '
                                   'experiments; existing checkpoints resume normally.')
-        precision = gr.Radio(label='Precision', choices=list(PRECISIONS), value='fp32',
+        is_tpu = tpu_available()
+        precision = gr.Radio(label='Precision', choices=['bf16'] if is_tpu else list(PRECISIONS),
+                             value='bf16' if is_tpu else 'fp32',
                              info='SingingVocoders trains in fp32 and advises against bf16.')
         with gr.Row():
             batch = gr.Number(label='Batch size', value=TRAINING['batch_size'], minimum=1, precision=0,

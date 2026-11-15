@@ -291,13 +291,14 @@ def grad_norm(parameters, norm_type: float = 2.0):
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
 
-    gradients = [p.grad.detach() for p in parameters if p.grad is not None]
+    gradients = [p.grad.detach().float() for p in parameters if p.grad is not None]
     if not gradients:
         return 0.0
 
-    total_norm = torch.nn.utils.get_total_norm(
-        gradients,
-        norm_type=float(norm_type),
-        foreach=None,
-    )
+    with torch.amp.autocast(device_type=gradients[0].device.type, enabled=False):
+        total_norm = torch.nn.utils.get_total_norm(
+            gradients,
+            norm_type=float(norm_type),
+            foreach=None,
+        )
     return total_norm

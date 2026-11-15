@@ -7,11 +7,14 @@ sys.path.append(now_dir)
 
 import gradio as gr
 from assets.i18n.i18n import I18nAuto
+from rvc.train.tpu import tpu_available
 
 i18n = I18nAuto()
 
 
 def set_precision(precision: str):
+    if tpu_available():
+        precision = "bf16"
     with open(
         os.path.join(now_dir, "assets", "config.json"), "r", encoding="utf-8"
     ) as f:
@@ -29,6 +32,8 @@ def set_precision(precision: str):
 
 
 def get_precision():
+    if tpu_available():
+        return "bf16"
     with open(
         os.path.join(now_dir, "assets", "config.json"), "r", encoding="utf-8"
     ) as f:
@@ -38,11 +43,12 @@ def get_precision():
 
 
 def precision_tab():
+    is_tpu = tpu_available()
     precision = gr.Radio(
         label=i18n("Precision"),
         info=i18n("Select the precision you want to use for training and inference."),
-        value=get_precision(),
-        choices=["fp32", "fp16", "bf16"],
+        value="bf16" if is_tpu else get_precision(),
+        choices=["bf16"] if is_tpu else ["fp32", "fp16", "bf16"],
         interactive=True,
     )
     precision_info = gr.Textbox(

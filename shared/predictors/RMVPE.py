@@ -388,44 +388,46 @@ class MelSpectrogram(torch.nn.Module):
         self.clamp = clamp
 
     def forward(self, audio, keyshift=0, speed=1, center=True):
-        factor = 2 ** (keyshift / 12)
-        n_fft_new = int(np.round(self.n_fft * factor))
-        win_length_new = int(np.round(self.win_length * factor))
-        hop_length_new = int(np.round(self.hop_length * speed))
-        keyshift_key = str(keyshift) + "_" + str(audio.device)
-        if keyshift_key not in self.hann_window:
-            self.hann_window[keyshift_key] = torch.hann_window(win_length_new).to(
-                audio.device
-            )
-        if audio.device.type == "xla" and n_fft_new == win_length_new:
-            real, imag = stft_real_imag(
-                audio,
-                n_fft_new,
-                hop_length_new,
-                self.hann_window[keyshift_key],
-                center=center,
-            )
-            magnitude = torch.sqrt(real.pow(2) + imag.pow(2))
-        else:
-            fft = torch.stft(
-                audio,
-                n_fft=n_fft_new,
-                hop_length=hop_length_new,
-                win_length=win_length_new,
-                window=self.hann_window[keyshift_key],
-                center=center,
-                return_complex=True,
-            )
-            magnitude = torch.sqrt(fft.real.pow(2) + fft.imag.pow(2))
-        if keyshift != 0:
-            size = self.n_fft // 2 + 1
-            resize = magnitude.size(1)
-            if resize < size:
-                magnitude = F.pad(magnitude, (0, 0, 0, size - resize))
-            magnitude = magnitude[:, :size, :] * self.win_length / win_length_new
-        mel_output = torch.matmul(self.mel_basis, magnitude)
-        log_mel_spec = torch.log(torch.clamp(mel_output, min=self.clamp))
-        return log_mel_spec
+        with torch.amp.autocast(device_type=audio.device.type, enabled=False):
+            audio = audio.float()
+            factor = 2 ** (keyshift / 12)
+            n_fft_new = int(np.round(self.n_fft * factor))
+            win_length_new = int(np.round(self.win_length * factor))
+            hop_length_new = int(np.round(self.hop_length * speed))
+            keyshift_key = str(keyshift) + "_" + str(audio.device)
+            if keyshift_key not in self.hann_window:
+                self.hann_window[keyshift_key] = torch.hann_window(win_length_new).to(
+                    audio.device
+                )
+            if audio.device.type == "xla" and n_fft_new == win_length_new:
+                real, imag = stft_real_imag(
+                    audio,
+                    n_fft_new,
+                    hop_length_new,
+                    self.hann_window[keyshift_key],
+                    center=center,
+                )
+                magnitude = torch.sqrt(real.pow(2) + imag.pow(2))
+            else:
+                fft = torch.stft(
+                    audio,
+                    n_fft=n_fft_new,
+                    hop_length=hop_length_new,
+                    win_length=win_length_new,
+                    window=self.hann_window[keyshift_key],
+                    center=center,
+                    return_complex=True,
+                )
+                magnitude = torch.sqrt(fft.real.pow(2) + fft.imag.pow(2))
+            if keyshift != 0:
+                size = self.n_fft // 2 + 1
+                resize = magnitude.size(1)
+                if resize < size:
+                    magnitude = F.pad(magnitude, (0, 0, 0, size - resize))
+                magnitude = magnitude[:, :size, :] * self.win_length / win_length_new
+            mel_output = torch.matmul(self.mel_basis.float(), magnitude)
+            log_mel_spec = torch.log(torch.clamp(mel_output, min=self.clamp))
+            return log_mel_spec
 
 
 class RMVPE0Predictor:

@@ -230,7 +230,11 @@ class Synthesizer(torch.nn.Module):
         m_p, logs_p, x_mask = self.enc_p(
             phone, pitch, phone_lengths, flow_head if skip_head is not None else None
         )
-        z_p = (m_p + torch.exp(logs_p) * torch.randn_like(m_p) * 0.66666) * x_mask
+        with torch.amp.autocast(device_type=m_p.device.type, enabled=False):
+            z_p = (
+                m_p.float()
+                + torch.exp(logs_p.float()) * torch.randn_like(m_p.float()) * 0.66666
+            ) * x_mask.float()
 
         z = self.flow(z_p, x_mask, g=g, reverse=True)
         if skip_head is not None and return_length is not None:

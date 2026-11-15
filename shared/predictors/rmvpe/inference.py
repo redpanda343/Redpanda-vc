@@ -109,20 +109,26 @@ class RMVPE:
 
     @torch.no_grad()
     def get_pitch_batch(self, waveforms, samplerate, lengths, *, hop_size, speed=1, interp_uv=False):
-        resampled = [self._resample(waveform, samplerate)[0] for waveform in waveforms]
-        groups = {}
-        for index, audio in enumerate(resampled):
-            groups.setdefault(self._padded_length(audio.shape[0]), []).append(index)
-        results = [None] * len(resampled)
-        for padded, indices in groups.items():
-            batch = torch.stack([F.pad(resampled[index], (0, padded - resampled[index].shape[0]))
-                                 for index in indices])
-            hidden = self.model(self.mel_extractor(batch, center=True))
-            f0s = self.decode(hidden).reshape(len(indices), -1)
-            for f0, index in zip(f0s, indices):
-                f0 = f0[:resampled[index].shape[0] // self.hop_length + 1]
-                results[index] = self._align_pitch(f0, samplerate, lengths[index], hop_size, speed, interp_uv)
-        return results
+        with torch.amp.autocast(device_type=self.device.type, enabled=False):
+            resampled = [self._resample(waveform, samplerate)[0] for waveform in waveforms]
+            groups = {}
+            for index, audio in enumerate(resampled):
+                groups.setdefault(self._padded_length(audio.shape[0]), []).append(index)
+            results = [None] * len(resampled)
+            for padded, indices in groups.items():
+                batch = torch.stack([F.pad(resampled[index], (0, padded - resampled[index].shape[0]))
+                                     for index in indices])
+                mel = self.mel_extractor(batch, center=True).float()
+                if mel.device != self.device:
+                    mel = mel.to(self.device)
+                hidden = self.model(mel)
+                if self.is_xla:
+                    hidden = hidden.cpu()
+                f0s = self.decode(hidden).reshape(len(indices), -1)
+                for f0, index in zip(f0s, indices):
+                    f0 = f0[:resampled[index].shape[0] // self.hop_length + 1]
+                    results[index] = self._align_pitch(f0, samplerate, lengths[index], hop_size, speed, interp_uv)
+            return results
 
     def _align_pitch(self, f0, samplerate, length, hop_size, speed, interp_uv):
         uv = f0 == 0

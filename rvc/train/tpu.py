@@ -37,11 +37,11 @@ def tpu_available():
     return bool(glob.glob("/dev/accel*") or glob.glob("/dev/vfio/[0-9]*"))
 
 
-_PRECISION_CONFIGURED = False
+_PRECISION_CONFIGURED_PID = None
 
 
 def require_torch_xla():
-    global _PRECISION_CONFIGURED
+    global _PRECISION_CONFIGURED_PID
     if not torch_xla_installed():
         raise RuntimeError(INSTALL_HINT)
     os.environ.setdefault("PJRT_DEVICE", "TPU")
@@ -49,13 +49,11 @@ def require_torch_xla():
     os.environ.pop("XLA_DOWNCAST_BF16", None)
     import torch_xla
 
-    if not _PRECISION_CONFIGURED:
-        if hasattr(torch, "set_float32_matmul_precision"):
-            torch.set_float32_matmul_precision("highest")
-        xlac = getattr(torch_xla, "_XLAC", None)
-        if xlac is not None and hasattr(xlac, "_xla_set_mat_mul_precision"):
-            xlac._xla_set_mat_mul_precision("highest")
-        _PRECISION_CONFIGURED = True
+    pid = os.getpid()
+    if _PRECISION_CONFIGURED_PID != pid:
+        set_matmul_precision("highest")
+        patch_xla_ops()
+        _PRECISION_CONFIGURED_PID = pid
 
     return torch_xla
 
@@ -86,6 +84,23 @@ def spawn(fn, args, single_core=False):
 _XLA_OPS_PATCHED = False
 
 
+def _compute_weight_norm_xla(weight_v, weight_g, dim):
+    with torch.amp.autocast(device_type="xla", enabled=False):
+        v_fp32 = weight_v.float()
+        g_fp32 = weight_g.float()
+        if dim == -1 or dim is None:
+            norm = torch.linalg.vector_norm(v_fp32)
+        else:
+            target_dim = dim if dim >= 0 else v_fp32.ndim + dim
+            dims = tuple(i for i in range(v_fp32.ndim) if i != target_dim)
+            norm = (
+                torch.linalg.vector_norm(v_fp32, dim=dims, keepdim=True)
+                if dims
+                else v_fp32.abs()
+            )
+        return (v_fp32 * (g_fp32 / norm.clamp_min(1e-12))).to(weight_v.dtype)
+
+
 def patch_xla_ops():
     global _XLA_OPS_PATCHED
     if _XLA_OPS_PATCHED:
@@ -98,22 +113,20 @@ def patch_xla_ops():
     def _xla_weight_norm_forward(self, weight_g, weight_v):
         if weight_v.device.type != "xla":
             return orig_forward(self, weight_g, weight_v)
-        with torch.amp.autocast(device_type="xla", enabled=False):
-            v_fp32 = weight_v.float()
-            g_fp32 = weight_g.float()
-            if self.dim == -1:
-                norm = torch.linalg.vector_norm(v_fp32)
-            else:
-                target_dim = self.dim if self.dim >= 0 else v_fp32.ndim + self.dim
-                dims = tuple(i for i in range(v_fp32.ndim) if i != target_dim)
-                norm = (
-                    torch.linalg.vector_norm(v_fp32, dim=dims, keepdim=True)
-                    if dims
-                    else v_fp32.abs()
-                )
-            return (v_fp32 * (g_fp32 / norm.clamp_min(1e-12))).to(weight_v.dtype)
+        return _compute_weight_norm_xla(weight_v, weight_g, self.dim)
 
     _WeightNorm.forward = _xla_weight_norm_forward
+
+    orig_weight_norm_fn = getattr(torch, "_weight_norm", None)
+    if orig_weight_norm_fn is not None:
+
+        def _xla_weight_norm_fn(weight_v, weight_g, dim=0):
+            if weight_v.device.type != "xla":
+                return orig_weight_norm_fn(weight_v, weight_g, dim)
+            return _compute_weight_norm_xla(weight_v, weight_g, dim)
+
+        torch._weight_norm = _xla_weight_norm_fn
+
     _XLA_OPS_PATCHED = True
 
 
@@ -150,18 +163,21 @@ def initialize_cache(path, index):
         print(f"Could not enable the XLA compilation cache at {path}: {error}")
 
 
-def set_matmul_precision(precision):
+def set_matmul_precision(precision="highest"):
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision(precision)
     try:
         import torch_xla.backends
 
         torch_xla.backends.set_mat_mul_precision(precision)
-        return
     except (ImportError, AttributeError):
         pass
     try:
         import torch_xla
 
-        torch_xla._XLAC._xla_set_mat_mul_precision(precision)
+        xlac = getattr(torch_xla, "_XLAC", None)
+        if xlac is not None and hasattr(xlac, "_xla_set_mat_mul_precision"):
+            xlac._xla_set_mat_mul_precision(precision)
     except Exception as error:
         print(f"Could not set the TPU matmul precision to {precision}: {error}")
 

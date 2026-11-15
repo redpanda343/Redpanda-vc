@@ -208,13 +208,15 @@ class GeneratorEMA:
         self.updates += 1
         beta = self.decay
         decay = beta * (1 - beta ** (self.updates - 1)) / (1 - beta**self.updates)
-        if self.ema_floats and self.ema_floats[0].device.type == "xla":
-            for target, value in zip(self.ema_floats, self.live_floats):
-                target.lerp_(value, 1 - decay)
-        else:
-            torch._foreach_lerp_(self.ema_floats, self.live_floats, 1 - decay)
-        for target, value in self.copied:
-            target.copy_(value)
+        dev_type = self.ema_floats[0].device.type if self.ema_floats else "cpu"
+        with torch.amp.autocast(device_type=dev_type, enabled=False):
+            if self.ema_floats and dev_type == "xla":
+                for target, value in zip(self.ema_floats, self.live_floats):
+                    target.lerp_(value, 1 - decay)
+            else:
+                torch._foreach_lerp_(self.ema_floats, self.live_floats, 1 - decay)
+            for target, value in self.copied:
+                target.copy_(value)
 
     def state_dict(self):
         return {"updates": self.updates, "weights": self.weights}
@@ -344,6 +346,8 @@ def parse_arguments(argv=None):
 
 
 def configured_train_dtype(accelerator="gpu"):
+    if accelerator == "tpu":
+        return torch.bfloat16
     try:
         with open(
             os.path.join(now_dir, "assets", "config.json"), "r", encoding="utf-8"
@@ -351,10 +355,6 @@ def configured_train_dtype(accelerator="gpu"):
             precision = json.load(f)["precision"]
     except (FileNotFoundError, json.JSONDecodeError, KeyError):
         return torch.float32
-    if accelerator == "tpu":
-        if precision == "fp16":
-            print("TPUs do not train in FP16, so this run uses BF16 instead.")
-        return torch.bfloat16 if precision in ("bf16", "fp16") else torch.float32
     if precision == "bf16" and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
         return torch.bfloat16
     if precision == "fp16" and torch.cuda.is_available():
@@ -536,8 +536,7 @@ def run_tpu(index, args, config):
     faulthandler.enable()
     tpu.initialize_cache(XLA_CACHE_DIR, index)
     tpu.patch_xla_ops()
-    if args.train_dtype == torch.float32:
-        tpu.set_matmul_precision("high")
+    tpu.set_matmul_precision("highest")
     device = tpu.device()
     rank, world_size = tpu.rank(), tpu.world_size()
     torch.manual_seed(config.train.seed + rank)
@@ -1045,27 +1044,31 @@ class Trainer:
 
     def mel_loss(self, wave, y_hat, spec, ids_slice):
         config = self.config
-        if self.args.multiscale_mel_loss:
-            return self.fn_mel_loss(wave, y_hat) * config.train.c_mel / 3.0
-        wave_mel = spec_to_mel_torch(
-            commons.slice_segments(spec, ids_slice, self.segment_frames, dim=3),
-            config.data.filter_length,
-            config.data.n_mel_channels,
-            config.data.sample_rate,
-            config.data.mel_fmin,
-            config.data.mel_fmax,
-        )
-        y_hat_mel = mel_spectrogram_torch(
-            y_hat.float().squeeze(1),
-            config.data.filter_length,
-            config.data.n_mel_channels,
-            config.data.sample_rate,
-            config.data.hop_length,
-            config.data.win_length,
-            config.data.mel_fmin,
-            config.data.mel_fmax,
-        )
-        return self.fn_mel_loss(wave_mel, y_hat_mel) * config.train.c_mel
+        with torch.amp.autocast(device_type=self.device.type, enabled=False):
+            wave = wave.float()
+            y_hat = y_hat.float()
+            spec = spec.float()
+            if self.args.multiscale_mel_loss:
+                return self.fn_mel_loss(wave, y_hat) * config.train.c_mel / 3.0
+            wave_mel = spec_to_mel_torch(
+                commons.slice_segments(spec, ids_slice, self.segment_frames, dim=3),
+                config.data.filter_length,
+                config.data.n_mel_channels,
+                config.data.sample_rate,
+                config.data.mel_fmin,
+                config.data.mel_fmax,
+            )
+            y_hat_mel = mel_spectrogram_torch(
+                y_hat.squeeze(1),
+                config.data.filter_length,
+                config.data.n_mel_channels,
+                config.data.sample_rate,
+                config.data.hop_length,
+                config.data.win_length,
+                config.data.mel_fmin,
+                config.data.mel_fmax,
+            )
+            return self.fn_mel_loss(wave_mel, y_hat_mel) * config.train.c_mel
 
     def train_step(self, batch):
         config = self.config
