@@ -92,6 +92,8 @@ def _get_aed_model(use_gpu: bool = False):
             chunk_max_frame=30000,
         )
         _AED_MODEL = FireRedAed.from_pretrained(str(FIRERED_MODEL_DIR), config)
+        if hasattr(_AED_MODEL, "model") and hasattr(_AED_MODEL.model, "float"):
+            _AED_MODEL.model = _AED_MODEL.model.float()
         _AED_MODEL_PID = pid
         _AED_MODEL_USE_GPU = use_gpu
         return _AED_MODEL
@@ -202,9 +204,10 @@ class _GpuAedBatcher:
     def _forward_batch(self, requests):
         import torch
 
-        features = torch.stack([item[0] for item in requests]).cuda()
-        probs, _ = self.aed.model.forward(features)
-        return probs.cpu()
+        with torch.amp.autocast(device_type="cuda", enabled=False):
+            features = torch.stack([item[0].float() for item in requests]).cuda()
+            probs, _ = self.aed.model.forward(features)
+            return probs.float().cpu()
 
     def _try_forward_batch(self, requests):
         import torch
@@ -410,15 +413,20 @@ class Slicer:
         elif long_audio:
             import torch
 
-            with torch.inference_mode():
+            with torch.inference_mode(), torch.amp.autocast(
+                device_type="cpu", enabled=False
+            ):
                 probs = []
                 for chunk in features.split(aed.config.chunk_max_frame, dim=0):
-                    chunk_probs, _ = aed.model.forward(chunk.unsqueeze(0))
-                    probs.append(chunk_probs.squeeze(0).cpu())
+                    chunk_probs, _ = aed.model.forward(chunk.float().unsqueeze(0))
+                    probs.append(chunk_probs.squeeze(0).float().cpu())
             events = _postprocess_aed_probs(aed, torch.cat(probs, dim=0), duration)
         else:
+            import torch
+
             aed = _get_aed_model()
-            result, _ = aed.detect(detector_audio)
+            with torch.amp.autocast(device_type="cpu", enabled=False):
+                result, _ = aed.detect(detector_audio)
             events = result.get("event2timestamps", {})
         intervals = list(events.get("speech", ()))
         intervals.extend(events.get("singing", ()))
