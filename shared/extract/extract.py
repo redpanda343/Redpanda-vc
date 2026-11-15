@@ -18,9 +18,10 @@ now_dir = os.getcwd()
 sys.path.append(os.path.join(now_dir))
 
 # Zluda hijack
+from contextlib import nullcontext
 import shared.zluda
 from rvc.configs.config import Config
-from rvc.train.tpu import device as tpu_device, initialize_cache, tpu_available
+from rvc.train.tpu import device as tpu_device, tpu_available
 from beatrice.resources import ensure_pitch_estimator
 from shared.predictors.f0 import RMVPE, RVCRMVPE, BeatricePitch, Swift
 from shared.predictors.swift_dependencies import ensure_swift_f0
@@ -454,14 +455,13 @@ if __name__ == "__main__":
     else:
         devices = [f"cuda:{idx}" for idx in gpus.split("-")]
 
-    if devices == ["xla"]:
-        initialize_cache(os.path.join(now_dir, "logs", ".xla_cache"), 0)
-
-    with mp.Manager() as manager, tqdm.tqdm(
+    use_mp_manager = not (devices == ["xla"] and f0_method in ("rmvpe", "swift"))
+    manager_ctx = mp.Manager() if use_mp_manager else nullcontext()
+    with manager_ctx as manager, tqdm.tqdm(
         total=2 * len(files), desc=f"Extracting F0 ({f0_method})", unit="file",
         dynamic_ncols=True,
     ) as progress:
-        updates = manager.Queue()
+        updates = manager.Queue() if manager is not None else None
         run_pitch_extraction(
             files, devices, f0_method, num_processes, progress, updates,
             force=force_pitch_extraction,

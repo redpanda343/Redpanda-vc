@@ -65,7 +65,7 @@ class RMVPE:
                 mel_padded = F.pad(mel, (0, bucket_frames - c_frames)) if bucket_frames > c_frames else mel
                 mel_xla = mel_padded.to(self.device).transpose(-1, -2).unsqueeze(1)
                 x = self.model.cnn(self.model.unet(mel_xla)).transpose(1, 2).flatten(-2)
-                x_cpu = x[:, :c_frames, :].float().cpu()
+                x_cpu = x.float().cpu()[:, :c_frames, :]
                 with torch.amp.autocast(device_type='cpu', enabled=False):
                     hidden = self.model.fc(x_cpu)
                 return hidden[:, :n_frames]
@@ -110,7 +110,7 @@ class RMVPE:
                 mel_padded = F.pad(mel, (0, bucket_frames - c_frames)) if bucket_frames > c_frames else mel
                 mel_xla = mel_padded.to(self.device).transpose(-1, -2).unsqueeze(1)
                 x = self.model.cnn(self.model.unet(mel_xla)).transpose(1, 2).flatten(-2)
-                x_cpu = x[:, :c_frames, :].float().cpu()
+                x_cpu = x.float().cpu()[:, :c_frames, :]
                 with torch.amp.autocast(device_type='cpu', enabled=False):
                     hidden = self.model.fc(x_cpu)
                 return hidden[:, :n_frames]

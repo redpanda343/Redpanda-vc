@@ -497,7 +497,7 @@ class RMVPE0Predictor:
                         mel_chunk = F.pad(mel_chunk, (0, bucket_frames - c_frames))
                     mel_xla = mel_chunk.to(self.device).transpose(-1, -2).unsqueeze(1)
                     x = self.model.cnn(self.model.unet(mel_xla)).transpose(1, 2).flatten(-2)
-                    x_cpu = x[:, :c_frames, :].float().cpu()
+                    x_cpu = x.float().cpu()[:, :c_frames, :]
                     with torch.amp.autocast(device_type="cpu", enabled=False):
                         out_chunk = self.model.fc(x_cpu)
                 else:
