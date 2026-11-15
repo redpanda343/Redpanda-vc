@@ -12,6 +12,7 @@
 *.wav
 *.txt
 !requirements.txt
+!requirements-tpu.txt
 *.zip
 *.png
 !assets/applio_mascot.png

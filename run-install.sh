@@ -76,15 +76,30 @@ create_conda_env() {
     fi
 }
 
+is_tpu() {
+    if [ "${PJRT_DEVICE:-}" = "TPU" ] || [ "${PJRT_DEVICE:-}" = "tpu" ]; then
+        return 0
+    fi
+    if [ -n "${TPU_NAME:-}${COLAB_TPU_ADDR:-}${TPU_ACCELERATOR_TYPE:-}${TPU_CHIPS_PER_HOST_BOUNDS:-}${TPU_WORKER_ID:-}${KAGGLE_TPU_NAME:-}" ]; then
+        return 0
+    fi
+    compgen -G "/dev/accel*" >/dev/null 2>&1 || compgen -G "/dev/vfio/[0-9]*" >/dev/null 2>&1
+}
+
 install_dependencies() {
     echo "Installing dependencies..."
     # shellcheck disable=SC1091
     source "$MINICONDA_DIR/etc/profile.d/conda.sh"
     conda activate "$ENV_DIR"
-    uv pip install -r "$INSTALL_DIR/requirements.txt" \
-        --extra-index-url https://download.pytorch.org/whl/cu130 \
-        --index-strategy unsafe-best-match
-    uv pip install --no-deps swift-f0==0.3.0
+    if is_tpu; then
+        echo "TPU detected. Installing TPU dependencies..."
+        uv pip install -r "$INSTALL_DIR/requirements-tpu.txt"
+    else
+        uv pip install -r "$INSTALL_DIR/requirements.txt" \
+            --extra-index-url https://download.pytorch.org/whl/cu130 \
+            --index-strategy unsafe-best-match
+        uv pip install --no-deps swift-f0==0.3.0
+    fi
     conda deactivate
     echo "Dependencies installation complete."
     echo
