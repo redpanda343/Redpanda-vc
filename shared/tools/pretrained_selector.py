@@ -11,6 +11,8 @@ def pretrained_selector(vocoder, sample_rate, version="v2"):
             "models", "pretraineds", "hifi-gan", "v1"
         )
     else:
+        if int(sample_rate) == 22000 and vocoder != "HiFi-GAN":
+            raise ValueError("22000 Hz pretrained models require HiFi-GAN.")
         base_path = os.path.join("models", "pretraineds", f"{vocoder.lower()}")
 
     path_g = os.path.join(base_path, f"f0G{str(sample_rate)[:2]}k.pth")

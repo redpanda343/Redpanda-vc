@@ -169,6 +169,24 @@ def generate_filelist(model_path: str, sample_rate: int, include_mutes: int = 2)
         if not os.path.isfile(absolute_mute_feature_path):
             raise RuntimeError(f"Mute feature not found: {absolute_mute_feature_path}")
 
+        mute_wav_abs = os.path.abspath(mute_audio_path)
+        if not os.path.isfile(mute_wav_abs):
+            import wave
+
+            os.makedirs(os.path.dirname(mute_wav_abs), exist_ok=True)
+            n_mute_samples = 3 * int(sample_rate)
+            tmp_mute = f"{mute_wav_abs}.{os.getpid()}.tmp"
+            try:
+                with wave.open(tmp_mute, "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(int(sample_rate))
+                    wf.writeframes(b"\x00" * (n_mute_samples * 2))
+                os.replace(tmp_mute, mute_wav_abs)
+            finally:
+                if os.path.exists(tmp_mute):
+                    os.remove(tmp_mute)
+
         # adding x files per sid
         for sid in sids * include_mutes:
             options.append(

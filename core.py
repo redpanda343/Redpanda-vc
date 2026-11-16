@@ -667,6 +667,8 @@ def _build_train_command(
         raise ValueError(f"Unsupported RVC version: {version}")
     if version == "v1" and (int(sample_rate) != 40000 or vocoder != "HiFi-GAN"):
         raise ValueError("RVC v1 training requires HiFi-GAN at 40000 Hz.")
+    if int(sample_rate) == 22000 and (version != "v2" or vocoder != "HiFi-GAN"):
+        raise ValueError("22000 Hz training only supports RVC v2 with HiFi-GAN.")
     expected_feature_dim = 256 if version == "v1" else 768
     model_config_path = os.path.join("logs", model_name, "config.json")
     feature_dim = expected_feature_dim
@@ -1258,7 +1260,7 @@ def batch_infer(**kwargs):
 @click.option(
     "--sample-rate",
     required=True,
-    type=click.Choice(["32000", "40000", "48000"]),
+    type=click.Choice(["22000", "32000", "40000", "48000"]),
     help="Target sampling rate.",
 )
 @click.option(
@@ -1415,7 +1417,7 @@ def preprocess(**kwargs):
 @click.option(
     "--sample-rate",
     required=True,
-    type=click.Choice(["32000", "40000", "48000"]),
+    type=click.Choice(["22000", "32000", "40000", "48000"]),
     help="Target sampling rate.",
 )
 @click.option(
@@ -1499,7 +1501,7 @@ def extract(**kwargs):
 @click.option(
     "--sample-rate",
     required=True,
-    type=click.Choice(["32000", "40000", "48000"]),
+    type=click.Choice(["22000", "32000", "40000", "48000"]),
     help="Training sampling rate.",
 )
 @click.option(

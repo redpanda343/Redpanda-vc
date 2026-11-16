@@ -154,6 +154,8 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--lr-final-ratio must be above 0 and at most 1.")
     if args.version == "v1" and (args.sample_rate != 40000 or args.vocoder != "HiFi-GAN"):
         parser.error("RVC v1 training requires HiFi-GAN at 40000 Hz.")
+    if args.sample_rate == 22000 and (args.version != "v2" or args.vocoder != "HiFi-GAN"):
+        parser.error("22000 Hz training only supports RVC v2 with HiFi-GAN.")
 
     args.experiment_dir = os.path.join(now_dir, "logs", args.model_name)
     args.disc_version = "v3" if args.vocoder == "RefineGAN" else args.version
