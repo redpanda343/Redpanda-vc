@@ -206,6 +206,12 @@ def run_pitch_extraction(files, devices, f0_method, threads, progress, updates, 
                     progress.update(1)
                 else:
                     pending.append(file_info)
+            skipped_f0 = len(files) - len(pending)
+            if skipped_f0:
+                print(
+                    f"\nReusing F0 for {skipped_f0}/{len(files)} file(s).",
+                    flush=True,
+                )
             if pending:
                 print(
                     f"\nExtracting F0 ({f0_method}) on TPU for {len(pending)} file(s) (batch_size=8)...",
@@ -291,9 +297,11 @@ def process_file_embedding(
         expected_dim = int(getattr(model, "feature_dim", 768 if version == "v2" else 256))
         requires_norm = getattr(model, "audio_requires_normalization", False)
         buckets = {}
+        reused_count = 0
         for file_info in files:
             wav_file_path, _, _, out_file_path = file_info
             if readable_npy(out_file_path):
+                reused_count += 1
                 updates.put(1)
                 continue
             feats = torch.from_numpy(load_audio_16k(wav_file_path)).float()
@@ -307,6 +315,11 @@ def process_file_embedding(
             )
 
         total_pending = sum(len(v) for v in buckets.values())
+        if reused_count:
+            print(
+                f"\nReusing {embedder_model} features for {reused_count}/{len(files)} file(s).",
+                flush=True,
+            )
         if total_pending:
             print(
                 f"\nExtracting features ({embedder_model}) on TPU for {total_pending} file(s) (batch_size=8)...",
@@ -314,6 +327,7 @@ def process_file_embedding(
             )
         batch_size = 8
         done_feat = 0
+        batch_idx = 0
         for pad_len, items in buckets.items():
             for start in range(0, len(items), batch_size):
                 batch = items[start : start + batch_size]
@@ -351,11 +365,12 @@ def process_file_embedding(
                         raise RuntimeError(f"{wav_file_path} produced non-finite values.")
                     save_npy(out_file_path, feats_out)
                 done_feat += valid_count
+                batch_idx += 1
                 updates.put(valid_count)
                 if not sys.stderr.isatty() and (
-                    done_feat == valid_count
+                    batch_idx == 1
                     or done_feat == total_pending
-                    or (done_feat // batch_size) % 8 == 0
+                    or batch_idx % 8 == 0
                 ):
                     print(
                         f"Extracting features ({embedder_model}): {done_feat}/{total_pending}",
@@ -528,7 +543,7 @@ if __name__ == "__main__":
     for file in sorted(glob.glob(os.path.join(wav_path, f"*{audio_extension}"))):
         file_name = os.path.basename(file)
         feature_name = (
-            file_name.replace("wav", "npy")
+            f"{os.path.splitext(file_name)[0]}.npy"
             if dataset_format == "wav"
             else f"{file_name}.npy"
         )

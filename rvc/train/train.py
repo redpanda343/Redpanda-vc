@@ -46,7 +46,8 @@ from rvc.train.process.extract_model import extract_model
 VOCODERS = ("HiFi-GAN", "MRF HiFi-GAN", "RefineGAN")
 LR_SCHEDULES = ("exponential", "cosine")
 ACCELERATORS = ("gpu", "tpu")
-BUCKET_BOUNDARIES = (100, 200, 300, 400, 500, 600, 700, 800, 900)
+BUCKET_BOUNDARIES = (50, 200, 300, 400, 500, 600, 700, 800, 900)
+XLA_BUCKET_BOUNDARIES = (50, 300, 600, 900)
 LATEST_CHECKPOINT_SUFFIX = 2333333
 XLA_CACHE_DIR = os.environ.get(
     "RVC_XLA_CACHE_DIR", os.path.join(now_dir, "assets", "xla_cache")
@@ -559,9 +560,10 @@ class Trainer:
             torch.float16,
         )
         self.cache_in_gpu = device.type == "cuda" and args.cache_data_in_gpu
-        max_workers = 2 if (self.xla and world_size > 1) else 4
+        max_workers = 2 if self.xla else 4
         self.workers = max(1, min(max_workers, (os.cpu_count() or 1) // world_size))
         self.pending_rng = None
+        self._compiled_xla_shapes = set()
         self.global_step = 0
         self.loss_sums = torch.zeros(6, device=device, dtype=torch.float32)
         self.batch_count = 0
@@ -604,7 +606,7 @@ class Trainer:
             self.exporter = AsyncInferenceExporter(self.device)
 
         if self.rank == 0:
-            print(self.summary(epoch, start_batch, last_g))
+            print(self.summary(epoch, start_batch, last_g), flush=True)
         total_steps = self.args.total_steps
         finished = self.global_step >= total_steps
         if finished and self.rank == 0:
@@ -715,14 +717,15 @@ class Trainer:
         data = self.config.data
         max_frames = int(self.args.max_batch_seconds * data.sample_rate / data.hop_length)
         self.dataset = TextAudioLoaderMultiNSFsid(data)
+        boundaries = XLA_BUCKET_BOUNDARIES if self.xla else BUCKET_BOUNDARIES
         self.collate = TextAudioCollateMultiNSFsid(
-            frame_buckets=BUCKET_BOUNDARIES if self.xla else None,
+            frame_buckets=boundaries[1:] if self.xla else None,
             hop_length=data.hop_length,
         )
         self.sampler = DistributedBucketSampler(
             self.dataset,
             self.args.batch_size,
-            list(BUCKET_BOUNDARIES),
+            list(boundaries),
             num_replicas=self.world_size,
             rank=self.rank,
             shuffle=True,
@@ -1072,6 +1075,19 @@ class Trainer:
         config = self.config
         self.last_batch = None
         phone, phone_lengths, pitch, pitchf, spec, spec_lengths, wave, _, sid = batch
+        if self.xla and self.rank == 0:
+            shape = (int(phone.shape[0]), int(phone.shape[1]))
+            if shape not in self._compiled_xla_shapes:
+                self._compiled_xla_shapes.add(shape)
+                message = (
+                    f"Compiling TPU training graph (batch={shape[0]}, frames={shape[1]}); "
+                    "the first run of each shape can take several minutes..."
+                )
+                if self.progress is not None:
+                    self.progress.write(message)
+                else:
+                    print(message, flush=True)
+                sys.stdout.flush()
         log_grad_norms = (
             (self.rank == 0 or self.xla)
             and (self.global_step + 1) % self.log_interval == 0
