@@ -157,6 +157,7 @@ def require_tpu():
         pid = os.getpid()
         if _PRECISION_CONFIGURED_PID != pid:
             set_matmul_precision("highest")
+            patch_xla_ops()
             _PRECISION_CONFIGURED_PID = pid
         return torch_tpu
 
@@ -368,8 +369,18 @@ def spawn(fn, args, single_core=False):
 _XLA_OPS_PATCHED = False
 
 
+def _has_privateuse1_kernel(op_name):
+    checker = getattr(torch._C, "_dispatch_has_kernel_for_dispatch_key", None)
+    if checker is None:
+        return False
+    try:
+        return bool(checker(op_name, "PrivateUse1"))
+    except RuntimeError:
+        return False
+
+
 def _compute_weight_norm_xla(weight_v, weight_g, dim):
-    with torch.amp.autocast(device_type="xla", enabled=False):
+    with torch.amp.autocast(device_type=weight_v.device.type, enabled=False):
         v_fp32 = weight_v.float()
         g_fp32 = weight_g.float()
         if dim == -1 or dim is None:
@@ -387,30 +398,40 @@ def _compute_weight_norm_xla(weight_v, weight_g, dim):
 
 def patch_xla_ops():
     global _XLA_OPS_PATCHED
-    if _XLA_OPS_PATCHED or backend() != "xla":
+    if _XLA_OPS_PATCHED:
+        return
+    active = backend()
+    if active == "torch_tpu":
+        if _has_privateuse1_kernel("aten::_weight_norm_interface_backward"):
+            _XLA_OPS_PATCHED = True
+            return
+    elif active != "xla":
         return
     from torch.nn.utils.parametrizations import _WeightNorm
 
     orig_forward = _WeightNorm.forward
 
-    def _xla_weight_norm_forward(self, weight_g, weight_v):
-        if weight_v.device.type != "xla":
+    def _tpu_weight_norm_forward(self, weight_g, weight_v):
+        if weight_v.device.type not in ("xla", "tpu"):
             return orig_forward(self, weight_g, weight_v)
         return _compute_weight_norm_xla(weight_v, weight_g, self.dim)
 
-    _WeightNorm.forward = _xla_weight_norm_forward
+    _WeightNorm.forward = _tpu_weight_norm_forward
 
     orig_weight_norm_fn = getattr(torch, "_weight_norm", None)
     if orig_weight_norm_fn is not None:
 
-        def _xla_weight_norm_fn(weight_v, weight_g, dim=0):
-            if weight_v.device.type != "xla":
+        def _tpu_weight_norm_fn(weight_v, weight_g, dim=0):
+            if weight_v.device.type not in ("xla", "tpu"):
                 return orig_weight_norm_fn(weight_v, weight_g, dim)
             return _compute_weight_norm_xla(weight_v, weight_g, dim)
 
-        torch._weight_norm = _xla_weight_norm_fn
+        torch._weight_norm = _tpu_weight_norm_fn
 
     _XLA_OPS_PATCHED = True
+
+
+patch_tpu_ops = patch_xla_ops
 
 
 def device():

@@ -183,12 +183,33 @@ def upsample_nearest_1d(x: torch.Tensor, factor: int) -> torch.Tensor:
     )
 
 
+_TPU_LINEAR1D_BACKWARD_SUPPORTED = None
+
+
+def _needs_linear1d_bilinear_fallback(device_type: str) -> bool:
+    if device_type == "xla":
+        return True
+    if device_type != "tpu":
+        return False
+    global _TPU_LINEAR1D_BACKWARD_SUPPORTED
+    if _TPU_LINEAR1D_BACKWARD_SUPPORTED is None:
+        checker = getattr(torch._C, "_dispatch_has_kernel_for_dispatch_key", None)
+        try:
+            _TPU_LINEAR1D_BACKWARD_SUPPORTED = bool(
+                checker is not None
+                and checker("aten::upsample_linear1d_backward.grad_input", "PrivateUse1")
+            )
+        except RuntimeError:
+            _TPU_LINEAR1D_BACKWARD_SUPPORTED = False
+    return not _TPU_LINEAR1D_BACKWARD_SUPPORTED
+
+
 def upsample_linear_1d(
     x: torch.Tensor,
     size: int | None = None,
     scale_factor: int | float | None = None,
 ) -> torch.Tensor:
-    if x.device.type == "xla":
+    if _needs_linear1d_bilinear_fallback(x.device.type):
         target = int(size if size is not None else x.shape[-1] * scale_factor)
         return torch.nn.functional.interpolate(
             x.unsqueeze(2),
