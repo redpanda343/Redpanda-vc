@@ -95,6 +95,76 @@ _TOPOLOGY_ENV_VARS = (
 )
 
 
+def _mesh_size(spec):
+    """Return the chip/host count represented by a comma-separated TPU mesh shape."""
+    if not spec:
+        return None
+    total = 1
+    for part in spec.split(","):
+        try:
+            dim = int(part.strip())
+        except ValueError:
+            return None
+        if dim <= 0:
+            return None
+        total *= dim
+    return total
+
+
+def _probe_single_chip_topology():
+    """Return (is_single_chip, local_devices, num_workers) without initializing XLA."""
+    try:
+        from torch_xla._internal import tpu as internal_tpu
+    except ImportError:
+        return False, None, None
+
+    try:
+        if internal_tpu.num_available_chips() != 1:
+            return False, None, None
+    except Exception:
+        return False, None, None
+
+    num_workers = None
+    local_devices = None
+    try:
+        num_workers = internal_tpu.num_tpu_workers()
+    except Exception:
+        pass
+    try:
+        local_devices = internal_tpu.num_available_devices()
+    except Exception:
+        pass
+    return True, local_devices, num_workers
+
+
+def _configure_spawn_topology(single_core):
+    """Scrub stale topology env vars and normalize single-chip host bounds."""
+    for name in _TOPOLOGY_ENV_VARS:
+        if single_core and name == "TPU_VISIBLE_CHIPS":
+            visible = os.environ.get(name, "").strip()
+            if visible and "," not in visible:
+                continue
+        os.environ.pop(name, None)
+
+    is_single_chip, local_devices, num_workers = _probe_single_chip_topology()
+
+    # Single-chip containers (e.g. Colab v5e-1) can inherit 4-chip host bounds
+    # such as TPU_CHIPS_PER_HOST_BOUNDS='2,2,1', causing PJRT multiprocess
+    # init to expect 4 worker addresses when only 1 process is spawned.
+    if is_single_chip:
+        chips_bounds = os.environ.get("TPU_CHIPS_PER_HOST_BOUNDS")
+        if chips_bounds is not None and _mesh_size(chips_bounds) != 1:
+            os.environ["TPU_CHIPS_PER_HOST_BOUNDS"] = "1,1,1"
+        if num_workers == 1:
+            host_bounds = os.environ.get("TPU_HOST_BOUNDS")
+            if host_bounds is not None and _mesh_size(host_bounds) != 1:
+                os.environ["TPU_HOST_BOUNDS"] = "1,1,1"
+
+    if single_core:
+        return True
+    return is_single_chip and num_workers == 1 and (local_devices is None or local_devices == 1)
+
+
 def spawn(fn, args, single_core=False):
     # Don't initialize XLA in the parent: each child configures its own topology.
     if not torch_xla_installed():
@@ -102,17 +172,15 @@ def spawn(fn, args, single_core=False):
     os.environ.setdefault("PJRT_DEVICE", "TPU")
     os.environ.pop("XLA_USE_BF16", None)
     os.environ.pop("XLA_DOWNCAST_BF16", None)
-    if not single_core:
-        for name in _TOPOLOGY_ENV_VARS:
-            os.environ.pop(name, None)
+    effective_single_core = _configure_spawn_topology(single_core)
     import torch_xla
 
     if hasattr(torch_xla, "launch"):
-        torch_xla.launch(fn, args=args, debug_single_process=single_core)
+        torch_xla.launch(fn, args=args, debug_single_process=effective_single_core)
         return
     import torch_xla.distributed.xla_multiprocessing as xmp
 
-    xmp.spawn(fn, args=args, nprocs=1 if single_core else None)
+    xmp.spawn(fn, args=args, nprocs=1 if effective_single_core else None)
 
 
 _XLA_OPS_PATCHED = False
