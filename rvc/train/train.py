@@ -887,9 +887,11 @@ class Trainer:
         else:
             optimizer = torch.optim.AdamW
             if self.torch_tpu:
+                from torch.optim import optimizer as optim_utils
+
                 supports_fused = (
-                    hasattr(torch.optim.optimizer, "_get_fused_kernels_supported_devices")
-                    and "tpu" in torch.optim.optimizer._get_fused_kernels_supported_devices()
+                    hasattr(optim_utils, "_get_fused_kernels_supported_devices")
+                    and "tpu" in optim_utils._get_fused_kernels_supported_devices()
                     and hasattr(torch._C, "_dispatch_has_kernel_for_dispatch_key")
                     and torch._C._dispatch_has_kernel_for_dispatch_key(
                         "aten::_fused_adamw_.tensor_lr", "PrivateUse1"
