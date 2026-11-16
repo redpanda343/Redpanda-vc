@@ -647,6 +647,7 @@ class Trainer:
         self.pending_rng = None
         self._compiled_xla_shapes = set()
         self._last_lr_values = {}
+        self._torch_tpu_shared_steps = {}
         self.global_step = 0
         self.loss_sums = torch.zeros(6, device=device, dtype=torch.float32)
         self._xla_grad_norm_d = (
@@ -858,7 +859,7 @@ class Trainer:
                 collate_fn=self.collate,
                 batch_sampler=self.sampler,
                 persistent_workers=True,
-                prefetch_factor=2 if self.tpu else 8,
+                prefetch_factor=4 if self.tpu else 8,
             )
 
     def build_models(self, last_g):
@@ -1091,7 +1092,7 @@ class Trainer:
                 yield from tpu.iter_batches(self.loader, self.device)
                 return
             for batch in self.loader:
-                if self.device.type == "cuda":
+                if self.device.type in ("cuda", "tpu"):
                     yield [tensor.to(self.device, non_blocking=True) for tensor in batch]
                 else:
                     yield [tensor.to(self.device) for tensor in batch]
@@ -1110,6 +1111,8 @@ class Trainer:
 
     def _prepare_xla_optimizers(self):
         """Pin AdamW step/lr/state tensors on TPU backends so LR or lazy init won't recompile."""
+        if not hasattr(self, "_torch_tpu_shared_steps"):
+            self._torch_tpu_shared_steps = {}
         for optimizer in (self.optim_g, self.optim_d):
             for group in optimizer.param_groups:
                 lr_val = float(group["lr"])
@@ -1121,15 +1124,21 @@ class Trainer:
                 for param in group["params"]:
                     state = optimizer.state.get(param)
                     if state and "step" in state:
-                        shared_step = state["step"].to(
-                            dtype=torch.float32, device=param.device
+                        shared_step = state["step"].detach().to(
+                            dtype=torch.float32, device=self.device
                         )
+                        if shared_step.numel() == 1 and shared_step.ndim != 0:
+                            shared_step = shared_step.reshape(())
                         break
                 if shared_step is None:
                     shared_step = torch.zeros(
                         (), dtype=torch.float32, device=self.device
                     )
                 shared_step_cpu = shared_step.detach().cpu() if self.torch_tpu else None
+                if shared_step_cpu is not None:
+                    self._torch_tpu_shared_steps[id(group)] = shared_step_cpu.clone().to(
+                        device=self.device
+                    )
                 for param in group["params"]:
                     if not param.requires_grad:
                         continue
@@ -1281,8 +1290,119 @@ class Trainer:
                 else:
                     group["lr"] = new_lr
 
+    def _can_use_torch_tpu_fused_adamw(self, optimizer):
+        shared_steps = getattr(self, "_torch_tpu_shared_steps", None)
+        if (
+            not self.torch_tpu
+            or not shared_steps
+            or type(optimizer) is not torch.optim.AdamW
+            or self.scaler.is_enabled()
+            or getattr(optimizer, "grad_scale", None) is not None
+            or getattr(optimizer, "found_inf", None) is not None
+            or getattr(optimizer, "_optimizer_step_pre_hooks", None)
+            or getattr(optimizer, "_optimizer_step_post_hooks", None)
+        ):
+            return False
+        for group in optimizer.param_groups:
+            if (
+                not group.get("fused", False)
+                or group.get("amsgrad", False)
+                or group.get("differentiable", False)
+                or not group.get("decoupled_weight_decay", True)
+                or not torch.is_tensor(group.get("lr"))
+                or group["lr"].device != self.device
+            ):
+                return False
+            shared_step = shared_steps.get(id(group))
+            if shared_step is None or shared_step.device != self.device:
+                return False
+            for param in group["params"]:
+                if param.grad is None:
+                    continue
+                if param.grad.is_sparse:
+                    return False
+                state = optimizer.state.get(param)
+                if (
+                    not state
+                    or "exp_avg" not in state
+                    or "exp_avg_sq" not in state
+                ):
+                    return False
+        return True
+
+    def _torch_tpu_fused_adamw_step(self, optimizer):
+        """Run fused AdamW with one shared step update per group to avoid per-param _foreach_add_ loops."""
+        with torch.no_grad():
+            for group in optimizer.param_groups:
+                params = []
+                grads = []
+                exp_avgs = []
+                exp_avg_sqs = []
+                for param in group["params"]:
+                    if param.grad is None:
+                        continue
+                    state = optimizer.state[param]
+                    params.append(param)
+                    grads.append(param.grad)
+                    exp_avgs.append(state["exp_avg"])
+                    exp_avg_sqs.append(state["exp_avg_sq"])
+                if not params:
+                    continue
+                shared_step = self._torch_tpu_shared_steps[id(group)]
+                shared_step.add_(1.0)
+                beta1, beta2 = group["betas"]
+                if torch.is_tensor(beta1):
+                    beta1 = beta1.item()
+                if torch.is_tensor(beta2):
+                    beta2 = beta2.item()
+                state_steps = [shared_step] * len(params)
+                grouped_tensors = (
+                    torch.optim.Optimizer._group_tensors_by_device_and_dtype(
+                        [params, grads, exp_avgs, exp_avg_sqs, state_steps]
+                    )
+                )
+                for (
+                    device_params,
+                    device_grads,
+                    device_exp_avgs,
+                    device_exp_avg_sqs,
+                    device_state_steps,
+                ), _ in grouped_tensors.values():
+                    torch._fused_adamw_(
+                        device_params,
+                        device_grads,
+                        device_exp_avgs,
+                        device_exp_avg_sqs,
+                        [],
+                        device_state_steps,
+                        amsgrad=False,
+                        lr=group["lr"],
+                        beta1=beta1,
+                        beta2=beta2,
+                        weight_decay=group["weight_decay"],
+                        eps=group["eps"],
+                        maximize=group["maximize"],
+                        grad_scale=None,
+                        found_inf=None,
+                    )
+
+    def _sync_torch_tpu_optimizer_steps(self, optimizer):
+        """Materialize the shared TorchTPU step counter onto per-param optimizer states before saving."""
+        shared_steps = getattr(self, "_torch_tpu_shared_steps", None)
+        if not self.torch_tpu or not shared_steps:
+            return
+        for group in optimizer.param_groups:
+            shared_step = shared_steps.get(id(group))
+            if shared_step is None:
+                continue
+            shared_step_cpu = shared_step.detach().cpu()
+            for param in group["params"]:
+                state = optimizer.state.get(param)
+                if state and "step" in state:
+                    state["step"] = shared_step_cpu.clone().to(device=param.device)
+
     def optimizer_step(self, optimizer, net, loss, log_grad_norm, update_scaler, before_step=None):
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         self.scaler.scale(loss).backward()
         if self.tpu and self.world_size > 1:
             tpu.reduce_gradients(optimizer)
@@ -1294,6 +1414,8 @@ class Trainer:
             before_step()
         if self.xla:
             _xla_adamw_step(optimizer)
+        elif self._can_use_torch_tpu_fused_adamw(optimizer):
+            self._torch_tpu_fused_adamw_step(optimizer)
         else:
             self.scaler.step(optimizer)
         if update_scaler:
@@ -1391,7 +1513,7 @@ class Trainer:
                 self.optim_d,
                 self.net_d,
                 loss_disc,
-                last_discriminator_step if self.tpu else (log_grad_norms and last_discriminator_step),
+                last_discriminator_step if self.xla else (log_grad_norms and last_discriminator_step),
                 update_scaler=not last_discriminator_step,
             )
         if self.tpu:
@@ -1413,7 +1535,7 @@ class Trainer:
         if self.xla:
             # Flush forward/backward + D step before optim_g/EMA so optimizer state
             # (~3,100 buffers) compiles once for all bucket lengths instead of per-shape.
-            self.optim_g.zero_grad()
+            self.optim_g.zero_grad(set_to_none=True)
             loss_gen_all.backward()
             if self.world_size > 1:
                 tpu.reduce_gradients(self.optim_g)
@@ -1442,7 +1564,7 @@ class Trainer:
                 self.optim_g,
                 self.net_g,
                 loss_gen_all,
-                True if self.torch_tpu else log_grad_norms,
+                log_grad_norms,
                 update_scaler=True,
                 before_step=self.exporter.wait_for_staging if self.exporter else None,
             )
@@ -1652,6 +1774,7 @@ class Trainer:
                 ("D", self.net_d, self.optim_d, {"step": self.global_step}),
                 ("G", self.net_g, self.optim_g, generator_extra),
             ):
+                self._sync_torch_tpu_optimizer_steps(optimizer)
                 path = os.path.join(args.experiment_dir, f"{prefix}_{suffix}.pth")
                 save_checkpoint(
                     net,
