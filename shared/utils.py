@@ -146,6 +146,43 @@ def load_audio_infer(
     return np.array(audio).flatten()
 
 
+def readable_npy(path):
+    """Return True if `.npy` file exists and its header can be memory-mapped safely."""
+    try:
+        np.load(path, mmap_mode="r", allow_pickle=False)
+    except Exception:
+        return False
+    return True
+
+
+def save_npy(path, array):
+    """Atomically write an `.npy` file via temp file in parent directory."""
+    directory = os.path.dirname(os.path.dirname(os.path.abspath(path)))
+    handle, temporary = tempfile.mkstemp(dir=directory, prefix=".", suffix=".partial")
+    try:
+        with os.fdopen(handle, "wb") as file:
+            np.save(file, array, allow_pickle=False)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
+
+
+def compute_coarse_f0(f0, f0_bin=256, f0_min=50.0, f0_max=1100.0):
+    """Quantize continuous F0 (Hz) into 1..255 mel-spaced bins matching RVC."""
+    f0_mel_min = 1127.0 * np.log(1.0 + float(f0_min) / 700.0)
+    f0_mel_max = 1127.0 * np.log(1.0 + float(f0_max) / 700.0)
+    f0_mel = 1127.0 * np.log(1.0 + np.asarray(f0, dtype=np.float64) / 700.0)
+    mask = f0_mel > 0
+    f0_mel[mask] = (f0_mel[mask] - f0_mel_min) * (f0_bin - 2) / (f0_mel_max - f0_mel_min) + 1.0
+    f0_mel[f0_mel <= 1.0] = 1.0
+    f0_mel[f0_mel > f0_bin - 1] = f0_bin - 1
+    f0_coarse = np.rint(f0_mel).astype(int)
+    if f0_coarse.size and (f0_coarse.max() > 255 or f0_coarse.min() < 1):
+        raise ValueError(f"Coarse F0 out of bounds: min={f0_coarse.min()}, max={f0_coarse.max()}")
+    return f0_coarse
+
+
 def format_title(title):
     formatted_title = unicodedata.normalize("NFC", title)
     formatted_title = re.sub(r"[\u2500-\u257F]+", "", formatted_title)
@@ -203,7 +240,8 @@ def extract_embedding_features(model, source, version):
     raise ValueError(f"Unsupported RVC version: {version}")
 
 
-def load_embedding(embedder_model, version="v2"):
+def ensure_embedding_files(embedder_model):
+    """Ensure embedder weights and config.json exist locally, returning the directory path."""
     embedder_root = os.path.join(now_dir, "models", "embedders")
     rvc_contentvec_base_url = (
         "https://huggingface.co/IAHispano/Applio/resolve/main/Resources/embedders/contentvec"
@@ -268,6 +306,13 @@ def load_embedding(embedder_model, version="v2"):
             _download_file(online_embedders[embedder_model], bin_file)
         if not os.path.exists(json_file):
             _download_file(config_files[embedder_model], json_file)
+
+    return model_path
+
+
+def load_embedding(embedder_model, version="v2"):
+    model_path = ensure_embedding_files(embedder_model)
+    preprocessor_json_file = os.path.join(model_path, "preprocessor_config.json")
 
     models = hubert_model_class().from_pretrained(model_path)
     if os.path.isfile(preprocessor_json_file):

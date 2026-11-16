@@ -33,6 +33,80 @@ def leaky_relu(x: Array, negative_slope: float = 0.1) -> Array:
     return jax.nn.leaky_relu(x, negative_slope=negative_slope)
 
 
+def exact_gelu(x: Array) -> Array:
+    """Exact Gaussian Error Linear Unit matching torch.nn.functional.gelu(x, approximate='none')."""
+    x_f32 = jnp.asarray(x, jnp.float32)
+    return jnp.asarray(jax.nn.gelu(x_f32, approximate=False), x.dtype)
+
+
+def avg_pool2d(x: Array, kernel_size: tuple[int, int] = (2, 2), stride: tuple[int, int] | None = None) -> Array:
+    """2D average pooling on NHWC (B, H, W, C) with VALID padding."""
+    kh, kw = int(kernel_size[0]), int(kernel_size[1])
+    sh, sw = (kh, kw) if stride is None else (int(stride[0]), int(stride[1]))
+    sums = lax.reduce_window(
+        x,
+        jnp.array(0.0, dtype=x.dtype),
+        lax.add,
+        window_dimensions=(1, kh, kw, 1),
+        window_strides=(1, sh, sw, 1),
+        padding="VALID",
+    )
+    return sums / jnp.asarray(float(kh * kw), dtype=x.dtype)
+
+
+def conv_transpose2d(
+    x: Array,
+    params: Mapping[str, Array],
+    stride: tuple[int, int] = (2, 2),
+    padding: tuple[int, int] = (1, 1),
+    output_padding: tuple[int, int] = (1, 1),
+    dtype: Any = jnp.float32,
+    precision: Any = None,
+) -> Array:
+    """2D transposed convolution on NHWC tensor with weight shape (Kh, Kw, C_out, C_in)."""
+    w = resolve_kernel(params)
+    kh, kw = w.shape[0], w.shape[1]
+    pad_h = (kh - 1 - int(padding[0]), kh - 1 - int(padding[0]) + int(output_padding[0]))
+    pad_w = (kw - 1 - int(padding[1]), kw - 1 - int(padding[1]) + int(output_padding[1]))
+    y = lax.conv_transpose(
+        lhs=jnp.asarray(x, dtype),
+        rhs=jnp.asarray(w, dtype),
+        strides=(int(stride[0]), int(stride[1])),
+        padding=(pad_h, pad_w),
+        dimension_numbers=("NHWC", "HWIO", "NHWC"),
+        transpose_kernel=True,
+        precision=precision,
+    )
+    if "bias" in params and params["bias"] is not None:
+        y = y + jnp.asarray(params["bias"], dtype)
+    return y
+
+
+def masked_group_norm_1d(
+    x: Array,
+    params: Mapping[str, Array],
+    num_groups: int,
+    mask_bt1: Array | None = None,
+    eps: float = 1e-5,
+) -> Array:
+    """Strictly FP32 masked GroupNorm over NWC (B, T, C) supporting per-channel (G=C) and multi-group."""
+    x_f32 = jnp.asarray(x, jnp.float32)
+    b, t, c = x_f32.shape
+    group_size = c // int(num_groups)
+    xg = x_f32.reshape(b, t, int(num_groups), group_size)
+    if mask_bt1 is not None:
+        m = jnp.asarray(mask_bt1, jnp.float32)[..., None]  # (B, T, 1, 1)
+        denom = jnp.maximum(jnp.sum(m, axis=1, keepdims=True) * float(group_size), 1.0)
+        mean = jnp.sum(xg * m, axis=(1, 3), keepdims=True) / denom
+        var = jnp.sum(jnp.square(xg - mean) * m, axis=(1, 3), keepdims=True) / denom
+        normed = ((xg - mean) * lax.rsqrt(var + eps) * m).reshape(b, t, c)
+    else:
+        mean = jnp.mean(xg, axis=(1, 3), keepdims=True)
+        var = jnp.mean(jnp.square(xg - mean), axis=(1, 3), keepdims=True)
+        normed = ((xg - mean) * lax.rsqrt(var + eps)).reshape(b, t, c)
+    return normed * jnp.asarray(params["weight"], jnp.float32) + jnp.asarray(params["bias"], jnp.float32)
+
+
 def gelu_1702(x: Array) -> Array:
     """Fast sigmoid GELU approximation x * sigmoid(1.702 * x) matching rvc.algorithm.attentions.FFN."""
     x_f32 = jnp.asarray(x, jnp.float32)

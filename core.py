@@ -1444,7 +1444,7 @@ def preprocess(**kwargs):
 def extract(**kwargs):
     """Extract features from a preprocessed dataset."""
     kwargs["sample_rate"] = int(kwargs["sample_rate"])
-    kwargs["cpu_cores"] = kwargs.get("cpu_cores") or 1
+    kwargs["cpu_cores"] = kwargs.get("cpu_cores") or min(64, os.cpu_count() or 1)
     result = run_extract_script(
         model_name=kwargs["model_name"],
         f0_method=kwargs["f0_method"],

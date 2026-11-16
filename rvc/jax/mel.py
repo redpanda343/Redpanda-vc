@@ -14,7 +14,15 @@ from jax import lax
 from rvc.jax.ops import Array, stft_complex
 
 _HANN_CACHE: dict[int, np.ndarray] = {}
-_MEL_BANK_CACHE: dict[tuple[int, int, int, float, float], np.ndarray] = {}
+_MEL_BANK_CACHE: dict[tuple[int, int, int, float, float, bool], np.ndarray] = {}
+
+
+def _hz_to_mel_htk(freqs: np.ndarray | float) -> np.ndarray:
+    return 2595.0 * np.log10(1.0 + np.asarray(freqs, dtype=np.float64) / 700.0)
+
+
+def _mel_to_hz_htk(mels: np.ndarray | float) -> np.ndarray:
+    return 700.0 * (10.0 ** (np.asarray(mels, dtype=np.float64) / 2595.0) - 1.0)
 
 
 def hann_window_np(win_length: int) -> np.ndarray:
@@ -66,10 +74,11 @@ def mel_filterbank_np(
     num_mels: int,
     fmin: float = 0.0,
     fmax: float | None = None,
+    htk: bool = False,
 ) -> np.ndarray:
-    """Pure-NumPy Slaney mel filterbank (num_mels, 1 + n_fft // 2) matching librosa.filters.mel."""
+    """Pure-NumPy Slaney or HTK mel filterbank (num_mels, 1 + n_fft // 2) matching librosa.filters.mel."""
     fmax_val = float(sample_rate) / 2.0 if fmax is None else float(fmax)
-    key = (int(sample_rate), int(n_fft), int(num_mels), float(fmin), fmax_val)
+    key = (int(sample_rate), int(n_fft), int(num_mels), float(fmin), fmax_val, bool(htk))
     cached = _MEL_BANK_CACHE.get(key)
     if cached is not None:
         return cached
@@ -78,9 +87,11 @@ def mel_filterbank_np(
     weights = np.zeros((int(num_mels), n_freqs), dtype=np.float64)
     fftfreqs = np.fft.rfftfreq(n=int(n_fft), d=1.0 / float(sample_rate))
 
-    min_mel = float(_hz_to_mel_slaney(float(fmin)))
-    max_mel = float(_hz_to_mel_slaney(fmax_val))
-    mel_f = _mel_to_hz_slaney(np.linspace(min_mel, max_mel, int(num_mels) + 2))
+    hz_to_mel = _hz_to_mel_htk if htk else _hz_to_mel_slaney
+    mel_to_hz = _mel_to_hz_htk if htk else _mel_to_hz_slaney
+    min_mel = float(hz_to_mel(float(fmin)))
+    max_mel = float(hz_to_mel(fmax_val))
+    mel_f = mel_to_hz(np.linspace(min_mel, max_mel, int(num_mels) + 2))
 
     fdiff = np.diff(mel_f)
     ramps = np.subtract.outer(mel_f, fftfreqs)

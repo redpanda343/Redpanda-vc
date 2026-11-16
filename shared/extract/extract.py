@@ -22,36 +22,25 @@ from beatrice.resources import ensure_pitch_estimator
 from shared.predictors.f0 import RMVPE, RVCRMVPE, BeatricePitch, Swift
 from shared.predictors.swift_dependencies import ensure_swift_f0
 from shared.utils import (
+    compute_coarse_f0,
     extract_embedding_features,
     get_embedding_metadata,
     load_audio_16k,
     load_embedding,
+    readable_npy,
+    save_npy,
 )
 from shared.extract.preparing_files import generate_config, generate_filelist
-
-
-def readable_npy(path):
-    try:
-        np.load(path, mmap_mode="r", allow_pickle=False)
-    except Exception:
-        return False
-    return True
-
-
-def save_npy(path, array):
-    directory = os.path.dirname(os.path.dirname(os.path.abspath(path)))
-    handle, temporary = tempfile.mkstemp(dir=directory, prefix=".", suffix=".partial")
-    try:
-        with os.fdopen(handle, "wb") as file:
-            np.save(file, array, allow_pickle=False)
-        os.replace(temporary, path)
-    finally:
-        if os.path.exists(temporary):
-            os.remove(temporary)
 
 # Load config
 config = Config()
 mp.set_start_method("spawn", force=True)
+
+
+def _configure_cpu_worker_threads(device, worker_count):
+    if str(device) == "cpu":
+        cpu_total = os.cpu_count() or 1
+        torch.set_num_threads(max(1, cpu_total // max(1, int(worker_count))))
 
 
 class FeatureInput:
@@ -115,18 +104,12 @@ class FeatureInput:
         return f0
 
     def coarse_f0(self, f0):
-        f0_mel = 1127 * np.log(1 + f0 / 700)
-        f0_mel[f0_mel > 0] = (f0_mel[f0_mel > 0] - self.f0_mel_min) * (
-            self.f0_bin - 2
-        ) / (self.f0_mel_max - self.f0_mel_min) + 1
-        f0_mel[f0_mel <= 1] = 1
-        f0_mel[f0_mel > self.f0_bin - 1] = self.f0_bin - 1
-        f0_coarse = np.rint(f0_mel).astype(int)
-        assert f0_coarse.max() <= 255 and f0_coarse.min() >= 1, (
-            f0_coarse.max(),
-            f0_coarse.min(),
+        return compute_coarse_f0(
+            f0,
+            f0_bin=self.f0_bin,
+            f0_min=self.f0_min,
+            f0_max=self.f0_max,
         )
-        return f0_coarse
 
     def process_file(self, file_info, force=False):
         inp_path, opt_path_coarse, opt_path_full, _ = file_info
@@ -135,7 +118,8 @@ class FeatureInput:
 
         try:
             np_arr = load_audio_16k(inp_path)
-            feature_pit = self.compute_f0(np_arr)
+            with torch.inference_mode():
+                feature_pit = self.compute_f0(np_arr)
             if feature_pit.ndim != 1 or not feature_pit.size:
                 raise ValueError("Pitch extraction returned an empty or invalid contour.")
             if not np.isfinite(feature_pit).all() or np.any(feature_pit < 0):
@@ -149,7 +133,8 @@ class FeatureInput:
             ) from error
 
 
-def process_files(files, f0_method, device, force, updates, rectified):
+def process_files(files, f0_method, device, force, updates, rectified, worker_count=1):
+    _configure_cpu_worker_threads(device, worker_count)
     fe = FeatureInput(f0_method=f0_method, device=device, rectified=rectified)
     for file_info in files:
         fe.process_file(file_info, force=force)
@@ -187,6 +172,11 @@ def run_pitch_extraction(files, devices, f0_method, threads, progress, updates, 
     if f0_method == "pm":
         worker_count = min(threads, len(files))
         worker_devices = ["cpu"] * worker_count
+    elif len(devices) == 1 and str(devices[0]) == "cpu":
+        # Scale neural F0 (RMVPE/Beatrice) across CPU worker processes instead of 1 worker.
+        cpu_total = os.cpu_count() or threads
+        worker_count = min(threads, cpu_total, len(files), 8)
+        worker_devices = ["cpu"] * max(1, worker_count)
     else:
         worker_count = min(len(devices), len(files))
         worker_devices = devices[:worker_count]
@@ -202,6 +192,7 @@ def run_pitch_extraction(files, devices, f0_method, threads, progress, updates, 
                 force,
                 updates,
                 rectified,
+                worker_count,
             )
             for i in range(worker_count)
         ]
@@ -209,26 +200,27 @@ def run_pitch_extraction(files, devices, f0_method, threads, progress, updates, 
 
 
 def process_file_embedding(
-    files, embedder_model, version, device, n_threads, updates
+    files, embedder_model, version, device, n_threads, updates, worker_count=1
 ):
     from transformers.utils import logging as transformers_logging
 
     transformers_logging.disable_progress_bar()
     transformers_logging.set_verbosity_error()
+    _configure_cpu_worker_threads(device, worker_count)
     model = load_embedding(embedder_model, version).to(device).float()
     model.eval()
     n_threads = max(1, n_threads)
 
-    def worker(file_info):
+    decode_workers = min(4, n_threads) if str(device) != "cpu" else 1
+    write_workers = min(4, max(2, n_threads))
+
+    def _infer_and_save(file_info, wav_16k, writer_pool, write_futures):
         wav_file_path, _, _, out_file_path = file_info
-        if readable_npy(out_file_path):
-            return
-        feats = torch.from_numpy(load_audio_16k(wav_file_path)).float()
+        feats = torch.from_numpy(wav_16k).float()
         if getattr(model, "audio_requires_normalization", False):
             feats = torch.nn.functional.layer_norm(feats, feats.shape)
-        feats = feats.to(device)
-        feats = feats.view(1, -1)
-        with torch.no_grad():
+        feats = feats.to(device, non_blocking=str(device).startswith("cuda")).view(1, -1)
+        with torch.inference_mode():
             result = extract_embedding_features(model, feats, version)
         feats_out = result.squeeze(0).float().cpu().numpy()
         expected_dim = int(getattr(model, "feature_dim", feats_out.shape[-1]))
@@ -239,29 +231,60 @@ def process_file_embedding(
             )
         if not np.isfinite(feats_out).all():
             raise RuntimeError(f"{wav_file_path} produced non-finite values.")
-        save_npy(out_file_path, feats_out)
+        fut = writer_pool.submit(save_npy, out_file_path, feats_out)
+        write_futures.append(fut)
+        while len(write_futures) > 16:
+            write_futures.pop(0).result()
+        updates.put(1)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=n_threads) as executor:
-        futures = [executor.submit(worker, f) for f in files]
-        for future in concurrent.futures.as_completed(futures):
-            future.result()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=decode_workers) as dec_pool, concurrent.futures.ThreadPoolExecutor(
+        max_workers=write_workers
+    ) as writer_pool:
+        write_futures = []
+        pending_files = [fi for fi in files if not readable_npy(fi[3])]
+        skipped = len(files) - len(pending_files)
+        for _ in range(skipped):
             updates.put(1)
+
+        if decode_workers > 1 and pending_files:
+            decoded = dec_pool.map(lambda fi: (fi, load_audio_16k(fi[0])), pending_files)
+            for fi, wav_16k in decoded:
+                _infer_and_save(fi, wav_16k, writer_pool, write_futures)
+        else:
+            for fi in pending_files:
+                _infer_and_save(fi, load_audio_16k(fi[0]), writer_pool, write_futures)
+
+        for fut in write_futures:
+            fut.result()
 
 
 def run_embedding_extraction(files, devices, embedder_model, version, threads, progress, updates):
+    if not files:
+        return
     progress.set_description(f"Extracting features ({embedder_model})")
-    with concurrent.futures.ProcessPoolExecutor(max_workers=len(devices)) as executor:
+    threads = max(1, int(threads))
+    if len(devices) == 1 and str(devices[0]) == "cpu":
+        # Shard CPU embedding extraction across processes instead of threading one shared CPU model.
+        cpu_total = os.cpu_count() or threads
+        worker_count = min(threads, cpu_total, len(files), 8)
+        worker_devices = ["cpu"] * max(1, worker_count)
+    else:
+        worker_count = min(len(devices), len(files))
+        worker_devices = devices[:worker_count]
+
+    with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count) as executor:
         tasks = [
             executor.submit(
                 process_file_embedding,
-                files[i :: len(devices)],
+                files[i::worker_count],
                 embedder_model,
                 version,
-                devices[i],
-                threads // len(devices),
+                worker_devices[i],
+                max(1, threads // worker_count),
                 updates,
+                worker_count,
             )
-            for i in range(len(devices))
+            for i in range(worker_count)
         ]
         follow_progress(tasks, updates, progress)
 
@@ -395,24 +418,81 @@ if __name__ == "__main__":
         else [f"cuda:{idx}" for idx in gpus.split("-")]
     )
 
-    with mp.Manager() as manager, tqdm.tqdm(
-        total=2 * len(files), desc=f"Extracting F0 ({f0_method})", unit="file",
-        dynamic_ncols=True,
-    ) as progress:
-        updates = manager.Queue()
-        run_pitch_extraction(
-            files, devices, f0_method, num_processes, progress, updates,
-            force=force_pitch_extraction,
-            rectified=rectified,
-        )
+    from rvc.jax.extract import jax_extraction_available, run_jax_extraction
+
+    use_jax = jax_extraction_available() and (devices == ["cpu"] or os.environ.get("REDPANDA_EXTRACT_BACKEND", "").lower() == "jax")
+    if use_jax and f0_method == "rmvpe":
+        with tqdm.tqdm(
+            total=2 * len(files),
+            desc=f"Extracting F0 ({f0_method}) + Features ({embedder_model}) [JAX TPU]",
+            unit="step",
+            dynamic_ncols=True,
+        ) as progress:
+            run_jax_extraction(
+                files,
+                extract_f0=True,
+                f0_force=force_pitch_extraction,
+                rectified=rectified,
+                extract_features=True,
+                embedder_model=embedder_model,
+                version=version,
+                accelerator="auto",
+                progress=progress,
+            )
         data["f0_method"] = f0_method
         data["f0_model"] = f0_model
         with open(file_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4)
+    elif use_jax and f0_method != "swift":
+        with mp.Manager() as manager, tqdm.tqdm(
+            total=2 * len(files), desc=f"Extracting F0 ({f0_method})", unit="file",
+            dynamic_ncols=True,
+        ) as progress:
+            updates = manager.Queue()
+            run_pitch_extraction(
+                files, devices, f0_method, num_processes, progress, updates,
+                force=force_pitch_extraction,
+                rectified=rectified,
+            )
+        data["f0_method"] = f0_method
+        data["f0_model"] = f0_model
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4)
+        with tqdm.tqdm(
+            total=2 * len(files),
+            initial=len(files),
+            desc=f"Extracting features ({embedder_model}) [JAX TPU]",
+            unit="file",
+            dynamic_ncols=True,
+        ) as progress:
+            run_jax_extraction(
+                files,
+                extract_f0=False,
+                extract_features=True,
+                embedder_model=embedder_model,
+                version=version,
+                accelerator="auto",
+                progress=progress,
+            )
+    else:
+        with mp.Manager() as manager, tqdm.tqdm(
+            total=2 * len(files), desc=f"Extracting F0 ({f0_method})", unit="file",
+            dynamic_ncols=True,
+        ) as progress:
+            updates = manager.Queue()
+            run_pitch_extraction(
+                files, devices, f0_method, num_processes, progress, updates,
+                force=force_pitch_extraction,
+                rectified=rectified,
+            )
+            data["f0_method"] = f0_method
+            data["f0_model"] = f0_model
+            with open(file_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4)
 
-        run_embedding_extraction(
-            files, devices, embedder_model, version, num_processes, progress, updates
-        )
+            run_embedding_extraction(
+                files, devices, embedder_model, version, num_processes, progress, updates
+            )
 
     if rectified:
         generate_filelist(exp_dir, sample_rate, 0)

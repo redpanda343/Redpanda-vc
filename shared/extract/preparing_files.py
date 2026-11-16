@@ -25,7 +25,9 @@ def generate_config(sample_rate: int, model_path: str, version: str = "v2"):
             model_config.get("text_enc_hidden_dim", expected_feature_dim)
         )
         if current_feature_dim != expected_feature_dim:
-            if glob.glob(os.path.join(model_path, "G_*.pth")):
+            if glob.glob(os.path.join(model_path, "G_*.pth")) or glob.glob(
+                os.path.join(model_path, "G_*.npz")
+            ):
                 raise RuntimeError(
                     "The experiment already has generator checkpoints for a different "
                     "RVC version. Use a new model name before changing versions."
