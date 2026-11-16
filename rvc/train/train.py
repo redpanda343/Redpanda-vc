@@ -605,6 +605,7 @@ def run_tpu(index, args, config):
         print(f"TPU backend: {tpu.mode_description()} ({device})", flush=True)
     torch.manual_seed(config.train.seed + rank)
     tpu.manual_seed(config.train.seed + rank)
+    tpu.disable_child_autoload()
     Trainer(rank, world_size, args, config, device).fit()
 
 
@@ -833,6 +834,8 @@ class Trainer:
             )
             sys.exit(1)
         if not self.cache_in_gpu:
+            if self.tpu:
+                tpu.disable_child_autoload()
             self.loader = DataLoader(
                 self.dataset,
                 num_workers=self.workers,

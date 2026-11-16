@@ -39,6 +39,9 @@ def backend():
 def configure_env(cache_dir=None):
     """Configure TorchTPU or PyTorch/XLA env vars before importing torch."""
     active = backend()
+    if os.environ.get("RVC_TPU_DISABLE_AUTOLOAD") == "1":
+        os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
+        return active
     if active == "torch_tpu":
         # Override legacy TORCH_DEVICE_BACKEND_AUTOLOAD=0 so preinstalled torch-tpu
         # registers the native "tpu" PrivateUse1 backend when torch loads.
@@ -55,6 +58,12 @@ def configure_env(cache_dir=None):
     else:
         os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
     return active
+
+
+def disable_child_autoload():
+    """Prevent CPU child processes (e.g. DataLoader workers) from loading TPU/PJRT."""
+    os.environ["RVC_TPU_DISABLE_AUTOLOAD"] = "1"
+    os.environ["TORCH_DEVICE_BACKEND_AUTOLOAD"] = "0"
 
 
 configure_env()
