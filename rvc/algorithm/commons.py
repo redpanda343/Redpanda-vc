@@ -304,6 +304,22 @@ def activation_checkpoint(
     return out
 
 
+def post_conv_tanh(conv: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """Run final conv under active autocast, then compute tanh in FP32 when weights are FP32."""
+    y = conv(x)
+    weight_dtype = next((p.dtype for p in conv.parameters()), y.dtype)
+    if weight_dtype != torch.float32:
+        return torch.tanh(y)
+    with torch.amp.autocast(device_type=y.device.type, enabled=False):
+        return torch.tanh(y.float())
+
+
+def call_vocoder_utility_fp32(module: torch.nn.Module, x: torch.Tensor, target_dtype: torch.dtype) -> torch.Tensor:
+    """Execute vocoder excitation utility layers in FP32 unless model weights were explicitly cast."""
+    with torch.amp.autocast(device_type=x.device.type, enabled=False):
+        return module(x.to(dtype=target_dtype))
+
+
 def grad_norm(parameters, norm_type: float = 2.0):
     """
     Calculates norm of parameter gradients

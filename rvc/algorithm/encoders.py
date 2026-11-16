@@ -132,15 +132,15 @@ class TextEncoder(torch.nn.Module):
         lengths: torch.Tensor,
         skip_head: Optional[int] = None,
     ):
-        x = self.emb_phone(phone)
+        x = self.emb_phone(phone).float()
         if pitch is not None and self.emb_pitch:
-            x += self.emb_pitch(pitch)
+            x = x + self.emb_pitch(pitch).float()
 
         x *= math.sqrt(self.hidden_channels)
         x = self.lrelu(x)
         x = x.transpose(1, -1)  # [B, H, T]
 
-        x_mask = sequence_mask(lengths, x.size(2)).unsqueeze(1).to(x.dtype)
+        x_mask = sequence_mask(lengths, x.size(2)).unsqueeze(1).to(dtype=torch.float32)
         x = self.encoder(x, x_mask)
         if skip_head is not None:
             x = x[:, :, skip_head:]
@@ -190,7 +190,7 @@ class PosteriorEncoder(torch.nn.Module):
     def forward(
         self, x: torch.Tensor, x_lengths: torch.Tensor, g: Optional[torch.Tensor] = None
     ):
-        x_mask = sequence_mask(x_lengths, x.size(2)).unsqueeze(1).to(x.dtype)
+        x_mask = sequence_mask(x_lengths, x.size(2)).unsqueeze(1).to(dtype=torch.float32)
 
         x = self.pre(x) * x_mask
         x = self.enc(x, x_mask, g=g)

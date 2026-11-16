@@ -1574,29 +1574,31 @@ class Trainer:
 
     def summarize_mels(self, spec, ids_slice, y_hat):
         config = self.config
-        mel = spec_to_mel_torch(
-            spec,
-            config.data.filter_length,
-            config.data.n_mel_channels,
-            config.data.sample_rate,
-            config.data.mel_fmin,
-            config.data.mel_fmax,
-        )
-        y_mel = (
-            commons.slice_segments(mel, ids_slice, self.segment_frames, dim=3)
-            if randomized
-            else mel
-        )
-        y_hat_mel = mel_spectrogram_torch(
-            y_hat.float().squeeze(1),
-            config.data.filter_length,
-            config.data.n_mel_channels,
-            config.data.sample_rate,
-            config.data.hop_length,
-            config.data.win_length,
-            config.data.mel_fmin,
-            config.data.mel_fmax,
-        )
+        with torch.amp.autocast(device_type=spec.device.type, enabled=False):
+            spec = spec.float()
+            mel = spec_to_mel_torch(
+                spec,
+                config.data.filter_length,
+                config.data.n_mel_channels,
+                config.data.sample_rate,
+                config.data.mel_fmin,
+                config.data.mel_fmax,
+            )
+            y_mel = (
+                commons.slice_segments(mel, ids_slice, self.segment_frames, dim=3)
+                if randomized
+                else mel
+            )
+            y_hat_mel = mel_spectrogram_torch(
+                y_hat.float().squeeze(1),
+                config.data.filter_length,
+                config.data.n_mel_channels,
+                config.data.sample_rate,
+                config.data.hop_length,
+                config.data.win_length,
+                config.data.mel_fmin,
+                config.data.mel_fmax,
+            )
         summarize(
             writer=self.writer,
             global_step=self.global_step,

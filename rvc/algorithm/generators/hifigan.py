@@ -5,7 +5,7 @@ from torch.nn.utils.parametrizations import weight_norm
 from typing import Optional
 
 from rvc.algorithm.residuals import LRELU_SLOPE, ResBlock
-from rvc.algorithm.commons import init_weights, upsample_nearest_1d
+from rvc.algorithm.commons import init_weights, post_conv_tanh, upsample_nearest_1d
 
 
 class HiFiGANGenerator(torch.nn.Module):
@@ -89,9 +89,7 @@ class HiFiGANGenerator(torch.nn.Module):
             x = xs / self.num_kernels
         # in-place call
         x = torch.nn.functional.leaky_relu(x)
-        x = self.conv_post(x)
-        # in-place call
-        x = torch.tanh(x)
+        x = post_conv_tanh(self.conv_post, x)
 
         return x
 

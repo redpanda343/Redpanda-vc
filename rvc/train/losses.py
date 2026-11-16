@@ -1,4 +1,24 @@
+from contextlib import nullcontext
+
 import torch
+
+
+def _first_tensor(value):
+    if torch.is_tensor(value):
+        return value
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            found = _first_tensor(item)
+            if found is not None:
+                return found
+    return None
+
+
+def _fp32_loss_context(*tensor_groups):
+    tensor = _first_tensor(tensor_groups)
+    if tensor is None:
+        return nullcontext()
+    return torch.amp.autocast(device_type=tensor.device.type, enabled=False)
 
 
 def feature_loss(fmap_r, fmap_g):
@@ -9,11 +29,12 @@ def feature_loss(fmap_r, fmap_g):
         fmap_r (list of torch.Tensor): List of reference feature maps.
         fmap_g (list of torch.Tensor): List of generated feature maps.
     """
-    return 2 * sum(
-        torch.mean(torch.abs(rl.float() - gl.float()), dtype=torch.float32)
-        for dr, dg in zip(fmap_r, fmap_g)
-        for rl, gl in zip(dr, dg)
-    )
+    with _fp32_loss_context(fmap_r, fmap_g):
+        return 2 * sum(
+            torch.mean(torch.abs(rl.float() - gl.float()), dtype=torch.float32)
+            for dr, dg in zip(fmap_r, fmap_g)
+            for rl, gl in zip(dr, dg)
+        )
 
 
 def discriminator_loss(disc_real_outputs, disc_generated_outputs):
@@ -27,13 +48,14 @@ def discriminator_loss(disc_real_outputs, disc_generated_outputs):
     loss = 0
     r_losses = []
     g_losses = []
-    for dr, dg in zip(disc_real_outputs, disc_generated_outputs):
-        r_loss = torch.mean((1 - dr.float()) ** 2)
-        g_loss = torch.mean(dg.float() ** 2)
+    with _fp32_loss_context(disc_real_outputs, disc_generated_outputs):
+        for dr, dg in zip(disc_real_outputs, disc_generated_outputs):
+            r_loss = torch.mean((1 - dr.float()) ** 2)
+            g_loss = torch.mean(dg.float() ** 2)
 
-        # r_losses.append(r_loss.item())
-        # g_losses.append(g_loss.item())
-        loss += r_loss + g_loss
+            # r_losses.append(r_loss.item())
+            # g_losses.append(g_loss.item())
+            loss += r_loss + g_loss
 
     return loss, r_losses, g_losses
 
@@ -47,10 +69,11 @@ def generator_loss(disc_outputs):
     """
     loss = 0
     gen_losses = []
-    for dg in disc_outputs:
-        l = torch.mean((1 - dg.float()) ** 2)
-        # gen_losses.append(l.item())
-        loss += l
+    with _fp32_loss_context(disc_outputs):
+        for dg in disc_outputs:
+            l = torch.mean((1 - dg.float()) ** 2)
+            # gen_losses.append(l.item())
+            loss += l
 
     return loss, gen_losses
 
@@ -66,14 +89,15 @@ def discriminator_loss_scaled(disc_real, disc_fake, scale=1.0):
     """
     midpoint = len(disc_real) // 2
     losses = []
-    for i, (d_real, d_fake) in enumerate(zip(disc_real, disc_fake)):
-        real_loss = (1 - d_real.float()).pow(2).mean()
-        fake_loss = d_fake.float().pow(2).mean()
-        total_loss = real_loss + fake_loss
-        if i >= midpoint:
-            total_loss *= scale
-        losses.append(total_loss)
-    loss = sum(losses)
+    with _fp32_loss_context(disc_real, disc_fake):
+        for i, (d_real, d_fake) in enumerate(zip(disc_real, disc_fake)):
+            real_loss = (1 - d_real.float()).pow(2).mean()
+            fake_loss = d_fake.float().pow(2).mean()
+            total_loss = real_loss + fake_loss
+            if i >= midpoint:
+                total_loss *= scale
+            losses.append(total_loss)
+        loss = sum(losses)
     return loss, None, None
 
 
@@ -87,12 +111,13 @@ def generator_loss_scaled(disc_outputs, scale=1.0):
     """
     midpoint = len(disc_outputs) // 2
     losses = []
-    for i, d_fake in enumerate(disc_outputs):
-        loss_value = (1 - d_fake.float()).pow(2).mean()
-        if i >= midpoint:
-            loss_value *= scale
-        losses.append(loss_value)
-    loss = sum(losses)
+    with _fp32_loss_context(disc_outputs):
+        for i, d_fake in enumerate(disc_outputs):
+            loss_value = (1 - d_fake.float()).pow(2).mean()
+            if i >= midpoint:
+                loss_value *= scale
+            losses.append(loss_value)
+        loss = sum(losses)
     return loss, None, None
 
 
@@ -107,10 +132,11 @@ def kl_loss(z_p, logs_q, m_p, logs_p, z_mask):
         logs_p (torch.Tensor): Log variance of p [b, h, t_t].
         z_mask (torch.Tensor): Mask for the latent variables [b, h, t_t].
     """
-    z_p, logs_q, m_p, logs_p, z_mask = (
-        z_p.float(), logs_q.float(), m_p.float(), logs_p.float(), z_mask.float()
-    )
-    kl = logs_p - logs_q - 0.5 + 0.5 * ((z_p - m_p) ** 2) * torch.exp(-2 * logs_p)
-    kl = (kl * z_mask).sum()
-    loss = kl / z_mask.sum()
-    return loss
+    with _fp32_loss_context(z_p, logs_q, m_p, logs_p, z_mask):
+        z_p, logs_q, m_p, logs_p, z_mask = (
+            z_p.float(), logs_q.float(), m_p.float(), logs_p.float(), z_mask.float()
+        )
+        kl = logs_p - logs_q - 0.5 + 0.5 * ((z_p - m_p) ** 2) * torch.exp(-2 * logs_p)
+        kl = (kl * z_mask).sum()
+        loss = kl / z_mask.sum()
+        return loss

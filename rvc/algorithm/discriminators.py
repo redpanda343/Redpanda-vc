@@ -241,26 +241,26 @@ class DiscriminatorR(torch.nn.Module):
     def spectrogram(self, x):
         n_fft, hop_length, win_length = self.resolution
         pad = int((n_fft - hop_length) / 2)
-        x = F.pad(
-            x,
-            (pad, pad),
-            mode="reflect",
-        ).squeeze(1)
-        window = torch.ones(win_length, device=x.device)
-        if x.device.type in ("xla", "tpu"):
-            with torch.amp.autocast(device_type=x.device.type, enabled=False):
-                real, imag = stft_real_imag(x.float(), n_fft, hop_length, window, center=False)
+        with torch.amp.autocast(device_type=x.device.type, enabled=False):
+            x = F.pad(
+                x.float(),
+                (pad, pad),
+                mode="reflect",
+            ).squeeze(1)
+            window = torch.ones(win_length, device=x.device, dtype=torch.float32)
+            if x.device.type in ("xla", "tpu"):
+                real, imag = stft_real_imag(x, n_fft, hop_length, window, center=False)
                 return torch.sqrt(real.pow(2) + imag.pow(2) + 1e-9)
-        x = torch.stft(
-            x,
-            n_fft=n_fft,
-            hop_length=hop_length,
-            win_length=win_length,
-            window=window,
-            center=False,
-            return_complex=True,
-        )
+            x = torch.stft(
+                x,
+                n_fft=n_fft,
+                hop_length=hop_length,
+                win_length=win_length,
+                window=window,
+                center=False,
+                return_complex=True,
+            )
 
-        mag = torch.norm(torch.view_as_real(x), p=2, dim=-1)  # [B, F, TT]
+            mag = torch.norm(torch.view_as_real(x), p=2, dim=-1)  # [B, F, TT]
 
-        return mag
+            return mag

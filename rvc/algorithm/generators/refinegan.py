@@ -9,9 +9,11 @@ from torch.nn.utils import remove_weight_norm
 from rvc.algorithm.commons import (
     UpsampleLinear1d,
     activation_checkpoint,
+    call_vocoder_utility_fp32,
     get_padding,
     init_weights,
     leaky_relu,
+    post_conv_tanh,
     upsample_linear_1d,
 )
 
@@ -290,7 +292,7 @@ class SineGenerator(nn.Module):
             sine_waves = sine_waves * uv + noise
 
         # merge with grad
-        return self.merge(sine_waves.to(dtype=self.merge[0].weight.dtype))
+        return call_vocoder_utility_fp32(self.merge, sine_waves, self.merge[0].weight.dtype)
 
 
 class RefineGANGenerator(nn.Module):
@@ -415,7 +417,8 @@ class RefineGANGenerator(nn.Module):
     def forward(self, mel: torch.Tensor, f0: torch.Tensor, g: torch.Tensor = None):
         f0_size = mel.shape[-1]
         # change f0 helper to full size
-        f0 = upsample_linear_1d(f0.unsqueeze(1), size=f0_size * self.upp)
+        with torch.amp.autocast(device_type=f0.device.type, enabled=False):
+            f0 = upsample_linear_1d(f0.unsqueeze(1).float(), size=f0_size * self.upp)
         # get f0 turned into sines harmonics
         har_source = self.m_source(f0.transpose(1, 2)).transpose(1, 2)
         # prepare for fusion to mel
@@ -465,8 +468,7 @@ class RefineGANGenerator(nn.Module):
                 x = res(x)
 
         x = F.leaky_relu(x, self.leaky_relu_slope, inplace=True)
-        x = self.conv_post(x)
-        x = torch.tanh(x)
+        x = post_conv_tanh(self.conv_post, x)
 
         return x
 

@@ -5,7 +5,12 @@ import torch
 from torch.nn.utils import remove_weight_norm
 from torch.nn.utils.parametrizations import weight_norm
 
-from rvc.algorithm.commons import activation_checkpoint, init_weights
+from rvc.algorithm.commons import (
+    activation_checkpoint,
+    call_vocoder_utility_fp32,
+    init_weights,
+    post_conv_tanh,
+)
 from rvc.algorithm.generators.hifigan import SineGenerator
 from rvc.algorithm.residuals import LRELU_SLOPE, ResBlock
 
@@ -46,8 +51,9 @@ class SourceModuleHnNSF(torch.nn.Module):
 
     def forward(self, x: torch.Tensor, upsample_factor: int = 1):
         sine_wavs, uv, _ = self.l_sin_gen(x, upsample_factor)
-        sine_wavs = sine_wavs.to(dtype=self.l_linear.weight.dtype)
-        sine_merge = self.l_tanh(self.l_linear(sine_wavs))
+        sine_merge = self.l_tanh(
+            call_vocoder_utility_fp32(self.l_linear, sine_wavs, self.l_linear.weight.dtype)
+        )
         return sine_merge, None, None
 
 
@@ -193,7 +199,7 @@ class HiFiGANNSFGenerator(torch.nn.Module):
             x = xs / self.num_kernels
 
         x = torch.nn.functional.leaky_relu(x, inplace=True)
-        x = torch.tanh(self.conv_post(x))
+        x = post_conv_tanh(self.conv_post, x)
 
         return x
 

@@ -6,7 +6,13 @@ import torch
 from torch.nn.utils import remove_weight_norm
 from torch.nn.utils.parametrizations import weight_norm
 
-from rvc.algorithm.commons import activation_checkpoint, leaky_relu, upsample_nearest_1d
+from rvc.algorithm.commons import (
+    activation_checkpoint,
+    call_vocoder_utility_fp32,
+    leaky_relu,
+    post_conv_tanh,
+    upsample_nearest_1d,
+)
 
 LRELU_SLOPE = 0.1
 
@@ -218,8 +224,9 @@ class SourceModuleHnNSF(torch.nn.Module):
 
     def forward(self, x: torch.Tensor):
         sine_wavs, uv, _ = self.l_sin_gen(x)
-        sine_wavs = sine_wavs.to(dtype=self.l_linear.weight.dtype)
-        sine_merge = self.l_tanh(self.l_linear(sine_wavs))
+        sine_merge = self.l_tanh(
+            call_vocoder_utility_fp32(self.l_linear, sine_wavs, self.l_linear.weight.dtype)
+        )
 
         return sine_merge, None, None
 
@@ -343,11 +350,13 @@ class HiFiGANMRFGenerator(torch.nn.Module):
     def forward(
         self, x: torch.Tensor, f0: torch.Tensor, g: Optional[torch.Tensor] = None
     ):
-        f0 = (
-            upsample_nearest_1d(f0[:, None, :], int(self.f0_upsample.scale_factor))
-            if f0.device.type in ("xla", "tpu")
-            else self.f0_upsample(f0[:, None, :])
-        ).transpose(-1, -2)
+        with torch.amp.autocast(device_type=f0.device.type, enabled=False):
+            f0_fp32 = f0.float()[:, None, :]
+            f0 = (
+                upsample_nearest_1d(f0_fp32, int(self.f0_upsample.scale_factor))
+                if f0_fp32.device.type in ("xla", "tpu")
+                else self.f0_upsample(f0_fp32)
+            ).transpose(-1, -2)
         har_source, _, _ = self.m_source(f0)
         har_source = har_source.transpose(-1, -2)
         x = self.conv_pre(x)
@@ -368,7 +377,7 @@ class HiFiGANMRFGenerator(torch.nn.Module):
             x = xs / self.num_kernels
 
         x = torch.nn.functional.leaky_relu(x, inplace=True)
-        x = torch.tanh(self.conv_post(x))
+        x = post_conv_tanh(self.conv_post, x)
 
         return x
 
