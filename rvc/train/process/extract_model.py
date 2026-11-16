@@ -92,11 +92,13 @@ def extract_model(
         )
         feature_fingerprint = feature_metadata.get("feature_fingerprint")
 
-        with open(
-            os.path.join(now_dir, "assets", "config.json"), "r", encoding="utf-8"
-        ) as f:
-            data = json.load(f)
-            model_author = data.get("model_author", None)
+        model_author = None
+        for cfg_name in ("config.json", "config_template.json"):
+            cfg_path = os.path.join(now_dir, "assets", cfg_name)
+            if os.path.isfile(cfg_path):
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    model_author = json.load(f).get("model_author", None)
+                break
 
         if export_dtype not in (torch.float16, torch.float32):
             raise ValueError("Inference checkpoints must use float16 or float32.")

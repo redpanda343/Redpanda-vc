@@ -12,7 +12,9 @@
 *.wav
 *.txt
 !requirements.txt
+!requirements-jax.txt
 *.zip
+*.npz
 *.png
 !assets/applio_mascot.png
 *.safetensors
@@ -25,6 +27,7 @@ assets/datasets
 assets/config.json
 assets/realtime_config.json
 assets/sha256_cache.json
+assets/xla_cache/
 
 logs/*
 !logs/.gitkeep

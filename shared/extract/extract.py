@@ -343,7 +343,9 @@ if __name__ == "__main__":
         if unreadable:
             print(f"Removed {unreadable} unreadable feature file(s); they are extracted again.")
     if feature_contract_changed:
-        generator_checkpoints = glob.glob(os.path.join(exp_dir, "G_*.pth"))
+        generator_checkpoints = glob.glob(os.path.join(exp_dir, "G_*.pth")) + glob.glob(
+            os.path.join(exp_dir, "G_*.npz")
+        )
         if generator_checkpoints:
             raise RuntimeError(
                 "This experiment already has resumable generator checkpoints for a "
@@ -387,7 +389,11 @@ if __name__ == "__main__":
         )
         sys.exit(1)
 
-    devices = ["cpu"] if gpus == "-" else [f"cuda:{idx}" for idx in gpus.split("-")]
+    devices = (
+        ["cpu"]
+        if (gpus == "-" or not torch.cuda.is_available())
+        else [f"cuda:{idx}" for idx in gpus.split("-")]
+    )
 
     with mp.Manager() as manager, tqdm.tqdm(
         total=2 * len(files), desc=f"Extracting F0 ({f0_method})", unit="file",

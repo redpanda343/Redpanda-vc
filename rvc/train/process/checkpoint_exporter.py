@@ -8,20 +8,22 @@ from rvc.train.process.extract_model import extract_model
 from rvc.train.utils import HParams
 
 
-def _detect_vocoder(state_dict):
-    keys = state_dict.keys()
+def _detect_vocoder(keys):
     if any(
-        key.startswith(("dec.upsample_blocks.", "dec.downsample_blocks."))
+        key.startswith(("dec.upsample_blocks.", "dec.downsample_blocks.", "dec/upsample_conv_blocks/", "dec/downsample_blocks/"))
         for key in keys
     ):
         return "RefineGAN"
-    if any(key.startswith(("dec.upsamples.", "dec.mrfs.")) for key in keys):
+    if any(
+        key.startswith(("dec.upsamples.", "dec.mrfs.", "dec/upsamples/", "dec/mrfs/"))
+        for key in keys
+    ):
         return "MRF HiFi-GAN"
     return "HiFi-GAN"
 
 
 def _checkpoint_step(checkpoint_path):
-    match = re.fullmatch(r"G_(\d+)\.pth", os.path.basename(checkpoint_path))
+    match = re.fullmatch(r"G_(\d+)\.(?:pth|npz)", os.path.basename(checkpoint_path))
     if not match:
         return 0
     step = int(match.group(1))
@@ -39,6 +41,60 @@ def _output_filename(output_name, automatic_name):
     if not filename:
         raise ValueError("Enter a valid output file name.")
     return f"{filename}.pth"
+
+
+def _load_checkpoint_for_export(checkpoint_path, hps):
+    if checkpoint_path.lower().endswith(".npz"):
+        import numpy as np
+        from rvc.jax.checkpoint import load_jax_checkpoint, read_jax_checkpoint_meta
+        from rvc.jax.synthesizers import (
+            init_synthesizer_params,
+            synthesizer_config_from_hparams,
+            synthesizer_to_torch_state,
+        )
+
+        meta = read_jax_checkpoint_meta(checkpoint_path)
+        extra = meta.get("extra") or {}
+        if "spk_embed_dim" not in meta:
+            raise ValueError("The selected JAX generator checkpoint has no speaker embedding weights.")
+        hps.model.spk_embed_dim = int(meta["spk_embed_dim"])
+        vocoder = extra.get("vocoder") or _detect_vocoder(meta.get("model_keys", ()))
+        use_f0 = any(k.startswith("enc_p/emb_pitch/") for k in meta.get("model_keys", ()))
+        cfg = synthesizer_config_from_hparams(hps, vocoder=vocoder, use_f0=use_f0)
+        template = init_synthesizer_params(np.random.default_rng(0), cfg)
+        params, _, _, epoch, extra, ema_params = load_jax_checkpoint(
+            checkpoint_path, template, load_opt=False
+        )
+        use_ema = ema_params is not None
+        chosen = ema_params if use_ema else params
+        np_state = synthesizer_to_torch_state(
+            chosen, cfg, remove_weight_norm=False, inference_only=True
+        )
+        state_dict = {
+            k: torch.from_numpy(np.array(v, dtype=np.float32, copy=True))
+            for k, v in np_state.items()
+        }
+        step = int(extra.get("step", 0)) or _checkpoint_step(checkpoint_path)
+        return state_dict, epoch, step, vocoder, use_ema
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    if not isinstance(checkpoint, dict):
+        raise ValueError("The selected file is not a resumable generator checkpoint.")
+    state_dict = checkpoint.get("model")
+    if not isinstance(state_dict, dict):
+        raise ValueError("The selected file is not a resumable generator checkpoint.")
+    if "emb_g.weight" not in state_dict:
+        raise ValueError("The selected generator has no speaker embedding weights.")
+
+    hps.model.spk_embed_dim = state_dict["emb_g.weight"].shape[0]
+    epoch = int(checkpoint.get("iteration", 0))
+    step = _checkpoint_step(checkpoint_path)
+    vocoder = _detect_vocoder(state_dict.keys())
+    ema = checkpoint.get("ema")
+    use_ema = isinstance(ema, dict) and isinstance(ema.get("weights"), dict)
+    if use_ema:
+        state_dict = ema["weights"]
+    return state_dict, epoch, step, vocoder, use_ema
 
 
 def export_generator_checkpoint(checkpoint_path, precision, output_name=None):
@@ -63,30 +119,14 @@ def export_generator_checkpoint(checkpoint_path, precision, output_name=None):
     with open(config_path, "r", encoding="utf-8") as config_file:
         hps = HParams(**json.load(config_file))
 
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    if not isinstance(checkpoint, dict):
-        raise ValueError("The selected file is not a resumable generator checkpoint.")
-    state_dict = checkpoint.get("model")
-    if not isinstance(state_dict, dict):
-        raise ValueError("The selected file is not a resumable generator checkpoint.")
-    if "emb_g.weight" not in state_dict:
-        raise ValueError("The selected generator has no speaker embedding weights.")
-
-    hps.model.spk_embed_dim = state_dict["emb_g.weight"].shape[0]
-    epoch = int(checkpoint.get("iteration", 0))
-    step = _checkpoint_step(checkpoint_path)
+    state_dict, epoch, step, vocoder, use_ema = _load_checkpoint_for_export(checkpoint_path, hps)
     model_name = os.path.basename(model_dir)
-    vocoder = _detect_vocoder(state_dict)
     feature_dim = int(getattr(hps.model, "text_enc_hidden_dim", 768))
     if feature_dim == 256:
         version = "v1"
     else:
         version = "v3" if vocoder == "RefineGAN" else "v2"
     export_dtype = torch.float16 if precision == "fp16" else torch.float32
-    ema = checkpoint.get("ema")
-    use_ema = isinstance(ema, dict) and isinstance(ema.get("weights"), dict)
-    if use_ema:
-        state_dict = ema["weights"]
 
     checkpoint_label = f"{epoch}e"
     if step:

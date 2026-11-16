@@ -1,224 +1,106 @@
+"""Native JAX/XLA trainer for RVC models (TPU, GPU, CPU) with PyTorch .pth inference export."""
+
+from __future__ import annotations
+
 import os
 import sys
 
-os.environ["USE_LIBUV"] = "0" if sys.platform == "win32" else "1"
+# Pre-parse accelerator and GPU selection before importing JAX so XLA sees CUDA_VISIBLE_DEVICES.
+def _preparse_device_env(argv: list[str] | None) -> None:
+    raw = list(sys.argv[1:] if argv is None else argv)
+    acc = "auto"
+    gpus = None
+    for i, tok in enumerate(raw):
+        if tok == "--accelerator" and i + 1 < len(raw):
+            acc = raw[i + 1].lower()
+        elif tok.startswith("--accelerator="):
+            acc = tok.split("=", 1)[1].lower()
+        elif tok == "--gpus" and i + 1 < len(raw):
+            gpus = raw[i + 1]
+        elif tok.startswith("--gpus="):
+            gpus = tok.split("=", 1)[1]
+    if acc == "cpu":
+        os.environ.setdefault("JAX_PLATFORMS", "cpu")
+    elif acc in ("auto", "gpu") and gpus and gpus != "-" and all(p.isdigit() for p in gpus.split("-")):
+        os.environ.setdefault("CUDA_VISIBLE_DEVICES", gpus.replace("-", ","))
+
+
+_preparse_device_env(None)
+
 import argparse
-import faulthandler
 import glob
 import json
-import logging
 import math
-from concurrent.futures import Future, ThreadPoolExecutor
-from random import randint
+from functools import partial
 
-import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+from jax import lax
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from tqdm import tqdm
 
 now_dir = os.getcwd()
-sys.path.append(os.path.join(now_dir))
+if now_dir not in sys.path:
+    sys.path.append(now_dir)
 
-from rvc.train.losses import discriminator_loss, feature_loss, generator_loss, kl_loss
-from rvc.train.mel_processing import (
-    MultiScaleMelSpectrogramLoss,
-    mel_spectrogram_torch,
-    spec_to_mel_torch,
+from rvc.jax import JAX_BUCKET_BOUNDARIES, PrecisionConfig, resolve_jax_devices, supports_bfloat16
+from rvc.jax.checkpoint import (
+    LATEST_CHECKPOINT_SUFFIX,
+    AsyncJaxInferenceExporter,
+    latest_checkpoint_pair,
+    load_jax_checkpoint,
+    load_pretrained_torch_d,
+    load_pretrained_torch_g,
+    read_jax_checkpoint_meta,
+    save_jax_checkpoint,
 )
-from rvc.train.utils import (
-    HParams,
-    load_checkpoint,
-    load_wav_to_torch,
-    plot_spectrogram_to_numpy,
-    save_checkpoint,
-    summarize,
+from rvc.jax.data import BucketBatchSampler, PrefetchBatchLoader, TextAudioDataset
+from rvc.jax.discriminators import (
+    MultiPeriodDiscriminatorConfig,
+    init_mpd_params,
+    mpd_forward,
 )
-
-# Zluda hijack
-import shared.zluda
-from rvc.algorithm import commons
-from rvc.train.process.extract_model import extract_model
+from rvc.jax.losses import discriminator_loss, feature_loss, generator_loss, kl_loss
+from rvc.jax.mel import (
+    MultiScaleMelLossConfig,
+    mel_spectrogram_jax,
+    multi_scale_mel_loss,
+    spec_to_mel_jax,
+)
+from rvc.jax.ops import slice_segments
+from rvc.jax.synthesizers import (
+    init_synthesizer_params,
+    synthesizer_config_from_hparams,
+    synthesizer_forward,
+)
+from rvc.train.utils import HParams, load_wav_to_torch, plot_spectrogram_to_numpy, summarize
 
 VOCODERS = ("HiFi-GAN", "MRF HiFi-GAN", "RefineGAN")
 LR_SCHEDULES = ("exponential", "cosine")
-BUCKET_BOUNDARIES = (100, 200, 300, 400, 500, 600, 700, 800, 900)
-LATEST_CHECKPOINT_SUFFIX = 2333333
+BUCKET_BOUNDARIES = JAX_BUCKET_BOUNDARIES
+LEGACY_BUCKET_BOUNDARIES = (100, 200, 300, 400, 500, 600, 700, 800, 900)
 
-# experimental settings
+# Experimental settings matching main
 randomized = True
 d_lr_coeff = 1.0
 g_lr_coeff = 1.0
 d_step_per_g_step = 1
-bf16_adamw = False
-
-torch.backends.cudnn.deterministic = False
-torch.backends.cudnn.benchmark = os.name == "nt"
-try:
-    torch.backends.cuda.matmul.fp32_precision = "ieee"
-    torch.backends.cudnn.fp32_precision = "ieee"
-except Exception as e:
-    print(f'Torch tf32: {e}')
-
-logging.getLogger("torch").setLevel(logging.ERROR)
 
 
-class AsyncInferenceExporter:
-    def __init__(self, device):
-        self.device = device
-        self.executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="inference-export"
-        )
-        self.export_future = None
-        self.staging_future = None
-        self.copy_stream = (
-            torch.cuda.Stream(device=device) if device.type == "cuda" else None
-        )
-
-    @staticmethod
-    def _export_staged(snapshot, copy_event, staging_future, export_args):
-        if copy_event is not None:
-            try:
-                copy_event.synchronize()
-            except Exception as error:
-                staging_future.set_exception(error)
-                raise
-            staging_future.set_result(None)
-        return extract_model(ckpt=snapshot, **export_args)
-
-    def _stage_cuda(self, state_dict, export_dtype):
-        snapshot = {}
-        current_stream = torch.cuda.current_stream(self.device)
-        try:
-            with torch.cuda.stream(self.copy_stream):
-                self.copy_stream.wait_stream(current_stream)
-                for key, value in state_dict.items():
-                    if "enc_q" in key:
-                        continue
-                    value = value.detach()
-                    dtype = export_dtype if value.is_floating_point() else value.dtype
-                    staged = torch.empty_like(
-                        value, device="cpu", dtype=dtype, pin_memory=True
-                    )
-                    staged.copy_(value, non_blocking=True)
-                    snapshot[key] = staged
-                copy_event = torch.cuda.Event()
-                copy_event.record(self.copy_stream)
-        except Exception:
-            self.copy_stream.synchronize()
-            raise
-        return snapshot, copy_event
-
-    @staticmethod
-    def _stage_synchronous(state_dict, export_dtype):
-        return {
-            key: value.detach().to(
-                device="cpu",
-                dtype=export_dtype if value.is_floating_point() else value.dtype,
-                copy=True,
-            )
-            for key, value in state_dict.items()
-            if "enc_q" not in key
-        }
-
-    def submit(self, state_dict, export_dtype, **export_args):
-        self.wait_for_completion()
-        if self.device.type == "cuda":
-            snapshot, copy_event = self._stage_cuda(state_dict, export_dtype)
-            staging_future = Future()
-        else:
-            snapshot = self._stage_synchronous(state_dict, export_dtype)
-            copy_event = None
-            staging_future = Future()
-            staging_future.set_result(None)
-        self.staging_future = staging_future
-        try:
-            self.export_future = self.executor.submit(
-                self._export_staged,
-                snapshot,
-                copy_event,
-                staging_future,
-                dict(export_args, export_dtype=export_dtype),
-            )
-        except Exception:
-            if copy_event is not None:
-                copy_event.synchronize()
-            self.staging_future = None
-            raise
-
-    def wait_for_staging(self):
-        if self.staging_future is not None:
-            self.staging_future.result()
-        self.raise_if_failed()
-
-    def raise_if_failed(self):
-        if self.export_future is not None and self.export_future.done():
-            self.wait_for_completion()
-
-    def wait_for_completion(self):
-        export_future = self.export_future
-        if export_future is None:
-            return
-        try:
-            export_future.result()
-        finally:
-            self.export_future = None
-            self.staging_future = None
-
-    def close(self):
-        if self.executor is None:
-            return
-        try:
-            self.wait_for_completion()
-        finally:
-            self.executor.shutdown(wait=True, cancel_futures=False)
-            self.executor = None
+def _init_xla_cache() -> None:
+    cache_dir = os.path.join(now_dir, "assets", "xla_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    try:
+        jax.config.update("jax_compilation_cache_dir", cache_dir)
+        jax.config.update("jax_persistent_cache_min_compile_time_secs", 1.0)
+    except Exception:
+        pass
 
 
-class GeneratorEMA:
-    def __init__(self, model, decay):
-        self.decay = decay
-        self.updates = 0
-        live = {
-            key: value
-            for key, value in model.state_dict().items()
-            if "enc_q" not in key
-        }
-        self.weights = {key: value.clone() for key, value in live.items()}
-        float_keys = [key for key, value in live.items() if value.is_floating_point()]
-        self.live_floats = [live[key] for key in float_keys]
-        self.ema_floats = [self.weights[key] for key in float_keys]
-        self.copied = [
-            (self.weights[key], value)
-            for key, value in live.items()
-            if not value.is_floating_point()
-        ]
-
-    @torch.no_grad()
-    def update(self):
-        self.updates += 1
-        beta = self.decay
-        decay = beta * (1 - beta ** (self.updates - 1)) / (1 - beta**self.updates)
-        torch._foreach_lerp_(self.ema_floats, self.live_floats, 1 - decay)
-        for target, value in self.copied:
-            target.copy_(value)
-
-    def state_dict(self):
-        return {"updates": self.updates, "weights": self.weights}
-
-    @torch.no_grad()
-    def load_state_dict(self, state):
-        weights = state["weights"]
-        if weights.keys() != self.weights.keys():
-            raise ValueError("the saved EMA weights do not match the generator")
-        for key, value in weights.items():
-            self.weights[key].copy_(value)
-        self.updates = int(state["updates"])
-
-
-def parse_arguments(argv=None):
-    parser = argparse.ArgumentParser(description="Train an RVC voice model.")
+def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Train an RVC voice model with JAX/XLA.")
     parser.add_argument("--model-name", required=True)
     parser.add_argument("--sample-rate", type=int, required=True)
     parser.add_argument("--total-steps", type=int, required=True)
@@ -230,6 +112,9 @@ def parse_arguments(argv=None):
     )
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--gpus", default="0", help="CUDA device indices joined by -, such as 0-1.")
+    parser.add_argument("--accelerator", choices=("auto", "tpu", "gpu", "cpu"), default="auto")
+    parser.add_argument("--tpu-cores", choices=("all", "1"), default="all")
+    parser.add_argument("--dtype", choices=("auto", "bf16", "fp32"), default="auto")
     parser.add_argument("--pretrained-g", default="")
     parser.add_argument("--pretrained-d", default="")
     parser.add_argument("--vocoder", choices=VOCODERS, default="HiFi-GAN")
@@ -245,45 +130,15 @@ def parse_arguments(argv=None):
     parser.add_argument(
         "--reset-optimizer",
         action="store_true",
-        help="When resuming from G_*.pth and D_*.pth, start the optimizers without their saved moments. The learning rate schedule continues.",
+        help="When resuming, start optimizers without their saved moments.",
     )
     parser.add_argument("--checkpointing", action="store_true")
-    parser.add_argument(
-        "--warmup-steps",
-        type=int,
-        default=0,
-        help="Ramp the learning rate up over this many steps.",
-    )
-    parser.add_argument(
-        "--lr-decay-steps",
-        type=int,
-        default=0,
-        help="Apply lr_decay every this many steps instead of once per epoch (0).",
-    )
-    parser.add_argument(
-        "--lr-schedule",
-        choices=LR_SCHEDULES,
-        default="exponential",
-        help="exponential applies lr_decay every epoch or every --lr-decay-steps; cosine decays to --lr-final-ratio at --total-steps.",
-    )
-    parser.add_argument(
-        "--lr-final-ratio",
-        type=float,
-        default=0.1,
-        help="Fraction of the starting learning rate that the cosine schedule reaches at the last step.",
-    )
-    parser.add_argument(
-        "--max-batch-seconds",
-        type=float,
-        default=0.0,
-        help="Limit clips per batch times the longest clip to this much audio (0 disables it).",
-    )
-    parser.add_argument(
-        "--ema-decay",
-        type=float,
-        default=0.999,
-        help="Export inference models from an EMA of the generator weights with this decay (0 disables it).",
-    )
+    parser.add_argument("--warmup-steps", type=int, default=0)
+    parser.add_argument("--lr-decay-steps", type=int, default=0)
+    parser.add_argument("--lr-schedule", choices=LR_SCHEDULES, default="exponential")
+    parser.add_argument("--lr-final-ratio", type=float, default=0.1)
+    parser.add_argument("--max-batch-seconds", type=float, default=0.0)
+    parser.add_argument("--ema-decay", type=float, default=0.999)
     args = parser.parse_args(argv)
 
     for name in ("total_steps", "save_every_steps", "batch_size"):
@@ -300,51 +155,40 @@ def parse_arguments(argv=None):
         parser.error("RVC v1 training requires HiFi-GAN at 40000 Hz.")
 
     args.experiment_dir = os.path.join(now_dir, "logs", args.model_name)
-    args.train_dtype = configured_train_dtype()
-    args.export_dtype = (
-        torch.float32 if args.train_dtype == torch.float32 else torch.float16
-    )
-    if args.train_dtype == torch.float16:
-        unreliable = fp16_unreliable_gpus(args.gpus)
-        if unreliable:
-            print(
-                f"FP16 training is unreliable on {', '.join(unreliable)}, so this run trains in FP32."
-            )
-            args.train_dtype = torch.float32
     args.disc_version = "v3" if args.vocoder == "RefineGAN" else args.version
     args.multiscale_mel_loss = args.vocoder == "RefineGAN"
     return args
 
 
-def configured_train_dtype():
+def _configured_precision_setting() -> str:
     try:
-        with open(
-            os.path.join(now_dir, "assets", "config.json"), "r", encoding="utf-8"
-        ) as f:
-            precision = json.load(f)["precision"]
+        with open(os.path.join(now_dir, "assets", "config.json"), "r", encoding="utf-8") as f:
+            return str(json.load(f).get("precision", "fp16")).lower()
     except (FileNotFoundError, json.JSONDecodeError, KeyError):
-        return torch.float32
-    if precision == "bf16" and torch.cuda.is_available() and torch.cuda.is_bf16_supported():
-        return torch.bfloat16
-    if precision == "fp16" and torch.cuda.is_available():
-        return torch.float16
-    return torch.float32
+        return "fp16"
 
 
-def fp16_unreliable_gpus(gpus):
-    names = [torch.cuda.get_device_name(int(index)) for index in gpus.split("-")]
-    return [name for name in names if "GTX16" in name.upper().replace(" ", "")]
+def resolve_precision(args: argparse.Namespace, devices: list[jax.Device]) -> tuple[PrecisionConfig, str, str]:
+    """Choose BF16 MXU compute or pure FP32 compute, plus inference export dtype."""
+    bf16_hw = supports_bfloat16(devices)
+    cfg_prec = _configured_precision_setting()
+    if args.dtype == "bf16":
+        return PrecisionConfig.bfloat16(), "BF16", "float16"
+    if args.dtype == "fp32":
+        return PrecisionConfig.float32(), "FP32", "float32"
+    if bf16_hw:
+        return PrecisionConfig.bfloat16(), "BF16", "float32" if cfg_prec == "fp32" else "float16"
+    export_str = "float32" if cfg_prec == "fp32" or devices[0].platform == "cpu" else "float16"
+    return PrecisionConfig.float32(), "FP32", export_str
 
 
-def load_experiment_config(args):
+def load_experiment_config(args: argparse.Namespace) -> HParams:
     config_save_path = os.path.join(args.experiment_dir, "config.json")
     try:
         with open(config_save_path, "r", encoding="utf-8") as f:
             config = HParams(**json.load(f))
     except FileNotFoundError:
-        print(
-            f"Config file not found at {config_save_path}. Did you run preprocessing and feature extraction steps?"
-        )
+        print(f"Config file not found at {config_save_path}. Did you run preprocessing and feature extraction steps?")
         sys.exit(1)
 
     config.data.training_files = os.path.join(args.experiment_dir, "filelist.txt")
@@ -358,41 +202,37 @@ def load_experiment_config(args):
     return config
 
 
-def read_model_info(args):
+def read_model_info(args: argparse.Namespace) -> dict:
     try:
-        with open(
-            os.path.join(args.experiment_dir, "model_info.json"), "r", encoding="utf-8"
-        ) as f:
+        with open(os.path.join(args.experiment_dir, "model_info.json"), "r", encoding="utf-8") as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
 
-def check_dataset_sample_rate(args, config):
+def check_dataset_sample_rate(args: argparse.Namespace, config: HParams) -> None:
     dataset_format = str(read_model_info(args).get("dataset_format", "wav")).lower()
     if dataset_format not in {"wav", "flac"}:
         dataset_format = "wav"
-    wavs = glob.glob(
-        os.path.join(args.experiment_dir, "sliced_audios", f"*.{dataset_format}")
-    )
+    wavs = glob.glob(os.path.join(args.experiment_dir, "sliced_audios", f"*.{dataset_format}"))
     if not wavs:
         print(f"No {dataset_format} file found.")
         return
     _, sr = load_wav_to_torch(wavs[0])
     if sr != config.data.sample_rate:
-        print(
-            f"Error: Pretrained model sample rate ({config.data.sample_rate} Hz) does not match dataset audio sample rate ({sr} Hz)."
-        )
+        print(f"Error: Pretrained model sample rate ({config.data.sample_rate} Hz) does not match dataset audio sample rate ({sr} Hz).")
         sys.exit(1)
 
 
-def remove_previous_attempt(experiment_dir):
+def remove_previous_attempt(experiment_dir: str) -> None:
+    if not os.path.isdir(experiment_dir):
+        return
     for root, dirs, files in os.walk(experiment_dir, topdown=False):
         for name in files:
             file_name, file_extension = os.path.splitext(name)
             if (
-                file_extension in (".0", ".pth")
-                or name.endswith((".spec.pt", ".pth.tmp"))
+                file_extension in (".0", ".pth", ".npz")
+                or name.endswith((".spec.pt", ".pth.tmp", ".tmp.npz"))
                 or (file_name.startswith("added") and file_extension == ".index")
             ):
                 os.remove(os.path.join(root, name))
@@ -406,192 +246,449 @@ def remove_previous_attempt(experiment_dir):
                 os.rmdir(folder_path)
 
 
-def cpu_allreduce_hook(group, bucket):
-    buffer = bucket.buffer()
-    work = dist.all_reduce(buffer.cpu(), group=group, async_op=True)
-    world_size = dist.get_world_size(group)
-
-    def unstage(future):
-        return buffer.copy_(future.value()[0].div_(world_size))
-
-    return work.get_future().then(unstage)
-
-
-def latest_checkpoint_pair(experiment_dir):
-    generators = sorted(
-        glob.glob(os.path.join(experiment_dir, "G_*.pth")),
-        key=os.path.getmtime,
-        reverse=True,
-    )
-    for generator in generators:
-        discriminator = os.path.join(
-            experiment_dir, "D_" + os.path.basename(generator)[2:]
-        )
-        if os.path.isfile(discriminator):
-            return generator, discriminator
-    if generators:
-        return generators[0], None
-    discriminators = glob.glob(os.path.join(experiment_dir, "D_*.pth"))
-    return None, discriminators[0] if discriminators else None
+def _create_summary_writer(log_dir: str, purge_step: int):
+    for mod_name in ("torch.utils.tensorboard", "tensorboardX"):
+        try:
+            mod = __import__(mod_name, fromlist=["SummaryWriter"])
+            return mod.SummaryWriter(log_dir=log_dir, purge_step=purge_step, max_queue=1000)
+        except Exception:
+            continue
+    return None
 
 
-def main():
-    args = parse_arguments()
-    config = load_experiment_config(args)
-    check_dataset_sample_rate(args, config)
-
-    if torch.cuda.is_available():
-        device_type = "cuda"
-        device_ids = [int(item) for item in args.gpus.split("-")]
-    elif torch.backends.mps.is_available():
-        device_type = "mps"
-        device_ids = [0]
-    else:
-        device_type = "cpu"
-        device_ids = [0]
-
-    if args.cleanup:
-        remove_previous_attempt(args.experiment_dir)
-
-    world_size = len(device_ids)
-    if world_size > 1:
-        os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = str(randint(20000, 55555))
-        mp.spawn(
-            run,
-            args=(world_size, args, config, device_type, device_ids),
-            nprocs=world_size,
-            join=True,
-        )
-    else:
-        run(0, 1, args, config, device_type, device_ids)
-
-
-def run(rank, world_size, args, config, device_type, device_ids):
-    faulthandler.enable()
-    device_id = device_ids[rank]
-    if world_size > 1:
-        dist.init_process_group(
-            backend="gloo" if sys.platform == "win32" else "nccl",
-            init_method="env://",
-            world_size=world_size,
-            rank=rank,
-        )
-    try:
-        torch.manual_seed(config.train.seed + rank)
-        if device_type == "cuda":
-            torch.cuda.set_device(device_id)
-            device = torch.device("cuda", device_id)
-        else:
-            device = torch.device(device_type)
-        Trainer(rank, world_size, args, config, device).fit()
-    finally:
-        if world_size > 1:
-            dist.destroy_process_group()
-
-
-class Trainer:
-    def __init__(self, rank, world_size, args, config, device):
-        self.rank = rank
-        self.world_size = world_size
+class JaxTrainer:
+    def __init__(self, args: argparse.Namespace, config: HParams) -> None:
         self.args = args
         self.config = config
-        self.device = device
-        self.segment_frames = config.train.segment_size // config.data.hop_length
-        self.log_interval = int(config.train.log_interval)
-        if self.log_interval < 1:
-            raise ValueError("train.log_interval must be at least 1")
-        self.use_amp = device.type == "cuda" and args.train_dtype in (
-            torch.bfloat16,
-            torch.float16,
-        )
-        self.cache_in_gpu = device.type == "cuda" and args.cache_data_in_gpu
-        self.workers = max(1, min(4, (os.cpu_count() or 1) // world_size))
-        self.pending_rng = None
+        _init_xla_cache()
+
+        self.devices = resolve_jax_devices(args.accelerator, args.tpu_cores)
+        self.num_devices = len(self.devices)
+        self.platform = self.devices[0].platform
+        self.prec, self.precision_label, self.export_dtype_str = resolve_precision(args, self.devices)
+
+        self.mesh = Mesh(np.array(self.devices), ("data",))
+        self.replicated_sharding = NamedSharding(self.mesh, PartitionSpec())
+        self.data_sharding = NamedSharding(self.mesh, PartitionSpec("data"))
+
+        self.segment_frames = int(config.train.segment_size) // int(config.data.hop_length)
+        self.workers = min(8, os.cpu_count() or 1)
+        self.log_interval = 200
         self.global_step = 0
-        self.loss_sums = torch.zeros(6, device=device, dtype=torch.float32)
-        self.batch_count = 0
-        self.cache = None
-        self.loader = None
-        self.last_batch = None
-        self.writer = None
-        self.exporter = None
-        self.ema = None
-        self.lr_schedule = None
-        self.progress = None
-        self.epoch = 0
+        self.epoch = 1
         self.epoch_step = 0
-        self.logged_losses = None
+        self.ema_updates = 0
+        self.lr_schedule: dict | None = None
+        self.logged_losses: tuple[float, float, float] | None = None
+        self.loss_sums = jax.device_put(jnp.zeros((6,), dtype=jnp.float32), self.replicated_sharding)
+        self.batch_count = 0
+        self.last_batch: tuple | None = None
+        self.rng_key = jax.random.PRNGKey(int(getattr(config.train, "seed", 1234)))
 
-    def fit(self):
-        self.build_data()
-        last_g, last_d = latest_checkpoint_pair(self.args.experiment_dir)
-        self.build_models(last_g)
-        epoch, start_batch, extra = self.restore(last_g, last_d)
-        for optimizer in (self.optim_g, self.optim_d):
-            for group in optimizer.param_groups:
-                group.setdefault("initial_lr", group["lr"])
-        if self.args.lr_schedule == "cosine":
-            self.build_lr_schedule(extra.get("lr_schedule"))
-        if self.rank == 0 and self.args.ema_decay > 0:
-            self.build_ema(last_g, extra.get("ema"))
+        self.writer = None
+        self.exporter: AsyncJaxInferenceExporter | None = None
+        self.progress = None
 
-        if self.rank == 0:
-            from torch.utils.tensorboard import SummaryWriter
+    def build_data(self) -> None:
+        data = self.config.data
+        max_frames = int(self.args.max_batch_seconds * data.sample_rate / data.hop_length)
+        self.dataset = TextAudioDataset(data)
+        use_tpu_buckets = self.platform in ("tpu", "gpu")
+        boundaries = list(BUCKET_BOUNDARIES if use_tpu_buckets else LEGACY_BUCKET_BOUNDARIES)
+        # Ensure tiny test clips are also representable if user didn't filter or if dataset has short clips
+        if self.dataset.lengths and min(self.dataset.lengths) <= boundaries[0] and max(self.dataset.lengths) <= boundaries[0]:
+            boundaries = [max(1, self.segment_frames), boundaries[-1]]
 
-            self.writer = SummaryWriter(
-                log_dir=os.path.join(self.args.experiment_dir, "eval"),
-                purge_step=self.global_step + 1 if self.global_step else 0,
-                max_queue=1000,
-            )
-            self.exporter = AsyncInferenceExporter(self.device)
+        if self.args.batch_size % self.num_devices != 0:
+            aligned_bs = ((self.args.batch_size + self.num_devices - 1) // self.num_devices) * self.num_devices
+            print(f"Adjusting batch size from {self.args.batch_size} to {aligned_bs} for {self.num_devices} JAX devices.")
+            self.args.batch_size = aligned_bs
 
-        if self.rank == 0:
-            print(self.summary(epoch, start_batch, last_g))
-        total_steps = self.args.total_steps
-        finished = self.global_step >= total_steps
-        if finished and self.rank == 0:
-            print(
-                f"{self.args.model_name} already reached step {total_steps}. "
-                "Raise the total steps to continue training."
-            )
-        self.progress = tqdm(
-            total=max(total_steps, self.global_step),
-            initial=self.global_step,
-            desc="Training",
-            unit="step",
-            dynamic_ncols=True,
-            disable=self.rank != 0 or finished,
+        self.sampler = BucketBatchSampler(
+            self.dataset.lengths,
+            self.args.batch_size,
+            boundaries,
+            shuffle=True,
+            max_frames=max_frames or None,
+            batch_multiple=self.num_devices,
+            static_bucket_padding=use_tpu_buckets,
         )
+        if len(self.sampler) < 3 and not os.environ.get("REDPANDA_ALLOW_SMALL_DATASET"):
+            print("Not enough data present in the training set. Perhaps you forgot to slice the audio files in preprocess?")
+            sys.exit(1)
+
+        self.loader = PrefetchBatchLoader(
+            self.dataset,
+            self.sampler,
+            hop_length=int(data.hop_length),
+            num_workers=self.workers,
+            prefetch_batches=8,
+            cache_in_ram=bool(self.args.cache_data_in_gpu),
+        )
+
+    def build_models(self, last_g: str | None) -> None:
+        config, args = self.config, self.args
+        spk_dim = int(config.model.spk_embed_dim)
         try:
-            while self.global_step < total_steps:
-                self.train_epoch(epoch, start_batch)
+            spk_dim = int(read_model_info(args).get("speakers_id", spk_dim))
+        except Exception as exc:
+            print(f"Could not load model info file: {exc}. Using defaults.")
+
+        if last_g:
+            try:
+                if last_g.lower().endswith(".npz"):
+                    meta = read_jax_checkpoint_meta(last_g)
+                    if "spk_embed_dim" in meta:
+                        spk_dim = int(meta["spk_embed_dim"])
+                else:
+                    import torch
+                    ckpt = torch.load(last_g, map_location="cpu", weights_only=True)
+                    spk_dim = int(ckpt["model"]["emb_g.weight"].shape[0])
+            except Exception as exc:
+                print(f"Failed to read speaker count from checkpoint: {exc}. Using default {spk_dim}.")
+
+        config.model.spk_embed_dim = spk_dim
+        self.syn_cfg = synthesizer_config_from_hparams(
+            config,
+            vocoder=args.vocoder,
+            use_f0=True,
+            checkpointing=args.checkpointing,
+            randomized=randomized,
+        )
+        self.mpd_cfg = MultiPeriodDiscriminatorConfig(
+            use_spectral_norm=bool(config.model.use_spectral_norm),
+            checkpointing=args.checkpointing,
+            version=args.disc_version,
+        )
+
+        seed = int(getattr(config.train, "seed", 1234))
+        rng_np = np.random.default_rng(seed)
+        self.host_params_g = init_synthesizer_params(rng_np, self.syn_cfg)
+        self.host_params_d = init_mpd_params(rng_np, self.mpd_cfg)
+
+        b1, b2 = (float(x) for x in config.train.betas)
+        eps = float(config.train.eps)
+        base_lr = float(config.train.learning_rate)
+        self.opt_g = optax.inject_hyperparams(optax.adamw)(
+            learning_rate=base_lr * g_lr_coeff, b1=b1, b2=b2, eps=eps, weight_decay=0.0
+        )
+        self.opt_d = optax.inject_hyperparams(optax.adamw)(
+            learning_rate=base_lr * d_lr_coeff, b1=b1, b2=b2, eps=eps, weight_decay=0.0
+        )
+        self.opt_state_g = self.opt_g.init(self.host_params_g)
+        self.opt_state_d = self.opt_d.init(self.host_params_d)
+        self.ema_params_host = (
+            {k: jax.tree.map(np.copy, v) for k, v in self.host_params_g.items() if k != "enc_q"}
+            if args.ema_decay > 0
+            else {}
+        )
+
+    def restore(self, last_g: str | None, last_d: str | None) -> tuple[int, int, dict]:
+        if last_g or last_d:
+            if not (last_g and last_d):
+                raise FileNotFoundError("Resuming needs both G and D checkpoints with the same suffix.")
+            if last_g.lower().endswith(".npz"):
+                p_d, opt_d, _, _, d_extra, _ = load_jax_checkpoint(
+                    last_d,
+                    self.host_params_d,
+                    self.opt_d,
+                    self.opt_state_d,
+                    reset_state=self.args.reset_optimizer,
+                )
+                p_g, opt_g, _, epoch, extra, ema_loaded = load_jax_checkpoint(
+                    last_g,
+                    self.host_params_g,
+                    self.opt_g,
+                    self.opt_state_g,
+                    reset_state=self.args.reset_optimizer,
+                )
+                self.host_params_d, self.opt_state_d = p_d, opt_d
+                self.host_params_g, self.opt_state_g = p_g, opt_g
+                if self.args.ema_decay > 0 and ema_loaded is not None:
+                    self.ema_params_host = ema_loaded
+                    self.ema_updates = int(extra.get("ema_updates", 0))
+                step = extra.get("step")
+                if d_extra.get("step") not in (None, step):
+                    print(f"{os.path.basename(last_d)} was saved at step {d_extra['step']}, {os.path.basename(last_g)} at step {step}.")
+                start_batch = int(extra.get("epoch_step", 0))
+                if start_batch >= len(self.sampler):
+                    epoch, start_batch = epoch + 1, 0
+                self.global_step = int(step) if step is not None else (epoch - 1) * len(self.sampler) + start_batch
+                if "rng_key" in extra:
+                    self.rng_key = jnp.asarray(extra["rng_key"], dtype=jnp.uint32)
+                return epoch, start_batch, extra
+
+            # Legacy PyTorch .pth checkpoint migration
+            import torch
+            d_ckpt = torch.load(last_d, map_location="cpu", weights_only=True)
+            g_ckpt = torch.load(last_g, map_location="cpu", weights_only=True)
+            self.host_params_d = load_pretrained_torch_d(last_d, self.mpd_cfg)
+            self.host_params_g = load_pretrained_torch_g(last_g, self.syn_cfg, self.host_params_g, match_speakers=False)
+            self.opt_state_g = self.opt_g.init(self.host_params_g)
+            self.opt_state_d = self.opt_d.init(self.host_params_d)
+            if self.args.ema_decay > 0:
+                self.ema_params_host = {k: jax.tree.map(np.copy, v) for k, v in self.host_params_g.items() if k != "enc_q"}
+            epoch = int(g_ckpt.get("iteration", 1))
+            step = int(g_ckpt.get("step", (epoch - 1) * len(self.sampler)))
+            start_batch = int(g_ckpt.get("epoch_step", 0))
+            if start_batch >= len(self.sampler):
                 epoch, start_batch = epoch + 1, 0
-        finally:
-            self.progress.close()
-            if self.exporter is not None:
-                self.exporter.close()
-            if self.writer is not None:
-                self.writer.close()
-        if self.rank == 0 and not finished:
-            print(
-                f"{self.args.model_name} | training completed at epoch {self.epoch}, step {self.global_step}"
+            self.global_step = step
+            print(f"Imported PyTorch weights from {os.path.basename(last_g)} into native JAX with fresh Optax moments.")
+            return epoch, start_batch, {k: v for k, v in g_ckpt.items() if k in ("lr_schedule",)}
+
+        if self.args.pretrained_g not in ("", "None"):
+            self.host_params_g = load_pretrained_torch_g(
+                self.args.pretrained_g, self.syn_cfg, self.host_params_g, match_speakers=True
+            )
+            if self.args.ema_decay > 0:
+                self.ema_params_host = {k: jax.tree.map(np.copy, v) for k, v in self.host_params_g.items() if k != "enc_q"}
+        if self.args.pretrained_d not in ("", "None"):
+            self.host_params_d = load_pretrained_torch_d(self.args.pretrained_d, self.mpd_cfg)
+        return 1, 0, {}
+
+    def _put_replicated(self) -> None:
+        self.params_g = jax.device_put(jax.tree.map(jnp.asarray, self.host_params_g), self.replicated_sharding)
+        self.opt_state_g = jax.device_put(self.opt_state_g, self.replicated_sharding)
+        self.params_d = jax.device_put(jax.tree.map(jnp.asarray, self.host_params_d), self.replicated_sharding)
+        self.opt_state_d = jax.device_put(self.opt_state_d, self.replicated_sharding)
+        self.ema_params = jax.device_put(jax.tree.map(jnp.asarray, self.ema_params_host), self.replicated_sharding)
+
+    def build_lr_schedule(self, saved: dict | None) -> None:
+        target = {"total_steps": self.args.total_steps, "final_ratio": self.args.lr_final_ratio}
+        if saved and all(saved.get(k) == v for k, v in target.items()):
+            self.lr_schedule = saved
+            return
+        start_factor = 1.0
+        if self.global_step:
+            lr_cur = float(self.opt_state_g.hyperparams["learning_rate"])
+            lr_init = float(self.config.train.learning_rate) * g_lr_coeff
+            ramp = self.warmup_ramp(self.global_step - 1)
+            start_factor = (lr_cur / lr_init / ramp) if (lr_init and ramp) else 1.0
+        self.lr_schedule = dict(
+            target,
+            start_step=max(self.global_step, self.args.warmup_steps),
+            start_factor=start_factor,
+        )
+
+    def warmup_ramp(self, step: int) -> float:
+        warmup = self.args.warmup_steps
+        return (step + 1) / warmup if step < warmup else 1.0
+
+    def exponential_factor(self, epoch: int, step: int) -> float:
+        decay = float(self.config.train.lr_decay)
+        if self.args.lr_decay_steps:
+            return decay ** (max(0, step - self.args.warmup_steps) / self.args.lr_decay_steps)
+        return decay ** max(0, epoch - 1)
+
+    def cosine_factor(self, step: int) -> float:
+        schedule = self.lr_schedule
+        start, start_factor = schedule["start_step"], schedule["start_factor"]
+        end = min(schedule["final_ratio"], start_factor)
+        span = schedule["total_steps"] - 1 - start
+        progress = min(1.0, max(0, step - start) / span) if span > 0 else 1.0
+        return end + (start_factor - end) * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    def current_lr_factor(self, epoch: int) -> float:
+        step = self.global_step
+        factor = self.cosine_factor(step) if self.lr_schedule is not None else self.exponential_factor(epoch, step)
+        return factor * self.warmup_ramp(step)
+
+    def _compile_train_step(self):
+        syn_cfg = self.syn_cfg
+        mpd_cfg = self.mpd_cfg
+        prec = self.prec
+        opt_g = self.opt_g
+        opt_d = self.opt_d
+        data_cfg = self.config.data
+        c_mel = float(self.config.train.c_mel)
+        c_kl = float(self.config.train.c_kl)
+        segment_frames = self.segment_frames
+        hop_length = int(data_cfg.hop_length)
+        segment_samples = int(self.config.train.segment_size)
+        multiscale_mel = self.args.multiscale_mel_loss
+        ms_mel_cfg = MultiScaleMelLossConfig(sample_rate=int(data_cfg.sample_rate))
+        use_ema = self.args.ema_decay > 0
+
+        @partial(jax.jit, donate_argnums=(0, 1, 2, 3, 4, 5))
+        def _step(
+            params_g,
+            opt_state_g,
+            params_d,
+            opt_state_d,
+            ema_params,
+            loss_sums,
+            lr_g,
+            lr_d,
+            ema_lerp,
+            compute_grad_norms,
+            rng_key,
+            batch,
+        ):
+            phone, phone_lengths, pitch, pitchf, spec, spec_lengths, wave, _wave_lengths, sid = batch
+            rng_key, step_rng = jax.random.split(rng_key)
+
+            def _gen_diff(p_g):
+                o, ids_slice, x_m, z_m, (_, z_p, m_p, logs_p, _, logs_q) = synthesizer_forward(
+                    phone, phone_lengths, pitch, pitchf, spec, spec_lengths, sid,
+                    p_g, syn_cfg, step_rng, deterministic=False, prec=prec,
+                )
+                return (o, z_p, m_p, logs_p, logs_q), (ids_slice, x_m, z_m)
+
+            diff_out, gen_vjp, aux_out = jax.vjp(_gen_diff, params_g, has_aux=True)
+            y_hat, _, _, _, _ = diff_out
+            ids_slice, _, z_mask = aux_out
+
+            if syn_cfg.randomized:
+                wave_slice = slice_segments(wave, ids_slice * hop_length, segment_samples)
+                spec_slice = slice_segments(spec, ids_slice, segment_frames)
+            else:
+                wave_slice = wave
+                spec_slice = spec
+
+            wave_slice_f32 = lax.stop_gradient(jnp.asarray(wave_slice, jnp.float32))
+            if not multiscale_mel:
+                wave_mel_ref = lax.stop_gradient(
+                    spec_to_mel_jax(
+                        spec_slice,
+                        int(data_cfg.filter_length),
+                        int(data_cfg.n_mel_channels),
+                        int(data_cfg.sample_rate),
+                        float(data_cfg.mel_fmin),
+                        data_cfg.mel_fmax,
+                    )
+                )
+            else:
+                wave_mel_ref = None
+
+            y_hat_det = lax.stop_gradient(y_hat)
+
+            def _loss_d(p_d):
+                yr, yg, _, _ = mpd_forward(p_d, mpd_cfg, wave_slice_f32, y_hat_det, prec=prec)
+                l_d, _, _ = discriminator_loss(yr, yg)
+                return l_d
+
+            loss_disc = jnp.float32(0.0)
+            grads_d = None
+            opt_state_d = opt_state_d._replace(hyperparams={**opt_state_d.hyperparams, "learning_rate": lr_d})
+            for _ in range(d_step_per_g_step):
+                loss_disc, grads_d = jax.value_and_grad(_loss_d)(params_d)
+                upd_d, opt_state_d = opt_d.update(grads_d, opt_state_d, params_d)
+                params_d = optax.apply_updates(params_d, upd_d)
+
+            params_d_sg = lax.stop_gradient(params_d)
+            z_mask_sg = lax.stop_gradient(z_mask)
+
+            def _loss_from_gen(d_out):
+                y_h, z_p_v, m_p_v, logs_p_v, logs_q_v = d_out
+                _, y_d_g, fmap_r, fmap_g = mpd_forward(params_d_sg, mpd_cfg, wave_slice_f32, y_h, prec=prec)
+                if multiscale_mel:
+                    l_mel = multi_scale_mel_loss(wave_slice_f32, y_h, ms_mel_cfg) * c_mel / 3.0
+                else:
+                    y_h_mel = mel_spectrogram_jax(
+                        y_h,
+                        int(data_cfg.filter_length),
+                        int(data_cfg.n_mel_channels),
+                        int(data_cfg.sample_rate),
+                        int(data_cfg.hop_length),
+                        int(data_cfg.win_length),
+                        float(data_cfg.mel_fmin),
+                        data_cfg.mel_fmax,
+                        center=False,
+                    )
+                    l_mel = jnp.mean(jnp.abs(wave_mel_ref - y_h_mel)) * c_mel
+                l_kl = kl_loss(z_p_v, logs_q_v, m_p_v, logs_p_v, z_mask_sg) * c_kl
+                l_fm = feature_loss(fmap_r, fmap_g)
+                l_gen, _ = generator_loss(y_d_g)
+                l_total = l_gen + l_fm + l_mel + l_kl
+                return l_total, (l_gen, l_fm, l_mel, l_kl)
+
+            ((loss_gen_all, (loss_gen, loss_fm, loss_mel, loss_kl)), grad_diff_out) = jax.value_and_grad(
+                _loss_from_gen, has_aux=True
+            )(diff_out)
+            (grads_g,) = gen_vjp(grad_diff_out)
+
+            opt_state_g = opt_state_g._replace(hyperparams={**opt_state_g.hyperparams, "learning_rate": lr_g})
+            upd_g, opt_state_g = opt_g.update(grads_g, opt_state_g, params_g)
+            params_g = optax.apply_updates(params_g, upd_g)
+
+            if use_ema:
+                gen_view = {k: v for k, v in params_g.items() if k != "enc_q"}
+                ema_params = jax.tree.map(lambda e, p: e + ema_lerp * (p - e), ema_params, gen_view)
+
+            gn_d, gn_g = lax.cond(
+                compute_grad_norms,
+                lambda _: (optax.global_norm(grads_d), optax.global_norm(grads_g)),
+                lambda _: (jnp.float32(0.0), jnp.float32(0.0)),
+                None,
             )
 
-    def summary(self, epoch, start_batch, last_g):
+            loss_sums = loss_sums + jnp.stack([loss_gen_all, loss_disc, loss_gen, loss_fm, loss_mel, loss_kl])
+            return (
+                params_g,
+                opt_state_g,
+                params_d,
+                opt_state_d,
+                ema_params,
+                loss_sums,
+                gn_d,
+                gn_g,
+                rng_key,
+                y_hat[0],
+                ids_slice[0],
+                spec[0],
+            )
+
+        @jax.jit
+        def _mel_summary_arrays(spec_0, id_0, y_hat_0):
+            mel_all = spec_to_mel_jax(
+                spec_0[None, ...],
+                int(data_cfg.filter_length),
+                int(data_cfg.n_mel_channels),
+                int(data_cfg.sample_rate),
+                float(data_cfg.mel_fmin),
+                data_cfg.mel_fmax,
+            )
+            y_mel = slice_segments(mel_all, id_0[None], segment_frames) if syn_cfg.randomized else mel_all
+            y_hat_mel = mel_spectrogram_jax(
+                y_hat_0[None, ...],
+                int(data_cfg.filter_length),
+                int(data_cfg.n_mel_channels),
+                int(data_cfg.sample_rate),
+                int(data_cfg.hop_length),
+                int(data_cfg.win_length),
+                float(data_cfg.mel_fmin),
+                data_cfg.mel_fmax,
+                center=False,
+            )
+            # Transpose (TT, n_mels) -> (n_mels, TT) to match plot_spectrogram_to_numpy axes.
+            return y_mel[0].T, y_hat_mel[0].T, mel_all[0].T
+
+        self._step_fn = _step
+        self._mel_summary_fn = _mel_summary_arrays
+
+    def _shard_batch(self, np_batch):
+        if self.num_devices == 1:
+            return tuple(jax.device_put(x, self.devices[0]) for x in np_batch)
+        return tuple(jax.device_put(x, self.data_sharding) for x in np_batch)
+
+    def _next_ema_lerp(self) -> float:
+        if self.args.ema_decay <= 0:
+            return 0.0
+        self.ema_updates += 1
+        beta = float(self.args.ema_decay)
+        decay = beta * (1.0 - beta ** (self.ema_updates - 1)) / (1.0 - beta ** self.ema_updates)
+        return float(1.0 - decay)
+
+    def summary(self, epoch: int, start_batch: int, last_g: str | None) -> str:
         args, data = self.args, self.config.data
-        precision = (
-            {torch.float16: "FP16", torch.bfloat16: "BF16"}[args.train_dtype]
-            if self.use_amp
-            else "FP32"
-        )
-        device = f"GPU {args.gpus}" if self.device.type == "cuda" else self.device.type.upper()
-        speakers = self.config.model.spk_embed_dim
+        dev_str = f"{self.platform.upper()} x{self.num_devices}"
+        speakers = int(self.config.model.spk_embed_dim)
         parts = [
             args.model_name,
-            f"{args.vocoder} {data.sample_rate} Hz {args.version}",
+            f"{args.vocoder} {data.sample_rate} Hz {args.version} [JAX]",
             f"{speakers} speaker{'' if speakers == 1 else 's'}",
-            f"{device} {precision}",
+            f"{dev_str} {self.precision_label}",
             f"batch {args.batch_size}, {len(self.sampler)} steps per epoch",
             f"{args.total_steps} total steps (~{math.ceil(args.total_steps / len(self.sampler))} epochs)",
             f"saving every {args.save_every_steps} steps",
@@ -599,32 +696,25 @@ class Trainer:
         options = []
         if args.max_batch_seconds:
             sizes = self.sampler.bucket_batch_sizes
-            options.append(
-                f"max {args.max_batch_seconds:g} s audio per batch ({min(sizes)}-{max(sizes)} clips)"
-            )
+            options.append(f"max {args.max_batch_seconds:g} s audio per batch ({min(sizes)}-{max(sizes)} clips)")
         if args.warmup_steps:
             options.append(f"{args.warmup_steps} warmup steps")
         if self.lr_schedule is not None:
-            schedule = self.lr_schedule
-            end = min(schedule["final_ratio"], schedule["start_factor"])
-            options.append(
-                f"cosine LR {schedule['start_factor']:.3g}x to {end:.3g}x from step {schedule['start_step']}"
-            )
+            sc = self.lr_schedule
+            end = min(sc["final_ratio"], sc["start_factor"])
+            options.append(f"cosine LR {sc['start_factor']:.3g}x to {end:.3g}x from step {sc['start_step']}")
         elif args.lr_decay_steps:
             options.append(f"lr_decay every {args.lr_decay_steps} steps")
-        if self.ema is not None:
+        if args.ema_decay > 0:
             options.append(f"generator EMA {args.ema_decay:g}")
-        if self.cache_in_gpu:
-            options.append("dataset cached in GPU")
+        if args.cache_data_in_gpu:
+            options.append("dataset cached in RAM")
         if args.checkpointing:
             options.append("checkpointing")
         if options:
             parts.append(", ".join(options))
-        pretrained = [
-            os.path.basename(path)
-            for path in (args.pretrained_g, args.pretrained_d)
-            if path not in ("", "None")
-        ]
+
+        pretrained = [os.path.basename(p) for p in (args.pretrained_g, args.pretrained_d) if p not in ("", "None")]
         if last_g:
             parts.append(
                 f"resuming at step {self.global_step}, epoch {epoch} batch {start_batch + 1} of {len(self.sampler)}"
@@ -636,283 +726,159 @@ class Trainer:
             parts.append("from scratch")
         return " | ".join(parts)
 
-    def update_postfix(self):
+    def update_postfix(self) -> None:
+        if self.progress is None:
+            return
         text = f"epoch {self.epoch}"
         if self.logged_losses is not None:
             total, disc, mel = self.logged_losses
             text += f", g {total:.2f}, d {disc:.2f}, mel {mel:.2f}"
         self.progress.set_postfix_str(text, refresh=False)
 
-    def build_data(self):
-        from rvc.train.data_utils import (
-            DistributedBucketSampler,
-            TextAudioCollateMultiNSFsid,
-            TextAudioLoaderMultiNSFsid,
-        )
-
-        data = self.config.data
-        max_frames = int(self.args.max_batch_seconds * data.sample_rate / data.hop_length)
-        self.dataset = TextAudioLoaderMultiNSFsid(data)
-        self.collate = TextAudioCollateMultiNSFsid()
-        self.sampler = DistributedBucketSampler(
-            self.dataset,
-            self.args.batch_size,
-            list(BUCKET_BOUNDARIES),
-            num_replicas=self.world_size,
-            rank=self.rank,
-            shuffle=True,
-            max_frames=max_frames or None,
-        )
-        if len(self.sampler) < 3:
-            print(
-                "Not enough data present in the training set. Perhaps you forgot to slice the audio files in preprocess?"
-            )
-            sys.exit(1)
-        if not self.cache_in_gpu:
-            self.loader = DataLoader(
-                self.dataset,
-                num_workers=self.workers,
-                shuffle=False,
-                pin_memory=self.device.type == "cuda",
-                collate_fn=self.collate,
-                batch_sampler=self.sampler,
-                persistent_workers=True,
-                prefetch_factor=8,
-            )
-
-    def build_models(self, last_g):
-        from rvc.algorithm.discriminators import MultiPeriodDiscriminator
-        from rvc.algorithm.synthesizers import Synthesizer
-
-        config, args = self.config, self.args
-        spk_dim = config.model.spk_embed_dim
-        try:
-            spk_dim = read_model_info(args)["speakers_id"]
-        except Exception as e:
-            print(f"Could not load model info file: {e}. Using defaults.")
-        if last_g:
-            try:
-                ckpt = torch.load(last_g, map_location="cpu", weights_only=True)
-                spk_dim = ckpt["model"]["emb_g.weight"].shape[0]
-                del ckpt
-            except Exception as e:
-                print(f"Failed to load checkpoint: {e}. Using default number of speakers.")
-        config.model.spk_embed_dim = spk_dim
-
-        net_g = Synthesizer(
-            config.data.filter_length // 2 + 1,
-            self.segment_frames,
-            **config.model,
-            use_f0=True,
-            sr=config.data.sample_rate,
-            vocoder=args.vocoder,
-            checkpointing=args.checkpointing,
-            randomized=randomized,
-        ).to(self.device)
-        net_d = MultiPeriodDiscriminator(
-            config.model.use_spectral_norm,
-            checkpointing=args.checkpointing,
-            version=args.disc_version,
-        ).to(self.device)
-
-        if bf16_adamw and args.train_dtype == torch.bfloat16:
-            from rvc.train.anyprecision_optimizer import AnyPrecisionAdamW
-
-            optimizer = AnyPrecisionAdamW
-            options = {}
-        else:
-            optimizer = torch.optim.AdamW
-            options = {"fused": self.device.type == "cuda"}
-        self.optim_g = optimizer(
-            net_g.parameters(),
-            config.train.learning_rate * g_lr_coeff,
-            betas=config.train.betas,
-            eps=config.train.eps,
-            **options,
-        )
-        self.optim_d = optimizer(
-            net_d.parameters(),
-            config.train.learning_rate * d_lr_coeff,
-            betas=config.train.betas,
-            eps=config.train.eps,
-            **options,
-        )
-        if args.multiscale_mel_loss:
-            self.fn_mel_loss = MultiScaleMelSpectrogramLoss(
-                sample_rate=config.data.sample_rate
-            )
-        else:
-            self.fn_mel_loss = torch.nn.L1Loss()
-
-        if self.world_size > 1 and self.device.type == "cuda":
-            net_g = DDP(net_g, device_ids=[self.device.index], gradient_as_bucket_view=True)
-            net_d = DDP(net_d, device_ids=[self.device.index], gradient_as_bucket_view=True)
-            if dist.get_backend() == "gloo":
-                net_g.register_comm_hook(None, cpu_allreduce_hook)
-                net_d.register_comm_hook(None, cpu_allreduce_hook)
-        self.net_g, self.net_d = net_g, net_d
-        self.freeze_discriminator = self.device.type == "cuda"
-        self.net_d_for_generator = (
-            net_d.module if self.freeze_discriminator and hasattr(net_d, "module") else net_d
-        )
-
-        self.scaler = torch.amp.GradScaler(
-            enabled=self.device.type == "cuda" and args.train_dtype == torch.float16
-        )
-
-    def restore(self, last_g, last_d):
-        if last_g or last_d:
-            try:
-                if not (last_g and last_d):
-                    raise FileNotFoundError(
-                        "resuming needs a G_*.pth and a D_*.pth checkpoint with the same suffix"
-                    )
-                reset = self.args.reset_optimizer
-                _, _, _, _, scaler_dict, d_extra = load_checkpoint(
-                    last_d, self.net_d, self.optim_d, reset_state=reset
-                )
-                _, _, _, epoch, _, extra = load_checkpoint(
-                    last_g, self.net_g, self.optim_g, reset_state=reset
-                )
-            except Exception as e:
-                print(f"Could not resume from the checkpoints in {self.args.experiment_dir}: {e}")
-                print("Fix or remove them, or enable cleanup to start over from the pretrained models.")
-                sys.exit(1)
-            if scaler_dict:
-                self.scaler.load_state_dict(scaler_dict)
-            step = extra.get("step")
-            if d_extra.get("step") not in (None, step):
-                print(
-                    f"{os.path.basename(last_d)} was saved at step {d_extra['step']}, "
-                    f"but {os.path.basename(last_g)} at step {step}."
-                )
-            start_batch = extra.get("epoch_step")
-            if start_batch is None or start_batch >= len(self.sampler):
-                epoch, start_batch = epoch + 1, 0
-            self.global_step = (
-                int(step)
-                if step is not None
-                else (epoch - 1) * len(self.sampler) + start_batch
-            )
-            self.pending_rng = extra.get("rng")
-            return epoch, int(start_batch), extra
-
-        self.load_pretrained(self.net_g, self.args.pretrained_g, "G", match_speakers=True)
-        self.load_pretrained(self.net_d, self.args.pretrained_d, "D")
-        return 1, 0, {}
-
-    def rng_state(self):
-        state = {"cpu": torch.get_rng_state()}
-        if self.device.type == "cuda":
-            state["cuda"] = torch.cuda.get_rng_state(self.device)
-        return state
-
-    def restore_rng(self, state):
-        if isinstance(state, list):
-            state = state[self.rank] if self.rank < len(state) else None
-        elif self.rank:
-            state = None
-        if not state:
+    def _record_and_maybe_log(self, gn_d, gn_g, current_lr_g: float) -> None:
+        self.batch_count += 1
+        if self.global_step % self.log_interval != 0:
             return
-        try:
-            torch.set_rng_state(state["cpu"])
-            if self.device.type == "cuda" and "cuda" in state:
-                torch.cuda.set_rng_state(state["cuda"], self.device)
-        except (KeyError, RuntimeError, TypeError) as e:
-            print(f"Could not restore the random number generator state: {e}")
+        sums_np = np.asarray(jax.device_get(self.loss_sums), dtype=np.float32) / float(max(1, self.batch_count))
+        self.loss_sums = jax.device_put(jnp.zeros((6,), dtype=jnp.float32), self.replicated_sharding)
+        self.batch_count = 0
+        self.logged_losses = (float(sums_np[0]), float(sums_np[1]), float(sums_np[4]))
+        self.update_postfix()
+        if self.writer is not None:
+            summarize(
+                writer=self.writer,
+                global_step=self.global_step,
+                scalars={
+                    "loss/g/total": float(sums_np[0]),
+                    "loss/d/adv": float(sums_np[1]),
+                    "learning_rate": float(current_lr_g),
+                    "loss/g/adv": float(sums_np[2]),
+                    "loss/g/fm": float(sums_np[3]),
+                    "loss/g/mel": float(sums_np[4]),
+                    "loss/g/kl": float(sums_np[5]),
+                    "grad/norm_d": float(jax.device_get(gn_d)),
+                    "grad/norm_g": float(jax.device_get(gn_g)),
+                },
+            )
 
-    def build_lr_schedule(self, saved):
-        target = {
-            "total_steps": self.args.total_steps,
-            "final_ratio": self.args.lr_final_ratio,
+    def save(self, epoch: int, final: bool) -> None:
+        args = self.args
+        if self.writer is not None and self.last_batch is not None:
+            spec_0, id_0, y_hat_0 = self.last_batch
+            y_m, yh_m, m_all = self._mel_summary_fn(spec_0, id_0, y_hat_0)
+            y_m_np, yh_m_np, m_all_np = jax.device_get((y_m, yh_m, m_all))
+            summarize(
+                writer=self.writer,
+                global_step=self.global_step,
+                images={
+                    "slice/mel_org": plot_spectrogram_to_numpy(y_m_np),
+                    "slice/mel_gen": plot_spectrogram_to_numpy(yh_m_np),
+                    "all/mel": plot_spectrogram_to_numpy(m_all_np),
+                },
+            )
+
+        weights_path = os.path.join(args.experiment_dir, f"{args.model_name}_{epoch}e_{self.global_step}s.pth")
+        export_src = self.ema_params if args.ema_decay > 0 else self.params_g
+        if (args.save_every_weights or final) and not os.path.exists(weights_path):
+            assert self.exporter is not None
+            self.exporter.submit(
+                export_src,
+                self.syn_cfg,
+                sr=int(self.config.data.sample_rate),
+                name=args.model_name,
+                model_path=weights_path,
+                epoch=epoch,
+                step=self.global_step,
+                hps=self.config,
+                vocoder=args.vocoder,
+                pitch_guidance=True,
+                version=args.version,
+                export_dtype_str=self.export_dtype_str,
+                verbose=False,
+            )
+
+        suffix = LATEST_CHECKPOINT_SUFFIX if args.save_only_latest else self.global_step
+        rng_words = [int(w) for w in np.asarray(jax.device_get(self.rng_key), dtype=np.uint32).reshape(-1).tolist()]
+        gen_extra = {
+            "step": self.global_step,
+            "epoch_step": self.epoch_step,
+            "ema_updates": self.ema_updates,
+            "rng_key": rng_words,
+            "vocoder": args.vocoder,
         }
-        if saved and all(saved.get(key) == value for key, value in target.items()):
-            self.lr_schedule = saved
-            return
-        start_factor = 1.0
-        if self.global_step:
-            group = self.optim_g.param_groups[0]
-            start_factor = (
-                group["lr"] / group["initial_lr"] / self.warmup_ramp(self.global_step - 1)
-            )
-        self.lr_schedule = dict(
-            target,
-            start_step=max(self.global_step, self.args.warmup_steps),
-            start_factor=start_factor,
+        if self.lr_schedule is not None:
+            gen_extra["lr_schedule"] = self.lr_schedule
+
+        d_path = os.path.join(args.experiment_dir, f"D_{suffix}.npz")
+        g_path = os.path.join(args.experiment_dir, f"G_{suffix}.npz")
+        save_jax_checkpoint(
+            d_path,
+            self.params_d,
+            self.opt_state_d,
+            self.config.train.learning_rate,
+            epoch,
+            extra={"step": self.global_step},
         )
-
-    def build_ema(self, last_g, ema_state):
-        self.ema = GeneratorEMA(self.generator(), self.args.ema_decay)
-        if ema_state is not None:
-            try:
-                self.ema.load_state_dict(ema_state)
-                return
-            except Exception as e:
-                print(f"Could not restore the generator EMA from {last_g}: {e}")
-        if last_g:
-            print("Starting the generator EMA from the resumed weights.")
-
-    def load_pretrained(self, net, path, label, match_speakers=False):
-        if path in ("", "None"):
-            return
-        target = net.module if hasattr(net, "module") else net
-        try:
-            ckpt = torch.load(path, map_location="cpu", weights_only=True)["model"]
-            if match_speakers:
-                if "emb_g.weight" not in ckpt:
-                    raise KeyError("The pretrained generator has no speaker embedding.")
-                speakers = target.emb_g.weight.detach().cpu().clone()
-                rows = min(speakers.shape[0], ckpt["emb_g.weight"].shape[0])
-                speakers[:rows] = ckpt["emb_g.weight"][:rows].to(speakers.dtype)
-                ckpt["emb_g.weight"] = speakers
-            target.load_state_dict(ckpt)
-            del ckpt
-        except Exception as e:
-            print(
-                "The parameters of the pretrain model such as the sample rate or architecture do not match the selected model."
-            )
-            print(e)
-            sys.exit(1)
-
-    def autocast(self):
-        return torch.amp.autocast(
-            device_type="cuda", enabled=self.use_amp, dtype=self.args.train_dtype
+        save_jax_checkpoint(
+            g_path,
+            self.params_g,
+            self.opt_state_g,
+            self.config.train.learning_rate,
+            epoch,
+            extra=gen_extra,
+            ema_params=self.ema_params if args.ema_decay > 0 else None,
         )
+        if final and self.exporter is not None:
+            self.exporter.wait_for_completion()
 
-    def batches(self):
-        if not self.cache_in_gpu:
-            for batch in self.loader:
-                if self.device.type == "cuda":
-                    yield [tensor.to(self.device, non_blocking=True) for tensor in batch]
-                else:
-                    yield [tensor.to(self.device) for tensor in batch]
-            return
-        if self.cache is None:
-            loader = DataLoader(
-                self.dataset, batch_size=None, num_workers=self.workers, pin_memory=True
-            )
-            self.cache = [
-                tuple(tensor.to(self.device, non_blocking=True) for tensor in item)
-                for item in loader
-            ]
-        for indices in self.sampler:
-            batch = self.collate([self.cache[index] for index in indices])
-            yield [tensor.to(self.device, non_blocking=True) for tensor in batch]
-
-    def train_epoch(self, epoch, start_batch):
+    def train_epoch(self, epoch: int, start_batch: int) -> None:
         self.sampler.set_epoch(epoch, start_batch)
-        self.net_g.train()
-        self.net_d.train()
         self.epoch = epoch
         self.epoch_step = start_batch
         self.update_postfix()
-        for batch in self.batches():
-            if self.pending_rng is not None:
-                self.restore_rng(self.pending_rng)
-                self.pending_rng = None
-            self.set_learning_rate(epoch)
-            self.train_step(batch)
+        base_lr = float(self.config.train.learning_rate)
+
+        for np_batch in self.loader:
+            if self.exporter is not None:
+                self.exporter.raise_if_failed()
+            factor = self.current_lr_factor(epoch)
+            lr_g_val = base_lr * g_lr_coeff * factor
+            lr_d_val = base_lr * d_lr_coeff * factor
+            ema_lerp = self._next_ema_lerp()
+            log_norms = (self.global_step + 1) % self.log_interval == 0
+            dev_batch = self._shard_batch(np_batch)
+
+            (
+                self.params_g,
+                self.opt_state_g,
+                self.params_d,
+                self.opt_state_d,
+                self.ema_params,
+                self.loss_sums,
+                gn_d,
+                gn_g,
+                self.rng_key,
+                y_hat_0,
+                id_0,
+                spec_0,
+            ) = self._step_fn(
+                self.params_g,
+                self.opt_state_g,
+                self.params_d,
+                self.opt_state_d,
+                self.ema_params,
+                self.loss_sums,
+                jnp.float32(lr_g_val),
+                jnp.float32(lr_d_val),
+                jnp.float32(ema_lerp),
+                jnp.bool_(log_norms),
+                self.rng_key,
+                dev_batch,
+            )
+            self.last_batch = (spec_0, id_0, y_hat_0)
+            self.global_step += 1
             self.epoch_step += 1
+            self._record_and_maybe_log(gn_d, gn_g, lr_g_val)
             self.progress.update(1)
             final = self.global_step >= self.args.total_steps
             if final or self.global_step % self.args.save_every_steps == 0:
@@ -920,280 +886,61 @@ class Trainer:
             if final:
                 break
 
-    def warmup_ramp(self, step):
-        warmup = self.args.warmup_steps
-        return (step + 1) / warmup if step < warmup else 1.0
+    def fit(self) -> None:
+        self.build_data()
+        last_g, last_d = latest_checkpoint_pair(self.args.experiment_dir)
+        self.build_models(last_g)
+        epoch, start_batch, extra = self.restore(last_g, last_d)
+        self._put_replicated()
+        if self.args.lr_schedule == "cosine":
+            self.build_lr_schedule(extra.get("lr_schedule"))
+        self._compile_train_step()
 
-    def exponential_factor(self, epoch, step):
-        args, decay = self.args, self.config.train.lr_decay
-        if args.lr_decay_steps:
-            return decay ** (max(0, step - args.warmup_steps) / args.lr_decay_steps)
-        return decay ** (epoch - 1)
-
-    def cosine_factor(self, step):
-        schedule = self.lr_schedule
-        start, start_factor = schedule["start_step"], schedule["start_factor"]
-        end = min(schedule["final_ratio"], start_factor)
-        span = schedule["total_steps"] - 1 - start
-        progress = min(1.0, max(0, step - start) / span) if span > 0 else 1.0
-        return end + (start_factor - end) * 0.5 * (1 + math.cos(math.pi * progress))
-
-    def set_learning_rate(self, epoch):
-        step = self.global_step
-        if self.lr_schedule is not None:
-            factor = self.cosine_factor(step)
-        else:
-            factor = self.exponential_factor(epoch, step)
-        factor *= self.warmup_ramp(step)
-        for optimizer in (self.optim_g, self.optim_d):
-            for group in optimizer.param_groups:
-                group["lr"] = group["initial_lr"] * factor
-
-    def optimizer_step(self, optimizer, net, loss, log_grad_norm, update_scaler, before_step=None):
-        optimizer.zero_grad()
-        self.scaler.scale(loss).backward()
-        norm = None
-        if log_grad_norm:
-            self.scaler.unscale_(optimizer)
-            norm = commons.grad_norm(net.parameters())
-        if before_step is not None:
-            before_step()
-        self.scaler.step(optimizer)
-        if update_scaler:
-            self.scaler.update()
-        return norm
-
-    def mel_loss(self, wave, y_hat, spec, ids_slice):
-        config = self.config
-        if self.args.multiscale_mel_loss:
-            return self.fn_mel_loss(wave, y_hat) * config.train.c_mel / 3.0
-        wave_mel = spec_to_mel_torch(
-            commons.slice_segments(spec, ids_slice, self.segment_frames, dim=3),
-            config.data.filter_length,
-            config.data.n_mel_channels,
-            config.data.sample_rate,
-            config.data.mel_fmin,
-            config.data.mel_fmax,
+        self.writer = _create_summary_writer(
+            os.path.join(self.args.experiment_dir, "eval"),
+            purge_step=self.global_step + 1 if self.global_step else 0,
         )
-        y_hat_mel = mel_spectrogram_torch(
-            y_hat.float().squeeze(1),
-            config.data.filter_length,
-            config.data.n_mel_channels,
-            config.data.sample_rate,
-            config.data.hop_length,
-            config.data.win_length,
-            config.data.mel_fmin,
-            config.data.mel_fmax,
+        self.exporter = AsyncJaxInferenceExporter()
+        print(self.summary(epoch, start_batch, last_g))
+
+        total_steps = self.args.total_steps
+        finished = self.global_step >= total_steps
+        if finished:
+            print(f"{self.args.model_name} already reached step {total_steps}. Raise --total-steps to continue training.")
+
+        self.progress = tqdm(
+            total=max(total_steps, self.global_step),
+            initial=self.global_step,
+            desc="Training",
+            unit="step",
+            dynamic_ncols=True,
+            disable=finished,
         )
-        return self.fn_mel_loss(wave_mel, y_hat_mel) * config.train.c_mel
+        try:
+            while self.global_step < total_steps:
+                self.train_epoch(epoch, start_batch)
+                epoch, start_batch = epoch + 1, 0
+        finally:
+            self.progress.close()
+            self.loader.close()
+            if self.exporter is not None:
+                self.exporter.close()
+            if self.writer is not None:
+                self.writer.close()
 
-    def train_step(self, batch):
-        config = self.config
-        self.last_batch = None
-        phone, phone_lengths, pitch, pitchf, spec, spec_lengths, wave, _, sid = batch
-        log_grad_norms = self.rank == 0 and (self.global_step + 1) % self.log_interval == 0
+        if not finished:
+            print(f"{self.args.model_name} | training completed at epoch {self.epoch}, step {self.global_step}")
 
-        with self.autocast():
-            y_hat, ids_slice, _, z_mask, (_, z_p, m_p, logs_p, _, logs_q) = self.net_g(
-                phone, phone_lengths, pitch, pitchf, spec, spec_lengths, sid
-            )
-            if randomized:
-                wave = commons.slice_segments(
-                    wave,
-                    ids_slice * config.data.hop_length,
-                    config.train.segment_size,
-                    dim=3,
-                )
 
-        for discriminator_step in range(d_step_per_g_step):
-            last_discriminator_step = discriminator_step + 1 == d_step_per_g_step
-            with self.autocast():
-                y_d_hat_r, y_d_hat_g, _, _ = self.net_d(wave, y_hat.detach())
-            loss_disc, _, _ = discriminator_loss(y_d_hat_r, y_d_hat_g)
-            grad_norm_d = self.optimizer_step(
-                self.optim_d,
-                self.net_d,
-                loss_disc,
-                log_grad_norms and last_discriminator_step,
-                update_scaler=not last_discriminator_step,
-            )
-
-        if self.freeze_discriminator:
-            self.optim_d.zero_grad(set_to_none=True)
-            self.net_d.requires_grad_(False)
-
-        with self.autocast():
-            _, y_d_hat_g, fmap_r, fmap_g = self.net_d_for_generator(wave, y_hat)
-
-        loss_mel = self.mel_loss(wave, y_hat, spec, ids_slice)
-        loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask) * config.train.c_kl
-        loss_fm = feature_loss(fmap_r, fmap_g)
-        loss_gen, _ = generator_loss(y_d_hat_g)
-        loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl
-        grad_norm_g = self.optimizer_step(
-            self.optim_g,
-            self.net_g,
-            loss_gen_all,
-            log_grad_norms,
-            update_scaler=True,
-            before_step=self.exporter.wait_for_staging if self.exporter else None,
-        )
-
-        if self.freeze_discriminator:
-            self.net_d.requires_grad_(True)
-        if self.ema is not None:
-            self.ema.update()
-
-        self.global_step += 1
-        self.record_losses(
-            (loss_gen_all, loss_disc, loss_gen, loss_fm, loss_mel, loss_kl),
-            (grad_norm_d, grad_norm_g),
-        )
-        self.last_batch = (spec, ids_slice, y_hat)
-
-    def record_losses(self, losses, grad_norms):
-        self.loss_sums.add_(torch.stack([loss.detach() for loss in losses]).float())
-        self.batch_count += 1
-        if self.global_step % self.log_interval != 0:
-            return
-        totals = torch.cat((self.loss_sums, self.loss_sums.new_tensor([self.batch_count])))
-        if self.world_size > 1:
-            if dist.get_backend() == "gloo" and totals.is_cuda:
-                totals = totals.cpu()
-            dist.reduce(totals, dst=0, op=dist.ReduceOp.SUM)
-        if self.rank == 0:
-            loss_values = (totals[:-1] / totals[-1]).cpu().tolist()
-            self.logged_losses = (loss_values[0], loss_values[1], loss_values[4])
-            self.update_postfix()
-            gradient_values = torch.stack(grad_norms).float().cpu().tolist()
-            summarize(
-                writer=self.writer,
-                global_step=self.global_step,
-                scalars={
-                    "loss/g/total": loss_values[0],
-                    "loss/d/adv": loss_values[1],
-                    "learning_rate": self.optim_g.param_groups[0]["lr"],
-                    "loss/g/adv": loss_values[2],
-                    "loss/g/fm": loss_values[3],
-                    "loss/g/mel": loss_values[4],
-                    "loss/g/kl": loss_values[5],
-                    "grad/norm_d": gradient_values[0],
-                    "grad/norm_g": gradient_values[1],
-                },
-            )
-        self.loss_sums.zero_()
-        self.batch_count = 0
-
-    def generator(self):
-        return self.net_g.module if hasattr(self.net_g, "module") else self.net_g
-
-    def export_state_dict(self):
-        return self.ema.weights if self.ema is not None else self.generator().state_dict()
-
-    def weights_path(self, epoch):
-        return os.path.join(
-            self.args.experiment_dir,
-            f"{self.args.model_name}_{epoch}e_{self.global_step}s.pth",
-        )
-
-    def export_arguments(self, epoch):
-        return dict(
-            sr=self.config.data.sample_rate,
-            name=self.args.model_name,
-            epoch=epoch,
-            step=self.global_step,
-            hps=self.config,
-            vocoder=self.args.vocoder,
-            version=self.args.version,
-            verbose=False,
-        )
-
-    def summarize_mels(self, spec, ids_slice, y_hat):
-        config = self.config
-        mel = spec_to_mel_torch(
-            spec,
-            config.data.filter_length,
-            config.data.n_mel_channels,
-            config.data.sample_rate,
-            config.data.mel_fmin,
-            config.data.mel_fmax,
-        )
-        y_mel = (
-            commons.slice_segments(mel, ids_slice, self.segment_frames, dim=3)
-            if randomized
-            else mel
-        )
-        y_hat_mel = mel_spectrogram_torch(
-            y_hat.float().squeeze(1),
-            config.data.filter_length,
-            config.data.n_mel_channels,
-            config.data.sample_rate,
-            config.data.hop_length,
-            config.data.win_length,
-            config.data.mel_fmin,
-            config.data.mel_fmax,
-        )
-        summarize(
-            writer=self.writer,
-            global_step=self.global_step,
-            images={
-                "slice/mel_org": plot_spectrogram_to_numpy(y_mel[0].data.cpu().numpy()),
-                "slice/mel_gen": plot_spectrogram_to_numpy(y_hat_mel[0].data.cpu().numpy()),
-                "all/mel": plot_spectrogram_to_numpy(mel[0].data.cpu().numpy()),
-            },
-        )
-
-    def save(self, epoch, final):
-        rng = [self.rng_state()]
-        if self.world_size > 1:
-            gathered = [None] * self.world_size if self.rank == 0 else None
-            dist.gather_object(rng[0], gathered, dst=0)
-            rng = gathered
-        if self.rank != 0:
-            return
-        args = self.args
-        self.summarize_mels(*self.last_batch)
-        weights = self.weights_path(epoch)
-        if (args.save_every_weights or final) and not os.path.exists(weights):
-            self.exporter.submit(
-                state_dict=self.export_state_dict(),
-                export_dtype=args.export_dtype,
-                model_path=weights,
-                **self.export_arguments(epoch),
-            )
-
-        suffix = LATEST_CHECKPOINT_SUFFIX if args.save_only_latest else self.global_step
-        generator_extra = {
-            "step": self.global_step,
-            "epoch_step": self.epoch_step,
-            "rng": rng,
-        }
-        if self.ema is not None:
-            generator_extra["ema"] = self.ema.state_dict()
-        if self.lr_schedule is not None:
-            generator_extra["lr_schedule"] = self.lr_schedule
-        paths = []
-        for prefix, net, optimizer, extra in (
-            ("D", self.net_d, self.optim_d, {"step": self.global_step}),
-            ("G", self.net_g, self.optim_g, generator_extra),
-        ):
-            path = os.path.join(args.experiment_dir, f"{prefix}_{suffix}.pth")
-            save_checkpoint(
-                net,
-                optimizer,
-                self.config.train.learning_rate,
-                epoch,
-                f"{path}.tmp",
-                self.scaler,
-                extra,
-            )
-            paths.append(path)
-        for path in paths:
-            os.replace(f"{path}.tmp", path)
-        if final:
-            self.exporter.wait_for_completion()
+def main(argv: list[str] | None = None) -> None:
+    args = parse_arguments(argv)
+    config = load_experiment_config(args)
+    check_dataset_sample_rate(args, config)
+    if args.cleanup:
+        remove_previous_attempt(args.experiment_dir)
+    trainer = JaxTrainer(args, config)
+    trainer.fit()
 
 
 if __name__ == "__main__":
-    torch.multiprocessing.set_start_method("spawn")
     main()

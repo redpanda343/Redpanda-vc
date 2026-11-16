@@ -1,0 +1,87 @@
+"""Native JAX/XLA implementation of RVC models and training."""
+
+from dataclasses import dataclass
+from typing import Any, Sequence
+
+import jax
+import jax.numpy as jnp
+from jax import lax
+
+# 128-lane / 16-frame aligned bucket upper boundaries for TPU MXU compilation stability.
+# At upsample_rates=(10, 8, 2, 2) or (10, 10, 2, 2), L % 16 == 0 ensures (frames * 8) % 128 == 0.
+JAX_BUCKET_BOUNDARIES: tuple[int, ...] = (50, 304, 608, 912)
+
+
+@dataclass(frozen=True)
+class PrecisionConfig:
+    """Precision policy enforcing FP32 storage/math where stability requires and BF16 on MXU ops."""
+
+    compute_dtype: Any = jnp.float32
+    param_dtype: Any = jnp.float32
+    compute_precision: Any = lax.Precision.HIGHEST
+    fp32_precision: Any = lax.Precision.HIGHEST
+
+    @classmethod
+    def bfloat16(cls) -> "PrecisionConfig":
+        """Mixed precision: BF16 heavy convolutions/linears with FP32 parameters, losses, and utils."""
+        return cls(
+            compute_dtype=jnp.bfloat16,
+            param_dtype=jnp.float32,
+            compute_precision=lax.Precision.DEFAULT,
+            fp32_precision=lax.Precision.HIGHEST,
+        )
+
+    @classmethod
+    def float32(cls) -> "PrecisionConfig":
+        """Full FP32 precision with Precision.HIGHEST."""
+        return cls(
+            compute_dtype=jnp.float32,
+            param_dtype=jnp.float32,
+            compute_precision=lax.Precision.HIGHEST,
+            fp32_precision=lax.Precision.HIGHEST,
+        )
+
+
+def resolve_jax_devices(accelerator: str = "auto", tpu_cores: str = "all") -> list[jax.Device]:
+    """Select JAX devices for training based on CLI flags."""
+    acc = (accelerator or "auto").strip().lower()
+    if acc == "tpu":
+        devices = jax.devices("tpu")
+    elif acc == "gpu":
+        devices = jax.devices("gpu")
+    elif acc == "cpu":
+        devices = jax.devices("cpu")
+    else:
+        for backend in ("tpu", "gpu", "cpu"):
+            try:
+                devices = jax.devices(backend)
+                if devices:
+                    break
+            except RuntimeError:
+                continue
+        else:
+            devices = jax.devices()
+
+    if not devices:
+        raise RuntimeError(f"No JAX devices found for accelerator='{accelerator}'.")
+
+    platform = devices[0].platform
+    cores_mode = str(tpu_cores or "all").strip().lower()
+    if platform == "tpu" and cores_mode == "1":
+        return [devices[0]]
+    return list(devices)
+
+
+def supports_bfloat16(devices: Sequence[jax.Device]) -> bool:
+    """Return True if the target JAX devices natively accelerate bfloat16."""
+    if not devices:
+        return False
+    platform = devices[0].platform
+    if platform == "tpu":
+        return True
+    if platform == "gpu":
+        kind = getattr(devices[0], "device_kind", "").lower()
+        # NVIDIA Volta/Turing (T4/V100) lack native tensor-core BF16; Ampere+ and MI200+ support it.
+        non_bf16_kinds = ("t4", "v100", "p100", "p4", "k80", "gtx", "rtx 20", "quadro rtx")
+        return not any(tok in kind for tok in non_bf16_kinds)
+    return False

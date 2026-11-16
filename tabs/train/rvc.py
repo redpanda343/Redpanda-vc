@@ -751,6 +751,28 @@ def rvc_train_tab():
                         interactive=True,
                     )
             with gr.Row():
+                accelerator = gr.Radio(
+                    label=i18n("Training Accelerator"),
+                    info=i18n("JAX backend selection (Auto prefers TPU, then GPU, then CPU)."),
+                    choices=["auto", "tpu", "gpu", "cpu"],
+                    value="auto",
+                    interactive=True,
+                )
+                tpu_cores = gr.Radio(
+                    label=i18n("TPU Cores"),
+                    info=i18n("Use all TPU chips for data parallelism or pin to a single chip."),
+                    choices=["all", "1"],
+                    value="all",
+                    interactive=True,
+                )
+                train_dtype = gr.Radio(
+                    label=i18n("JAX Precision"),
+                    info=i18n("Auto uses BF16 on TPU/Ampere+ GPUs and FP32 elsewhere; weight storage and losses stay FP32."),
+                    choices=["auto", "bf16", "fp32"],
+                    value="auto",
+                    interactive=True,
+                )
+            with gr.Row():
                 lr_schedule = gr.Radio(
                     label=i18n("Learning Rate Schedule"),
                     info=i18n(
@@ -867,7 +889,19 @@ def rvc_train_tab():
             )
 
         def start_training(*args):
-            *arguments, warmup, decay_steps, batch_seconds, ema, schedule, final_ratio, reset = args
+            (
+                *arguments,
+                warmup,
+                decay_steps,
+                batch_seconds,
+                ema,
+                schedule,
+                final_ratio,
+                reset,
+                acc,
+                cores,
+                precision_mode,
+            ) = args
             message = start_train_script(
                 *arguments,
                 warmup_steps=warmup,
@@ -877,6 +911,9 @@ def rvc_train_tab():
                 lr_schedule=schedule,
                 lr_final_ratio=final_ratio,
                 reset_optimizer=reset,
+                accelerator=acc,
+                tpu_cores=cores,
+                dtype=precision_mode,
             )
             gr.Info(message)
             return training_ui_state(args[0])
@@ -1208,6 +1245,9 @@ def rvc_train_tab():
                     lr_schedule,
                     lr_final_ratio,
                     reset_optimizer,
+                    accelerator,
+                    tpu_cores,
+                    train_dtype,
                 ],
                 outputs=training_outputs,
             ).then(**wake_training_timer)

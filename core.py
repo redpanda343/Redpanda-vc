@@ -659,6 +659,9 @@ def _build_train_command(
     lr_schedule: str = "exponential",
     lr_final_ratio: float = 0.1,
     reset_optimizer: bool = False,
+    accelerator: str = "auto",
+    tpu_cores: str = "all",
+    dtype: str = "auto",
 ):
     if version not in {"v1", "v2"}:
         raise ValueError(f"Unsupported RVC version: {version}")
@@ -726,6 +729,12 @@ def _build_train_command(
         str(lr_schedule).lower(),
         "--lr-final-ratio",
         str(float(lr_final_ratio)),
+        "--accelerator",
+        str(accelerator).lower(),
+        "--tpu-cores",
+        str(tpu_cores).lower(),
+        "--dtype",
+        str(dtype).lower(),
     ]
     if pg:
         command += ["--pretrained-g", pg]
@@ -772,6 +781,9 @@ def run_train_script(
     lr_schedule: str = "exponential",
     lr_final_ratio: float = 0.1,
     reset_optimizer: bool = False,
+    accelerator: str = "auto",
+    tpu_cores: str = "all",
+    dtype: str = "auto",
 ):
     command = _build_train_command(
         model_name,
@@ -799,6 +811,9 @@ def run_train_script(
         lr_schedule,
         lr_final_ratio,
         reset_optimizer,
+        accelerator,
+        tpu_cores,
+        dtype,
     )
     result = subprocess.run(command)
     if result.returncode != 0:
@@ -853,6 +868,9 @@ def start_train_script(
     lr_schedule: str = "exponential",
     lr_final_ratio: float = 0.1,
     reset_optimizer: bool = False,
+    accelerator: str = "auto",
+    tpu_cores: str = "all",
+    dtype: str = "auto",
 ):
     command = _build_train_command(
         model_name,
@@ -880,6 +898,9 @@ def start_train_script(
         lr_schedule,
         lr_final_ratio,
         reset_optimizer,
+        accelerator,
+        tpu_cores,
+        dtype,
     )
 
     on_success = None
@@ -1566,7 +1587,25 @@ def extract(**kwargs):
     "--reset-optimizer",
     is_flag=True,
     default=False,
-    help="When resuming from G_*.pth and D_*.pth, start the optimizers without their saved moments.",
+    help="When resuming from G_*.pth/G_*.npz and D_*.pth/D_*.npz, start the optimizers without their saved moments.",
+)
+@click.option(
+    "--accelerator",
+    type=click.Choice(["auto", "tpu", "gpu", "cpu"]),
+    default="auto",
+    help="JAX accelerator backend.",
+)
+@click.option(
+    "--tpu-cores",
+    type=click.Choice(["all", "1"]),
+    default="all",
+    help="Use all TPU chips or pin to 1 chip.",
+)
+@click.option(
+    "--dtype",
+    type=click.Choice(["auto", "bf16", "fp32"]),
+    default="auto",
+    help="JAX compute precision policy (parameters, losses, and reference decode always remain FP32).",
 )
 def train(**kwargs):
     """Train an RVC model."""
@@ -1596,6 +1635,9 @@ def train(**kwargs):
         lr_schedule=kwargs["lr_schedule"],
         lr_final_ratio=kwargs["lr_final_ratio"],
         reset_optimizer=kwargs["reset_optimizer"],
+        accelerator=kwargs["accelerator"],
+        tpu_cores=kwargs["tpu_cores"],
+        dtype=kwargs["dtype"],
     )
     click.echo(result)
 
