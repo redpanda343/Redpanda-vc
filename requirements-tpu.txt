@@ -21,9 +21,8 @@ soxr==1.1.0
 fireredvad==0.0.2
 
 --extra-index-url https://download.pytorch.org/whl/cpu
-torch>=2.10.0
+torch>=2.11.0
 torchaudio>=2.10.0
-torchvision>=0.24.0
 torch-tpu>=0.2.0; sys_platform == "linux"
 libtpu>=0.0.30; sys_platform == "linux"
 tpu-info; sys_platform == "linux"

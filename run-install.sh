@@ -93,7 +93,8 @@ install_dependencies() {
     conda activate "$ENV_DIR"
     if is_tpu; then
         echo "TPU detected. Installing TPU dependencies..."
-        uv pip install -r "$INSTALL_DIR/requirements-tpu.txt"
+        uv pip install -r "$INSTALL_DIR/requirements-tpu.txt" \
+            --index-strategy unsafe-best-match
         uv pip install --no-deps swift-f0==0.3.0
     else
         uv pip install -r "$INSTALL_DIR/requirements.txt" \
