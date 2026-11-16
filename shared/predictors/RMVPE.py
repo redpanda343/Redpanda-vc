@@ -491,13 +491,9 @@ class RMVPE0Predictor:
                     mel_chunk.shape[-1] % 32 == 0
                 ), "chunk_size must be divisible by 32"
                 if self.is_xla and network is None:
-                    c_frames = mel_chunk.shape[-1]
-                    bucket_frames = max(512, ((c_frames + 511) // 512) * 512)
-                    if bucket_frames > c_frames:
-                        mel_chunk = F.pad(mel_chunk, (0, bucket_frames - c_frames))
                     mel_xla = mel_chunk.to(self.device).transpose(-1, -2).unsqueeze(1)
                     x = self.model.cnn(self.model.unet(mel_xla)).transpose(1, 2).flatten(-2)
-                    x_cpu = x.float().cpu()[:, :c_frames, :]
+                    x_cpu = x.float().cpu()
                     with torch.amp.autocast(device_type="cpu", enabled=False):
                         out_chunk = self.model.fc(x_cpu)
                 else:
