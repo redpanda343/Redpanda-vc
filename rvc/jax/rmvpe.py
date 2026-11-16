@@ -330,6 +330,41 @@ def rmvpe_salience_forward(
     return jax.nn.sigmoid(logits)
 
 
+def decode_rmvpe_f0_jax(hidden_btc: Array, threshold: float = 0.03) -> Array:
+    """Exact on-device local-average F0 decoding matching decode_rmvpe_f0_np."""
+    sal = jnp.asarray(hidden_btc, jnp.float32)
+    centers = jnp.argmax(sal, axis=-1).astype(jnp.int32)
+    max_sal = jnp.max(sal, axis=-1)
+    padded = jnp.pad(sal, ((0, 0), (0, 0), (4, 4)))
+    offsets = jnp.arange(-4, 5, dtype=jnp.int32)
+    idx = (centers + 4)[..., None] + offsets[None, None, :]
+    local_sal = jnp.take_along_axis(padded, idx, axis=-1)
+    cents_map = jnp.asarray(
+        np.pad(20.0 * np.arange(N_CLASS, dtype=np.float64) + RMVPE_CONST, (4, 4)),
+        jnp.float32,
+    )
+    local_cents = cents_map[idx]
+    prod_sum = jnp.sum(local_sal * local_cents, axis=-1)
+    w_sum = jnp.sum(local_sal, axis=-1)
+    cents = jnp.where(w_sum > 0.0, prod_sum / jnp.maximum(w_sum, 1e-12), 0.0)
+    cents = jnp.where(max_sal > jnp.asarray(threshold, jnp.float32), cents, 0.0)
+    f0 = 10.0 * jnp.exp2(cents / 1200.0)
+    return jnp.where(f0 == 10.0, 0.0, f0)
+
+
+def rmvpe_f0_forward(
+    audio_bt: Array,
+    audio_lengths: Array,
+    params: Mapping[str, Any],
+    *,
+    threshold: float = 0.03,
+    prec: PrecisionConfig = PrecisionConfig(),
+) -> Array:
+    """Compute batched RMVPE F0 contours `(B, T_mel)` directly on TPU to minimize host transfer."""
+    salience = rmvpe_salience_forward(audio_bt, audio_lengths, params, prec=prec)
+    return decode_rmvpe_f0_jax(salience, threshold=threshold)
+
+
 def decode_rmvpe_f0_np(hidden: np.ndarray, threshold: float = 0.03) -> np.ndarray:
     """Exact NumPy local-average F0 decoding matching RMVPE0Predictor.decode / to_local_average_f0."""
     salience = np.asarray(hidden, dtype=np.float32)

@@ -49,9 +49,9 @@ def load_filepaths_and_text(filename: str, split: str = "|") -> list[list[str]]:
 
 
 class TextAudioDataset:
-    """Loads WAV audio, linear STFT, phoneme features, and pitch for NWC JAX training."""
+    """Loads WAV audio, optional linear STFT, phoneme features, and pitch for NWC JAX training."""
 
-    def __init__(self, data_cfg) -> None:
+    def __init__(self, data_cfg, *, compute_spec: bool = True) -> None:
         self.audiopaths_and_text = load_filepaths_and_text(data_cfg.training_files)
         self.max_wav_value = float(data_cfg.max_wav_value)
         self.sample_rate = int(data_cfg.sample_rate)
@@ -59,6 +59,7 @@ class TextAudioDataset:
         self.hop_length = int(data_cfg.hop_length)
         self.win_length = int(data_cfg.win_length)
         self.max_sample_frames = 900
+        self.compute_spec = bool(compute_spec)
         self.min_text_len = int(getattr(data_cfg, "min_text_len", 1))
         self.max_text_len = int(getattr(data_cfg, "max_text_len", 5000))
         self._filter()
@@ -101,19 +102,22 @@ class TextAudioDataset:
         if int(sr) != self.sample_rate:
             raise ValueError(f"{sr} SR doesn't match target {self.sample_rate} SR in '{audiopath}'.")
         audio = np.ascontiguousarray(audio[: self.max_sample_frames * self.hop_length], dtype=np.float32)
-        spec = spectrogram_np(audio, self.filter_length, self.hop_length, self.win_length)
-        wav = audio[:, None]  # (T_wav, 1) NWC
 
-        len_phone = phone.shape[0]
-        len_spec = spec.shape[0]
-        if len_phone != len_spec:
-            len_min = min(len_phone, len_spec)
-            len_wav = len_min * self.hop_length
-            spec = spec[:len_min, :]
-            wav = wav[:len_wav, :]
-            phone = phone[:len_min, :]
-            pitch = pitch[:len_min]
-            pitchf = pitchf[:len_min]
+        n_frames_audio = len(audio) // self.hop_length
+        len_min = min(phone.shape[0], n_frames_audio)
+        len_wav = len_min * self.hop_length
+        audio = np.ascontiguousarray(audio[:len_wav], dtype=np.float32)
+        wav = audio[:, None]  # (T_wav, 1) NWC
+        if len_min < n_num:
+            phone = np.ascontiguousarray(phone[:len_min, :], dtype=np.float32)
+            pitch = np.ascontiguousarray(pitch[:len_min], dtype=np.int32)
+            pitchf = np.ascontiguousarray(pitchf[:len_min], dtype=np.float32)
+
+        spec = (
+            spectrogram_np(audio, self.filter_length, self.hop_length, self.win_length)
+            if self.compute_spec
+            else None
+        )
 
         try:
             sid = np.int32(int(dv_str))
@@ -221,49 +225,68 @@ class BucketBatchSampler:
 
 
 def collate_nwc_batch(
-    rows: Sequence[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.int32]],
+    rows: Sequence[tuple[np.ndarray | None, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.int32]],
     hop_length: int,
     target_frames: int | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, ...]:
     """Collate sample rows into NWC NumPy arrays with optional static XLA bucket padding."""
-    sorted_rows = sorted(rows, key=lambda r: r[0].shape[0], reverse=True)
+    has_spec = rows[0][0] is not None
+    sorted_rows = sorted(rows, key=lambda r: r[2].shape[0], reverse=True)
     batch_size = len(sorted_rows)
 
-    spec_lengths = np.asarray([r[0].shape[0] for r in sorted_rows], dtype=np.int32)
-    wave_lengths = np.asarray([r[1].shape[0] for r in sorted_rows], dtype=np.int32)
     phone_lengths = np.asarray([r[2].shape[0] for r in sorted_rows], dtype=np.int32)
+    wave_lengths = np.asarray([r[1].shape[0] for r in sorted_rows], dtype=np.int32)
+    spec_lengths = (
+        np.asarray([r[0].shape[0] for r in sorted_rows], dtype=np.int32)
+        if has_spec
+        else phone_lengths.copy()
+    )
 
     max_spec = int(spec_lengths.max())
     max_phone = int(phone_lengths.max())
     frames = max(int(target_frames), max_spec, max_phone) if target_frames is not None else max(max_spec, max_phone)
     wave_frames = max(frames * int(hop_length), int(wave_lengths.max()))
 
-    spec_bins = sorted_rows[0][0].shape[1]
     phone_dim = sorted_rows[0][2].shape[1]
 
     phone_padded = np.zeros((batch_size, frames, phone_dim), dtype=np.float32)
     pitch_padded = np.zeros((batch_size, frames), dtype=np.int32)
     pitchf_padded = np.zeros((batch_size, frames), dtype=np.float32)
-    spec_padded = np.zeros((batch_size, frames, spec_bins), dtype=np.float32)
     wave_padded = np.zeros((batch_size, wave_frames, 1), dtype=np.float32)
     sid = np.asarray([int(r[5]) for r in sorted_rows], dtype=np.int32)
+    spec_padded = (
+        np.zeros((batch_size, frames, sorted_rows[0][0].shape[1]), dtype=np.float32)
+        if has_spec
+        else None
+    )
 
     for i, (spec, wav, phone, pitch, pitchf, _) in enumerate(sorted_rows):
-        s_len = spec.shape[0]
         w_len = wav.shape[0]
         p_len = phone.shape[0]
-        spec_padded[i, :s_len, :] = spec
+        if has_spec and spec_padded is not None and spec is not None:
+            spec_padded[i, : spec.shape[0], :] = spec
         wave_padded[i, :w_len, :] = wav
         phone_padded[i, :p_len, :] = phone
         pitch_padded[i, : pitch.shape[0]] = pitch
         pitchf_padded[i, : pitchf.shape[0]] = pitchf
 
+    if has_spec and spec_padded is not None:
+        return (
+            phone_padded,
+            phone_lengths,
+            pitch_padded,
+            pitchf_padded,
+            spec_padded,
+            spec_lengths,
+            wave_padded,
+            wave_lengths,
+            sid,
+        )
     return (
         phone_padded,
         phone_lengths,
         pitch_padded,
         pitchf_padded,
-        spec_padded,
         spec_lengths,
         wave_padded,
         wave_lengths,

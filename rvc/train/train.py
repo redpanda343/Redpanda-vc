@@ -68,6 +68,7 @@ from rvc.jax.mel import (
     mel_spectrogram_jax,
     multi_scale_mel_loss,
     spec_to_mel_jax,
+    spectrogram_jax_padded,
 )
 from rvc.jax.ops import slice_segments
 from rvc.jax.synthesizers import (
@@ -292,7 +293,7 @@ class JaxTrainer:
     def build_data(self) -> None:
         data = self.config.data
         max_frames = int(self.args.max_batch_seconds * data.sample_rate / data.hop_length)
-        self.dataset = TextAudioDataset(data)
+        self.dataset = TextAudioDataset(data, compute_spec=False)
         use_tpu_buckets = self.platform in ("tpu", "gpu")
         boundaries = list(BUCKET_BOUNDARIES if use_tpu_buckets else LEGACY_BUCKET_BOUNDARIES)
         # Ensure tiny test clips are also representable if user didn't filter or if dataset has short clips
@@ -525,7 +526,17 @@ class JaxTrainer:
             rng_key,
             batch,
         ):
-            phone, phone_lengths, pitch, pitchf, spec, spec_lengths, wave, _wave_lengths, sid = batch
+            phone, phone_lengths, pitch, pitchf, spec_lengths, wave, wave_lengths, sid = batch
+            spec = lax.stop_gradient(
+                spectrogram_jax_padded(
+                    wave,
+                    wave_lengths,
+                    int(data_cfg.filter_length),
+                    hop_length,
+                    int(data_cfg.win_length),
+                    max_frames=phone.shape[1],
+                )
+            )
             rng_key, step_rng = jax.random.split(rng_key)
 
             def _gen_diff(p_g):
@@ -838,53 +849,66 @@ class JaxTrainer:
         self.update_postfix()
         base_lr = float(self.config.train.learning_rate)
 
-        for np_batch in self.loader:
-            if self.exporter is not None:
-                self.exporter.raise_if_failed()
-            factor = self.current_lr_factor(epoch)
-            lr_g_val = base_lr * g_lr_coeff * factor
-            lr_d_val = base_lr * d_lr_coeff * factor
-            ema_lerp = self._next_ema_lerp()
-            log_norms = (self.global_step + 1) % self.log_interval == 0
-            dev_batch = self._shard_batch(np_batch)
+        batch_iter = iter(self.loader)
+        try:
+            cur_np = next(batch_iter, None)
+            if cur_np is None:
+                return
+            cur_dev = self._shard_batch(cur_np)
 
-            (
-                self.params_g,
-                self.opt_state_g,
-                self.params_d,
-                self.opt_state_d,
-                self.ema_params,
-                self.loss_sums,
-                gn_d,
-                gn_g,
-                self.rng_key,
-                y_hat_0,
-                id_0,
-                spec_0,
-            ) = self._step_fn(
-                self.params_g,
-                self.opt_state_g,
-                self.params_d,
-                self.opt_state_d,
-                self.ema_params,
-                self.loss_sums,
-                jnp.float32(lr_g_val),
-                jnp.float32(lr_d_val),
-                jnp.float32(ema_lerp),
-                jnp.bool_(log_norms),
-                self.rng_key,
-                dev_batch,
-            )
-            self.last_batch = (spec_0, id_0, y_hat_0)
-            self.global_step += 1
-            self.epoch_step += 1
-            self._record_and_maybe_log(gn_d, gn_g, lr_g_val)
-            self.progress.update(1)
-            final = self.global_step >= self.args.total_steps
-            if final or self.global_step % self.args.save_every_steps == 0:
-                self.save(epoch, final)
-            if final:
-                break
+            while cur_dev is not None:
+                if self.exporter is not None:
+                    self.exporter.raise_if_failed()
+                factor = self.current_lr_factor(epoch)
+                lr_g_val = base_lr * g_lr_coeff * factor
+                lr_d_val = base_lr * d_lr_coeff * factor
+                ema_lerp = self._next_ema_lerp()
+                log_norms = (self.global_step + 1) % self.log_interval == 0
+
+                (
+                    self.params_g,
+                    self.opt_state_g,
+                    self.params_d,
+                    self.opt_state_d,
+                    self.ema_params,
+                    self.loss_sums,
+                    gn_d,
+                    gn_g,
+                    self.rng_key,
+                    y_hat_0,
+                    id_0,
+                    spec_0,
+                ) = self._step_fn(
+                    self.params_g,
+                    self.opt_state_g,
+                    self.params_d,
+                    self.opt_state_d,
+                    self.ema_params,
+                    self.loss_sums,
+                    np.float32(lr_g_val),
+                    np.float32(lr_d_val),
+                    np.float32(ema_lerp),
+                    np.bool_(log_norms),
+                    self.rng_key,
+                    cur_dev,
+                )
+                self.last_batch = (spec_0, id_0, y_hat_0)
+                self.global_step += 1
+                self.epoch_step += 1
+                self._record_and_maybe_log(gn_d, gn_g, lr_g_val)
+                self.progress.update(1)
+                final = self.global_step >= self.args.total_steps
+                if final or self.global_step % self.args.save_every_steps == 0:
+                    self.save(epoch, final)
+                if final:
+                    break
+
+                # Stage next batch on device while current _step_fn executes asynchronously on TPU.
+                next_np = next(batch_iter, None)
+                cur_dev = self._shard_batch(next_np) if next_np is not None else None
+        finally:
+            if hasattr(batch_iter, "close"):
+                batch_iter.close()
 
     def fit(self) -> None:
         self.build_data()

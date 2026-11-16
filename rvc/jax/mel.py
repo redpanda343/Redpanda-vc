@@ -133,6 +133,39 @@ def spectrogram_jax(
     return jnp.transpose(spec, (0, 2, 1))
 
 
+def spectrogram_jax_padded(
+    y: Array,
+    wave_lengths: Array,
+    n_fft: int,
+    hop_size: int,
+    win_size: int,
+    max_frames: int | None = None,
+) -> Array:
+    """Exact variable-length magnitude STFT on bucket-padded audio (B, T_wav, 1) -> (B, TT, F)."""
+    pad = int((n_fft - hop_size) // 2)
+    y_bt = jnp.asarray(y, jnp.float32)
+    if y_bt.ndim == 3:
+        y_bt = y_bt[..., 0]
+    lengths = jnp.asarray(wave_lengths, jnp.int32)
+
+    def _pad_one(wav: Array, w_len: Array) -> Array:
+        left = wav[pad:0:-1]
+        ext = jnp.concatenate([left, wav, jnp.zeros((pad,), dtype=jnp.float32)], axis=0)
+        start = jnp.maximum(w_len - 1, 0)
+        seg = lax.dynamic_slice(ext, (start,), (pad,))[::-1]
+        return lax.dynamic_update_slice(ext, seg, (pad + w_len,))
+
+    y_padded = jax.vmap(_pad_one, in_axes=(0, 0))(y_bt, lengths)
+    win = hann_window_np(win_size)
+    real, imag = stft_complex(y_padded, n_fft, hop_size, win_size, win, pad_left=0, pad_right=0)
+    spec = jnp.transpose(jnp.sqrt(real * real + imag * imag + 2e-7), (0, 2, 1))  # (B, TT, F)
+    if max_frames is not None:
+        spec = spec[:, : int(max_frames), :]
+    valid_frames = (lengths // int(hop_size))[:, None, None]
+    frame_idx = jnp.arange(spec.shape[1], dtype=jnp.int32)[None, :, None]
+    return jnp.where(frame_idx < valid_frames, spec, 0.0)
+
+
 def spec_to_mel_jax(
     spec_nwc: Array,
     n_fft: int,
