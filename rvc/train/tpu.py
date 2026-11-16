@@ -48,7 +48,6 @@ def configure_env(cache_dir=None):
             os.environ.setdefault("TORCH_TPU_DEFER_AND_FUSE", "1")
         elif mode == "eager":
             os.environ.setdefault("TORCH_TPU_DEFER_AND_FUSE", "0")
-        os.environ.setdefault("TORCH_TPU_TIER2_COMPILATION_CACHE", "default")
         os.environ.setdefault(
             "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
             cache_dir or DEFAULT_TPU_CACHE_DIR,
@@ -270,22 +269,25 @@ def _configure_spawn_topology(single_core):
     return is_single_chip and num_workers == 1 and (local_devices is None or local_devices == 1)
 
 
-def _torch_tpu_worker(local_rank, fn, args, world_size):
+def _torch_tpu_worker(local_rank, fn, args, nproc_per_node):
+    node_rank = int(os.environ.get("NODE_RANK", "0"))
+    nnodes = int(os.environ.get("NNODES", "1"))
+    global_rank = node_rank * nproc_per_node + local_rank
+    world_size = nnodes * nproc_per_node
     os.environ["LOCAL_RANK"] = str(local_rank)
-    os.environ["RANK"] = str(local_rank)
+    os.environ["LOCAL_WORLD_SIZE"] = str(nproc_per_node)
+    os.environ["RANK"] = str(global_rank)
     os.environ["WORLD_SIZE"] = str(world_size)
     require_tpu()
-    if hasattr(torch, "accelerator") and hasattr(torch.accelerator, "set_device_index"):
-        torch.accelerator.set_device_index(local_rank)
     if world_size > 1 and not dist.is_initialized():
         dist.init_process_group(
             backend="tpu_dist",
             init_method="env://",
             world_size=world_size,
-            rank=local_rank,
+            rank=global_rank,
         )
     try:
-        fn(local_rank, *args)
+        fn(global_rank, *args)
     finally:
         if world_size > 1 and dist.is_initialized():
             dist.destroy_process_group()
@@ -308,7 +310,9 @@ def spawn(fn, args, single_core=False):
             except Exception:
                 count = 1
         if single_core or count <= 1:
-            for key in ("RANK", "LOCAL_RANK", "WORLD_SIZE"):
+            if single_core:
+                os.environ.setdefault("TPU_VISIBLE_DEVICES", "0")
+            for key in ("RANK", "LOCAL_RANK", "LOCAL_WORLD_SIZE", "WORLD_SIZE"):
                 os.environ.pop(key, None)
             fn(0, *args)
             return
@@ -316,7 +320,12 @@ def spawn(fn, args, single_core=False):
         require_tpu()
         tpu_dist = getattr(getattr(torch, "tpu", None), "distributed", None)
         if tpu_dist is not None and hasattr(tpu_dist, "set_tpu_launch_env"):
-            tpu_dist.set_tpu_launch_env()
+            try:
+                tpu_dist.set_tpu_launch_env(nproc_per_node=count)
+            except TypeError:
+                tpu_dist.set_tpu_launch_env()
+        if torch.multiprocessing.get_start_method(allow_none=True) != "spawn":
+            torch.multiprocessing.set_start_method("spawn", force=True)
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
         if "MASTER_PORT" not in os.environ:
             import socket
@@ -457,7 +466,6 @@ def initialize_cache(path, index):
     try:
         os.makedirs(path, exist_ok=True)
         if backend() == "torch_tpu":
-            os.environ.setdefault("TORCH_TPU_TIER2_COMPILATION_CACHE", "default")
             os.environ.setdefault("TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT", path)
             return
         _xr().initialize_cache(path, readonly=index != 0)
@@ -522,12 +530,20 @@ def get_rng_state():
 
 def set_rng_state(state):
     if backend() == "torch_tpu":
+        if isinstance(state, int):
+            manual_seed(state)
+            return
+        if torch.is_tensor(state):
+            state = state.detach().to(device="cpu", dtype=torch.uint8)
         acc_random = getattr(getattr(torch, "accelerator", None), "random", None)
         if acc_random is not None and hasattr(acc_random, "set_rng_state"):
             acc_random.set_rng_state(state)
             return
         torch.tpu.set_rng_state(state)
         return
+    if torch.is_tensor(state):
+        raw = bytes(state.detach().cpu().to(torch.uint8).reshape(-1)[:8].tolist())
+        state = int.from_bytes(raw or b"\x00", "little")
     _xm().set_rng_state(int(state))
 
 

@@ -1448,8 +1448,8 @@ class Trainer:
             ):
                 self._last_step_compiled = True
         elif self.torch_tpu:
-            tpu.sync()
             if phase2_timing is not None:
+                tpu.sync()
                 t_shape, shape_label = phase2_timing
                 self._write_tpu_log(
                     f"Warmed up TPU {shape_label} in {time.perf_counter() - t_shape:.1f}s"
@@ -1481,11 +1481,12 @@ class Trainer:
             stats_rst0 = tpu.compile_stats()
             self.loss_sums.zero_()
             self.batch_count = 0
-            tpu.sync()
-            if self.xla and self._log_xla_compile(
-                "loss buffer reset", t_rst, stats_rst0, tpu.compile_stats()
-            ):
-                self._last_step_compiled = True
+            if self.xla:
+                tpu.sync()
+                if self._log_xla_compile(
+                    "loss buffer reset", t_rst, stats_rst0, tpu.compile_stats()
+                ):
+                    self._last_step_compiled = True
         else:
             totals = torch.cat((self.loss_sums, self.loss_sums.new_tensor([self.batch_count])))
             if self.world_size > 1:
