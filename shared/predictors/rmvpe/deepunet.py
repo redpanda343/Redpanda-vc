@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from .constants import N_MELS
 
 
@@ -31,11 +32,21 @@ class ConvBlockRes(nn.Module):
         else:
             self.is_shortcut = False
 
-    def forward(self, x):
-        if self.is_shortcut:
-            return self.conv(x) + self.shortcut(x)
-        else:
-            return self.conv(x) + x
+    def forward(self, x, mask=None):
+        if mask is not None:
+            x = x * mask
+        h = self.conv[0](x)
+        h = self.conv[1](h)
+        h = self.conv[2](h)
+        if mask is not None:
+            h = h * mask
+        h = self.conv[3](h)
+        h = self.conv[4](h)
+        h = self.conv[5](h)
+        out = h + (self.shortcut(x) if self.is_shortcut else x)
+        if mask is not None:
+            out = out * mask
+        return out
 
 
 class ResEncoderBlock(nn.Module):
@@ -50,9 +61,9 @@ class ResEncoderBlock(nn.Module):
         if self.kernel_size is not None:
             self.pool = nn.AvgPool2d(kernel_size=kernel_size)
 
-    def forward(self, x):
+    def forward(self, x, mask=None):
         for i in range(self.n_blocks):
-            x = self.conv[i](x)
+            x = self.conv[i](x, mask=mask)
         if self.kernel_size is not None:
             return x, self.pool(x)
         else:
@@ -80,11 +91,13 @@ class ResDecoderBlock(nn.Module):
         for i in range(n_blocks-1):
             self.conv2.append(ConvBlockRes(out_channels, out_channels, momentum))
 
-    def forward(self, x, concat_tensor):
+    def forward(self, x, concat_tensor, mask=None):
         x = self.conv1(x)
+        if mask is not None:
+            x = x * mask
         x = torch.cat((x, concat_tensor), dim=1)
         for i in range(self.n_blocks):
-            x = self.conv2[i](x)
+            x = self.conv2[i](x, mask=mask)
         return x
 
 
@@ -104,13 +117,19 @@ class Encoder(nn.Module):
         self.out_size = in_size
         self.out_channel = out_channels
 
-    def forward(self, x):
+    def forward(self, x, mask=None):
         concat_tensors = []
+        masks = []
         x = self.bn(x)
+        if mask is not None:
+            x = x * mask
         for i in range(self.n_encoders):
-            _, x = self.layers[i](x)
-            concat_tensors.append(_)
-        return x, concat_tensors
+            masks.append(mask)
+            t, x = self.layers[i](x, mask=mask)
+            concat_tensors.append(t)
+            if mask is not None:
+                mask = F.avg_pool2d(mask, kernel_size=(2, 1))
+        return x, concat_tensors, mask, masks
 
 
 class Intermediate(nn.Module):
@@ -122,9 +141,9 @@ class Intermediate(nn.Module):
         for i in range(self.n_inters-1):
             self.layers.append(ResEncoderBlock(out_channels, out_channels, None, n_blocks, momentum))
 
-    def forward(self, x):
+    def forward(self, x, mask=None):
         for i in range(self.n_inters):
-            x = self.layers[i](x)
+            x = self.layers[i](x, mask=mask)
         return x
 
 
@@ -138,9 +157,10 @@ class Decoder(nn.Module):
             self.layers.append(ResDecoderBlock(in_channels, out_channels, stride, n_blocks, momentum))
             in_channels = out_channels
 
-    def forward(self, x, concat_tensors):
+    def forward(self, x, concat_tensors, masks=None):
         for i in range(self.n_decoders):
-            x = self.layers[i](x, concat_tensors[-1-i])
+            m = masks[-1 - i] if masks is not None else None
+            x = self.layers[i](x, concat_tensors[-1 - i], mask=m)
         return x
 
 
@@ -166,8 +186,8 @@ class DeepUnet0(nn.Module):
         self.tf = TimbreFilter(self.encoder.latent_channels)
         self.decoder = Decoder(self.encoder.out_channel, en_de_layers, kernel_size, n_blocks)
 
-    def forward(self, x):
-        x, concat_tensors = self.encoder(x)
-        x = self.intermediate(x)
-        x = self.decoder(x, concat_tensors)
+    def forward(self, x, mask=None):
+        x, concat_tensors, mask_low, masks = self.encoder(x, mask=mask)
+        x = self.intermediate(x, mask=mask_low)
+        x = self.decoder(x, concat_tensors, masks=masks)
         return x

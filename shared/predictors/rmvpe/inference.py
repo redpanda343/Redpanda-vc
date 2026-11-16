@@ -60,9 +60,16 @@ class RMVPE:
             n_frames = mel.shape[-1]
             mel = F.pad(mel.float(), (0, 32 * ((n_frames - 1) // 32 + 1) - n_frames), mode='reflect')
             if self.is_xla:
-                mel_xla = mel.to(self.device).transpose(-1, -2).unsqueeze(1)
-                x = self.model.cnn(self.model.unet(mel_xla)).transpose(1, 2).flatten(-2)
-                x_cpu = x.float().cpu()
+                c_frames = mel.shape[-1]
+                bucket_frames = max(512, ((c_frames + 511) // 512) * 512)
+                mel_padded = F.pad(mel, (0, bucket_frames - c_frames)) if bucket_frames > c_frames else mel
+                mask = torch.zeros((mel_padded.shape[0], 1, bucket_frames, 1), dtype=torch.float32)
+                mask[:, :, :c_frames, :] = 1.0
+                mel_xla = mel_padded.to(self.device).transpose(-1, -2).unsqueeze(1)
+                mask_xla = mask.to(self.device)
+                x = self.model.cnn(self.model.unet(mel_xla, mask=mask_xla)) * mask_xla
+                x = x.transpose(1, 2).flatten(-2)
+                x_cpu = x.float().cpu()[:, :c_frames, :]
                 with torch.amp.autocast(device_type='cpu', enabled=False):
                     hidden = self.model.fc(x_cpu)
                 return hidden[:, :n_frames]
@@ -102,9 +109,16 @@ class RMVPE:
             audio_res = F.pad(audio_res, (0, self._padded_length(T) - T))
             mel = self.mel_extractor(audio_res, center=True).float()
             if self.is_xla and network is None:
-                mel_xla = mel.to(self.device).transpose(-1, -2).unsqueeze(1)
-                x = self.model.cnn(self.model.unet(mel_xla)).transpose(1, 2).flatten(-2)
-                x_cpu = x.float().cpu()
+                c_frames = mel.shape[-1]
+                bucket_frames = max(512, ((c_frames + 511) // 512) * 512)
+                mel_padded = F.pad(mel, (0, bucket_frames - c_frames)) if bucket_frames > c_frames else mel
+                mask = torch.zeros((mel_padded.shape[0], 1, bucket_frames, 1), dtype=torch.float32)
+                mask[:, :, :c_frames, :] = 1.0
+                mel_xla = mel_padded.to(self.device).transpose(-1, -2).unsqueeze(1)
+                mask_xla = mask.to(self.device)
+                x = self.model.cnn(self.model.unet(mel_xla, mask=mask_xla)) * mask_xla
+                x = x.transpose(1, 2).flatten(-2)
+                x_cpu = x.float().cpu()[:, :c_frames, :]
                 with torch.amp.autocast(device_type='cpu', enabled=False):
                     hidden = self.model.fc(x_cpu)
                 return hidden[:, :n_frames]

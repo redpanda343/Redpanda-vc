@@ -52,11 +52,21 @@ class ConvBlockRes(nn.Module):
         else:
             self.is_shortcut = False
 
-    def forward(self, x):
-        if self.is_shortcut:
-            return self.conv(x) + self.shortcut(x)
-        else:
-            return self.conv(x) + x
+    def forward(self, x, mask=None):
+        if mask is not None:
+            x = x * mask
+        h = self.conv[0](x)
+        h = self.conv[1](h)
+        h = self.conv[2](h)
+        if mask is not None:
+            h = h * mask
+        h = self.conv[3](h)
+        h = self.conv[4](h)
+        h = self.conv[5](h)
+        out = h + (self.shortcut(x) if self.is_shortcut else x)
+        if mask is not None:
+            out = out * mask
+        return out
 
 
 class ResEncoderBlock(nn.Module):
@@ -84,9 +94,9 @@ class ResEncoderBlock(nn.Module):
         if self.kernel_size is not None:
             self.pool = nn.AvgPool2d(kernel_size=kernel_size)
 
-    def forward(self, x):
+    def forward(self, x, mask=None):
         for i in range(self.n_blocks):
-            x = self.conv[i](x)
+            x = self.conv[i](x, mask=mask)
         if self.kernel_size is not None:
             return x, self.pool(x)
         else:
@@ -135,13 +145,19 @@ class Encoder(nn.Module):
         self.out_size = in_size
         self.out_channel = out_channels
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, mask=None):
         concat_tensors: List[torch.Tensor] = []
+        masks = []
         x = self.bn(x)
+        if mask is not None:
+            x = x * mask
         for i in range(self.n_encoders):
-            t, x = self.layers[i](x)
+            masks.append(mask)
+            t, x = self.layers[i](x, mask=mask)
             concat_tensors.append(t)
-        return x, concat_tensors
+            if mask is not None:
+                mask = F.avg_pool2d(mask, kernel_size=(2, 1))
+        return x, concat_tensors, mask, masks
 
 
 class Intermediate(nn.Module):
@@ -168,9 +184,9 @@ class Intermediate(nn.Module):
                 ResEncoderBlock(out_channels, out_channels, None, n_blocks, momentum)
             )
 
-    def forward(self, x):
+    def forward(self, x, mask=None):
         for i in range(self.n_inters):
-            x = self.layers[i](x)
+            x = self.layers[i](x, mask=mask)
         return x
 
 
@@ -208,11 +224,13 @@ class ResDecoderBlock(nn.Module):
         for _ in range(n_blocks - 1):
             self.conv2.append(ConvBlockRes(out_channels, out_channels, momentum))
 
-    def forward(self, x, concat_tensor):
+    def forward(self, x, concat_tensor, mask=None):
         x = self.conv1(x)
+        if mask is not None:
+            x = x * mask
         x = torch.cat((x, concat_tensor), dim=1)
         for i in range(self.n_blocks):
-            x = self.conv2[i](x)
+            x = self.conv2[i](x, mask=mask)
         return x
 
 
@@ -239,9 +257,10 @@ class Decoder(nn.Module):
             )
             in_channels = out_channels
 
-    def forward(self, x, concat_tensors):
+    def forward(self, x, concat_tensors, masks=None):
         for i in range(self.n_decoders):
-            x = self.layers[i](x, concat_tensors[-1 - i])
+            m = masks[-1 - i] if masks is not None else None
+            x = self.layers[i](x, concat_tensors[-1 - i], mask=m)
         return x
 
 
@@ -281,10 +300,10 @@ class DeepUnet(nn.Module):
             self.encoder.out_channel, en_de_layers, kernel_size, n_blocks
         )
 
-    def forward(self, x):
-        x, concat_tensors = self.encoder(x)
-        x = self.intermediate(x)
-        x = self.decoder(x, concat_tensors)
+    def forward(self, x, mask=None):
+        x, concat_tensors, mask_low, masks = self.encoder(x, mask=mask)
+        x = self.intermediate(x, mask=mask_low)
+        x = self.decoder(x, concat_tensors, masks=masks)
         return x
 
 
@@ -491,9 +510,17 @@ class RMVPE0Predictor:
                     mel_chunk.shape[-1] % 32 == 0
                 ), "chunk_size must be divisible by 32"
                 if self.is_xla and network is None:
+                    c_frames = mel_chunk.shape[-1]
+                    bucket_frames = max(512, ((c_frames + 511) // 512) * 512)
+                    if bucket_frames > c_frames:
+                        mel_chunk = F.pad(mel_chunk, (0, bucket_frames - c_frames))
+                    mask = torch.zeros((mel_chunk.shape[0], 1, bucket_frames, 1), dtype=torch.float32)
+                    mask[:, :, :c_frames, :] = 1.0
                     mel_xla = mel_chunk.to(self.device).transpose(-1, -2).unsqueeze(1)
-                    x = self.model.cnn(self.model.unet(mel_xla)).transpose(1, 2).flatten(-2)
-                    x_cpu = x.float().cpu()
+                    mask_xla = mask.to(self.device)
+                    x = self.model.cnn(self.model.unet(mel_xla, mask=mask_xla)) * mask_xla
+                    x = x.transpose(1, 2).flatten(-2)
+                    x_cpu = x.float().cpu()[:, :c_frames, :]
                     with torch.amp.autocast(device_type="cpu", enabled=False):
                         out_chunk = self.model.fc(x_cpu)
                 else:
@@ -540,6 +567,58 @@ class RMVPE0Predictor:
         center = decoder(hidden, thred) if decoder is not None else None
         f0 = self.decode(hidden, thred=thred, center=center)
         return f0
+
+    def infer_from_audio_batch_xla(self, audios, thred=0.03, batch_size=8):
+        if not audios:
+            return []
+        results = [None] * len(audios)
+        with torch.no_grad(), torch.amp.autocast(device_type="cpu", enabled=False):
+            mels = []
+            n_frames_list = []
+            c_frames_list = []
+            for audio in audios:
+                audio_t = torch.as_tensor(audio, device="cpu", dtype=torch.float32).unsqueeze(0)
+                mel = self.mel_extractor(audio_t).float()
+                n_frames = mel.shape[-1]
+                pad_len = 32 * ((n_frames - 1) // 32 + 1) - n_frames
+                pad_mode = "reflect" if pad_len < n_frames else "replicate"
+                mel = F.pad(mel, (0, pad_len), mode=pad_mode)
+                mels.append(mel)
+                n_frames_list.append(n_frames)
+                c_frames_list.append(mel.shape[-1])
+
+        max_c = max(c_frames_list)
+        bucket_frames = max(512, ((max_c + 511) // 512) * 512)
+        valid_count = len(mels)
+        padded_mels = []
+        mask = torch.zeros((batch_size, 1, bucket_frames, 1), dtype=torch.float32)
+        for idx in range(batch_size):
+            if idx < valid_count:
+                m = mels[idx]
+                c_f = c_frames_list[idx]
+                if bucket_frames > c_f:
+                    m = F.pad(m, (0, bucket_frames - c_f))
+                padded_mels.append(m)
+                mask[idx, :, :c_f, :] = 1.0
+            else:
+                padded_mels.append(torch.zeros((1, N_MELS, bucket_frames), dtype=torch.float32))
+
+        mel_batch = torch.cat(padded_mels, dim=0)
+        with torch.no_grad(), torch.amp.autocast(device_type="xla", enabled=False):
+            mel_xla = mel_batch.to(self.device).transpose(-1, -2).unsqueeze(1)
+            mask_xla = mask.to(self.device)
+            x = self.model.cnn(self.model.unet(mel_xla, mask=mask_xla)) * mask_xla
+            x = x.transpose(1, 2).flatten(-2)
+            x_cpu = x.float().cpu()
+
+        with torch.no_grad(), torch.amp.autocast(device_type="cpu", enabled=False):
+            for idx in range(valid_count):
+                c_f = c_frames_list[idx]
+                n_f = n_frames_list[idx]
+                out = self.model.fc(x_cpu[idx : idx + 1, :c_f, :])[:, :n_f]
+                hidden = out.squeeze(0).float().numpy()
+                results[idx] = self.decode(hidden, thred=thred)
+        return results
 
     def to_local_average_cents(self, salience, thred=0.05, center=None):
         """

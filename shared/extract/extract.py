@@ -198,9 +198,58 @@ def run_pitch_extraction(files, devices, f0_method, threads, progress, updates, 
 
     if using_tpu and f0_method in ("rmvpe", "swift"):
         fe = FeatureInput(f0_method=f0_method, device=tpu_device(), rectified=rectified)
+        if f0_method == "rmvpe" and not rectified and hasattr(fe.model, "model") and hasattr(fe.model.model, "infer_from_audio_batch_xla"):
+            pending = []
+            for file_info in files:
+                _, opt_path_coarse, opt_path_full, _ = file_info
+                if not force and readable_npy(opt_path_coarse) and readable_npy(opt_path_full):
+                    progress.update(1)
+                else:
+                    pending.append(file_info)
+            if pending:
+                print(
+                    f"\nExtracting F0 ({f0_method}) on TPU for {len(pending)} file(s) (batch_size=8)...",
+                    flush=True,
+                )
+            batch_size = 8
+            for start in range(0, len(pending), batch_size):
+                batch = pending[start : start + batch_size]
+                try:
+                    audios = [load_audio_16k(item[0]) for item in batch]
+                    f0_outputs = fe.model.model.infer_from_audio_batch_xla(
+                        audios, thred=0.03, batch_size=batch_size
+                    )
+                    for item, feature_pit in zip(batch, f0_outputs):
+                        inp_path, opt_path_coarse, opt_path_full, _ = item
+                        feature_pit = np.asarray(feature_pit).copy()
+                        if feature_pit.ndim != 1 or not feature_pit.size:
+                            raise ValueError("Pitch extraction returned an empty or invalid contour.")
+                        if not np.isfinite(feature_pit).all() or np.any(feature_pit < 0):
+                            raise ValueError("Pitch extraction returned invalid frequencies.")
+                        coarse_pit = fe.coarse_f0(feature_pit)
+                        save_npy(opt_path_full, feature_pit)
+                        save_npy(opt_path_coarse, coarse_pit)
+                except Exception as error:
+                    raise RuntimeError(
+                        f"An error occurred extracting batch starting at {batch[0][0]} on {fe.device}: {error}"
+                    ) from error
+                progress.update(len(batch))
+                done_f0 = min(start + len(batch), len(pending))
+                if not sys.stderr.isatty() and (
+                    done_f0 == len(batch)
+                    or done_f0 == len(pending)
+                    or (start // batch_size) % 8 == 0
+                ):
+                    print(
+                        f"Extracting F0 ({f0_method}): {done_f0}/{len(pending)}",
+                        flush=True,
+                    )
+                sys.stderr.flush()
+            return
         for file_info in files:
             fe.process_file(file_info, force=force)
             progress.update(1)
+            sys.stderr.flush()
         return
 
     if f0_method == "pm" or (using_tpu and f0_method == "beatrice"):
@@ -239,33 +288,80 @@ def process_file_embedding(
     n_threads = max(1, n_threads)
 
     if is_xla:
+        expected_dim = int(getattr(model, "feature_dim", 768 if version == "v2" else 256))
+        requires_norm = getattr(model, "audio_requires_normalization", False)
+        buckets = {}
         for file_info in files:
             wav_file_path, _, _, out_file_path = file_info
-            if not readable_npy(out_file_path):
-                feats = torch.from_numpy(load_audio_16k(wav_file_path)).float()
-                if getattr(model, "audio_requires_normalization", False):
-                    feats = torch.nn.functional.layer_norm(feats, feats.shape)
-                orig_len = int(feats.shape[-1])
-                orig_frames = int(model._get_feat_extract_output_lengths(orig_len))
-                pad_len = max(400, ((orig_len + 63999) // 64000) * 64000)
-                if pad_len > orig_len:
-                    feats = torch.nn.functional.pad(feats, (0, pad_len - orig_len))
-                feats = feats.view(1, -1).to(device)
+            if readable_npy(out_file_path):
+                updates.put(1)
+                continue
+            feats = torch.from_numpy(load_audio_16k(wav_file_path)).float()
+            if requires_norm:
+                feats = torch.nn.functional.layer_norm(feats, feats.shape)
+            orig_len = int(feats.shape[-1])
+            orig_frames = int(model._get_feat_extract_output_lengths(orig_len))
+            pad_len = max(400, ((orig_len + 63999) // 64000) * 64000)
+            buckets.setdefault(pad_len, []).append(
+                (wav_file_path, out_file_path, feats, orig_len, orig_frames)
+            )
+
+        total_pending = sum(len(v) for v in buckets.values())
+        if total_pending:
+            print(
+                f"\nExtracting features ({embedder_model}) on TPU for {total_pending} file(s) (batch_size=8)...",
+                flush=True,
+            )
+        batch_size = 8
+        done_feat = 0
+        for pad_len, items in buckets.items():
+            for start in range(0, len(items), batch_size):
+                batch = items[start : start + batch_size]
+                valid_count = len(batch)
+                padded_tensors = []
+                orig_lens = []
+                orig_frames_list = []
+                for idx in range(batch_size):
+                    if idx < valid_count:
+                        _, _, feats, o_len, o_frames = batch[idx]
+                        if pad_len > o_len:
+                            feats = torch.nn.functional.pad(feats, (0, pad_len - o_len))
+                        padded_tensors.append(feats)
+                        orig_lens.append(o_len)
+                        orig_frames_list.append(o_frames)
+                    else:
+                        padded_tensors.append(torch.zeros(pad_len, dtype=torch.float32))
+                        orig_lens.append(orig_lens[-1])
+                        orig_frames_list.append(orig_frames_list[-1])
+                batch_feats = torch.stack(padded_tensors, dim=0).to(device)
                 with torch.no_grad():
                     result = extract_embedding_features_xla(
-                        model, feats, orig_len, orig_frames, version
+                        model, batch_feats, orig_lens, orig_frames_list, version
                     )
-                feats_out = result.squeeze(0).float().cpu().numpy()[:orig_frames]
-                expected_dim = int(getattr(model, "feature_dim", feats_out.shape[-1]))
-                if feats_out.ndim != 2 or feats_out.shape[1] != expected_dim:
-                    raise RuntimeError(
-                        f"{wav_file_path} produced shape {feats_out.shape}; expected "
-                        f"[frames, {expected_dim}]."
+                result_np = result.float().cpu().numpy()
+                for idx in range(valid_count):
+                    wav_file_path, out_file_path, _, _, o_frames = batch[idx]
+                    feats_out = result_np[idx, :o_frames]
+                    if feats_out.ndim != 2 or feats_out.shape[1] != expected_dim:
+                        raise RuntimeError(
+                            f"{wav_file_path} produced shape {feats_out.shape}; expected "
+                            f"[frames, {expected_dim}]."
+                        )
+                    if not np.isfinite(feats_out).all():
+                        raise RuntimeError(f"{wav_file_path} produced non-finite values.")
+                    save_npy(out_file_path, feats_out)
+                done_feat += valid_count
+                updates.put(valid_count)
+                if not sys.stderr.isatty() and (
+                    done_feat == valid_count
+                    or done_feat == total_pending
+                    or (done_feat // batch_size) % 8 == 0
+                ):
+                    print(
+                        f"Extracting features ({embedder_model}): {done_feat}/{total_pending}",
+                        flush=True,
                     )
-                if not np.isfinite(feats_out).all():
-                    raise RuntimeError(f"{wav_file_path} produced non-finite values.")
-                save_npy(out_file_path, feats_out)
-            updates.put(1)
+                sys.stderr.flush()
         return
 
     def worker(file_info):

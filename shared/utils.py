@@ -211,13 +211,21 @@ def extract_embedding_features_xla(model, source, orig_len, orig_frames, version
         source = source.float()
         device = source.device
         dtype = torch.float32
+        batch_size = int(source.shape[0])
+        orig_lens = orig_len if isinstance(orig_len, (list, tuple)) else [int(orig_len)] * batch_size
+        orig_frames_list = (
+            orig_frames
+            if isinstance(orig_frames, (list, tuple))
+            else [int(orig_frames)] * batch_size
+        )
         if getattr(model.config, "feat_extract_norm", "group") == "group":
             conv0 = model.feature_extractor.conv_layers[0]
             hidden = conv0.conv(source.unsqueeze(1))
-            t0_valid = max(1, (orig_len - 10) // 5 + 1)
             t0_total = hidden.shape[-1]
-            m0 = torch.zeros((1, 1, t0_total), dtype=dtype)
-            m0[..., :t0_valid] = 1.0
+            m0 = torch.zeros((batch_size, 1, t0_total), dtype=dtype)
+            for b_idx, o_len in enumerate(orig_lens):
+                t0_valid = max(1, (int(o_len) - 10) // 5 + 1)
+                m0[b_idx, :, :t0_valid] = 1.0
             m0 = m0.to(device)
             denom = m0.sum(dim=-1, keepdim=True).clamp_min(1.0)
             mean = (hidden * m0).sum(dim=-1, keepdim=True) / denom
@@ -239,12 +247,14 @@ def extract_embedding_features_xla(model, source, orig_len, orig_frames, version
         proj = model.feature_projection(extract_features)
         hidden_states = proj[0] if isinstance(proj, tuple) else proj
 
-        frame_mask = torch.zeros((1, pad_frames, 1), dtype=dtype)
-        frame_mask[:, :orig_frames, :] = 1.0
+        frame_mask = torch.zeros((batch_size, pad_frames, 1), dtype=dtype)
+        attn_bias = torch.zeros((batch_size, 1, pad_frames, pad_frames), dtype=dtype)
+        min_val = torch.finfo(dtype).min
+        for b_idx, o_frames in enumerate(orig_frames_list):
+            o_f = int(o_frames)
+            frame_mask[b_idx, :o_f, :] = 1.0
+            attn_bias[b_idx, :, :, o_f:] = min_val
         frame_mask = frame_mask.to(device)
-
-        attn_bias = torch.zeros((1, 1, pad_frames, pad_frames), dtype=dtype)
-        attn_bias[:, :, :, orig_frames:] = torch.finfo(dtype).min
         attn_bias = attn_bias.to(device)
 
         hidden_states = hidden_states * frame_mask
