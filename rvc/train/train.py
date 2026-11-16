@@ -196,7 +196,18 @@ class GeneratorEMA:
             for key, value in model.state_dict().items()
             if "enc_q" not in key
         }
-        self.weights = {key: value.clone() for key, value in live.items()}
+        # TorchTPU's CopyTpuToTpu shallow-shares TPU buffers on .clone()/.copy_(),
+        # which aliases EMA shadows to live generator parameters so fused AdamW
+        # buffer donation invalidates the EMA shadows in DeferAndFuse mode.
+        use_tpu_host_bounce = tpu.backend() == "torch_tpu"
+        self.weights = {
+            key: (
+                value.detach().cpu().clone().to(device=value.device)
+                if use_tpu_host_bounce and value.device.type == "tpu"
+                else value.clone()
+            )
+            for key, value in live.items()
+        }
         float_keys = [key for key, value in live.items() if value.is_floating_point()]
         self.live_floats = [live[key] for key in float_keys]
         self.ema_floats = [self.weights[key] for key in float_keys]
@@ -251,7 +262,10 @@ class GeneratorEMA:
         weights = state["weights"]
         if weights.keys() != self.weights.keys():
             raise ValueError("the saved EMA weights do not match the generator")
+        use_tpu_host_bounce = tpu.backend() == "torch_tpu"
         for key, value in weights.items():
+            if use_tpu_host_bounce and value.device.type == "tpu":
+                value = value.detach().cpu()
             self.weights[key].copy_(value)
         self.updates = int(state["updates"])
         if self._xla_step is not None:
@@ -1115,14 +1129,21 @@ class Trainer:
                     shared_step = torch.zeros(
                         (), dtype=torch.float32, device=self.device
                     )
+                shared_step_cpu = shared_step.detach().cpu() if self.torch_tpu else None
                 for param in group["params"]:
                     if not param.requires_grad:
                         continue
                     state = optimizer.state[param]
                     # Native PyTorch AdamW (used on torch_tpu) increments each param's
                     # state["step"] via _foreach_add_, whereas _xla_adamw_step updates
-                    # one shared step tensor per parameter group.
-                    step_tensor = shared_step if self.xla else shared_step.clone()
+                    # one shared step tensor per parameter group. Bounce through CPU
+                    # on TorchTPU so each parameter owns an independent device buffer.
+                    if self.xla:
+                        step_tensor = shared_step
+                    elif shared_step_cpu is not None:
+                        step_tensor = shared_step_cpu.clone().to(device=param.device)
+                    else:
+                        step_tensor = shared_step.clone()
                     if len(state) == 0:
                         optimizer.state[param] = {
                             "step": step_tensor,
