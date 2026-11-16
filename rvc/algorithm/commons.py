@@ -60,7 +60,9 @@ def convert_pad_shape(pad_shape):
     Args:
         pad_shape: The pad shape..
     """
-    return torch.tensor(pad_shape).flip(0).reshape(-1).int().tolist()
+    if isinstance(pad_shape, torch.Tensor):
+        return pad_shape.flip(0).reshape(-1).int().tolist()
+    return [int(value) for pair in reversed(pad_shape) for value in pair]
 
 
 def slice_segments(
@@ -114,8 +116,9 @@ def fused_add_tanh_sigmoid_multiply(input_a, input_b, n_channels):
         input_b: The second input tensor.
         n_channels: The number of channels.
     """
-    n_channels_int = n_channels[0]
-    in_act = input_a + input_b
+    # Avoid reading a device scalar (.item()) on XLA/TPU for every layer.
+    n_channels_int = n_channels if isinstance(n_channels, int) else int(n_channels[0])
+    in_act = input_a + input_b if input_b is not None else input_a
     t_act = torch.tanh(in_act[:, :n_channels_int, :])
     s_act = torch.sigmoid(in_act[:, n_channels_int:, :])
     acts = t_act * s_act

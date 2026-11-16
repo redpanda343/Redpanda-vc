@@ -9,6 +9,7 @@ import glob
 import json
 import logging
 import math
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from random import randint
 
@@ -208,25 +209,35 @@ class GeneratorEMA:
             if self.ema_floats and self.ema_floats[0].device.type == "xla"
             else None
         )
-        self._xla_weight = (
-            torch.zeros((), dtype=torch.float32, device=xla_device)
-            if xla_device is not None
-            else None
-        )
+        if xla_device is not None:
+            self._xla_step = torch.tensor(
+                float(self.updates), dtype=torch.float32, device=xla_device
+            )
+            self._xla_beta = torch.tensor(
+                float(self.decay), dtype=torch.float32, device=xla_device
+            )
+            self._xla_one_minus_beta = torch.tensor(
+                1.0 - float(self.decay), dtype=torch.float32, device=xla_device
+            )
+        else:
+            self._xla_step = None
 
     @torch.no_grad()
     def update(self):
         self.updates += 1
-        beta = self.decay
-        decay = beta * (1 - beta ** (self.updates - 1)) / (1 - beta**self.updates)
         dev_type = self.ema_floats[0].device.type if self.ema_floats else "cpu"
         with torch.amp.autocast(device_type=dev_type, enabled=False):
-            if self._xla_weight is not None:
-                # Copy into a persistent XLA scalar tensor so per-step decay doesn't recompile.
-                self._xla_weight.copy_(torch.tensor(1.0 - decay, dtype=torch.float32))
+            if self._xla_step is not None:
+                # Keep EMA decay purely on XLA so per-step updates neither recompile nor copy from CPU.
+                self._xla_step.add_(1.0)
+                weight = self._xla_one_minus_beta / (
+                    1.0 - torch.pow(self._xla_beta, self._xla_step)
+                )
                 for target, value in zip(self.ema_floats, self.live_floats):
-                    target.lerp_(value, self._xla_weight)
+                    target.lerp_(value, weight)
             else:
+                beta = self.decay
+                decay = beta * (1 - beta ** (self.updates - 1)) / (1 - beta**self.updates)
                 torch._foreach_lerp_(self.ema_floats, self.live_floats, 1 - decay)
             for target, value in self.copied:
                 target.copy_(value)
@@ -242,6 +253,8 @@ class GeneratorEMA:
         for key, value in weights.items():
             self.weights[key].copy_(value)
         self.updates = int(state["updates"])
+        if self._xla_step is not None:
+            self._xla_step.copy_(torch.tensor(float(self.updates), dtype=torch.float32))
 
 
 def parse_arguments(argv=None):
@@ -479,6 +492,43 @@ def latest_checkpoint_pair(experiment_dir):
     return None, discriminators[0] if discriminators else None
 
 
+def _xla_adamw_step(optimizer):
+    """Run AdamW with shared per-group scalar math to shrink the XLA HLO graph."""
+    with torch.no_grad():
+        for group in optimizer.param_groups:
+            params = [p for p in group["params"] if p.grad is not None]
+            if not params:
+                continue
+            beta1, beta2 = group["betas"]
+            lr = group["lr"]
+            eps = group["eps"]
+            weight_decay = group["weight_decay"]
+
+            # All params in a group share one step tensor on TPU so bias-correction
+            # math isn't duplicated across all 560+ generator parameters.
+            shared_step = optimizer.state[params[0]]["step"]
+            shared_step.add_(1.0)
+            bias_correction1 = 1.0 - torch.pow(beta1, shared_step)
+            bias_correction2 = 1.0 - torch.pow(beta2, shared_step)
+            step_size_neg = -(lr / bias_correction1)
+            denom_scale = torch.rsqrt(bias_correction2) / step_size_neg
+            eps_scaled = eps / step_size_neg
+            decay_scale = 1.0 - lr * weight_decay if weight_decay != 0 else None
+
+            for p in params:
+                grad = p.grad
+                st = optimizer.state[p]
+                exp_avg = st["exp_avg"]
+                exp_avg_sq = st["exp_avg_sq"]
+                st["step"] = shared_step
+                if decay_scale is not None:
+                    p.mul_(decay_scale)
+                exp_avg.lerp_(grad, 1.0 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+                denom = exp_avg_sq.sqrt().mul_(denom_scale).add_(eps_scaled)
+                p.addcdiv_(exp_avg, denom)
+
+
 def main():
     args = parse_arguments()
     config = load_experiment_config(args)
@@ -579,6 +629,13 @@ class Trainer:
         self._last_lr_values = {}
         self.global_step = 0
         self.loss_sums = torch.zeros(6, device=device, dtype=torch.float32)
+        self._xla_grad_norm_d = (
+            torch.zeros((), device=device, dtype=torch.float32) if self.xla else None
+        )
+        self._xla_grad_norm_g = (
+            torch.zeros((), device=device, dtype=torch.float32) if self.xla else None
+        )
+        self._last_step_compiled = False
         self.batch_count = 0
         self.cache = None
         self.loader = None
@@ -607,10 +664,22 @@ class Trainer:
                 group["initial_lr"] = float(group.get("initial_lr", group["lr"]))
         if self.args.lr_schedule == "cosine":
             self.build_lr_schedule(extra.get("lr_schedule"))
-        if self.xla:
-            self._prepare_xla_optimizers()
         if self.args.ema_decay > 0 and (self.rank == 0 or self.xla):
             self.build_ema(last_g, extra.get("ema"))
+        if self.xla:
+            self._prepare_xla_optimizers()
+            self._warmup_xla_caches()
+            if self.rank == 0:
+                bucket_shapes = [
+                    f"(batch={bs}, frames={bound})"
+                    for bs, bound in zip(
+                        self.sampler.bucket_batch_sizes, self.sampler.boundaries[1:]
+                    )
+                ]
+                self._write_tpu_log(
+                    f"TPU compile plan: {len(bucket_shapes)} forward/backward bucket shape(s) "
+                    f"[{', '.join(bucket_shapes)}] + 1 shared generator optimizer/EMA graph"
+                )
 
         if self.rank == 0:
             from torch.utils.tensorboard import SummaryWriter
@@ -1006,14 +1075,82 @@ class Trainer:
                     lr_val, dtype=torch.float32, device=self.device
                 )
                 self._last_lr_values[id(group)] = lr_val
+                shared_step = None
                 for param in group["params"]:
-                    if param.requires_grad and len(optimizer.state[param]) == 0:
+                    state = optimizer.state.get(param)
+                    if state and "step" in state:
+                        shared_step = state["step"].to(
+                            dtype=torch.float32, device=param.device
+                        )
+                        break
+                if shared_step is None:
+                    shared_step = torch.zeros(
+                        (), dtype=torch.float32, device=self.device
+                    )
+                for param in group["params"]:
+                    if not param.requires_grad:
+                        continue
+                    state = optimizer.state[param]
+                    if len(state) == 0:
                         optimizer.state[param] = {
-                            "step": torch.zeros((), dtype=torch.float32, device=param.device),
+                            "step": shared_step,
                             "exp_avg": torch.zeros_like(param),
                             "exp_avg_sq": torch.zeros_like(param),
                         }
+                    else:
+                        state["step"] = shared_step
+
+    def _write_tpu_log(self, message):
+        if self.rank != 0:
+            return
+        if self.progress is not None:
+            self.progress.write(message)
+        else:
+            print(message, flush=True)
+        sys.stdout.flush()
+
+    def _log_xla_compile(self, phase, start_time, before_stats, after_stats):
+        new_compiles = after_stats[0] - before_stats[0]
+        new_uncached = after_stats[1] - before_stats[1]
+        if new_compiles > 0 or new_uncached > 0:
+            elapsed = time.perf_counter() - start_time
+            self._write_tpu_log(
+                f"Compiled TPU {phase} in {elapsed:.1f}s "
+                f"(+{new_compiles}, total={after_stats[0]}, uncached={after_stats[1]})"
+            )
+            return True
+        return False
+
+    def _warmup_xla_caches(self):
+        """Materialize STFT/mel/reset buffers before step 1 so training steps never recompile them."""
+        data = self.config.data
+        stats_before = tpu.compile_stats()
+        t0 = time.perf_counter()
+        self._write_tpu_log("Compiling TPU STFT/mel & scalar buffer warmup...")
+        with torch.no_grad():
+            dummy_wave = torch.zeros(
+                (1, 1, self.config.train.segment_size),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            dummy_spec = torch.zeros(
+                (1, data.filter_length // 2 + 1, self.segment_frames),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            dummy_ids = torch.zeros((1,), dtype=torch.long, device=self.device)
+            _ = self.mel_loss(dummy_wave, dummy_wave, dummy_spec, dummy_ids)
         tpu.sync()
+        stats_mid = tpu.compile_stats()
+        self._log_xla_compile("STFT/mel warmup", t0, stats_before, stats_mid)
+
+        t1 = time.perf_counter()
+        self.loss_sums.zero_()
+        self._xla_grad_norm_d.zero_()
+        self._xla_grad_norm_g.zero_()
+        tpu.sync()
+        stats_after = tpu.compile_stats()
+        self._log_xla_compile("scalar buffer reset warmup", t1, stats_mid, stats_after)
 
     def train_epoch(self, epoch, start_batch):
         self.sampler.set_epoch(epoch, start_batch)
@@ -1023,21 +1160,27 @@ class Trainer:
         self.epoch_step = start_batch
         self.update_postfix()
         for batch in self.batches():
+            step_t0 = time.perf_counter()
             if self.pending_rng is not None:
                 self.restore_rng(self.pending_rng)
                 self.pending_rng = None
             self.set_learning_rate(epoch)
+            self._last_step_compiled = False
             self.train_step(batch)
             self.epoch_step += 1
             self.progress.update(1)
             if self.rank == 0 and (
-                (self.xla and self.global_step in (1, 2))
-                or (not sys.stderr.isatty() and self.global_step % 25 == 0)
+                (self.xla and (self.global_step <= 10 or self._last_step_compiled))
+                or (not sys.stderr.isatty() and self.global_step % 10 == 0)
             ):
-                self.progress.write(
-                    f"Step {self.global_step}/{self.args.total_steps} | epoch {self.epoch}"
+                step_dt = time.perf_counter() - step_t0
+                compile_note = ""
+                if self.xla:
+                    compiles, uncached = tpu.compile_stats()
+                    compile_note = f" | compiles={compiles}, uncached={uncached}"
+                self._write_tpu_log(
+                    f"Step {self.global_step}/{self.args.total_steps} | epoch {self.epoch} | {step_dt:.2f}s{compile_note}"
                 )
-                sys.stdout.flush()
             final = self.global_step >= self.args.total_steps
             if final or self.global_step % self.args.save_every_steps == 0:
                 self.save(epoch, final)
@@ -1091,7 +1234,10 @@ class Trainer:
             norm = commons.grad_norm(net.parameters())
         if before_step is not None:
             before_step()
-        self.scaler.step(optimizer)
+        if self.xla:
+            _xla_adamw_step(optimizer)
+        else:
+            self.scaler.step(optimizer)
         if update_scaler:
             self.scaler.update()
         return norm
@@ -1124,27 +1270,27 @@ class Trainer:
             )
             return self.fn_mel_loss(wave_mel, y_hat_mel) * config.train.c_mel
 
+    def _notify_xla_compile(self, key, label):
+        if not self.xla or key in self._compiled_xla_shapes:
+            return
+        self._compiled_xla_shapes.add(key)
+        self._write_tpu_log(f"Compiling TPU {label} (first run of this graph)...")
+
     def train_step(self, batch):
         config = self.config
         self.last_batch = None
         phone, phone_lengths, pitch, pitchf, spec, spec_lengths, wave, _, sid = batch
-        if self.xla and self.rank == 0:
-            shape = (int(phone.shape[0]), int(phone.shape[1]))
-            if shape not in self._compiled_xla_shapes:
-                self._compiled_xla_shapes.add(shape)
-                message = (
-                    f"Compiling TPU training graph (batch={shape[0]}, frames={shape[1]}); "
-                    "the first run of each shape can take several minutes..."
-                )
-                if self.progress is not None:
-                    self.progress.write(message)
-                else:
-                    print(message, flush=True)
-                sys.stdout.flush()
         log_grad_norms = (
-            (self.rank == 0 or self.xla)
-            and (self.global_step + 1) % self.log_interval == 0
+            self.rank == 0 and (self.global_step + 1) % self.log_interval == 0
         )
+        if self.xla:
+            t_phase1 = time.perf_counter()
+            stats_before = tpu.compile_stats()
+            fwd_key = ("fwd_bwd", int(phone.shape[0]), int(phone.shape[1]))
+            self._notify_xla_compile(
+                fwd_key,
+                f"forward/backward graph (batch={fwd_key[1]}, frames={fwd_key[2]})",
+            )
 
         with self.autocast():
             y_hat, ids_slice, _, z_mask, (_, z_p, m_p, logs_p, _, logs_q) = self.net_g(
@@ -1167,9 +1313,11 @@ class Trainer:
                 self.optim_d,
                 self.net_d,
                 loss_disc,
-                log_grad_norms and last_discriminator_step,
+                last_discriminator_step if self.xla else (log_grad_norms and last_discriminator_step),
                 update_scaler=not last_discriminator_step,
             )
+        if self.xla and grad_norm_d is not None:
+            self._xla_grad_norm_d.copy_(grad_norm_d.float())
 
         if self.freeze_discriminator:
             self.optim_d.zero_grad(set_to_none=True)
@@ -1183,14 +1331,43 @@ class Trainer:
         loss_fm = feature_loss(fmap_r, fmap_g)
         loss_gen, _ = generator_loss(y_d_hat_g)
         loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl
-        grad_norm_g = self.optimizer_step(
-            self.optim_g,
-            self.net_g,
-            loss_gen_all,
-            log_grad_norms,
-            update_scaler=True,
-            before_step=self.exporter.wait_for_staging if self.exporter else None,
-        )
+
+        if self.xla:
+            # Flush forward/backward + D step before optim_g/EMA so optimizer state
+            # (~3,100 buffers) compiles once for all bucket lengths instead of per-shape.
+            self.optim_g.zero_grad()
+            loss_gen_all.backward()
+            if self.world_size > 1:
+                tpu.reduce_gradients(self.optim_g)
+            tpu.sync()
+            stats_mid = tpu.compile_stats()
+            if self._log_xla_compile(
+                f"forward/backward (batch={fwd_key[1]}, frames={fwd_key[2]})",
+                t_phase1,
+                stats_before,
+                stats_mid,
+            ):
+                self._last_step_compiled = True
+
+            t_phase2 = time.perf_counter()
+            self._notify_xla_compile(
+                ("optim_g",),
+                "generator optimizer/EMA graph (shared across shapes)",
+            )
+            grad_norm_g = commons.grad_norm(self.net_g.parameters())
+            self._xla_grad_norm_g.copy_(grad_norm_g.float())
+            if self.exporter:
+                self.exporter.wait_for_staging()
+            _xla_adamw_step(self.optim_g)
+        else:
+            grad_norm_g = self.optimizer_step(
+                self.optim_g,
+                self.net_g,
+                loss_gen_all,
+                log_grad_norms,
+                update_scaler=True,
+                before_step=self.exporter.wait_for_staging if self.exporter else None,
+            )
 
         if self.freeze_discriminator:
             self.net_d.requires_grad_(True)
@@ -1201,40 +1378,73 @@ class Trainer:
         self.record_losses(
             (loss_gen_all, loss_disc, loss_gen, loss_fm, loss_mel, loss_kl),
             (grad_norm_d, grad_norm_g),
+            phase2_timing=(t_phase2, stats_mid) if self.xla else None,
         )
-        if self.xla and self.global_step % self.log_interval != 0:
-            tpu.sync()
         self.last_batch = (spec, ids_slice, y_hat)
 
-    def record_losses(self, losses, grad_norms):
+    def record_losses(self, losses, grad_norms, phase2_timing=None):
         self.loss_sums.add_(torch.stack([loss.detach() for loss in losses]).float())
         self.batch_count += 1
+        if self.xla:
+            t_phase2, stats_mid = phase2_timing
+            tpu.sync()
+            stats_after = tpu.compile_stats()
+            if self._log_xla_compile(
+                "generator optimizer/EMA", t_phase2, stats_mid, stats_after
+            ):
+                self._last_step_compiled = True
         if self.global_step % self.log_interval != 0:
             return
-        totals = torch.cat((self.loss_sums, self.loss_sums.new_tensor([self.batch_count])))
         if self.xla:
+            if self.world_size > 1:
+                t_red = time.perf_counter()
+                stats_r0 = tpu.compile_stats()
+                totals = tpu.sum_tensors(
+                    f"rvc_losses_{self.global_step}",
+                    torch.cat((self.loss_sums, self.loss_sums.new_tensor([self.batch_count]))),
+                )
+                totals_cpu = totals.cpu()
+                loss_values = (totals_cpu[:-1] / totals_cpu[-1]).tolist()
+                if self._log_xla_compile(
+                    "multi-core loss reduction", t_red, stats_r0, tpu.compile_stats()
+                ):
+                    self._last_step_compiled = True
+            else:
+                loss_values = (self.loss_sums.cpu() / self.batch_count).tolist()
+            gradient_values = [
+                float(self._xla_grad_norm_d.cpu()),
+                float(self._xla_grad_norm_g.cpu()),
+            ]
+            t_rst = time.perf_counter()
+            stats_rst0 = tpu.compile_stats()
             self.loss_sums.zero_()
             self.batch_count = 0
             tpu.sync()
-            totals = totals.cpu()
+            if self._log_xla_compile("loss buffer reset", t_rst, stats_rst0, tpu.compile_stats()):
+                self._last_step_compiled = True
+        else:
+            totals = torch.cat((self.loss_sums, self.loss_sums.new_tensor([self.batch_count])))
             if self.world_size > 1:
-                totals = tpu.sum_tensors(f"rvc_losses_{self.global_step}", totals)
-        elif self.world_size > 1:
-            if dist.get_backend() == "gloo" and totals.is_cuda:
-                totals = totals.cpu()
-            dist.reduce(totals, dst=0, op=dist.ReduceOp.SUM)
+                if dist.get_backend() == "gloo" and totals.is_cuda:
+                    totals = totals.cpu()
+                dist.reduce(totals, dst=0, op=dist.ReduceOp.SUM)
         if self.rank == 0:
-            loss_values = (totals[:-1] / totals[-1]).cpu().tolist()
+            if not self.xla:
+                loss_values = (totals[:-1] / totals[-1]).cpu().tolist()
+                gradient_values = torch.stack(grad_norms).float().cpu().tolist()
             self.logged_losses = (loss_values[0], loss_values[1], loss_values[4])
             self.update_postfix()
-            gradient_values = torch.stack(grad_norms).float().cpu().tolist()
+            lr_value = self._last_lr_values.get(
+                id(self.optim_g.param_groups[0]),
+                self.optim_g.param_groups[0]["lr"],
+            )
             summarize(
                 writer=self.writer,
                 global_step=self.global_step,
                 scalars={
                     "loss/g/total": loss_values[0],
                     "loss/d/adv": loss_values[1],
-                    "learning_rate": self.optim_g.param_groups[0]["lr"],
+                    "learning_rate": float(lr_value),
                     "loss/g/adv": loss_values[2],
                     "loss/g/fm": loss_values[3],
                     "loss/g/mel": loss_values[4],
@@ -1307,6 +1517,8 @@ class Trainer:
         )
 
     def save(self, epoch, final):
+        save_t0 = time.perf_counter()
+        save_stats0 = tpu.compile_stats() if self.xla else None
         rng = [self.rng_state()]
         if self.world_size > 1:
             if self.xla:
@@ -1365,6 +1577,8 @@ class Trainer:
                 self.exporter.wait_for_completion()
         if self.xla and self.world_size > 1:
             tpu.rendezvous(f"rvc_save_done_{self.global_step}")
+        if self.xla and save_stats0 is not None:
+            self._log_xla_compile("checkpoint/eval save", save_t0, save_stats0, tpu.compile_stats())
 
 
 if __name__ == "__main__":

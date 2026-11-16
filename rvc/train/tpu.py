@@ -257,6 +257,18 @@ def sync():
         _xm().mark_step()
 
 
+def compile_stats():
+    """Return (compile_count, uncached_count) from PyTorch/XLA metrics."""
+    try:
+        import torch_xla.debug.metrics as met
+    except ImportError:
+        return 0, 0
+    compile_data = met.metric_data("CompileTime")
+    compiles = int(compile_data[0]) if compile_data else 0
+    uncached = met.counter_value("UncachedCompile")
+    return compiles, int(uncached or 0)
+
+
 def initialize_cache(path, index):
     try:
         os.makedirs(path, exist_ok=True)
