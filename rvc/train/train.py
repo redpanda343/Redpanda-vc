@@ -203,6 +203,16 @@ class GeneratorEMA:
             for key, value in live.items()
             if not value.is_floating_point()
         ]
+        xla_device = (
+            self.ema_floats[0].device
+            if self.ema_floats and self.ema_floats[0].device.type == "xla"
+            else None
+        )
+        self._xla_weight = (
+            torch.zeros((), dtype=torch.float32, device=xla_device)
+            if xla_device is not None
+            else None
+        )
 
     @torch.no_grad()
     def update(self):
@@ -211,9 +221,11 @@ class GeneratorEMA:
         decay = beta * (1 - beta ** (self.updates - 1)) / (1 - beta**self.updates)
         dev_type = self.ema_floats[0].device.type if self.ema_floats else "cpu"
         with torch.amp.autocast(device_type=dev_type, enabled=False):
-            if self.ema_floats and dev_type == "xla":
+            if self._xla_weight is not None:
+                # Copy into a persistent XLA scalar tensor so per-step decay doesn't recompile.
+                self._xla_weight.copy_(torch.tensor(1.0 - decay, dtype=torch.float32))
                 for target, value in zip(self.ema_floats, self.live_floats):
-                    target.lerp_(value, 1 - decay)
+                    target.lerp_(value, self._xla_weight)
             else:
                 torch._foreach_lerp_(self.ema_floats, self.live_floats, 1 - decay)
             for target, value in self.copied:
@@ -564,6 +576,7 @@ class Trainer:
         self.workers = max(1, min(max_workers, (os.cpu_count() or 1) // world_size))
         self.pending_rng = None
         self._compiled_xla_shapes = set()
+        self._last_lr_values = {}
         self.global_step = 0
         self.loss_sums = torch.zeros(6, device=device, dtype=torch.float32)
         self.batch_count = 0
@@ -589,9 +602,13 @@ class Trainer:
             tpu.broadcast_master_params(self.net_d)
         for optimizer in (self.optim_g, self.optim_d):
             for group in optimizer.param_groups:
-                group.setdefault("initial_lr", group["lr"])
+                if not self.xla and torch.is_tensor(group["lr"]):
+                    group["lr"] = float(group["lr"])
+                group["initial_lr"] = float(group.get("initial_lr", group["lr"]))
         if self.args.lr_schedule == "cosine":
             self.build_lr_schedule(extra.get("lr_schedule"))
+        if self.xla:
+            self._prepare_xla_optimizers()
         if self.args.ema_decay > 0 and (self.rank == 0 or self.xla):
             self.build_ema(last_g, extra.get("ema"))
 
@@ -793,6 +810,7 @@ class Trainer:
             options = {"fused": self.device.type == "cuda"}
             if self.xla:
                 options["foreach"] = False
+                options["capturable"] = True
         self.optim_g = optimizer(
             net_g.parameters(),
             config.train.learning_rate * g_lr_coeff,
@@ -907,7 +925,9 @@ class Trainer:
         if self.global_step:
             group = self.optim_g.param_groups[0]
             start_factor = (
-                group["lr"] / group["initial_lr"] / self.warmup_ramp(self.global_step - 1)
+                float(group["lr"])
+                / float(group["initial_lr"])
+                / self.warmup_ramp(self.global_step - 1)
             )
         self.lr_schedule = dict(
             target,
@@ -977,6 +997,24 @@ class Trainer:
             batch = self.collate([self.cache[index] for index in indices])
             yield [tensor.to(self.device, non_blocking=True) for tensor in batch]
 
+    def _prepare_xla_optimizers(self):
+        """Pin AdamW step/lr tensors on XLA so step changes don't recompile the graph."""
+        for optimizer in (self.optim_g, self.optim_d):
+            for group in optimizer.param_groups:
+                lr_val = float(group["lr"])
+                group["lr"] = torch.tensor(
+                    lr_val, dtype=torch.float32, device=self.device
+                )
+                self._last_lr_values[id(group)] = lr_val
+                for param in group["params"]:
+                    if param.requires_grad and len(optimizer.state[param]) == 0:
+                        optimizer.state[param] = {
+                            "step": torch.zeros((), dtype=torch.float32, device=param.device),
+                            "exp_avg": torch.zeros_like(param),
+                            "exp_avg_sq": torch.zeros_like(param),
+                        }
+        tpu.sync()
+
     def train_epoch(self, epoch, start_batch):
         self.sampler.set_epoch(epoch, start_batch)
         self.net_g.train()
@@ -992,6 +1030,14 @@ class Trainer:
             self.train_step(batch)
             self.epoch_step += 1
             self.progress.update(1)
+            if self.rank == 0 and (
+                (self.xla and self.global_step in (1, 2))
+                or (not sys.stderr.isatty() and self.global_step % 25 == 0)
+            ):
+                self.progress.write(
+                    f"Step {self.global_step}/{self.args.total_steps} | epoch {self.epoch}"
+                )
+                sys.stdout.flush()
             final = self.global_step >= self.args.total_steps
             if final or self.global_step % self.args.save_every_steps == 0:
                 self.save(epoch, final)
@@ -1025,7 +1071,14 @@ class Trainer:
         factor *= self.warmup_ramp(step)
         for optimizer in (self.optim_g, self.optim_d):
             for group in optimizer.param_groups:
-                group["lr"] = group["initial_lr"] * factor
+                new_lr = float(group["initial_lr"]) * factor
+                if torch.is_tensor(group["lr"]):
+                    group_id = id(group)
+                    if self._last_lr_values.get(group_id) != new_lr:
+                        group["lr"].copy_(torch.tensor(new_lr, dtype=group["lr"].dtype))
+                        self._last_lr_values[group_id] = new_lr
+                else:
+                    group["lr"] = new_lr
 
     def optimizer_step(self, optimizer, net, loss, log_grad_norm, update_scaler, before_step=None):
         optimizer.zero_grad()

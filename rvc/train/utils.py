@@ -74,7 +74,7 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, load_opt=1, reset_st
             optimizer_state = dict(optimizer_state, state={})
         overrides = {
             key: optimizer.defaults[key]
-            for key in ("fused", "foreach")
+            for key in ("fused", "foreach", "capturable")
             if key in optimizer.defaults
         }
         optimizer.load_state_dict(
