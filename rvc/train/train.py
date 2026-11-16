@@ -49,7 +49,8 @@ VOCODERS = ("HiFi-GAN", "MRF HiFi-GAN", "RefineGAN")
 LR_SCHEDULES = ("exponential", "cosine")
 ACCELERATORS = ("gpu", "tpu")
 BUCKET_BOUNDARIES = (50, 200, 300, 400, 500, 600, 700, 800, 900)
-XLA_BUCKET_BOUNDARIES = (50, 300, 600, 900)
+# Align TPU padded frame bounds to multiples of 16 (and 8*T to 128 at batch 8) for MXU tiles.
+XLA_BUCKET_BOUNDARIES = (50, 304, 608, 912)
 LATEST_CHECKPOINT_SUFFIX = 2333333
 XLA_CACHE_DIR = os.environ.get(
     "RVC_XLA_CACHE_DIR", os.path.join(now_dir, "assets", "xla_cache")
@@ -209,6 +210,7 @@ class GeneratorEMA:
             for key, value in live.items()
         }
         float_keys = [key for key, value in live.items() if value.is_floating_point()]
+        self.float_keys = float_keys
         self.live_floats = [live[key] for key in float_keys]
         self.ema_floats = [self.weights[key] for key in float_keys]
         self.copied = [
@@ -220,6 +222,11 @@ class GeneratorEMA:
             self.ema_floats[0].device
             if self.ema_floats and self.ema_floats[0].device.type in ("xla", "tpu")
             else None
+        )
+        self._use_torch_tpu_foreach = (
+            use_tpu_host_bounce
+            and xla_device is not None
+            and xla_device.type == "tpu"
         )
         if xla_device is not None:
             self._xla_step = torch.tensor(
@@ -245,8 +252,19 @@ class GeneratorEMA:
                 weight = self._xla_one_minus_beta / (
                     1.0 - torch.pow(self._xla_beta, self._xla_step)
                 )
-                for target, value in zip(self.ema_floats, self.live_floats):
-                    target.lerp_(value, weight)
+                if self._use_torch_tpu_foreach and self.ema_floats:
+                    # Out-of-place foreach_lerp compiles into one StableHLO op without CopyTpuToTpu.
+                    updated = torch._foreach_lerp(
+                        self.ema_floats,
+                        self.live_floats,
+                        [weight] * len(self.ema_floats),
+                    )
+                    self.ema_floats = list(updated)
+                    for key, value in zip(self.float_keys, self.ema_floats):
+                        self.weights[key] = value
+                else:
+                    for target, value in zip(self.ema_floats, self.live_floats):
+                        target.lerp_(value, weight)
             else:
                 beta = self.decay
                 decay = beta * (1 - beta ** (self.updates - 1)) / (1 - beta**self.updates)

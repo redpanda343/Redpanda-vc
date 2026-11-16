@@ -99,9 +99,9 @@ class WaveNet(torch.nn.Module):
             # Residual and skip connections
             res_skip_acts = self.res_skip_layers[i](acts)
             if i < self.n_layers - 1:
-                res_acts = res_skip_acts[:, : self.hidden_channels, :]
+                res_acts, skip_acts = res_skip_acts.chunk(2, dim=1)
                 x = (x + res_acts) * x_mask
-                output = output + res_skip_acts[:, self.hidden_channels :, :]
+                output = output + skip_acts
             else:
                 output = output + res_skip_acts
 

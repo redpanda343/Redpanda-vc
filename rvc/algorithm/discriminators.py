@@ -38,6 +38,7 @@ class MultiPeriodDiscriminator(torch.nn.Module):
             periods = [2, 3, 5, 7, 11]
             resolutions = [[1024, 120, 600], [2048, 240, 1200], [512, 50, 240]]
 
+        self.use_spectral_norm = bool(use_spectral_norm)
         self.checkpointing = checkpointing
         self.discriminators = torch.nn.ModuleList(
             [DiscriminatorS(use_spectral_norm=use_spectral_norm)]
@@ -50,6 +51,33 @@ class MultiPeriodDiscriminator(torch.nn.Module):
 
     def forward(self, y, y_hat):
         y_d_rs, y_d_gs, fmap_rs, fmap_gs = [], [], [], []
+        # Batch real + fake inputs on discriminator steps (neither input carries input-grad);
+        # keeps Generator step separate so feature_loss(fmap_r, fmap_g) avoids backprop on y.
+        batch_inputs = (
+            not y.requires_grad
+            and not y_hat.requires_grad
+            and not (self.training and self.use_spectral_norm)
+            and not (self.training and self.checkpointing)
+            and y.shape == y_hat.shape
+            and y.dtype == y_hat.dtype
+        )
+        if batch_inputs:
+            both = torch.cat((y, y_hat), dim=0)
+            for d in self.discriminators:
+                y_d_both, fmap_both = d(both)
+                y_d_r, y_d_g = y_d_both.chunk(2, dim=0)
+                fmap_r = []
+                fmap_g = []
+                for feat in fmap_both:
+                    fr, fg = feat.chunk(2, dim=0)
+                    fmap_r.append(fr)
+                    fmap_g.append(fg)
+                y_d_rs.append(y_d_r)
+                y_d_gs.append(y_d_g)
+                fmap_rs.append(fmap_r)
+                fmap_gs.append(fmap_g)
+            return y_d_rs, y_d_gs, fmap_rs, fmap_gs
+
         for d in self.discriminators:
             if self.training and self.checkpointing:
                 y_d_r, fmap_r = activation_checkpoint(d, y, tuple_with_list=True)

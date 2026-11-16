@@ -133,7 +133,7 @@ class MultiHeadAttention(torch.nn.Module):
             rel_values = self._relative_embeddings(self.emb_rel_v, window).to(p_attn.dtype)
             output += torch.matmul(self._absolute_to_band(p_attn, window), rel_values)
 
-        return output.transpose(2, 3).contiguous().view(b, d, t_t), p_attn
+        return output.transpose(2, 3).reshape(b, d, t_t), p_attn
 
     def _relative_embeddings(self, embeddings, window):
         start = self.window_size - window
@@ -155,9 +155,7 @@ class MultiHeadAttention(torch.nn.Module):
             batch, heads, length * span
         )
         x = torch.nn.functional.pad(x, (0, length))
-        return x.reshape(batch, heads, length, span + 1)[
-            :, :, :, : 2 * window + 1
-        ].contiguous()
+        return x.reshape(batch, heads, length, span + 1)[:, :, :, : 2 * window + 1]
 
     def _attention_bias_proximal(self, length, device=None, dtype=torch.float32):
         r = torch.arange(length, dtype=torch.float32, device=device)
@@ -190,19 +188,30 @@ class FFN(torch.nn.Module):
         causal: bool = False,
     ):
         super().__init__()
-        self.padding_fn = self._causal_padding if causal else self._same_padding
+        if not causal and kernel_size % 2 == 1:
+            conv_padding = (kernel_size - 1) // 2
+            self.padding_fn = None
+        else:
+            conv_padding = 0
+            self.padding_fn = self._causal_padding if causal else self._same_padding
 
-        self.conv_1 = torch.nn.Conv1d(in_channels, filter_channels, kernel_size)
-        self.conv_2 = torch.nn.Conv1d(filter_channels, out_channels, kernel_size)
+        self.conv_1 = torch.nn.Conv1d(
+            in_channels, filter_channels, kernel_size, padding=conv_padding
+        )
+        self.conv_2 = torch.nn.Conv1d(
+            filter_channels, out_channels, kernel_size, padding=conv_padding
+        )
         self.drop = torch.nn.Dropout(p_dropout)
 
         self.activation = activation
 
     def forward(self, x, x_mask):
-        x = self.conv_1(self.padding_fn(x * x_mask))
+        masked = x * x_mask
+        x = self.conv_1(self.padding_fn(masked) if self.padding_fn is not None else masked)
         x = self._apply_activation(x)
         x = self.drop(x)
-        x = self.conv_2(self.padding_fn(x * x_mask))
+        masked = x * x_mask
+        x = self.conv_2(self.padding_fn(masked) if self.padding_fn is not None else masked)
         return x * x_mask
 
     def _apply_activation(self, x):

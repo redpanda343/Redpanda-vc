@@ -367,6 +367,7 @@ def spawn(fn, args, single_core=False):
 
 
 _XLA_OPS_PATCHED = False
+_HAS_NATIVE_WEIGHT_NORM_FWD = None
 
 
 def _has_privateuse1_kernel(op_name):
@@ -379,21 +380,126 @@ def _has_privateuse1_kernel(op_name):
         return False
 
 
-def _compute_weight_norm_xla(weight_v, weight_g, dim):
+def _can_use_native_weight_norm_fwd(weight_v, wrapped_dim, global_norm):
+    if weight_v.device.type != "tpu":
+        return False
+    if global_norm or not (wrapped_dim == 0 or wrapped_dim == weight_v.ndim - 1):
+        return False
+    global _HAS_NATIVE_WEIGHT_NORM_FWD
+    if _HAS_NATIVE_WEIGHT_NORM_FWD is None:
+        _HAS_NATIVE_WEIGHT_NORM_FWD = _has_privateuse1_kernel(
+            "aten::_weight_norm_interface"
+        )
+    return _HAS_NATIVE_WEIGHT_NORM_FWD
+
+
+def _weight_norm_forward_impl(weight_v, weight_g, dim, use_native_fwd=None):
     with torch.amp.autocast(device_type=weight_v.device.type, enabled=False):
         v_fp32 = weight_v.float()
         g_fp32 = weight_g.float()
-        if dim == -1 or dim is None:
-            norm = torch.linalg.vector_norm(v_fp32)
-        else:
-            target_dim = dim if dim >= 0 else v_fp32.ndim + dim
-            dims = tuple(i for i in range(v_fp32.ndim) if i != target_dim)
-            norm = (
-                torch.linalg.vector_norm(v_fp32, dim=dims, keepdim=True)
-                if dims
-                else v_fp32.abs()
+        ndim = v_fp32.ndim
+        wrapped_dim = -1 if dim is None else (dim if dim >= 0 else ndim + dim)
+        global_norm = dim is None or g_fp32.ndim == 0
+        dims = None if global_norm else tuple(i for i in range(ndim) if i != wrapped_dim)
+        if use_native_fwd is None:
+            use_native_fwd = _can_use_native_weight_norm_fwd(
+                weight_v, wrapped_dim, global_norm
             )
-        return (v_fp32 * (g_fp32 / norm.clamp_min(1e-12))).to(weight_v.dtype)
+
+        if use_native_fwd and not global_norm and (wrapped_dim == 0 or wrapped_dim == ndim - 1):
+            w_fp32, norms = torch._weight_norm_interface(v_fp32, g_fp32, wrapped_dim)
+        else:
+            if global_norm:
+                norms = torch.sqrt((v_fp32 * v_fp32).sum())
+            elif dims:
+                norms = torch.sqrt((v_fp32 * v_fp32).sum(dim=dims, keepdim=True))
+            else:
+                norms = v_fp32.abs()
+            g_b = g_fp32
+            if dims is not None and g_fp32.ndim == 1 and ndim > 1:
+                bshape = [1] * ndim
+                bshape[wrapped_dim] = g_fp32.shape[0]
+                g_b = g_fp32.view(bshape)
+            w_fp32 = v_fp32 * (g_b / norms.clamp_min(1e-12))
+
+        out = w_fp32.to(weight_v.dtype) if w_fp32.dtype != weight_v.dtype else w_fp32
+        return out, v_fp32, g_fp32, norms, dims, wrapped_dim
+
+
+class _TPUWeightNormFn(torch.autograd.Function):
+    """Fused native forward (when available on TPU) + minimal elementary FP32 backward for weight_norm."""
+
+    @staticmethod
+    def forward(ctx, weight_v, weight_g, dim, use_native_fwd):
+        out, v_fp32, g_fp32, norms, dims, wrapped_dim = _weight_norm_forward_impl(
+            weight_v, weight_g, dim, use_native_fwd=use_native_fwd
+        )
+        ctx.v_dtype = weight_v.dtype
+        ctx.g_dtype = weight_g.dtype
+        ctx.dims = dims
+        ctx.wrapped_dim = wrapped_dim
+        ctx.save_for_backward(v_fp32, g_fp32, norms)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_w):
+        v_fp32, g_fp32, norms = ctx.saved_tensors
+        need_v, need_g = ctx.needs_input_grad[0], ctx.needs_input_grad[1]
+        if not need_v and not need_g:
+            return None, None, None, None
+        with torch.amp.autocast(device_type=grad_w.device.type, enabled=False):
+            gw_fp32 = grad_w.float() if grad_w.dtype != torch.float32 else grad_w
+            dims = ctx.dims
+            ndim = v_fp32.ndim
+            keepdim = g_fp32.ndim == ndim
+            norms_safe = norms.clamp_min(1e-12)
+            if dims is not None and g_fp32.ndim == 1 and ndim > 1:
+                bshape = [1] * ndim
+                bshape[ctx.wrapped_dim] = g_fp32.shape[0]
+                g_b = g_fp32.view(bshape)
+                norms_b = (
+                    norms_safe.view(bshape) if norms_safe.ndim != ndim else norms_safe
+                )
+            else:
+                g_b = g_fp32
+                norms_b = norms_safe
+            inv_n_b = torch.reciprocal(norms_b)
+            per_dim_sums = (
+                (gw_fp32 * v_fp32).sum(dim=dims, keepdim=True)
+                if dims is not None
+                else (gw_fp32 * v_fp32).sum()
+            )
+            grad_g_full = per_dim_sums * inv_n_b
+            grad_g_fp32 = (
+                grad_g_full.reshape_as(g_fp32)
+                if dims is not None and not keepdim
+                else grad_g_full
+            )
+            grad_v = None
+            if need_v:
+                v_scale = grad_g_full * inv_n_b
+                grad_v_fp32 = (g_b * inv_n_b) * (gw_fp32 - v_fp32 * v_scale)
+                grad_v = (
+                    grad_v_fp32.to(ctx.v_dtype)
+                    if ctx.v_dtype != torch.float32
+                    else grad_v_fp32
+                )
+            grad_g = None
+            if need_g:
+                grad_g = (
+                    grad_g_fp32.to(ctx.g_dtype)
+                    if ctx.g_dtype != torch.float32
+                    else grad_g_fp32
+                )
+            return grad_v, grad_g, None, None
+
+
+def _compute_weight_norm_xla(weight_v, weight_g, dim):
+    if not torch.is_grad_enabled() or (
+        not weight_v.requires_grad and not weight_g.requires_grad
+    ):
+        return _weight_norm_forward_impl(weight_v, weight_g, dim)[0]
+    return _TPUWeightNormFn.apply(weight_v, weight_g, dim, None)
 
 
 def patch_xla_ops():
