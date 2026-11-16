@@ -426,7 +426,7 @@ class RefineGANGenerator(nn.Module):
             x = F.leaky_relu(x, self.leaky_relu_slope, inplace=True)
             downs.append(x)
             # attempt to cancel spectral aliasing
-            if x.device.type == "xla":
+            if x.device.type in ("xla", "tpu"):
                 x = _xla_resample(x.float().contiguous(), old_size, new_size).to(x.dtype)
             else:
                 x = torchaudio.functional.resample(

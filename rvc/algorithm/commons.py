@@ -99,7 +99,7 @@ def rand_slice_segments(x, x_lengths=None, segment_size=4):
     ids_str_max = x_lengths - segment_size + 1
     rand_vals = (
         torch.rand([b], device=x.device)
-        if x.device.type == "xla"
+        if x.device.type in ("xla", "tpu")
         else torch.rand([b]).to(device=x.device, non_blocking=True)
     )
     ids_str = (rand_vals * ids_str_max).to(dtype=torch.long)
@@ -172,7 +172,7 @@ def stft_real_imag(
 
 
 def upsample_nearest_1d(x: torch.Tensor, factor: int) -> torch.Tensor:
-    if x.device.type == "xla":
+    if x.device.type in ("xla", "tpu"):
         return (
             x.unsqueeze(-1)
             .expand(*x.shape, factor)

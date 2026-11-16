@@ -345,7 +345,7 @@ class HiFiGANMRFGenerator(torch.nn.Module):
     ):
         f0 = (
             upsample_nearest_1d(f0[:, None, :], int(self.f0_upsample.scale_factor))
-            if f0.device.type == "xla"
+            if f0.device.type in ("xla", "tpu")
             else self.f0_upsample(f0[:, None, :])
         ).transpose(-1, -2)
         har_source, _, _ = self.m_source(f0)

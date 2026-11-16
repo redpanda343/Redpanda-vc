@@ -3,8 +3,6 @@ import os
 import shutil
 import sys
 
-os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
-
 
 if __name__ == "__main__":
     from shared.updater import update_and_restart
@@ -15,6 +13,8 @@ if __name__ == "__main__":
 # We need the CWD for finding the config file, but while we're at it, add it to sys.path
 now_dir = os.getcwd()
 sys.path.append(now_dir)
+
+import rvc.train.tpu  # noqa: E402, F401
 
 from shared.platform import migrate_models_folder
 

@@ -4,8 +4,6 @@ import secrets
 import subprocess
 import sys
 
-os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
-
 import click
 
 from functools import lru_cache
@@ -13,6 +11,8 @@ from datetime import datetime, timedelta
 
 now_dir = os.getcwd()
 sys.path.append(now_dir)
+
+import rvc.train.tpu  # noqa: E402, F401
 
 from shared.platform import migrate_models_folder
 
@@ -671,9 +671,9 @@ def _build_train_command(
     if tpu_cores not in {"all", "1"}:
         raise ValueError(f"Unsupported TPU core selection: {tpu_cores}")
     if accelerator == "tpu":
-        from rvc.train.tpu import INSTALL_HINT, torch_xla_installed
+        from rvc.train.tpu import INSTALL_HINT, tpu_installed
 
-        if not torch_xla_installed():
+        if not tpu_installed():
             raise ValueError(INSTALL_HINT)
     if version not in {"v1", "v2"}:
         raise ValueError(f"Unsupported RVC version: {version}")

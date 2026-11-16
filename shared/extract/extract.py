@@ -7,21 +7,21 @@ import queue
 import sys
 import tempfile
 
-os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
+now_dir = os.getcwd()
+if now_dir not in sys.path:
+    sys.path.append(now_dir)
+
+from rvc.train.tpu import device as tpu_device, is_tpu_device, tpu_available
 
 import numpy as np
 import parselmouth
 import torch
 import tqdm
 
-now_dir = os.getcwd()
-sys.path.append(os.path.join(now_dir))
-
 # Zluda hijack
 from contextlib import nullcontext
 import shared.zluda
 from rvc.configs.config import Config
-from rvc.train.tpu import device as tpu_device, tpu_available
 from beatrice.resources import ensure_pitch_estimator
 from shared.predictors.f0 import RMVPE, RVCRMVPE, BeatricePitch, Swift
 from shared.predictors.swift_dependencies import ensure_swift_f0
@@ -179,7 +179,7 @@ def run_pitch_extraction(files, devices, f0_method, threads, progress, updates, 
         return
     if not devices:
         raise ValueError("No pitch extraction devices were selected.")
-    using_tpu = devices == ["xla"]
+    using_tpu = len(devices) == 1 and devices[0] in ("tpu", "xla")
     if f0_method == "swift":
         if using_tpu:
             ensure_swift_f0(require_cuda=False)
@@ -288,7 +288,7 @@ def process_file_embedding(
 
     transformers_logging.disable_progress_bar()
     transformers_logging.set_verbosity_error()
-    is_xla = torch.device(device).type == "xla"
+    is_xla = is_tpu_device(device)
     model = load_embedding(embedder_model, version).to(device).float()
     model.eval()
     n_threads = max(1, n_threads)
@@ -410,7 +410,7 @@ def process_file_embedding(
 
 def run_embedding_extraction(files, devices, embedder_model, version, threads, progress, updates):
     progress.set_description(f"Extracting features ({embedder_model})")
-    if devices == ["xla"]:
+    if len(devices) == 1 and devices[0] in ("tpu", "xla"):
         class _DirectProgressQueue:
             def put(self, n):
                 progress.update(n)
@@ -562,11 +562,11 @@ if __name__ == "__main__":
         sys.exit(1)
 
     if gpus == "-":
-        devices = ["xla"] if tpu_available() else ["cpu"]
+        devices = ["tpu"] if tpu_available() else ["cpu"]
     else:
         devices = [f"cuda:{idx}" for idx in gpus.split("-")]
 
-    use_mp_manager = not (devices == ["xla"] and f0_method in ("rmvpe", "swift"))
+    use_mp_manager = not (len(devices) == 1 and devices[0] in ("tpu", "xla") and f0_method in ("rmvpe", "swift"))
     manager_ctx = mp.Manager() if use_mp_manager else nullcontext()
     with manager_ctx as manager, tqdm.tqdm(
         total=2 * len(files), desc=f"Extracting F0 ({f0_method})", unit="file",

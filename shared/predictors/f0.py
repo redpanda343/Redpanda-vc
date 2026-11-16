@@ -65,7 +65,7 @@ class Swift:
         self.device = torch.device(device)
         self.sample_rate = sample_rate
         self.hop_size = hop_size
-        if self.device.type == "xla":
+        if self.device.type in ("xla", "tpu"):
             swift_f0 = ensure_swift_f0(require_cuda=False)
             model_path = os.path.join(os.path.dirname(swift_f0.__file__), "model.onnx")
             self.model = object.__new__(swift_f0.SwiftF0)

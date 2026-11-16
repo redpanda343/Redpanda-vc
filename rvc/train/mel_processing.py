@@ -38,7 +38,7 @@ def spectrogram_torch(y, n_fft, hop_size, win_size, center=False):
         )
         y = y.squeeze(1)
 
-        if y.device.type == "xla":
+        if y.device.type in ("xla", "tpu"):
             real, imag = stft_real_imag(
                 y, n_fft, hop_size, hann_window[wnsize_dtype_device], center=center
             )
@@ -161,7 +161,7 @@ class MultiScaleMelSpectrogramLoss(torch.nn.Module):
 
             wav = wav.squeeze(1)
 
-            if wav.device.type == "xla":
+            if wav.device.type in ("xla", "tpu"):
                 real, imag = stft_real_imag(
                     wav,
                     window_length,

@@ -2,7 +2,12 @@ import os
 import sys
 
 os.environ["USE_LIBUV"] = "0" if sys.platform == "win32" else "1"
-os.environ.setdefault("TORCH_DEVICE_BACKEND_AUTOLOAD", "0")
+now_dir = os.getcwd()
+if now_dir not in sys.path:
+    sys.path.append(now_dir)
+
+from rvc.train import tpu
+
 import argparse
 import faulthandler
 import glob
@@ -19,9 +24,6 @@ import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-
-now_dir = os.getcwd()
-sys.path.append(os.path.join(now_dir))
 
 from rvc.train.losses import discriminator_loss, feature_loss, generator_loss, kl_loss
 from rvc.train.mel_processing import (
@@ -41,7 +43,6 @@ from rvc.train.utils import (
 # Zluda hijack
 import shared.zluda
 from rvc.algorithm import commons
-from rvc.train import tpu
 from rvc.train.process.extract_model import extract_model
 
 VOCODERS = ("HiFi-GAN", "MRF HiFi-GAN", "RefineGAN")
@@ -137,7 +138,7 @@ class AsyncInferenceExporter:
             staging_future = Future()
         else:
             snapshot = self._stage_synchronous(
-                state_dict, export_dtype, xla=self.device.type == "xla"
+                state_dict, export_dtype, xla=self.device.type in ("xla", "tpu")
             )
             copy_event = None
             staging_future = Future()
@@ -206,7 +207,7 @@ class GeneratorEMA:
         ]
         xla_device = (
             self.ema_floats[0].device
-            if self.ema_floats and self.ema_floats[0].device.type == "xla"
+            if self.ema_floats and self.ema_floats[0].device.type in ("xla", "tpu")
             else None
         )
         if xla_device is not None:
@@ -535,7 +536,7 @@ def main():
     check_dataset_sample_rate(args, config)
 
     if args.accelerator == "tpu":
-        if not tpu.torch_xla_installed():
+        if not tpu.tpu_installed():
             print(tpu.INSTALL_HINT)
             sys.exit(1)
         if args.cleanup:
@@ -596,10 +597,12 @@ def run(rank, world_size, args, config, device_type, device_ids):
 def run_tpu(index, args, config):
     faulthandler.enable()
     tpu.initialize_cache(XLA_CACHE_DIR, index)
-    tpu.patch_xla_ops()
+    tpu.require_tpu()
     tpu.set_matmul_precision("highest")
     device = tpu.device()
     rank, world_size = tpu.rank(), tpu.world_size()
+    if rank == 0:
+        print(f"TPU backend: {tpu.mode_description()} ({device})", flush=True)
     torch.manual_seed(config.train.seed + rank)
     tpu.manual_seed(config.train.seed + rank)
     Trainer(rank, world_size, args, config, device).fit()
@@ -613,16 +616,18 @@ class Trainer:
         self.config = config
         self.device = device
         self.xla = device.type == "xla"
+        self.torch_tpu = device.type == "tpu"
+        self.tpu = self.xla or self.torch_tpu
         self.segment_frames = config.train.segment_size // config.data.hop_length
         self.log_interval = int(config.train.log_interval)
         if self.log_interval < 1:
             raise ValueError("train.log_interval must be at least 1")
-        self.use_amp = device.type in ("cuda", "xla") and args.train_dtype in (
+        self.use_amp = device.type in ("cuda", "xla", "tpu") and args.train_dtype in (
             torch.bfloat16,
             torch.float16,
         )
         self.cache_in_gpu = device.type == "cuda" and args.cache_data_in_gpu
-        max_workers = 2 if self.xla else 4
+        max_workers = 2 if self.tpu else 4
         self.workers = max(1, min(max_workers, (os.cpu_count() or 1) // world_size))
         self.pending_rng = None
         self._compiled_xla_shapes = set()
@@ -630,10 +635,10 @@ class Trainer:
         self.global_step = 0
         self.loss_sums = torch.zeros(6, device=device, dtype=torch.float32)
         self._xla_grad_norm_d = (
-            torch.zeros((), device=device, dtype=torch.float32) if self.xla else None
+            torch.zeros((), device=device, dtype=torch.float32) if self.tpu else None
         )
         self._xla_grad_norm_g = (
-            torch.zeros((), device=device, dtype=torch.float32) if self.xla else None
+            torch.zeros((), device=device, dtype=torch.float32) if self.tpu else None
         )
         self._last_step_compiled = False
         self.batch_count = 0
@@ -654,19 +659,19 @@ class Trainer:
         last_g, last_d = latest_checkpoint_pair(self.args.experiment_dir)
         self.build_models(last_g)
         epoch, start_batch, extra = self.restore(last_g, last_d)
-        if self.xla and self.world_size > 1:
+        if self.tpu and self.world_size > 1:
             tpu.broadcast_master_params(self.net_g)
             tpu.broadcast_master_params(self.net_d)
         for optimizer in (self.optim_g, self.optim_d):
             for group in optimizer.param_groups:
-                if not self.xla and torch.is_tensor(group["lr"]):
+                if not self.tpu and torch.is_tensor(group["lr"]):
                     group["lr"] = float(group["lr"])
                 group["initial_lr"] = float(group.get("initial_lr", group["lr"]))
         if self.args.lr_schedule == "cosine":
             self.build_lr_schedule(extra.get("lr_schedule"))
-        if self.args.ema_decay > 0 and (self.rank == 0 or self.xla):
+        if self.args.ema_decay > 0 and (self.rank == 0 or self.tpu):
             self.build_ema(last_g, extra.get("ema"))
-        if self.xla:
+        if self.tpu:
             self._prepare_xla_optimizers()
             self._warmup_xla_caches()
             if self.rank == 0:
@@ -676,9 +681,14 @@ class Trainer:
                         self.sampler.bucket_batch_sizes, self.sampler.boundaries[1:]
                     )
                 ]
+                plan_suffix = (
+                    "+ 1 shared generator optimizer/EMA graph"
+                    if self.xla
+                    else f"on {tpu.mode_description()}"
+                )
                 self._write_tpu_log(
                     f"TPU compile plan: {len(bucket_shapes)} forward/backward bucket shape(s) "
-                    f"[{', '.join(bucket_shapes)}] + 1 shared generator optimizer/EMA graph"
+                    f"[{', '.join(bucket_shapes)}] {plan_suffix}"
                 )
 
         if self.rank == 0:
@@ -730,7 +740,7 @@ class Trainer:
             if self.use_amp
             else "FP32"
         )
-        if self.xla:
+        if self.tpu:
             device = f"TPU x{self.world_size}"
         elif self.device.type == "cuda":
             device = f"GPU {args.gpus}"
@@ -803,9 +813,9 @@ class Trainer:
         data = self.config.data
         max_frames = int(self.args.max_batch_seconds * data.sample_rate / data.hop_length)
         self.dataset = TextAudioLoaderMultiNSFsid(data)
-        boundaries = XLA_BUCKET_BOUNDARIES if self.xla else BUCKET_BOUNDARIES
+        boundaries = XLA_BUCKET_BOUNDARIES if self.tpu else BUCKET_BOUNDARIES
         self.collate = TextAudioCollateMultiNSFsid(
-            frame_buckets=boundaries[1:] if self.xla else None,
+            frame_buckets=boundaries[1:] if self.tpu else None,
             hop_length=data.hop_length,
         )
         self.sampler = DistributedBucketSampler(
@@ -831,7 +841,7 @@ class Trainer:
                 collate_fn=self.collate,
                 batch_sampler=self.sampler,
                 persistent_workers=True,
-                prefetch_factor=2 if self.xla else 8,
+                prefetch_factor=2 if self.tpu else 8,
             )
 
     def build_models(self, last_g):
@@ -876,10 +886,21 @@ class Trainer:
             options = {}
         else:
             optimizer = torch.optim.AdamW
-            options = {"fused": self.device.type == "cuda"}
-            if self.xla:
-                options["foreach"] = False
-                options["capturable"] = True
+            if self.torch_tpu:
+                supports_fused = (
+                    hasattr(torch.optim.optimizer, "_get_fused_kernels_supported_devices")
+                    and "tpu" in torch.optim.optimizer._get_fused_kernels_supported_devices()
+                    and hasattr(torch._C, "_dispatch_has_kernel_for_dispatch_key")
+                    and torch._C._dispatch_has_kernel_for_dispatch_key(
+                        "aten::_fused_adamw_.tensor_lr", "PrivateUse1"
+                    )
+                )
+                options = {"fused": supports_fused, "capturable": True}
+            else:
+                options = {"fused": self.device.type == "cuda"}
+                if self.xla:
+                    options["foreach"] = False
+                    options["capturable"] = True
         self.optim_g = optimizer(
             net_g.parameters(),
             config.train.learning_rate * g_lr_coeff,
@@ -908,7 +929,7 @@ class Trainer:
                 net_g.register_comm_hook(None, cpu_allreduce_hook)
                 net_d.register_comm_hook(None, cpu_allreduce_hook)
         self.net_g, self.net_d = net_g, net_d
-        self.freeze_discriminator = self.device.type in ("cuda", "xla")
+        self.freeze_discriminator = self.device.type in ("cuda", "xla", "tpu")
         self.net_d_for_generator = (
             net_d.module if self.freeze_discriminator and hasattr(net_d, "module") else net_d
         )
@@ -962,8 +983,8 @@ class Trainer:
         state = {"cpu": torch.get_rng_state()}
         if self.device.type == "cuda":
             state["cuda"] = torch.cuda.get_rng_state(self.device)
-        elif self.xla:
-            state["xla"] = tpu.get_rng_state()
+        elif self.tpu:
+            state["tpu"] = tpu.get_rng_state()
         return state
 
     def restore_rng(self, state):
@@ -977,8 +998,8 @@ class Trainer:
             torch.set_rng_state(state["cpu"])
             if self.device.type == "cuda" and "cuda" in state:
                 torch.cuda.set_rng_state(state["cuda"], self.device)
-            elif self.xla and "xla" in state:
-                tpu.set_rng_state(state["xla"])
+            elif self.tpu and ("tpu" in state or "xla" in state):
+                tpu.set_rng_state(state.get("tpu", state.get("xla")))
         except (KeyError, RuntimeError, TypeError) as e:
             print(f"Could not restore the random number generator state: {e}")
 
@@ -1038,7 +1059,9 @@ class Trainer:
             sys.exit(1)
 
     def autocast(self):
-        device_type = self.device.type if self.device.type in ("cuda", "xla") else "cuda"
+        device_type = (
+            self.device.type if self.device.type in ("cuda", "xla", "tpu") else "cuda"
+        )
         return torch.amp.autocast(
             device_type=device_type, enabled=self.use_amp, dtype=self.args.train_dtype
         )
@@ -1067,7 +1090,7 @@ class Trainer:
             yield [tensor.to(self.device, non_blocking=True) for tensor in batch]
 
     def _prepare_xla_optimizers(self):
-        """Pin AdamW step/lr tensors on XLA so step changes don't recompile the graph."""
+        """Pin AdamW step/lr/state tensors on TPU backends so LR or lazy init won't recompile."""
         for optimizer in (self.optim_g, self.optim_d):
             for group in optimizer.param_groups:
                 lr_val = float(group["lr"])
@@ -1091,14 +1114,18 @@ class Trainer:
                     if not param.requires_grad:
                         continue
                     state = optimizer.state[param]
+                    # Native PyTorch AdamW (used on torch_tpu) increments each param's
+                    # state["step"] via _foreach_add_, whereas _xla_adamw_step updates
+                    # one shared step tensor per parameter group.
+                    step_tensor = shared_step if self.xla else shared_step.clone()
                     if len(state) == 0:
                         optimizer.state[param] = {
-                            "step": shared_step,
+                            "step": step_tensor,
                             "exp_avg": torch.zeros_like(param),
                             "exp_avg_sq": torch.zeros_like(param),
                         }
                     else:
-                        state["step"] = shared_step
+                        state["step"] = step_tensor
 
     def _write_tpu_log(self, message):
         if self.rank != 0:
@@ -1126,7 +1153,8 @@ class Trainer:
         data = self.config.data
         stats_before = tpu.compile_stats()
         t0 = time.perf_counter()
-        self._write_tpu_log("Compiling TPU STFT/mel & scalar buffer warmup...")
+        action = "Compiling" if self.xla else "Warming up"
+        self._write_tpu_log(f"{action} TPU STFT/mel & scalar buffer warmup...")
         with torch.no_grad():
             dummy_wave = torch.zeros(
                 (1, 1, self.config.train.segment_size),
@@ -1142,7 +1170,8 @@ class Trainer:
             _ = self.mel_loss(dummy_wave, dummy_wave, dummy_spec, dummy_ids)
         tpu.sync()
         stats_mid = tpu.compile_stats()
-        self._log_xla_compile("STFT/mel warmup", t0, stats_before, stats_mid)
+        if self.xla:
+            self._log_xla_compile("STFT/mel warmup", t0, stats_before, stats_mid)
 
         t1 = time.perf_counter()
         self.loss_sums.zero_()
@@ -1150,7 +1179,10 @@ class Trainer:
         self._xla_grad_norm_g.zero_()
         tpu.sync()
         stats_after = tpu.compile_stats()
-        self._log_xla_compile("scalar buffer reset warmup", t1, stats_mid, stats_after)
+        if self.xla:
+            self._log_xla_compile("scalar buffer reset warmup", t1, stats_mid, stats_after)
+        else:
+            self._write_tpu_log(f"Warmed up TPU warmup buffers in {time.perf_counter() - t0:.1f}s")
 
     def train_epoch(self, epoch, start_batch):
         self.sampler.set_epoch(epoch, start_batch)
@@ -1170,7 +1202,7 @@ class Trainer:
             self.epoch_step += 1
             self.progress.update(1)
             if self.rank == 0 and (
-                (self.xla and (self.global_step <= 10 or self._last_step_compiled))
+                (self.tpu and (self.global_step <= 10 or self._last_step_compiled))
                 or (not sys.stderr.isatty() and self.global_step % 10 == 0)
             ):
                 step_dt = time.perf_counter() - step_t0
@@ -1226,7 +1258,7 @@ class Trainer:
     def optimizer_step(self, optimizer, net, loss, log_grad_norm, update_scaler, before_step=None):
         optimizer.zero_grad()
         self.scaler.scale(loss).backward()
-        if self.xla and self.world_size > 1:
+        if self.tpu and self.world_size > 1:
             tpu.reduce_gradients(optimizer)
         norm = None
         if log_grad_norm:
@@ -1271,10 +1303,21 @@ class Trainer:
             return self.fn_mel_loss(wave_mel, y_hat_mel) * config.train.c_mel
 
     def _notify_xla_compile(self, key, label):
-        if not self.xla or key in self._compiled_xla_shapes:
-            return
+        if not self.tpu or key in self._compiled_xla_shapes:
+            return False
         self._compiled_xla_shapes.add(key)
-        self._write_tpu_log(f"Compiling TPU {label} (first run of this graph)...")
+        verb = "Compiling" if self.xla else "Warming up"
+        self._write_tpu_log(f"{verb} TPU {label} (first run)...")
+        return True
+
+    @staticmethod
+    def _record_grad_norm(target, grad_norm):
+        if grad_norm is None:
+            return
+        if torch.is_tensor(grad_norm):
+            target.copy_(grad_norm.float())
+        else:
+            target.fill_(float(grad_norm))
 
     def train_step(self, batch):
         config = self.config
@@ -1283,6 +1326,7 @@ class Trainer:
         log_grad_norms = (
             self.rank == 0 and (self.global_step + 1) % self.log_interval == 0
         )
+        tpu_step_note = None
         if self.xla:
             t_phase1 = time.perf_counter()
             stats_before = tpu.compile_stats()
@@ -1291,6 +1335,14 @@ class Trainer:
                 fwd_key,
                 f"forward/backward graph (batch={fwd_key[1]}, frames={fwd_key[2]})",
             )
+        elif self.torch_tpu:
+            t_shape = time.perf_counter()
+            shape_label = f"training shape (batch={int(phone.shape[0])}, frames={int(phone.shape[1])})"
+            if self._notify_xla_compile(
+                ("tpu_step", int(phone.shape[0]), int(phone.shape[1])),
+                shape_label,
+            ):
+                tpu_step_note = (t_shape, shape_label)
 
         with self.autocast():
             y_hat, ids_slice, _, z_mask, (_, z_p, m_p, logs_p, _, logs_q) = self.net_g(
@@ -1313,11 +1365,11 @@ class Trainer:
                 self.optim_d,
                 self.net_d,
                 loss_disc,
-                last_discriminator_step if self.xla else (log_grad_norms and last_discriminator_step),
+                last_discriminator_step if self.tpu else (log_grad_norms and last_discriminator_step),
                 update_scaler=not last_discriminator_step,
             )
-        if self.xla and grad_norm_d is not None:
-            self._xla_grad_norm_d.copy_(grad_norm_d.float())
+        if self.tpu:
+            self._record_grad_norm(self._xla_grad_norm_d, grad_norm_d)
 
         if self.freeze_discriminator:
             self.optim_d.zero_grad(set_to_none=True)
@@ -1355,7 +1407,7 @@ class Trainer:
                 "generator optimizer/EMA graph (shared across shapes)",
             )
             grad_norm_g = commons.grad_norm(self.net_g.parameters())
-            self._xla_grad_norm_g.copy_(grad_norm_g.float())
+            self._record_grad_norm(self._xla_grad_norm_g, grad_norm_g)
             if self.exporter:
                 self.exporter.wait_for_staging()
             _xla_adamw_step(self.optim_g)
@@ -1364,10 +1416,12 @@ class Trainer:
                 self.optim_g,
                 self.net_g,
                 loss_gen_all,
-                log_grad_norms,
+                True if self.torch_tpu else log_grad_norms,
                 update_scaler=True,
                 before_step=self.exporter.wait_for_staging if self.exporter else None,
             )
+            if self.torch_tpu:
+                self._record_grad_norm(self._xla_grad_norm_g, grad_norm_g)
 
         if self.freeze_discriminator:
             self.net_d.requires_grad_(True)
@@ -1378,7 +1432,7 @@ class Trainer:
         self.record_losses(
             (loss_gen_all, loss_disc, loss_gen, loss_fm, loss_mel, loss_kl),
             (grad_norm_d, grad_norm_g),
-            phase2_timing=(t_phase2, stats_mid) if self.xla else None,
+            phase2_timing=(t_phase2, stats_mid) if self.xla else tpu_step_note,
         )
         self.last_batch = (spec, ids_slice, y_hat)
 
@@ -1393,9 +1447,17 @@ class Trainer:
                 "generator optimizer/EMA", t_phase2, stats_mid, stats_after
             ):
                 self._last_step_compiled = True
+        elif self.torch_tpu:
+            tpu.sync()
+            if phase2_timing is not None:
+                t_shape, shape_label = phase2_timing
+                self._write_tpu_log(
+                    f"Warmed up TPU {shape_label} in {time.perf_counter() - t_shape:.1f}s"
+                )
+                self._last_step_compiled = True
         if self.global_step % self.log_interval != 0:
             return
-        if self.xla:
+        if self.tpu:
             if self.world_size > 1:
                 t_red = time.perf_counter()
                 stats_r0 = tpu.compile_stats()
@@ -1405,7 +1467,7 @@ class Trainer:
                 )
                 totals_cpu = totals.cpu()
                 loss_values = (totals_cpu[:-1] / totals_cpu[-1]).tolist()
-                if self._log_xla_compile(
+                if self.xla and self._log_xla_compile(
                     "multi-core loss reduction", t_red, stats_r0, tpu.compile_stats()
                 ):
                     self._last_step_compiled = True
@@ -1420,7 +1482,9 @@ class Trainer:
             self.loss_sums.zero_()
             self.batch_count = 0
             tpu.sync()
-            if self._log_xla_compile("loss buffer reset", t_rst, stats_rst0, tpu.compile_stats()):
+            if self.xla and self._log_xla_compile(
+                "loss buffer reset", t_rst, stats_rst0, tpu.compile_stats()
+            ):
                 self._last_step_compiled = True
         else:
             totals = torch.cat((self.loss_sums, self.loss_sums.new_tensor([self.batch_count])))
@@ -1429,7 +1493,7 @@ class Trainer:
                     totals = totals.cpu()
                 dist.reduce(totals, dst=0, op=dist.ReduceOp.SUM)
         if self.rank == 0:
-            if not self.xla:
+            if not self.tpu:
                 loss_values = (totals[:-1] / totals[-1]).cpu().tolist()
                 gradient_values = torch.stack(grad_norms).float().cpu().tolist()
             self.logged_losses = (loss_values[0], loss_values[1], loss_values[4])
@@ -1453,7 +1517,7 @@ class Trainer:
                     "grad/norm_g": gradient_values[1],
                 },
             )
-        if not self.xla:
+        if not self.tpu:
             self.loss_sums.zero_()
             self.batch_count = 0
 
@@ -1521,7 +1585,7 @@ class Trainer:
         save_stats0 = tpu.compile_stats() if self.xla else None
         rng = [self.rng_state()]
         if self.world_size > 1:
-            if self.xla:
+            if self.tpu:
                 rng = tpu.gather_objects(f"rvc_rng_{self.global_step}", rng[0])
             else:
                 gathered = [None] * self.world_size if self.rank == 0 else None
@@ -1530,7 +1594,7 @@ class Trainer:
         if self.rank == 0:
             args = self.args
             spec, ids_slice, y_hat = self.last_batch
-            if self.xla:
+            if self.tpu:
                 spec = spec[:1].detach().cpu()
                 ids_slice = ids_slice[:1].detach().cpu() if ids_slice is not None else None
                 y_hat = y_hat[:1].detach().cpu()
@@ -1568,14 +1632,14 @@ class Trainer:
                     f"{path}.tmp",
                     self.scaler,
                     extra,
-                    move_to_cpu=self.xla,
+                    move_to_cpu=self.tpu,
                 )
                 paths.append(path)
             for path in paths:
                 os.replace(f"{path}.tmp", path)
             if final:
                 self.exporter.wait_for_completion()
-        if self.xla and self.world_size > 1:
+        if self.tpu and self.world_size > 1:
             tpu.rendezvous(f"rvc_save_done_{self.global_step}")
         if self.xla and save_stats0 is not None:
             self._log_xla_compile("checkpoint/eval save", save_t0, save_stats0, tpu.compile_stats())

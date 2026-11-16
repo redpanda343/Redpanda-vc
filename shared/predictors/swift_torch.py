@@ -2,7 +2,7 @@ import struct
 import numpy as np
 import torch
 import torch.nn.functional as F
-from rvc.train.tpu import require_torch_xla
+from rvc.train.tpu import is_tpu_device, require_tpu
 
 
 _DTYPES = {
@@ -127,8 +127,8 @@ def _load_onnx_initializers(model_path):
 class SwiftF0Torch:
     def __init__(self, model_path, device):
         self.device = torch.device(device)
-        if self.device.type == "xla":
-            require_torch_xla()
+        if is_tpu_device(self.device):
+            require_tpu()
         inits = _load_onnx_initializers(model_path)
         self.eps = float(inits["v129"])
         self.scales = []
@@ -188,7 +188,7 @@ class SwiftF0Torch:
         if audio.ndim == 1:
             audio = audio[None, :]
         mel_spec, n_frames = self._compute_log_mel(audio)
-        is_xla = self.device.type == "xla"
+        is_xla = is_tpu_device(self.device)
         if is_xla:
             pad_frames = max(256, ((n_frames + 255) // 256) * 256)
             if pad_frames > n_frames:

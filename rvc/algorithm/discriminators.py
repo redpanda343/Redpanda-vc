@@ -247,7 +247,7 @@ class DiscriminatorR(torch.nn.Module):
             mode="reflect",
         ).squeeze(1)
         window = torch.ones(win_length, device=x.device)
-        if x.device.type == "xla":
+        if x.device.type in ("xla", "tpu"):
             with torch.amp.autocast(device_type=x.device.type, enabled=False):
                 real, imag = stft_real_imag(x.float(), n_fft, hop_length, window, center=False)
                 return torch.sqrt(real.pow(2) + imag.pow(2) + 1e-9)

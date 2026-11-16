@@ -6,7 +6,7 @@ import numpy as np
 from librosa.filters import mel
 from typing import List
 from rvc.algorithm.commons import stft_real_imag
-from rvc.train.tpu import require_torch_xla
+from rvc.train.tpu import is_tpu_device, require_tpu
 
 N_MELS = 128
 N_CLASS = 360
@@ -418,7 +418,7 @@ class MelSpectrogram(torch.nn.Module):
                 self.hann_window[keyshift_key] = torch.hann_window(win_length_new).to(
                     audio.device
                 )
-            if audio.device.type == "xla" and n_fft_new == win_length_new:
+            if is_tpu_device(audio.device) and n_fft_new == win_length_new:
                 real, imag = stft_real_imag(
                     audio,
                     n_fft_new,
@@ -461,9 +461,9 @@ class RMVPE0Predictor:
     def __init__(self, model_path, device=None):
         self.resample_kernel = {}
         self.device = device
-        self.is_xla = device is not None and torch.device(device).type == "xla"
+        self.is_xla = is_tpu_device(device)
         if self.is_xla:
-            require_torch_xla()
+            require_tpu()
         model = E2E(4, 1, (2, 2))
         ckpt = torch.load(model_path, map_location="cpu", weights_only=True)
         model.load_state_dict(ckpt)
@@ -604,7 +604,8 @@ class RMVPE0Predictor:
                 padded_mels.append(torch.zeros((1, N_MELS, bucket_frames), dtype=torch.float32))
 
         mel_batch = torch.cat(padded_mels, dim=0)
-        with torch.no_grad(), torch.amp.autocast(device_type="xla", enabled=False):
+        tpu_dev_type = torch.device(self.device).type if self.device is not None else "cpu"
+        with torch.no_grad(), torch.amp.autocast(device_type=tpu_dev_type, enabled=False):
             mel_xla = mel_batch.to(self.device).transpose(-1, -2).unsqueeze(1)
             mask_xla = mask.to(self.device)
             x = self.model.cnn(self.model.unet(mel_xla, mask=mask_xla)) * mask_xla

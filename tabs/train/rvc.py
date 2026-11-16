@@ -762,7 +762,7 @@ def rvc_train_tab():
                 accelerator = gr.Radio(
                     label=i18n("Training Device"),
                     info=i18n(
-                        "GPU trains on CUDA, MPS, or CPU. TPU trains on Cloud TPU via PyTorch/XLA and ignores GPU Number and Cache Dataset in GPU."
+                        "GPU trains on CUDA, MPS, or CPU. TPU trains on Cloud TPU (TorchTPU / PyTorch/XLA) and ignores GPU Number and Cache Dataset in GPU."
                     ),
                     choices=["GPU", "TPU"],
                     value=default_accelerator,

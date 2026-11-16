@@ -7,7 +7,7 @@ from .constants import *
 from .model import E2E0
 from .spec import MelSpectrogram
 from .utils import to_local_average_f0, to_viterbi_f0
-from rvc.train.tpu import require_torch_xla
+from rvc.train.tpu import is_tpu_device, require_tpu
 
 
 def interp_f0(f0, uv=None):
@@ -32,9 +32,9 @@ class RMVPE:
     def __init__(self, model_path, hop_length=160, device=None):
         self.resample_kernel = {}
         self.device = torch.device(device or ('cuda' if torch.cuda.is_available() else 'cpu'))
-        self.is_xla = self.device.type == 'xla'
+        self.is_xla = is_tpu_device(self.device)
         if self.is_xla:
-            require_torch_xla()
+            require_tpu()
         self.model = E2E0(4, 1, (2, 2)).eval()
         ckpt = torch.load(model_path, map_location='cpu', weights_only=True)
         if 'model' not in ckpt:

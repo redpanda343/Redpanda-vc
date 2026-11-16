@@ -48,7 +48,7 @@ class MelSpectrogram(torch.nn.Module):
             if keyshift_key not in self.hann_window:
                 self.hann_window[keyshift_key] = torch.hann_window(win_length_new).to(audio.device)
 
-            if audio.device.type == "xla" and n_fft_new == win_length_new:
+            if audio.device.type in ("xla", "tpu") and n_fft_new == win_length_new:
                 real, imag = stft_real_imag(
                     audio,
                     n_fft_new,
