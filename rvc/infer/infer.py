@@ -37,14 +37,29 @@ OUTPUT_NORMALIZATION_MAX_GAIN = 4.0
 OUTPUT_NORMALIZATION_OFF_DB = -12.0
 OUTPUT_PEAK_CEILING = 0.99
 
-if hasattr(torch, "set_float32_matmul_precision"):
+_NEW_TF32_API = hasattr(torch.backends.cuda.matmul, "fp32_precision")
+
+
+def _get_tf32_state():
+    if _NEW_TF32_API:
+        return (
+            torch.backends.cuda.matmul.fp32_precision,
+            torch.backends.cudnn.conv.fp32_precision,
+        )
+    return (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32)
+
+
+def _set_tf32_state(state):
+    if _NEW_TF32_API:
+        torch.backends.cuda.matmul.fp32_precision, torch.backends.cudnn.conv.fp32_precision = state
+    else:
+        torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = state
+
+
+_IEEE_FP32_STATE = ("ieee", "ieee") if _NEW_TF32_API else (False, False)
+_set_tf32_state(_IEEE_FP32_STATE)
+if not _NEW_TF32_API and hasattr(torch, "set_float32_matmul_precision"):
     torch.set_float32_matmul_precision("highest")
-if hasattr(torch.backends.cuda.matmul, "fp32_precision"):
-    torch.backends.cuda.matmul.fp32_precision = "ieee"
-    torch.backends.cudnn.conv.fp32_precision = "ieee"
-else:
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
 
 
 @contextmanager
@@ -58,14 +73,12 @@ def _deterministic_torch(enabled):
         torch.is_deterministic_algorithms_warn_only_enabled(),
         torch.backends.cudnn.benchmark,
         torch.backends.cudnn.deterministic,
-        torch.backends.cuda.matmul.allow_tf32,
-        torch.backends.cudnn.allow_tf32,
+        _get_tf32_state(),
     )
     torch.use_deterministic_algorithms(True)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
+    _set_tf32_state(_IEEE_FP32_STATE)
     try:
         yield
     finally:
@@ -74,16 +87,14 @@ def _deterministic_torch(enabled):
             deterministic_warn_only,
             cudnn_benchmark,
             cudnn_deterministic,
-            matmul_allow_tf32,
-            cudnn_allow_tf32,
+            tf32_state,
         ) = previous_settings
         torch.use_deterministic_algorithms(
             deterministic_algorithms, warn_only=deterministic_warn_only
         )
         torch.backends.cudnn.benchmark = cudnn_benchmark
         torch.backends.cudnn.deterministic = cudnn_deterministic
-        torch.backends.cuda.matmul.allow_tf32 = matmul_allow_tf32
-        torch.backends.cudnn.allow_tf32 = cudnn_allow_tf32
+        _set_tf32_state(tf32_state)
 
 
 @contextmanager

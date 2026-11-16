@@ -472,10 +472,8 @@ def main():
     check_dataset_sample_rate(args, config)
 
     if args.accelerator == "tpu":
-        try:
-            tpu.require_torch_xla()
-        except (RuntimeError, ImportError) as error:
-            print(error)
+        if not tpu.torch_xla_installed():
+            print(tpu.INSTALL_HINT)
             sys.exit(1)
         if args.cleanup:
             remove_previous_attempt(args.experiment_dir)

@@ -83,9 +83,30 @@ def _xr():
     return xr
 
 
+_TOPOLOGY_ENV_VARS = (
+    "TPU_PROCESS_ADDRESSES",
+    "TPU_PROCESS_PORT",
+    "TPU_VISIBLE_CHIPS",
+    "TPU_PROCESS_BOUNDS",
+    "TPU_CHIPS_PER_PROCESS_BOUNDS",
+    "CLOUD_TPU_TASK_ID",
+    "PJRT_LOCAL_PROCESS_COUNT",
+    "PJRT_LOCAL_PROCESS_RANK",
+)
+
+
 def spawn(fn, args, single_core=False):
-    torch_xla = require_torch_xla()
+    # Don't initialize XLA in the parent: each child configures its own topology.
+    if not torch_xla_installed():
+        raise RuntimeError(INSTALL_HINT)
     os.environ.setdefault("PJRT_DEVICE", "TPU")
+    os.environ.pop("XLA_USE_BF16", None)
+    os.environ.pop("XLA_DOWNCAST_BF16", None)
+    if not single_core:
+        for name in _TOPOLOGY_ENV_VARS:
+            os.environ.pop(name, None)
+    import torch_xla
+
     if hasattr(torch_xla, "launch"):
         torch_xla.launch(fn, args=args, debug_single_process=single_core)
         return
@@ -187,25 +208,20 @@ def set_matmul_precision(precision="highest"):
     prev_level = xla_logger.level
     xla_logger.setLevel(logging.ERROR)
     try:
-        if hasattr(torch, "set_float32_matmul_precision"):
-            torch.set_float32_matmul_precision(precision)
         try:
             import torch_xla.backends
 
             torch_xla.backends.set_mat_mul_precision(precision)
         except (ImportError, AttributeError):
-            pass
-        try:
-            import torch_xla
+            # Older torch_xla without torch_xla.backends.
+            try:
+                import torch_xla
 
-            xlac = getattr(torch_xla, "_XLAC", None)
-            if xlac is not None:
-                if hasattr(xlac, "_xla_set_mat_mul_precision"):
-                    xlac._xla_set_mat_mul_precision(precision)
-                if hasattr(xlac, "_xla_set_use_full_mat_mul_precision"):
+                xlac = getattr(torch_xla, "_XLAC", None)
+                if xlac is not None and hasattr(xlac, "_xla_set_use_full_mat_mul_precision"):
                     xlac._xla_set_use_full_mat_mul_precision(precision == "highest")
-        except Exception as error:
-            print(f"Could not set the TPU matmul precision to {precision}: {error}")
+            except Exception as error:
+                print(f"Could not set the TPU matmul precision to {precision}: {error}")
     finally:
         xla_logger.setLevel(prev_level)
     _MATMUL_PRECISION_STATE = state
