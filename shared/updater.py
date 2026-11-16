@@ -29,12 +29,13 @@ def pull_updates(directory, app_name):
         return False
     if git("diff", "--name-only", "--diff-filter=U").stdout.strip():
         raise SystemExit(f"Resolve the existing Git conflicts before starting the {app_name}.")
-    if git("branch", "--show-current").stdout.strip() != "main":
-        print("Automatic updates apply to main checkouts only; starting the current branch.", flush=True)
+    branch = git("branch", "--show-current").stdout.strip()
+    if branch not in ("main", "tpu"):
+        print("Automatic updates apply to main/tpu checkouts only; starting the current branch.", flush=True)
         return False
     previous = git("rev-parse", "HEAD").stdout.strip()
-    print("Checking origin/main for updates...", flush=True)
-    result = git("pull", "--ff-only", "--autostash", "origin", "main", check=False)
+    print(f"Checking origin/{branch} for updates...", flush=True)
+    result = git("pull", "--ff-only", "--autostash", "origin", branch, check=False)
     message = (result.stdout + result.stderr).strip()
     if message:
         print(message, flush=True)
