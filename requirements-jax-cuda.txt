@@ -1,0 +1,49 @@
+# Native JAX/XLA + PyTorch CUDA requirements for Redpanda-vc on Linux / WSL2 / Colab GPU
+# NVIDIA CUDA 12 GPU (Colab GPU / CUDA 12 driver):
+#   pip install -r requirements-jax-cuda.txt
+# NVIDIA CUDA 13 GPU (CUDA 13 driver):
+#   pip install "jax[cuda13]>=0.5.0" -r requirements-jax-cuda.txt --extra-index-url https://download.pytorch.org/whl/cu130
+
+click==8.1.8
+numpy==2.4.6
+requests==2.34.2
+tqdm==4.68.4
+wget==3.2
+h5py
+
+faiss-cpu==1.14.3
+librosa==0.11.0
+imageio-ffmpeg==0.6.0
+scipy==1.18.0; python_version >= "3.12"
+scipy==1.17.1; python_version < "3.12"
+scikit-learn==1.9.0
+soundfile==0.14.0
+sounddevice>=0.5.0,<1
+sv-ttk==2.6.1
+noisereduce==3.0.3
+pedalboard==0.9.26
+stftpitchshift==2.0
+soxr==1.1.0
+fireredvad==0.0.2
+
+jax[cuda12]>=0.5.0; sys_platform == "linux"
+jax>=0.5.0; sys_platform != "linux"
+optax>=0.2.4
+
+torch>=2.11.0
+torchaudio>=2.10.0
+lightning~=2.3.0
+setuptools<82
+praat-parselmouth
+pyworld==0.3.5
+onnxruntime-gpu==1.30.0
+transformers==5.13.1
+huggingface_hub>=1.5.0,<2
+
+matplotlib==3.11.0
+tensorboard==2.21.0
+gradio==6.29.1
+websockets>=13,<16
+
+beautifulsoup4==4.15.0
+psutil==7.2.2

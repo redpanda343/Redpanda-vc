@@ -45,22 +45,36 @@ class PrecisionConfig:
 def resolve_jax_devices(accelerator: str = "auto", tpu_cores: str = "all") -> list[jax.Device]:
     """Select JAX devices for training based on CLI flags."""
     acc = (accelerator or "auto").strip().lower()
-    if acc == "tpu":
-        devices = jax.devices("tpu")
-    elif acc == "gpu":
-        devices = jax.devices("gpu")
-    elif acc == "cpu":
-        devices = jax.devices("cpu")
-    else:
-        for backend in ("tpu", "gpu", "cpu"):
-            try:
-                devices = jax.devices(backend)
-                if devices:
-                    break
-            except RuntimeError:
-                continue
+    if acc == "cuda":
+        acc = "gpu"
+    try:
+        if acc == "tpu":
+            devices = jax.devices("tpu")
+        elif acc == "gpu":
+            devices = jax.devices("gpu")
+        elif acc == "cpu":
+            devices = jax.devices("cpu")
         else:
-            devices = jax.devices()
+            for backend in ("tpu", "gpu", "cpu"):
+                try:
+                    devices = jax.devices(backend)
+                    if devices:
+                        break
+                except RuntimeError:
+                    continue
+            else:
+                devices = jax.devices()
+    except RuntimeError as exc:
+        if acc == "gpu":
+            raise RuntimeError(
+                'No CUDA-enabled JAX GPU devices found. On Linux/WSL2 install "pip install -r requirements-jax-cuda.txt" '
+                '(or "jax[cuda12]"/"jax[cuda13]"). On Windows with an NVIDIA GPU, CUDA JAX wheels are unavailable so PyTorch CUDA is used instead.'
+            ) from exc
+        if acc == "tpu":
+            raise RuntimeError(
+                'No JAX TPU devices found. Ensure libtpu is installed ("pip install jax[tpu]") on a TPU VM.'
+            ) from exc
+        raise
 
     if not devices:
         raise RuntimeError(f"No JAX devices found for accelerator='{accelerator}'.")

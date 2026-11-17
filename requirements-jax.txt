@@ -1,7 +1,8 @@
-# Native JAX/XLA requirements for Redpanda-vc (TPU, GPU, or CPU)
-# Google Colab TPU VM:   pip install "jax[tpu]" -r requirements-jax.txt
-# NVIDIA CUDA 12 GPU:    pip install "jax[cuda12]" -r requirements-jax.txt
-# CPU / existing JAX:    pip install -r requirements-jax.txt
+# Native JAX/XLA requirements for Redpanda-vc (Colab TPU VM, CPU, or reference)
+# Google Colab TPU VM:            pip install "jax[tpu]" -r requirements-jax.txt
+# NVIDIA CUDA GPU (Linux/WSL2):   pip install -r requirements-jax-cuda.txt
+# Windows NVIDIA GPU:             use run-install.bat (trains with PyTorch CUDA automatically)
+# CPU / existing JAX:             pip install -r requirements-jax.txt
 
 click==8.1.8
 numpy==2.4.6

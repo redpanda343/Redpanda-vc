@@ -76,6 +76,23 @@ create_conda_env() {
     fi
 }
 
+install_jax_packages() {
+    local cuda_major=""
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        cuda_major="$(nvidia-smi 2>/dev/null | sed -nE 's/.*CUDA Version: ([0-9]+)\..*/\1/p' | head -n1 || true)"
+    fi
+    if [ -n "$cuda_major" ] && [ "$cuda_major" -ge 13 ] 2>/dev/null; then
+        echo "Detected NVIDIA CUDA $cuda_major driver; installing JAX CUDA 13..."
+        uv pip install "jax[cuda13]>=0.5.0" "optax>=0.2.4"
+    elif [ -n "$cuda_major" ] && [ "$cuda_major" -ge 12 ] 2>/dev/null; then
+        echo "Detected NVIDIA CUDA $cuda_major driver; installing JAX CUDA 12..."
+        uv pip install "jax[cuda12]>=0.5.0" "optax>=0.2.4"
+    else
+        echo "No CUDA 12/13 driver detected; installing default JAX + Optax..."
+        uv pip install "jax>=0.5.0" "optax>=0.2.4"
+    fi
+}
+
 install_dependencies() {
     echo "Installing dependencies..."
     # shellcheck disable=SC1091
@@ -84,6 +101,7 @@ install_dependencies() {
     uv pip install -r "$INSTALL_DIR/requirements.txt" \
         --extra-index-url https://download.pytorch.org/whl/cu130 \
         --index-strategy unsafe-best-match
+    install_jax_packages
     uv pip install --no-deps swift-f0==0.3.0
     conda deactivate
     echo "Dependencies installation complete."

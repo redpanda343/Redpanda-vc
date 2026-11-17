@@ -418,13 +418,21 @@ if __name__ == "__main__":
         else [f"cuda:{idx}" for idx in gpus.split("-")]
     )
 
-    from rvc.jax.extract import jax_extraction_available, run_jax_extraction
+    extract_backend = os.environ.get("REDPANDA_EXTRACT_BACKEND", "auto").strip().lower()
+    use_jax = False
+    if extract_backend != "torch" and (devices == ["cpu"] or extract_backend == "jax"):
+        from rvc.train.backend import has_jax_cuda_plugin, has_jax_tpu_runtime
 
-    use_jax = jax_extraction_available() and (devices == ["cpu"] or os.environ.get("REDPANDA_EXTRACT_BACKEND", "").lower() == "jax")
+        allow_jax_gpu = gpus != "-" and (not torch.cuda.is_available() or extract_backend == "jax")
+        if extract_backend == "jax" or has_jax_tpu_runtime() or (allow_jax_gpu and has_jax_cuda_plugin()):
+            from rvc.jax.extract import jax_extraction_available, run_jax_extraction
+
+            use_jax = jax_extraction_available(allow_gpu=allow_jax_gpu)
+
     if use_jax and f0_method == "rmvpe":
         with tqdm.tqdm(
             total=2 * len(files),
-            desc=f"Extracting F0 ({f0_method}) + Features ({embedder_model}) [JAX TPU]",
+            desc=f"Extracting F0 ({f0_method}) + Features ({embedder_model}) [JAX]",
             unit="step",
             dynamic_ncols=True,
         ) as progress:
@@ -461,7 +469,7 @@ if __name__ == "__main__":
         with tqdm.tqdm(
             total=2 * len(files),
             initial=len(files),
-            desc=f"Extracting features ({embedder_model}) [JAX TPU]",
+            desc=f"Extracting features ({embedder_model}) [JAX]",
             unit="file",
             dynamic_ncols=True,
         ) as progress:

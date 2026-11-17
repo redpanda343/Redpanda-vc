@@ -753,7 +753,7 @@ def rvc_train_tab():
             with gr.Row():
                 accelerator = gr.Radio(
                     label=i18n("Training Accelerator"),
-                    info=i18n("JAX backend selection (Auto prefers TPU, then GPU, then CPU)."),
+                    info=i18n("Backend selection (Auto prefers TPU, then JAX CUDA or PyTorch CUDA GPU, then CPU)."),
                     choices=["auto", "tpu", "gpu", "cpu"],
                     value="auto",
                     interactive=True,
@@ -766,8 +766,8 @@ def rvc_train_tab():
                     interactive=True,
                 )
                 train_dtype = gr.Radio(
-                    label=i18n("JAX Precision"),
-                    info=i18n("Auto uses BF16 on TPU/Ampere+ GPUs and FP32 elsewhere; weight storage and losses stay FP32."),
+                    label=i18n("Training Precision"),
+                    info=i18n("Auto uses BF16 on TPU/Ampere+ GPUs, or config/FP32 on PyTorch CUDA; weights and losses stay FP32."),
                     choices=["auto", "bf16", "fp32"],
                     value="auto",
                     interactive=True,

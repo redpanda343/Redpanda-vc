@@ -1593,9 +1593,9 @@ def extract(**kwargs):
 )
 @click.option(
     "--accelerator",
-    type=click.Choice(["auto", "tpu", "gpu", "cpu"]),
+    type=click.Choice(["auto", "tpu", "gpu", "cuda", "cpu"]),
     default="auto",
-    help="JAX accelerator backend.",
+    help="Training accelerator backend (auto selects JAX TPU/CUDA, or PyTorch CUDA when CUDA jaxlib is absent).",
 )
 @click.option(
     "--tpu-cores",
@@ -1605,9 +1605,9 @@ def extract(**kwargs):
 )
 @click.option(
     "--dtype",
-    type=click.Choice(["auto", "bf16", "fp32"]),
+    type=click.Choice(["auto", "bf16", "fp16", "fp32"]),
     default="auto",
-    help="JAX compute precision policy (parameters, losses, and reference decode always remain FP32).",
+    help="Compute precision policy (auto selects BF16/FP16 where supported and FP32 elsewhere; weights and losses remain FP32).",
 )
 def train(**kwargs):
     """Train an RVC model."""

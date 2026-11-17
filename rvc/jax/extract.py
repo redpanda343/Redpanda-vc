@@ -10,6 +10,10 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from typing import Any, Sequence
 
+from rvc.train.backend import configure_jax_env, has_jax_cuda_plugin, has_jax_tpu_runtime
+
+configure_jax_env("auto")
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -36,16 +40,21 @@ _BUCKET_KS = (4, 7, 10, 15, 20, 30)
 _RMVPE_SEG_SAMPLES = 32 * RMVPE_HOP  # 5120
 
 
-def jax_extraction_available(accelerator: str = "auto") -> bool:
-    """Return True if JAX TPU (or GPU when explicitly requested) extraction is available."""
+def jax_extraction_available(accelerator: str = "auto", *, allow_gpu: bool = False) -> bool:
+    """Return True if JAX TPU (or CUDA GPU when requested/needed) extraction is available."""
     mode = os.environ.get("REDPANDA_EXTRACT_BACKEND", "auto").strip().lower()
     if mode == "torch":
         return False
+    if mode != "jax":
+        if not (has_jax_tpu_runtime() or (allow_gpu and has_jax_cuda_plugin())):
+            return False
     try:
         devs = resolve_jax_devices(accelerator, "all")
         if mode == "jax":
             return len(devs) > 0
-        return bool(devs and devs[0].platform == "tpu")
+        if not devs:
+            return False
+        return devs[0].platform == "tpu" or (allow_gpu and devs[0].platform == "gpu")
     except Exception:
         return False
 

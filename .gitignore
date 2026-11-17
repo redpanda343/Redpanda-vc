@@ -13,6 +13,7 @@
 *.txt
 !requirements.txt
 !requirements-jax.txt
+!requirements-jax-cuda.txt
 *.zip
 *.npz
 *.png

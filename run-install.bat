@@ -93,6 +93,7 @@ exit /b 0
 echo Installing dependencies...
 call "%MINICONDA_DIR%\condabin\conda.bat" activate "%ENV_DIR%" || goto :error
 uv pip install -r "%INSTALL_DIR%\requirements.txt" --extra-index-url https://download.pytorch.org/whl/cu130 --index-strategy unsafe-best-match || goto :error
+uv pip install "jax>=0.5.0" "optax>=0.2.4" || goto :error
 uv pip install --no-deps swift-f0==0.3.0 || goto :error
 call "%MINICONDA_DIR%\condabin\conda.bat" deactivate
 echo Dependencies installation complete.
