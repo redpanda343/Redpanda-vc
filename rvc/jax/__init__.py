@@ -45,7 +45,7 @@ class PrecisionConfig:
 def resolve_jax_devices(accelerator: str = "auto", tpu_cores: str = "all") -> list[jax.Device]:
     """Select JAX devices for training based on CLI flags."""
     acc = (accelerator or "auto").strip().lower()
-    if acc == "cuda":
+    if acc in ("cuda", "jax-cuda", "jax_cuda", "jax-gpu", "jax_gpu", "jax"):
         acc = "gpu"
     try:
         if acc == "tpu":

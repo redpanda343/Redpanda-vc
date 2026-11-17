@@ -1593,9 +1593,9 @@ def extract(**kwargs):
 )
 @click.option(
     "--accelerator",
-    type=click.Choice(["auto", "tpu", "gpu", "cuda", "cpu"]),
+    type=click.Choice(["auto", "tpu", "jax-cuda", "torch-cuda", "gpu", "cuda", "cpu"]),
     default="auto",
-    help="Training accelerator backend (auto selects JAX TPU/CUDA, or PyTorch CUDA when CUDA jaxlib is absent).",
+    help="Training accelerator backend (auto, JAX tpu, jax-cuda, torch-cuda, gpu, cuda, or cpu).",
 )
 @click.option(
     "--tpu-cores",

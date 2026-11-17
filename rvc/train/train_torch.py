@@ -233,7 +233,11 @@ def parse_arguments(argv=None):
     )
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--gpus", default="0", help="CUDA device indices joined by -, such as 0-1.")
-    parser.add_argument("--accelerator", choices=("auto", "tpu", "gpu", "cuda", "cpu"), default="auto")
+    parser.add_argument(
+        "--accelerator",
+        choices=("auto", "tpu", "jax-cuda", "torch-cuda", "gpu", "cuda", "cpu"),
+        default="auto",
+    )
     parser.add_argument("--tpu-cores", choices=("all", "1"), default="all")
     parser.add_argument("--dtype", choices=("auto", "bf16", "fp16", "fp32"), default="auto")
     parser.add_argument("--pretrained-g", default="")
@@ -483,7 +487,7 @@ def main(argv=None):
     check_dataset_sample_rate(args, config)
 
     acc = str(args.accelerator).lower()
-    if acc == "cuda":
+    if acc in ("cuda", "torch-cuda"):
         acc = "gpu"
     gpu_str = str(args.gpus).strip()
     force_cpu = acc == "cpu" or (acc == "auto" and gpu_str == "-")

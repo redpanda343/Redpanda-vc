@@ -122,7 +122,11 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--gpus", default="0", help="CUDA device indices joined by -, such as 0-1.")
-    parser.add_argument("--accelerator", choices=("auto", "tpu", "gpu", "cuda", "cpu"), default="auto")
+    parser.add_argument(
+        "--accelerator",
+        choices=("auto", "tpu", "jax-cuda", "torch-cuda", "gpu", "cuda", "cpu"),
+        default="auto",
+    )
     parser.add_argument("--tpu-cores", choices=("all", "1"), default="all")
     parser.add_argument("--dtype", choices=("auto", "bf16", "fp16", "fp32"), default="auto")
     parser.add_argument("--pretrained-g", default="")
@@ -188,6 +192,8 @@ def resolve_precision(args: argparse.Namespace, devices: list[jax.Device]) -> tu
         return PrecisionConfig.bfloat16(), "BF16", "float16"
     if args.dtype == "fp32":
         return PrecisionConfig.float32(), "FP32", "float32"
+    if args.dtype == "fp16":
+        print("FP16 AMP applies to PyTorch CUDA; JAX auto-selects BF16 on supported hardware or FP32.")
     if bf16_hw:
         return PrecisionConfig.bfloat16(), "BF16", "float32" if cfg_prec == "fp32" else "float16"
     export_str = "float32" if cfg_prec == "fp32" or devices[0].platform == "cpu" else "float16"

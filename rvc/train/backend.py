@@ -98,16 +98,26 @@ def torch_mps_available() -> bool:
         return False
 
 
+def normalize_accelerator(accelerator: str) -> str:
+    """Normalize CLI/UI accelerator names into canonical backend selectors."""
+    raw = (accelerator or "auto").strip().lower()
+    if raw in ("jax-cuda", "jax_cuda", "jax-gpu", "jax_gpu", "jax"):
+        return "jax-cuda"
+    if raw in ("torch-cuda", "torch_cuda", "pytorch-cuda", "pytorch_cuda", "torch", "pytorch"):
+        return "torch-cuda"
+    if raw == "cuda":
+        return "gpu"
+    return raw
+
+
 def configure_jax_env(accelerator: str = "auto", gpus: str | None = None) -> None:
     """Apply JAX/XLA environment variables safely prior to importing jax."""
-    acc = (accelerator or "auto").strip().lower()
-    if acc == "cuda":
-        acc = "gpu"
+    acc = normalize_accelerator(accelerator)
     gpu_str = (gpus or "").strip()
 
     if acc == "cpu" or (acc == "auto" and gpu_str == "-"):
         os.environ.setdefault("JAX_PLATFORMS", "cpu")
-    elif acc in ("auto", "gpu") and gpu_str and gpu_str != "-" and all(
+    elif acc in ("auto", "gpu", "jax-cuda") and gpu_str and gpu_str != "-" and all(
         part.isdigit() for part in gpu_str.split("-")
     ):
         os.environ.setdefault("CUDA_VISIBLE_DEVICES", gpu_str.replace("-", ","))
@@ -119,9 +129,7 @@ def configure_jax_env(accelerator: str = "auto", gpus: str | None = None) -> Non
 
 def select_training_backend(accelerator: str, gpus: str) -> tuple[str, str | None]:
     """Select ('jax' | 'torch', optional user notice) before initializing heavy runtimes."""
-    acc = (accelerator or "auto").strip().lower()
-    if acc == "cuda":
-        acc = "gpu"
+    acc = normalize_accelerator(accelerator)
     gpu_str = (gpus or "0").strip()
 
     override = os.environ.get("REDPANDA_TRAIN_BACKEND", "").strip().lower()
@@ -134,6 +142,37 @@ def select_training_backend(accelerator: str, gpus: str) -> tuple[str, str | Non
                 'TPU training requested (--accelerator tpu), but JAX/Optax are not installed. Install with: pip install "jax[tpu]" -r requirements-jax.txt'
             )
         return "jax", None
+
+    if acc == "jax-cuda":
+        if gpu_str == "-":
+            raise RuntimeError("JAX CUDA requested (--accelerator jax-cuda), but --gpus is '-' (CPU).")
+        if not has_jax_packages():
+            raise RuntimeError(
+                'JAX CUDA requested (--accelerator jax-cuda), but JAX/Optax are not installed. '
+                'Install CUDA JAX via: pip install -r requirements-jax-cuda.txt'
+            )
+        if has_jax_cuda_plugin():
+            return "jax", None
+        if sys.platform == "win32":
+            raise RuntimeError(
+                "JAX CUDA requested (--accelerator jax-cuda), but Google JAX does not publish native Windows CUDA wheels. "
+                "Select 'PyTorch CUDA' (--accelerator torch-cuda) or 'Auto' on Windows, or run JAX CUDA on Linux/WSL2."
+            )
+        raise RuntimeError(
+            "JAX CUDA requested (--accelerator jax-cuda), but no CUDA-enabled jaxlib plugin is installed. "
+            'Install CUDA JAX via "pip install -r requirements-jax-cuda.txt", or select "PyTorch CUDA" (--accelerator torch-cuda).'
+        )
+
+    if acc == "torch-cuda":
+        if gpu_str == "-":
+            raise RuntimeError("PyTorch CUDA requested (--accelerator torch-cuda), but --gpus is '-' (CPU).")
+        cuda_ok, gpu_name = torch_cuda_info(gpu_str)
+        if cuda_ok:
+            return "torch", f"Using PyTorch CUDA backend on {gpu_name}."
+        raise RuntimeError(
+            "PyTorch CUDA requested (--accelerator torch-cuda), but torch.cuda.is_available() is False. "
+            "Install CUDA-enabled PyTorch (cu128/cu130) or select another accelerator."
+        )
 
     if acc == "cpu" or (acc == "auto" and gpu_str == "-"):
         return ("jax" if has_jax_packages() else "torch"), None

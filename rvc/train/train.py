@@ -12,7 +12,7 @@ for _path in (_repo_root, now_dir):
     if _path and _path not in sys.path:
         sys.path.insert(0, _path)
 
-from rvc.train.backend import configure_jax_env, select_training_backend, torch_cuda_info
+from rvc.train.backend import configure_jax_env, normalize_accelerator, select_training_backend, torch_cuda_info
 
 _COMPAT_EXPORTS = {
     "BUCKET_BOUNDARIES": "rvc.train.train_jax",
@@ -91,7 +91,8 @@ def main(argv: list[str] | None = None) -> None:
         elif prev_cvd is not None:
             os.environ["CUDA_VISIBLE_DEVICES"] = prev_cvd
 
-        if override != "jax" and acc in ("auto", "gpu", "cuda") and gpus.strip() != "-":
+        norm_acc = normalize_accelerator(acc)
+        if override != "jax" and norm_acc in ("auto", "gpu") and gpus.strip() != "-":
             cuda_ok, gpu_name = torch_cuda_info(gpus)
             if cuda_ok:
                 print(
@@ -101,6 +102,15 @@ def main(argv: list[str] | None = None) -> None:
 
                 train_torch.main(argv)
                 return
+
+        if norm_acc == "jax-cuda":
+            cuda_ok, gpu_name = torch_cuda_info(gpus)
+            if cuda_ok:
+                print(
+                    f"Error: {exc}\nHint: PyTorch CUDA is working on {gpu_name}; you can select 'PyTorch CUDA' (--accelerator torch-cuda) in the WebUI or CLI.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
 
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
