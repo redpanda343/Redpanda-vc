@@ -305,8 +305,9 @@ def mpd_forward(
         )
         y_d_rs.append(logits_p[:batch])
         y_d_gs.append(logits_p[batch:])
-        fmap_rs.append([f[:batch] for f in fmap_p])
-        fmap_gs.append([f[batch:] for f in fmap_p])
+        split = batch if transpose_fmap else batch * p_val
+        fmap_rs.append([f[:split] for f in fmap_p])
+        fmap_gs.append([f[split:] for f in fmap_p])
         idx += 1
 
     for resolution in cfg.resolutions:
