@@ -178,7 +178,10 @@ def spec_to_mel_jax(
     basis = jnp.asarray(mel_filterbank_np(sample_rate, n_fft, num_mels, fmin=fmin, fmax=fmax), jnp.float32)
     spec_f32 = jnp.asarray(spec_nwc, jnp.float32)
     melspec = jnp.matmul(spec_f32, basis.T, precision=lax.Precision.HIGHEST)
-    return jnp.log(jnp.maximum(melspec, 2e-6))
+    fwd = jnp.log(jnp.maximum(melspec, 2e-6))
+    # Bound quiet-bin 1/mel derivative smoothly without shifting the 2e-6 forward floor.
+    surrogate = jnp.log(melspec + 1e-4)
+    return surrogate + lax.stop_gradient(fwd - surrogate)
 
 
 def mel_spectrogram_jax(

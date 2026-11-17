@@ -56,6 +56,8 @@ g_lr_coeff = 1.0
 d_step_per_g_step = 1
 bf16_adamw = False
 MAX_GRAD_NORM = 500.0
+# Scale single-scale log-mel weight so mel gradients stay balanced against adversarial/FM instead of pinning at clip.
+SINGLE_SCALE_MEL_SCALE = 25.0 / 45.0
 
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = os.name == "nt"
@@ -1054,7 +1056,7 @@ class Trainer:
             config.data.mel_fmin,
             config.data.mel_fmax,
         )
-        return self.fn_mel_loss(wave_mel, y_hat_mel) * config.train.c_mel
+        return self.fn_mel_loss(wave_mel, y_hat_mel) * (config.train.c_mel * SINGLE_SCALE_MEL_SCALE)
 
     def train_step(self, batch):
         config = self.config

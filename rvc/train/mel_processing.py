@@ -74,8 +74,12 @@ def spec_to_mel_torch(spec, n_fft, num_mels, sample_rate, fmin, fmax):
         )
 
     melspec = torch.matmul(mel_basis[fmax_dtype_device], spec)
-    melspec = torch.log(melspec.clamp(min=2e-6) * 1)
-    return melspec
+    fwd = torch.log(melspec.clamp(min=2e-6) * 1)
+    if melspec.requires_grad:
+        # Bound quiet-bin 1/mel derivative smoothly without shifting the 2e-6 forward floor.
+        surrogate = torch.log(melspec + 1e-4)
+        return surrogate + (fwd - surrogate).detach()
+    return fwd
 
 
 def mel_spectrogram_torch(

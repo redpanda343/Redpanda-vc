@@ -98,6 +98,8 @@ d_lr_coeff = 0.5
 g_lr_coeff = 1.0
 d_step_per_g_step = 1
 MAX_GRAD_NORM = 500.0
+# Scale single-scale log-mel weight so mel gradients stay balanced against adversarial/FM instead of pinning at clip.
+SINGLE_SCALE_MEL_SCALE = 25.0 / 45.0
 
 
 def _clip_grads_by_global_norm(grads, max_norm: float):
@@ -642,7 +644,7 @@ class JaxTrainer:
                         data_cfg.mel_fmax,
                         center=False,
                     )
-                    l_mel = jnp.mean(jnp.abs(wave_mel_ref - y_h_mel)) * c_mel
+                    l_mel = jnp.mean(jnp.abs(wave_mel_ref - y_h_mel)) * (c_mel * SINGLE_SCALE_MEL_SCALE)
                 l_kl = kl_loss(z_p_v, logs_q_v, m_p_v, logs_p_v, z_mask_sg) * c_kl
                 l_fm = feature_loss(fmap_r, fmap_g)
                 l_gen, _ = generator_loss(y_d_g)
