@@ -244,7 +244,7 @@ def init_hifigan_nsf_params(rng: np.random.Generator, cfg: HiFiGANNSFConfig) -> 
         ch = cfg.upsample_initial_channel // (2 ** (i + 1))
         ups.append(init_conv_transpose1d_params(rng, in_ch, ch, k, weight_norm=True, init_std=0.01))
         nk, _ = _noise_conv_shape(stride_f0s[i])
-        noise_convs.append(init_conv1d_params(rng, 1, ch, nk))
+        noise_convs.append(init_conv1d_params(rng, 1, ch, nk, init_std=0.01))
         for rk, rd in zip(cfg.resblock_kernel_sizes, cfg.resblock_dilation_sizes):
             resblocks.append(init_resblock_params(rng, ch, rk, rd))
 
@@ -328,6 +328,9 @@ def hifigan_nsf_forward(
         h = jax.checkpoint(_stage)(h, p_up, p_nc, p_rbs) if cfg.checkpointing else _stage(h, p_up, p_nc, p_rbs)
 
     h = leaky_relu(h, 0.01)
+    # Remove leaky_relu DC offset in FP32 so conv_post (bias=False) does not coherently amplify temporal DC gradients.
+    h_f32 = jnp.asarray(h, jnp.float32)
+    h = h_f32 - jnp.mean(h_f32, axis=1, keepdims=True)
     h = conv1d(h, params["conv_post"], padding=3, dtype=prec.compute_dtype, precision=prec.compute_precision)
     return jnp.tanh(jnp.asarray(h, jnp.float32))
 

@@ -163,6 +163,11 @@ class HiFiGANNSFGenerator(torch.nn.Module):
 
         self.conv_post = torch.nn.Conv1d(channels[-1], 1, 7, 1, padding=3, bias=False)
         self.ups.apply(init_weights)
+        self.noise_convs.apply(init_weights)
+        with torch.no_grad():
+            for noise_conv in self.noise_convs:
+                if noise_conv.bias is not None:
+                    noise_conv.bias.zero_()
 
         if gin_channels != 0:
             self.cond = torch.nn.Conv1d(gin_channels, upsample_initial_channel, 1)
@@ -193,7 +198,9 @@ class HiFiGANNSFGenerator(torch.nn.Module):
                 xs = y if xs is None else xs + y
             x = xs / self.num_kernels
 
-        x = torch.nn.functional.leaky_relu(x, inplace=True)
+        x = torch.nn.functional.leaky_relu(x)
+        # Remove leaky_relu DC offset before biasless conv_post to avoid coherent sqrt(B*T) DC gradient spikes.
+        x = x - x.mean(dim=-1, keepdim=True)
         x = torch.tanh(self.conv_post(x))
 
         return x

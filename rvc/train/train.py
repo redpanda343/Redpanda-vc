@@ -87,7 +87,7 @@ LEGACY_BUCKET_BOUNDARIES = (100, 200, 300, 400, 500, 600, 700, 800, 900)
 
 # Experimental settings matching main
 randomized = True
-d_lr_coeff = 1.0
+d_lr_coeff = 0.2
 g_lr_coeff = 1.0
 d_step_per_g_step = 1
 
@@ -136,7 +136,7 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         help="When resuming, start optimizers without their saved moments.",
     )
     parser.add_argument("--checkpointing", action="store_true")
-    parser.add_argument("--warmup-steps", type=int, default=0)
+    parser.add_argument("--warmup-steps", type=int, default=50)
     parser.add_argument("--lr-decay-steps", type=int, default=0)
     parser.add_argument("--lr-schedule", choices=LR_SCHEDULES, default="exponential")
     parser.add_argument("--lr-final-ratio", type=float, default=0.1)

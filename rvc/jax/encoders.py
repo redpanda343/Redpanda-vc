@@ -151,10 +151,15 @@ def init_text_encoder_params(rng: np.random.Generator, cfg: TextEncoderConfig) -
         kernel_size=cfg.kernel_size,
         p_dropout=cfg.p_dropout,
     )
+    proj = init_conv1d_params(rng, cfg.hidden_channels, cfg.out_channels * 2, kernel_size=1)
+    # Keep initial prior log-std near 0 (sigma ~= 1) so step-0 KL avoids exp(-2 * logs_p) spikes.
+    proj["weight"][..., cfg.out_channels :] *= 0.05
+    if "bias" in proj:
+        proj["bias"][cfg.out_channels :] = 0.0
     params: dict[str, Any] = {
         "emb_phone": init_linear_params(rng, cfg.embedding_dim, cfg.hidden_channels),
         "encoder": init_encoder_params(rng, enc_cfg),
-        "proj": init_conv1d_params(rng, cfg.hidden_channels, cfg.out_channels * 2, kernel_size=1),
+        "proj": proj,
     }
     if cfg.f0:
         params["emb_pitch"] = init_embedding_params(rng, 256, cfg.hidden_channels)
@@ -220,8 +225,13 @@ def init_posterior_encoder_params(rng: np.random.Generator, cfg: PosteriorEncode
         n_layers=cfg.n_layers,
         gin_channels=cfg.gin_channels,
     )
+    pre = init_conv1d_params(rng, cfg.in_channels, cfg.hidden_channels, kernel_size=1)
+    # Attenuate initial linear-STFT input projection (raw linear spec peaks > 100) without altering forward().
+    pre["weight"] *= 0.1
+    if "bias" in pre:
+        pre["bias"].fill(0.0)
     return {
-        "pre": init_conv1d_params(rng, cfg.in_channels, cfg.hidden_channels, kernel_size=1),
+        "pre": pre,
         "enc": init_wavenet_params(rng, wn_cfg),
         "proj": init_conv1d_params(rng, cfg.hidden_channels, cfg.out_channels * 2, kernel_size=1),
     }

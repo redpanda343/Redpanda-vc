@@ -178,7 +178,7 @@ def spec_to_mel_jax(
     basis = jnp.asarray(mel_filterbank_np(sample_rate, n_fft, num_mels, fmin=fmin, fmax=fmax), jnp.float32)
     spec_f32 = jnp.asarray(spec_nwc, jnp.float32)
     melspec = jnp.matmul(spec_f32, basis.T, precision=lax.Precision.HIGHEST)
-    return jnp.log(jnp.maximum(melspec, 2e-6))
+    return jnp.log(melspec + 3e-4)
 
 
 def mel_spectrogram_jax(
