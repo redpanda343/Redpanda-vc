@@ -3,20 +3,16 @@ import torch
 
 def feature_loss(fmap_r, fmap_g):
     """
-    Compute the feature loss between reference and generated feature maps, normalized per discriminator.
+    Compute the feature loss between reference and generated feature maps.
 
     Args:
         fmap_r (list of torch.Tensor): List of reference feature maps.
         fmap_g (list of torch.Tensor): List of generated feature maps.
     """
-    return (
-        2
-        * sum(
-            torch.mean(torch.abs(rl - gl), dtype=torch.float32)
-            for dr, dg in zip(fmap_r, fmap_g)
-            for rl, gl in zip(dr, dg)
-        )
-        / max(len(fmap_r), 1)
+    return 2 * sum(
+        torch.mean(torch.abs(rl - gl), dtype=torch.float32)
+        for dr, dg in zip(fmap_r, fmap_g)
+        for rl, gl in zip(dr, dg)
     )
 
 
@@ -131,7 +127,11 @@ def kl_loss(z_p, logs_q, m_p, logs_p, z_mask):
         z_mask (torch.Tensor): Mask for the latent variables [b, h, t_t].
     """
     z_p, logs_q, m_p, logs_p, z_mask = (
-        z_p.float(), logs_q.float(), m_p.float(), logs_p.float().clamp(min=-2.0), z_mask.float()
+        z_p.float(),
+        logs_q.float(),
+        m_p.float(),
+        logs_p.float().clamp(min=-10.0),
+        z_mask.float(),
     )
     kl = logs_p - logs_q - 0.5 + 0.5 * ((z_p - m_p) ** 2) * torch.exp(-2 * logs_p)
     kl = (kl * z_mask).sum()

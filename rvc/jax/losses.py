@@ -13,12 +13,12 @@ def feature_loss(
     fmap_r: Sequence[Sequence[Array]],
     fmap_g: Sequence[Sequence[Array]],
 ) -> Array:
-    """L1 feature-matching loss in strict FP32, normalized per discriminator."""
+    """L1 feature-matching loss in strict FP32."""
     total = jnp.array(0.0, dtype=jnp.float32)
     for dr, dg in zip(fmap_r, fmap_g):
         for rl, gl in zip(dr, dg):
             total = total + jnp.mean(jnp.abs(jnp.asarray(rl, jnp.float32) - jnp.asarray(gl, jnp.float32)))
-    return 2.0 * total / float(max(len(fmap_r), 1))
+    return 2.0 * total
 
 
 def discriminator_loss(
@@ -86,7 +86,8 @@ def kl_loss(
     z_p_f = jnp.asarray(z_p, jnp.float32)
     logs_q_f = jnp.asarray(logs_q, jnp.float32)
     m_p_f = jnp.asarray(m_p, jnp.float32)
-    logs_p_f = jnp.maximum(jnp.asarray(logs_p, jnp.float32), -2.0)
+    # Guard only against numerical exp(-2 * logs_p) overflow without capping learned prior variance.
+    logs_p_f = jnp.maximum(jnp.asarray(logs_p, jnp.float32), -10.0)
     mask_f = jnp.asarray(z_mask, jnp.float32)
     kl = logs_p_f - logs_q_f - 0.5 + 0.5 * jnp.square(z_p_f - m_p_f) * jnp.exp(-2.0 * logs_p_f)
     return jnp.sum(kl * mask_f) / jnp.maximum(jnp.sum(mask_f), 1.0)

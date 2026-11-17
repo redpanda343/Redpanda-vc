@@ -244,7 +244,7 @@ def init_hifigan_nsf_params(rng: np.random.Generator, cfg: HiFiGANNSFConfig) -> 
         ch = cfg.upsample_initial_channel // (2 ** (i + 1))
         ups.append(init_conv_transpose1d_params(rng, in_ch, ch, k, weight_norm=True, init_std=0.01))
         nk, _ = _noise_conv_shape(stride_f0s[i])
-        noise_convs.append(init_conv1d_params(rng, 1, ch, nk, init_std=0.01))
+        noise_convs.append(init_conv1d_params(rng, 1, ch, nk))
         for rk, rd in zip(cfg.resblock_kernel_sizes, cfg.resblock_dilation_sizes):
             resblocks.append(init_resblock_params(rng, ch, rk, rd))
 

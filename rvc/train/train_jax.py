@@ -92,11 +92,19 @@ LR_SCHEDULES = ("exponential", "cosine")
 BUCKET_BOUNDARIES = JAX_BUCKET_BOUNDARIES
 LEGACY_BUCKET_BOUNDARIES = (100, 200, 300, 400, 500, 600, 700, 800, 900)
 
-# Experimental settings matching main
+# Experimental settings balanced for from-scratch NSF stability and healthy FM learning
 randomized = True
-d_lr_coeff = 0.2
+d_lr_coeff = 0.5
 g_lr_coeff = 1.0
 d_step_per_g_step = 1
+MAX_GRAD_NORM = 500.0
+
+
+def _clip_grads_by_global_norm(grads, max_norm: float):
+    norm = optax.global_norm(grads)
+    scale = jnp.minimum(jnp.float32(1.0), jnp.float32(max_norm) / jnp.maximum(norm, jnp.float32(1e-6)))
+    clipped = jax.tree.map(lambda g: g * scale, grads)
+    return clipped, jnp.minimum(norm, jnp.float32(max_norm))
 
 
 def _init_xla_cache() -> None:
@@ -601,10 +609,11 @@ class JaxTrainer:
                 return l_d
 
             loss_disc = jnp.float32(0.0)
-            grads_d = None
+            gn_d_val = jnp.float32(0.0)
             opt_state_d = opt_state_d._replace(hyperparams={**opt_state_d.hyperparams, "learning_rate": lr_d})
             for _ in range(d_step_per_g_step):
                 loss_disc, grads_d = jax.value_and_grad(_loss_d)(params_d)
+                grads_d, gn_d_val = _clip_grads_by_global_norm(grads_d, MAX_GRAD_NORM)
                 upd_d, opt_state_d = opt_d.update(grads_d, opt_state_d, params_d)
                 params_d = optax.apply_updates(params_d, upd_d)
 
@@ -644,6 +653,7 @@ class JaxTrainer:
                 _loss_from_gen, has_aux=True
             )(diff_out)
             (grads_g,) = gen_vjp(grad_diff_out)
+            grads_g, gn_g_val = _clip_grads_by_global_norm(grads_g, MAX_GRAD_NORM)
 
             opt_state_g = opt_state_g._replace(hyperparams={**opt_state_g.hyperparams, "learning_rate": lr_g})
             upd_g, opt_state_g = opt_g.update(grads_g, opt_state_g, params_g)
@@ -653,12 +663,8 @@ class JaxTrainer:
                 gen_view = {k: v for k, v in params_g.items() if k != "enc_q"}
                 ema_params = jax.tree.map(lambda e, p: e + ema_lerp * (p - e), ema_params, gen_view)
 
-            gn_d, gn_g = lax.cond(
-                compute_grad_norms,
-                lambda _: (optax.global_norm(grads_d), optax.global_norm(grads_g)),
-                lambda _: (jnp.float32(0.0), jnp.float32(0.0)),
-                None,
-            )
+            gn_d = jnp.where(compute_grad_norms, gn_d_val, jnp.float32(0.0))
+            gn_g = jnp.where(compute_grad_norms, gn_g_val, jnp.float32(0.0))
 
             loss_sums = loss_sums + jnp.stack([loss_gen_all, loss_disc, loss_gen, loss_fm, loss_mel, loss_kl])
             return (

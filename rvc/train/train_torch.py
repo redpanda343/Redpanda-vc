@@ -49,12 +49,13 @@ LR_SCHEDULES = ("exponential", "cosine")
 BUCKET_BOUNDARIES = (100, 200, 300, 400, 500, 600, 700, 800, 900)
 LATEST_CHECKPOINT_SUFFIX = 2333333
 
-# experimental settings (with stabilized NSF discriminator LR scale)
+# experimental settings balanced for from-scratch NSF stability and healthy FM learning
 randomized = True
-d_lr_coeff = 0.2
+d_lr_coeff = 0.5
 g_lr_coeff = 1.0
 d_step_per_g_step = 1
 bf16_adamw = False
+MAX_GRAD_NORM = 500.0
 
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = os.name == "nt"
@@ -1021,10 +1022,9 @@ class Trainer:
     def optimizer_step(self, optimizer, net, loss, log_grad_norm, update_scaler, before_step=None):
         optimizer.zero_grad()
         self.scaler.scale(loss).backward()
-        norm = None
-        if log_grad_norm:
-            self.scaler.unscale_(optimizer)
-            norm = commons.grad_norm(net.parameters())
+        self.scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(net.parameters(), MAX_GRAD_NORM)
+        norm = commons.grad_norm(net.parameters()) if log_grad_norm else None
         if before_step is not None:
             before_step()
         self.scaler.step(optimizer)
