@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -197,29 +196,14 @@ def flow_forward(
     """Apply ResidualCouplingBlock forward or reverse (Flip happens on channels axis -1 in NWC)."""
     cur = jnp.asarray(x, jnp.float32)
     flows = params["flows"]
-    indices = range(cfg.n_flows - 1, -1, -1) if reverse else range(cfg.n_flows)
-    flow_list = [flows[str(i * 2)] for i in indices]
-
-    if cfg.n_flows > 1:
-        stacked_flows = jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *flow_list)
-
-        def _scan_body(c: Array, flow_p: Mapping[str, Any]):
-            if reverse:
-                c = _coupling_layer_forward(c[..., ::-1], x_mask, flow_p, cfg, g=g, reverse=True, prec=prec)
-            else:
-                c = _coupling_layer_forward(c, x_mask, flow_p, cfg, g=g, reverse=False, prec=prec)[..., ::-1]
-            return c, None
-
-        cur, _ = jax.lax.scan(_scan_body, cur, stacked_flows)
+    if not reverse:
+        for i in range(cfg.n_flows):
+            cur = _coupling_layer_forward(cur, x_mask, flows[str(i * 2)], cfg, g=g, reverse=False, prec=prec)
+            cur = cur[..., ::-1]
         return cur
-
-    for flow_p in flow_list:
-        if reverse:
-            cur = cur[..., ::-1]
-            cur = _coupling_layer_forward(cur, x_mask, flow_p, cfg, g=g, reverse=True, prec=prec)
-        else:
-            cur = _coupling_layer_forward(cur, x_mask, flow_p, cfg, g=g, reverse=False, prec=prec)
-            cur = cur[..., ::-1]
+    for i in range(cfg.n_flows - 1, -1, -1):
+        cur = cur[..., ::-1]
+        cur = _coupling_layer_forward(cur, x_mask, flows[str(i * 2)], cfg, g=g, reverse=True, prec=prec)
     return cur
 
 

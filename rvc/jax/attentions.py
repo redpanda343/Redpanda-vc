@@ -127,14 +127,14 @@ def mha_forward(
     v_h = jnp.transpose(v_f32.reshape(b, t_s, cfg.n_heads, cfg.k_channels), (0, 2, 1, 3))
 
     q_scaled = q_h / math.sqrt(cfg.k_channels)
-    scores = jnp.matmul(q_scaled, jnp.swapaxes(k_h, -2, -1), precision=prec.fp32_precision)
+    scores = jnp.matmul(q_scaled, jnp.swapaxes(k_h, -2, -1), precision=prec.compute_precision)
 
     window = 0
     if cfg.window_size is not None:
         assert t_s == t_t, "Relative attention only supports self-attention."
         window = min(cfg.window_size, t_s - 1)
         rel_k = _relative_embeddings(jnp.asarray(params["emb_rel_k"], jnp.float32), cfg.window_size, window)
-        rel_scores = jnp.matmul(q_scaled, jnp.swapaxes(rel_k, -2, -1), precision=prec.fp32_precision)
+        rel_scores = jnp.matmul(q_scaled, jnp.swapaxes(rel_k, -2, -1), precision=prec.compute_precision)
         scores = scores + _band_to_absolute(rel_scores, window)
 
     if cfg.proximal_bias:
@@ -151,10 +151,10 @@ def mha_forward(
     p_attn = jax.nn.softmax(scores, axis=-1)
     p_attn = dropout(p_attn, rng_key, cfg.p_dropout, deterministic=deterministic)
 
-    out_h = jnp.matmul(p_attn, v_h, precision=prec.fp32_precision)
+    out_h = jnp.matmul(p_attn, v_h, precision=prec.compute_precision)
     if cfg.window_size is not None:
         rel_v = _relative_embeddings(jnp.asarray(params["emb_rel_v"], jnp.float32), cfg.window_size, window)
-        out_h = out_h + jnp.matmul(_absolute_to_band(p_attn, window), rel_v, precision=prec.fp32_precision)
+        out_h = out_h + jnp.matmul(_absolute_to_band(p_attn, window), rel_v, precision=prec.compute_precision)
 
     out_nwc = jnp.transpose(out_h, (0, 2, 1, 3)).reshape(b, t_t, d)
     return conv1d(out_nwc, params["conv_o"], dtype=prec.compute_dtype, precision=prec.compute_precision)

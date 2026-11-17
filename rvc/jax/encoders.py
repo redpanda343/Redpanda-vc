@@ -113,51 +113,18 @@ def encoder_forward(
     # (B, T, 1) -> (B, 1, 1, T) matching PyTorch x_mask.unsqueeze(2) on (B, 1, T)
     attn_mask = x_mask[:, None, None, :, 0]
     x_f32 = jnp.asarray(x, jnp.float32) * jnp.asarray(x_mask, jnp.float32)
-    use_dropout = rng_key is not None and not deterministic and cfg.p_dropout > 0.0
 
-    def _run_layer(cur_x: Array, attn_p: Any, norm1_p: Any, ffn_p: Any, norm2_p: Any, layer_key: Array | None) -> Array:
+    for i in range(cfg.n_layers):
         k_attn = k_d1 = k_ffn = k_d2 = None
-        if layer_key is not None:
-            k_attn, k_d1, k_ffn, k_d2 = jax.random.split(layer_key, 4)
-        y = mha_forward(cur_x, cur_x, attn_p, mha_cfg, attn_mask=attn_mask, rng_key=k_attn, deterministic=deterministic, prec=prec)
+        if rng_key is not None and not deterministic and cfg.p_dropout > 0.0:
+            rng_key, k_attn, k_d1, k_ffn, k_d2 = jax.random.split(rng_key, 5)
+        y = mha_forward(x_f32, x_f32, params["attn_layers"][i], mha_cfg, attn_mask=attn_mask, rng_key=k_attn, deterministic=deterministic, prec=prec)
         y = dropout(y, k_d1, cfg.p_dropout, deterministic=deterministic)
-        cur_x = layer_norm(cur_x + jnp.asarray(y, jnp.float32), norm1_p)
+        x_f32 = layer_norm(x_f32 + jnp.asarray(y, jnp.float32), params["norm_layers_1"][i])
 
-        y = ffn_forward(cur_x, x_mask, ffn_p, ffn_cfg, rng_key=k_ffn, deterministic=deterministic, prec=prec)
+        y = ffn_forward(x_f32, x_mask, params["ffn_layers"][i], ffn_cfg, rng_key=k_ffn, deterministic=deterministic, prec=prec)
         y = dropout(y, k_d2, cfg.p_dropout, deterministic=deterministic)
-        return layer_norm(cur_x + jnp.asarray(y, jnp.float32), norm2_p)
-
-    layer_keys = jax.random.split(rng_key, cfg.n_layers) if use_dropout else None
-    if cfg.n_layers > 1:
-        stacked_layers = jax.tree.map(
-            lambda *xs: jnp.stack(xs, axis=0),
-            *[
-                {
-                    "attn": params["attn_layers"][i],
-                    "norm1": params["norm_layers_1"][i],
-                    "ffn": params["ffn_layers"][i],
-                    "norm2": params["norm_layers_2"][i],
-                }
-                for i in range(cfg.n_layers)
-            ],
-        )
-
-        def _scan_body(cur_x: Array, item: tuple[dict[str, Any], Array | None]):
-            layer_p, l_key = item
-            return _run_layer(cur_x, layer_p["attn"], layer_p["norm1"], layer_p["ffn"], layer_p["norm2"], l_key), None
-
-        x_f32, _ = jax.lax.scan(_scan_body, x_f32, (stacked_layers, layer_keys))
-    else:
-        for i in range(cfg.n_layers):
-            l_key = layer_keys[i] if layer_keys is not None else None
-            x_f32 = _run_layer(
-                x_f32,
-                params["attn_layers"][i],
-                params["norm_layers_1"][i],
-                params["ffn_layers"][i],
-                params["norm_layers_2"][i],
-                l_key,
-            )
+        x_f32 = layer_norm(x_f32 + jnp.asarray(y, jnp.float32), params["norm_layers_2"][i])
 
     return x_f32 * jnp.asarray(x_mask, jnp.float32)
 
