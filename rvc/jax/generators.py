@@ -332,9 +332,6 @@ def hifigan_nsf_forward(
         h = jax.checkpoint(_stage)(h, p_up, p_nc, p_rbs) if cfg.checkpointing else _stage(h, p_up, p_nc, p_rbs)
 
     h = leaky_relu(h, 0.01)
-    # Remove leaky_relu DC offset in FP32 so conv_post (bias=False) does not coherently amplify temporal DC gradients.
-    h_f32 = jnp.asarray(h, jnp.float32)
-    h = h_f32 - jnp.mean(h_f32, axis=1, keepdims=True)
     h = conv1d(h, params["conv_post"], padding=3, dtype=prec.compute_dtype, precision=prec.compute_precision)
     return jnp.tanh(jnp.asarray(h, jnp.float32))
 

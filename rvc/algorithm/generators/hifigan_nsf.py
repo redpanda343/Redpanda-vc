@@ -198,9 +198,7 @@ class HiFiGANNSFGenerator(torch.nn.Module):
                 xs = y if xs is None else xs + y
             x = xs / self.num_kernels
 
-        x = torch.nn.functional.leaky_relu(x)
-        # Remove leaky_relu DC offset before biasless conv_post to avoid coherent sqrt(B*T) DC gradient spikes.
-        x = x - x.mean(dim=-1, keepdim=True)
+        x = torch.nn.functional.leaky_relu(x, inplace=True)
         x = torch.tanh(self.conv_post(x))
 
         return x
