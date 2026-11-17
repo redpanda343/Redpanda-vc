@@ -74,7 +74,7 @@ def spec_to_mel_torch(spec, n_fft, num_mels, sample_rate, fmin, fmax):
         )
 
     melspec = torch.matmul(mel_basis[fmax_dtype_device], spec)
-    melspec = torch.log(melspec.clamp(min=2e-6) * 1)
+    melspec = torch.log(melspec + 3e-4)
     return melspec
 
 

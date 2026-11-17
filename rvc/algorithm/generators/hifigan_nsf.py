@@ -163,6 +163,11 @@ class HiFiGANNSFGenerator(torch.nn.Module):
 
         self.conv_post = torch.nn.Conv1d(channels[-1], 1, 7, 1, padding=3, bias=False)
         self.ups.apply(init_weights)
+        # Zero initial NSF noise_conv bias (keeping Kaiming weights) to prevent step-0 DC flood without attenuating F0.
+        with torch.no_grad():
+            for noise_conv in self.noise_convs:
+                if noise_conv.bias is not None:
+                    noise_conv.bias.zero_()
 
         if gin_channels != 0:
             self.cond = torch.nn.Conv1d(gin_channels, upsample_initial_channel, 1)
