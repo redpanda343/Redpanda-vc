@@ -574,6 +574,32 @@ def conv1d(
     return y
 
 
+_POLYPHASE_BASIS_CACHE: dict[tuple[int, int, int], tuple[np.ndarray, int, int, int]] = {}
+
+
+def _polyphase_basis(kernel_size: int, stride: int, padding: int) -> tuple[np.ndarray, int, int, int]:
+    """Build static zero/one permutation matrix converting strided ConvTranspose1d to dense Conv1d."""
+    key = (int(kernel_size), int(stride), int(padding))
+    cached = _POLYPHASE_BASIS_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    d_min = -(stride - 1 + padding) // stride
+    d_max = (kernel_size - 1 - padding) // stride
+    u_min, u_max = -d_max, -d_min
+    k_eff = u_max - u_min + 1
+    mat = np.zeros((k_eff * stride, kernel_size), dtype=np.float32)
+    for u_idx, u in enumerate(range(u_min, u_max + 1)):
+        d = -u
+        for r in range(stride):
+            kk = d * stride + r + padding
+            if 0 <= kk < kernel_size:
+                mat[u_idx * stride + r, kk] = 1.0
+    result = (mat, u_min, u_max, k_eff)
+    _POLYPHASE_BASIS_CACHE[key] = result
+    return result
+
+
 def conv_transpose1d(
     x: Array,
     params: Mapping[str, Array],
@@ -589,22 +615,50 @@ def conv_transpose1d(
     if groups != 1:
         raise ValueError(f"Grouped conv_transpose1d is unsupported (got groups={groups}).")
     w = resolve_kernel(params)
-    k = w.shape[0]
-    k_eff = (k - 1) * int(dilation) + 1
-    pad_left = k_eff - 1 - int(padding)
-    pad_right = k_eff - 1 - int(padding) + int(output_padding)
+    k, c_out, c_in = w.shape
+    s = int(stride)
+    p = int(padding)
+    op = int(output_padding)
+    d = int(dilation)
     x_c = jnp.asarray(x, dtype)
-    w_c = jnp.asarray(w, dtype)
-    y = lax.conv_transpose(
-        lhs=x_c,
-        rhs=w_c,
-        strides=(int(stride),),
-        padding=((pad_left, pad_right),),
-        rhs_dilation=(int(dilation),),
-        dimension_numbers=("NWC", "WIO", "NWC"),
-        transpose_kernel=True,
-        precision=precision,
-    )
+
+    # Dense polyphase Conv1d avoids zero-interleaved lhs_dilate on TPU/CPU when stride > 1.
+    t_in = x_c.shape[1]
+    t_out = (t_in - 1) * s - 2 * p + k + op
+    if s > 1 and d == 1 and t_out > 0:
+        m_count = (t_out + s - 1) // s
+        mat_np, u_min, u_max, k_eff = _polyphase_basis(k, s, p)
+        w_ci = jnp.asarray(jnp.transpose(w, (0, 2, 1)), dtype).reshape(k, c_in * c_out)
+        w_packed = jnp.matmul(jnp.asarray(mat_np, dtype), w_ci, precision=precision).reshape(k_eff, s, c_in, c_out)
+        w_packed = jnp.transpose(w_packed, (0, 2, 1, 3)).reshape(k_eff, c_in, s * c_out)
+        need_end = (m_count - 1) + u_max + 1
+        pad_l = max(0, -u_min)
+        pad_r = max(0, need_end - t_in)
+        y_blk = lax.conv_general_dilated(
+            lhs=x_c,
+            rhs=w_packed,
+            window_strides=(1,),
+            padding=((pad_l, pad_r),),
+            dimension_numbers=("NWC", "WIO", "NWC"),
+            precision=precision,
+        )
+        start_idx = max(0, u_min)
+        y = y_blk[:, start_idx : start_idx + m_count, :].reshape(x_c.shape[0], m_count * s, c_out)[:, :t_out, :]
+    else:
+        k_eff = (k - 1) * d + 1
+        pad_left = k_eff - 1 - p
+        pad_right = k_eff - 1 - p + op
+        w_c = jnp.asarray(w, dtype)
+        y = lax.conv_transpose(
+            lhs=x_c,
+            rhs=w_c,
+            strides=(s,),
+            padding=((pad_left, pad_right),),
+            rhs_dilation=(d,),
+            dimension_numbers=("NWC", "WIO", "NWC"),
+            transpose_kernel=True,
+            precision=precision,
+        )
     if "bias" in params and params["bias"] is not None:
         y = y + jnp.asarray(params["bias"], dtype)
     return y

@@ -61,6 +61,8 @@ from rvc.jax.discriminators import (
     MultiPeriodDiscriminatorConfig,
     init_mpd_params,
     mpd_forward,
+    mpd_forward_single,
+    resolve_mpd_params,
 )
 from rvc.jax.losses import discriminator_loss, feature_loss, generator_loss, kl_loss
 from rvc.jax.mel import (
@@ -577,7 +579,7 @@ class JaxTrainer:
             y_hat_det = lax.stop_gradient(y_hat)
 
             def _loss_d(p_d):
-                yr, yg, _, _ = mpd_forward(p_d, mpd_cfg, wave_slice_f32, y_hat_det, prec=prec)
+                yr, yg, _, _ = mpd_forward(p_d, mpd_cfg, wave_slice_f32, y_hat_det, prec=prec, transpose_fmap=False)
                 l_d, _, _ = discriminator_loss(yr, yg)
                 return l_d
 
@@ -589,12 +591,17 @@ class JaxTrainer:
                 upd_d, opt_state_d = opt_d.update(grads_d, opt_state_d, params_d)
                 params_d = optax.apply_updates(params_d, upd_d)
 
-            params_d_sg = lax.stop_gradient(params_d)
+            params_d_resolved = lax.stop_gradient(resolve_mpd_params(params_d))
+            _, fmap_r = lax.stop_gradient(
+                mpd_forward_single(params_d_resolved, mpd_cfg, wave_slice_f32, prec=prec, transpose_fmap=False)
+            )
             z_mask_sg = lax.stop_gradient(z_mask)
 
             def _loss_from_gen(d_out):
                 y_h, z_p_v, m_p_v, logs_p_v, logs_q_v = d_out
-                _, y_d_g, fmap_r, fmap_g = mpd_forward(params_d_sg, mpd_cfg, wave_slice_f32, y_h, prec=prec)
+                y_d_g, fmap_g = mpd_forward_single(
+                    params_d_resolved, mpd_cfg, y_h, prec=prec, transpose_fmap=False
+                )
                 if multiscale_mel:
                     l_mel = multi_scale_mel_loss(wave_slice_f32, y_h, ms_mel_cfg) * c_mel / 3.0
                 else:
