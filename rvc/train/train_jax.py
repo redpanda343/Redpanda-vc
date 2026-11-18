@@ -331,7 +331,7 @@ class JaxTrainer:
     def build_data(self) -> None:
         data = self.config.data
         max_frames = int(self.args.max_batch_seconds * data.sample_rate / data.hop_length)
-        self.dataset = TextAudioDataset(data, compute_spec=False)
+        self.dataset = TextAudioDataset(data, compute_spec=False, repeat_phone=False)
         use_tpu_buckets = self.platform in ("tpu", "gpu")
         boundaries = list(BUCKET_BOUNDARIES if use_tpu_buckets else LEGACY_BUCKET_BOUNDARIES)
         # Ensure tiny test clips are also representable if user didn't filter or if dataset has short clips
@@ -613,7 +613,7 @@ class JaxTrainer:
                     int(data_cfg.filter_length),
                     hop_length,
                     int(data_cfg.win_length),
-                    max_frames=phone.shape[1],
+                    max_frames=pitch.shape[1],
                 )
             )
             next_rng_key, step_base_rng = jax.random.split(rng_key)
@@ -853,12 +853,14 @@ class JaxTrainer:
         phone_dim = int(self.syn_cfg.text_enc_hidden_dim)
         b_sharding = self.data_sharding
 
+        phone_half = not bool(getattr(getattr(self, "dataset", None), "repeat_phone", True))
         total = len(bucket_shapes)
         print(f"Pre-compiling XLA training kernels for {total} bucket shape(s)...", flush=True)
         for idx, (bs, frames) in enumerate(bucket_shapes, start=1):
             wave_frames = frames * hop_length
+            phone_frames = (frames + 1) // 2 if phone_half else frames
             batch_sds = (
-                jax.ShapeDtypeStruct((bs, frames, phone_dim), jnp.float32, sharding=b_sharding),
+                jax.ShapeDtypeStruct((bs, phone_frames, phone_dim), jnp.float32, sharding=b_sharding),
                 jax.ShapeDtypeStruct((bs,), jnp.int32, sharding=b_sharding),
                 jax.ShapeDtypeStruct((bs, frames), jnp.int32, sharding=b_sharding),
                 jax.ShapeDtypeStruct((bs, frames), jnp.float32, sharding=b_sharding),
@@ -960,10 +962,10 @@ class JaxTrainer:
             text += f", g {total:.2f}, d {disc:.2f}, mel {mel:.2f}"
         self.progress.set_postfix_str(text, refresh=False)
 
-    def _record_and_maybe_log(self, gn_d, gn_g, current_lr_g: float) -> None:
+    def _record_and_maybe_log(self, gn_d, gn_g, current_lr_g: float) -> bool:
         self.batch_count += 1
         if self.global_step % self.log_interval != 0:
-            return
+            return False
         sums_raw, gn_d_np, gn_g_np = jax.device_get((self.loss_sums, gn_d, gn_g))
         sums_np = np.asarray(sums_raw, dtype=np.float32) / float(max(1, self.batch_count))
         self.loss_sums = jax.device_put(np.zeros((6,), dtype=np.float32), self.replicated_sharding)
@@ -986,6 +988,7 @@ class JaxTrainer:
                     "grad/norm_g": float(gn_g_np),
                 },
             )
+        return True
 
     def save(self, epoch: int, final: bool) -> None:
         args = self.args
@@ -1129,13 +1132,15 @@ class JaxTrainer:
             if cur_np is None:
                 return
             cur_dev, cur_scalars, lr_g_val = self._stage_step_inputs(cur_np, epoch, base_lr)
+            prev_sync = None
+            pending_ticks = 0
 
             while cur_dev is not None:
                 if self.exporter is not None:
                     self.exporter.raise_if_failed()
                 if self.ckpt_writer is not None:
                     self.ckpt_writer.raise_if_failed()
-                step_key = (int(cur_dev[0].shape[0]), int(cur_dev[0].shape[1]), int(cur_dev[5].shape[1]))
+                step_key = (int(cur_dev[2].shape[0]), int(cur_dev[2].shape[1]), int(cur_dev[5].shape[1]))
                 step_fn = self._compiled_steps.get(step_key, self._step_fn)
 
                 (
@@ -1165,20 +1170,39 @@ class JaxTrainer:
                 self.last_batch = (spec_0, id_0, y_hat_0)
                 self.global_step += 1
                 self.epoch_step += 1
-                self._record_and_maybe_log(gn_d, gn_g, lr_g_val)
-                self.progress.update(1)
+                pending_ticks += 1
+                did_sync = self._record_and_maybe_log(gn_d, gn_g, lr_g_val)
                 final = self.global_step >= self.args.total_steps
                 if final or self.global_step % self.args.save_every_steps == 0:
                     self.save(epoch, final)
+                    did_sync = True
+                if did_sync:
+                    self.progress.update(pending_ticks)
+                    pending_ticks = 0
+                    prev_sync = None
                 if final:
                     break
 
-                # Stage next batch and packed step controls while TPU executes the current step asynchronously.
+                # Stage t+1 H2D while t executes asynchronously, then pace t-1 to keep a 2-deep TPU queue.
                 next_np = next(batch_iter, None)
-                if next_np is None:
+                if next_np is not None:
+                    cur_dev, cur_scalars, lr_g_val = self._stage_step_inputs(next_np, epoch, base_lr)
+                else:
                     cur_dev = None
-                    continue
-                cur_dev, cur_scalars, lr_g_val = self._stage_step_inputs(next_np, epoch, base_lr)
+                if not did_sync:
+                    if prev_sync is not None:
+                        jax.block_until_ready(prev_sync)
+                        done_now = max(0, pending_ticks - 1)
+                        if done_now:
+                            self.progress.update(done_now)
+                            pending_ticks -= done_now
+                    prev_sync = self.rng_key
+
+            if prev_sync is not None:
+                jax.block_until_ready(prev_sync)
+            if pending_ticks > 0:
+                self.progress.update(pending_ticks)
+                pending_ticks = 0
         finally:
             if hasattr(batch_iter, "close"):
                 batch_iter.close()

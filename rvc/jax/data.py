@@ -12,7 +12,7 @@ import queue
 import threading
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from typing import Iterator, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 import numpy as np
 import soundfile as sf
@@ -64,7 +64,7 @@ def _probe_audio_frames(audiopath: str, hop_length: int, max_sample_frames: int)
 class TextAudioDataset:
     """Loads WAV audio, optional linear STFT, phoneme features, and pitch for NWC JAX training."""
 
-    def __init__(self, data_cfg, *, compute_spec: bool = True) -> None:
+    def __init__(self, data_cfg, *, compute_spec: bool = True, repeat_phone: bool = True) -> None:
         self.audiopaths_and_text = load_filepaths_and_text(data_cfg.training_files)
         self.max_wav_value = float(data_cfg.max_wav_value)
         self.sample_rate = int(data_cfg.sample_rate)
@@ -73,9 +73,46 @@ class TextAudioDataset:
         self.win_length = int(data_cfg.win_length)
         self.max_sample_frames = 896
         self.compute_spec = bool(compute_spec)
+        self.repeat_phone = bool(repeat_phone)
         self.min_text_len = int(getattr(data_cfg, "min_text_len", 1))
         self.max_text_len = int(getattr(data_cfg, "max_text_len", 5000))
         self._filter()
+
+    @classmethod
+    def from_cached_entries(cls, cfg_dict: Mapping[str, Any]) -> "TextAudioDataset":
+        """Reconstruct dataset in worker processes using pre-filtered file lists and lengths."""
+        obj = cls.__new__(cls)
+        obj.audiopaths_and_text = [list(row) for row in cfg_dict["audiopaths_and_text"]]
+        obj.lengths = [int(x) for x in cfg_dict.get("lengths", ())]
+        obj.max_wav_value = float(cfg_dict.get("max_wav_value", 32768.0))
+        obj.sample_rate = int(cfg_dict["sample_rate"])
+        obj.filter_length = int(cfg_dict["filter_length"])
+        obj.hop_length = int(cfg_dict["hop_length"])
+        obj.win_length = int(cfg_dict["win_length"])
+        obj.max_sample_frames = int(cfg_dict.get("max_sample_frames", 896))
+        obj.compute_spec = bool(cfg_dict.get("compute_spec", False))
+        obj.repeat_phone = bool(cfg_dict.get("repeat_phone", True))
+        obj.min_text_len = int(cfg_dict.get("min_text_len", 1))
+        obj.max_text_len = int(cfg_dict.get("max_text_len", 5000))
+        return obj
+
+    def worker_config(self, hop_length: int, allowed_frames: Sequence[int] = ()) -> dict[str, Any]:
+        """Serialize picklable dataset metadata for multi-process batch workers."""
+        return {
+            "audiopaths_and_text": self.audiopaths_and_text,
+            "lengths": self.lengths,
+            "max_wav_value": self.max_wav_value,
+            "sample_rate": self.sample_rate,
+            "filter_length": self.filter_length,
+            "hop_length": int(hop_length),
+            "win_length": self.win_length,
+            "max_sample_frames": self.max_sample_frames,
+            "compute_spec": self.compute_spec,
+            "repeat_phone": self.repeat_phone,
+            "min_text_len": self.min_text_len,
+            "max_text_len": self.max_text_len,
+            "allowed_frames": tuple(int(x) for x in allowed_frames),
+        }
 
     def _filter(self) -> None:
         kept: list[list[str]] = []
@@ -104,16 +141,11 @@ class TextAudioDataset:
     def __getitem__(self, index: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.int32]:
         audiopath, phone_path, pitch_path, pitchf_path, dv_str = self.audiopaths_and_text[index]
 
-        phone = np.load(phone_path, allow_pickle=False)
-        phone = np.repeat(phone, 2, axis=0)
+        phone_raw = np.load(phone_path, allow_pickle=False)
         pitch = np.load(pitch_path, allow_pickle=False)
         pitchf = np.load(pitchf_path, allow_pickle=False)
 
-        n_num = min(phone.shape[0], pitch.shape[0], pitchf.shape[0], self.max_sample_frames)
-        phone = np.asarray(phone[:n_num, :], dtype=np.float32)
-        pitch = np.asarray(pitch[:n_num], dtype=np.int32)
-        pitchf = np.asarray(pitchf[:n_num], dtype=np.float32)
-
+        n_num = min(int(phone_raw.shape[0]) * 2, int(pitch.shape[0]), int(pitchf.shape[0]), self.max_sample_frames)
         audio, sr = sf.read(audiopath, dtype="float32")
         if audio.ndim > 1:
             audio = audio[:, 0]
@@ -121,14 +153,16 @@ class TextAudioDataset:
             raise ValueError(f"{sr} SR doesn't match target {self.sample_rate} SR in '{audiopath}'.")
 
         n_frames_audio = min(len(audio) // self.hop_length, self.max_sample_frames)
-        len_min = min(phone.shape[0], n_frames_audio)
+        len_min = min(n_num, n_frames_audio)
         len_wav = len_min * self.hop_length
         audio = np.asarray(audio[:len_wav], dtype=np.float32)
         wav = audio[:, None]  # (T_wav, 1) NWC
-        if len_min < n_num:
-            phone = phone[:len_min, :]
-            pitch = pitch[:len_min]
-            pitchf = pitchf[:len_min]
+
+        n_phone_half = (len_min + 1) // 2
+        phone_half = np.asarray(phone_raw[:n_phone_half, :], dtype=np.float32)
+        phone = np.repeat(phone_half, 2, axis=0)[:len_min, :] if self.repeat_phone else phone_half
+        pitch = np.asarray(pitch[:len_min], dtype=np.int32)
+        pitchf = np.asarray(pitchf[:len_min], dtype=np.float32)
 
         spec = (
             spectrogram_np(np.ascontiguousarray(audio, dtype=np.float32), self.filter_length, self.hop_length, self.win_length)
@@ -268,13 +302,16 @@ def collate_nwc_batch(
     hop_length: int,
     target_frames: int | None = None,
     allowed_frames: Sequence[int] | None = None,
+    phone_half: bool = False,
 ) -> tuple[np.ndarray, ...]:
     """Collate sample rows into NWC NumPy arrays with optional static XLA bucket padding."""
     has_spec = rows[0][0] is not None
-    sorted_rows = sorted(rows, key=lambda r: r[2].shape[0], reverse=True)
+    # Half-rate phoneme rows store 50Hz frames; pitch (index 3) always tracks full 100Hz frame count.
+    len_idx = 3 if phone_half else 2
+    sorted_rows = sorted(rows, key=lambda r: r[len_idx].shape[0], reverse=True)
     batch_size = len(sorted_rows)
 
-    phone_lengths = np.asarray([r[2].shape[0] for r in sorted_rows], dtype=np.int32)
+    phone_lengths = np.asarray([r[len_idx].shape[0] for r in sorted_rows], dtype=np.int32)
     wave_lengths = np.asarray([r[1].shape[0] for r in sorted_rows], dtype=np.int32)
     spec_lengths = (
         np.asarray([r[0].shape[0] for r in sorted_rows], dtype=np.int32)
@@ -288,8 +325,9 @@ def collate_nwc_batch(
     wave_frames = max(frames * int(hop_length), int(wave_lengths.max()))
 
     phone_dim = sorted_rows[0][2].shape[1]
+    phone_frames = (frames + 1) // 2 if phone_half else frames
 
-    phone_padded = np.zeros((batch_size, frames, phone_dim), dtype=np.float32)
+    phone_padded = np.zeros((batch_size, phone_frames, phone_dim), dtype=np.float32)
     pitch_padded = np.zeros((batch_size, frames), dtype=np.int32)
     pitchf_padded = np.zeros((batch_size, frames), dtype=np.float32)
     wave_padded = np.zeros((batch_size, wave_frames, 1), dtype=np.float32)
@@ -335,7 +373,7 @@ def collate_nwc_batch(
 
 
 class PrefetchBatchLoader:
-    """Threaded NumPy batch prefetcher + optional RAM dataset cache for high TPU throughput."""
+    """Multi-process / threaded NumPy batch prefetcher + optional RAM cache for high TPU throughput."""
 
     def __init__(
         self,
@@ -345,6 +383,7 @@ class PrefetchBatchLoader:
         num_workers: int = 4,
         prefetch_batches: int = 8,
         cache_in_ram: bool = False,
+        use_multiprocessing: bool | None = None,
     ) -> None:
         self.dataset = dataset
         self.sampler = sampler
@@ -353,8 +392,23 @@ class PrefetchBatchLoader:
         self.prefetch_batches = max(2, int(prefetch_batches))
         self.cache_in_ram = bool(cache_in_ram)
         self.allowed_frames = getattr(sampler, "allowed_frames", ())
+        self.phone_half = not bool(getattr(dataset, "repeat_phone", True))
+        if use_multiprocessing is None:
+            self.use_multiprocessing = (
+                os.name != "nt"
+                and not self.cache_in_ram
+                and self.num_workers > 0
+                and len(dataset) >= 32
+            )
+        else:
+            self.use_multiprocessing = bool(use_multiprocessing) and (not self.cache_in_ram) and (self.num_workers > 0)
         self._cache: list[tuple[np.ndarray, ...]] | None = None
-        self._pool = ThreadPoolExecutor(max_workers=max(1, self.num_workers)) if self.num_workers > 0 else None
+        self._mp_pool = None
+        self._pool = (
+            ThreadPoolExecutor(max_workers=max(1, self.num_workers))
+            if self.num_workers > 0 and not self.use_multiprocessing
+            else None
+        )
 
     def _get_item(self, idx: int):
         if self._cache is not None:
@@ -369,6 +423,7 @@ class PrefetchBatchLoader:
             self.hop_length,
             target_frames=target_frames,
             allowed_frames=self.allowed_frames,
+            phone_half=self.phone_half,
         )
 
     def _ensure_cache(self) -> None:
@@ -385,6 +440,19 @@ class PrefetchBatchLoader:
         self._ensure_cache()
         specs = list(iter(self.sampler))
         if not specs:
+            return
+
+        if self.use_multiprocessing and not self.cache_in_ram and self.num_workers > 0:
+            if self._mp_pool is None:
+                from rvc.train.jax_data_worker import SpawnBatchPool
+
+                cfg_dict = self.dataset.worker_config(self.hop_length, self.allowed_frames)
+                self._mp_pool = SpawnBatchPool(
+                    cfg_dict,
+                    num_workers=self.num_workers,
+                    prefetch_batches=self.prefetch_batches,
+                )
+            yield from self._mp_pool.iter_batches(specs)
             return
 
         if self._pool is None or self.num_workers == 0:
@@ -444,6 +512,9 @@ class PrefetchBatchLoader:
             thread.join(timeout=2.0)
 
     def close(self) -> None:
+        if self._mp_pool is not None:
+            self._mp_pool.close()
+            self._mp_pool = None
         if self._pool is not None:
             self._pool.shutdown(wait=True, cancel_futures=True)
             self._pool = None

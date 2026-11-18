@@ -192,9 +192,13 @@ def text_encoder_forward(
     rng_key: Array | None = None,
     deterministic: bool = True,
     prec: PrecisionConfig = PrecisionConfig(),
+    expected_frames: int | None = None,
 ) -> tuple[Array, Array, Array]:
     """Encode phoneme features and quantized pitch -> (m, logs, x_mask) in NWC (B, T, C)."""
     x = jnp.asarray(linear(phone, params["emb_phone"], dtype=prec.compute_dtype, precision=prec.compute_precision), jnp.float32)
+    if expected_frames is not None and x.shape[1] < int(expected_frames):
+        # Upsample 50Hz phoneme projections to 100Hz frame rate on TPU after emb_phone matmul.
+        x = jnp.repeat(x, 2, axis=1)[:, : int(expected_frames), :]
     if pitch is not None and cfg.f0 and "emb_pitch" in params:
         x = x + embedding(pitch, params["emb_pitch"]["weight"])
     x = x * math.sqrt(cfg.hidden_channels)
