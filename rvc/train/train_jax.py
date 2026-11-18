@@ -336,12 +336,11 @@ class JaxTrainer:
     def build_data(self) -> None:
         data = self.config.data
         max_frames = int(self.args.max_batch_seconds * data.sample_rate / data.hop_length)
-        phone_dtype = np.float16 if getattr(self, "precision_label", "FP32") == "BF16" else np.float32
         self.dataset = TextAudioDataset(
             data,
             compute_spec=False,
-            repeat_phone=False,
-            phone_dtype=phone_dtype,
+            repeat_phone=True,
+            phone_dtype=np.float32,
         )
         use_tpu_buckets = self.platform in ("tpu", "gpu")
         boundaries = list(BUCKET_BOUNDARIES if use_tpu_buckets else LEGACY_BUCKET_BOUNDARIES)
@@ -858,24 +857,7 @@ class JaxTrainer:
                 batch,
             )
 
-        @jax.jit
-        def _mel_hat_array(y_hat_0):
-            y_hat_mel = mel_spectrogram_jax(
-                y_hat_0[None, ...],
-                int(data_cfg.filter_length),
-                int(data_cfg.n_mel_channels),
-                int(data_cfg.sample_rate),
-                int(data_cfg.hop_length),
-                int(data_cfg.win_length),
-                float(data_cfg.mel_fmin),
-                data_cfg.mel_fmax,
-                center=False,
-            )
-            # Transpose (TT, n_mels) -> (n_mels, TT) to match plot_spectrogram_to_numpy axes.
-            return y_hat_mel[0].T
-
         self._step_fn = _step
-        self._mel_hat_fn = _mel_hat_array
 
     def _warmup_step_buckets(self) -> None:
         """Ahead-of-time compile all active static bucket shapes so training never stalls mid-epoch."""
@@ -937,14 +919,6 @@ class JaxTrainer:
                 f"  [{idx}/{total}] compiled (batch={bs}, frames={frames}, wave={wave_frames}) in {dt:.1f}s",
                 flush=True,
             )
-
-        seg_samples = int(self.config.train.segment_size)
-        try:
-            self._mel_hat_fn.lower(
-                jax.ShapeDtypeStruct((seg_samples, 1), jnp.float32, sharding=self.replicated_sharding)
-            ).compile()
-        except Exception:
-            pass
 
     def _shard_batch(self, np_batch):
         return jax.device_put(np_batch, self.data_sharding)
@@ -1044,14 +1018,14 @@ class JaxTrainer:
         args = self.args
         data_cfg = self.config.data
         use_ema = args.ema_decay > 0
+        t_save0 = time.perf_counter()
         if self.ckpt_writer is not None:
             self.ckpt_writer.wait_for_completion()
 
         summary_dev = None
         if self.writer is not None and self.last_batch is not None:
             spec_0, id_0, y_hat_0 = self.last_batch
-            yh_m = self._mel_hat_fn(jax.device_put(y_hat_0[0], self.replicated_sharding))
-            summary_dev = (yh_m, spec_0[0], id_0[0])
+            summary_dev = (y_hat_0[0], spec_0[0], id_0[0])
 
         ema_dev = self.ema_params if use_ema else None
         snapshot_dev = (
@@ -1074,7 +1048,23 @@ class JaxTrainer:
         ) = jax.device_get(snapshot_dev)
 
         if host_summary is not None and self.writer is not None:
-            yh_m_np, spec_0_np, id_0_np = host_summary
+            from rvc.jax.data import spectrogram_np
+
+            y_hat_0_np, spec_0_np, id_0_np = host_summary
+            yh_spec = spectrogram_np(
+                np.asarray(y_hat_0_np, dtype=np.float32),
+                int(data_cfg.filter_length),
+                int(data_cfg.hop_length),
+                int(data_cfg.win_length),
+            )
+            yh_m_np = spec_to_mel_np(
+                yh_spec[None, ...],
+                int(data_cfg.filter_length),
+                int(data_cfg.n_mel_channels),
+                int(data_cfg.sample_rate),
+                float(data_cfg.mel_fmin),
+                data_cfg.mel_fmax,
+            )[0].T
             mel_all = spec_to_mel_np(
                 np.asarray(spec_0_np, dtype=np.float32)[None, ...],
                 int(data_cfg.filter_length),
@@ -1153,6 +1143,12 @@ class JaxTrainer:
                 self.ckpt_writer.wait_for_completion()
             if self.exporter is not None:
                 self.exporter.wait_for_completion()
+        dt_save = time.perf_counter() - t_save0
+        msg = f"Saved checkpoint for {args.model_name} at epoch {epoch}, step {self.global_step} ({dt_save:.2f}s)."
+        if self.progress is not None and hasattr(self.progress, "write"):
+            self.progress.write(msg)
+        else:
+            print(msg, flush=True)
 
     def _stage_step_inputs(self, np_batch, epoch: int, base_lr: float) -> tuple[Any, jax.Array, float]:
         """Dispatch asynchronous H2D transfers for the next batch and packed step controls."""

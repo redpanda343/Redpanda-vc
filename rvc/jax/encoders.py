@@ -195,7 +195,7 @@ def text_encoder_forward(
     expected_frames: int | None = None,
 ) -> tuple[Array, Array, Array]:
     """Encode phoneme features and quantized pitch -> (m, logs, x_mask) in NWC (B, T, C)."""
-    x = jnp.asarray(linear(phone, params["emb_phone"], dtype=prec.compute_dtype, precision=prec.compute_precision), jnp.float32)
+    x = jnp.asarray(linear(phone, params["emb_phone"], dtype=jnp.float32, precision=prec.fp32_precision), jnp.float32)
     if expected_frames is not None and x.shape[1] < int(expected_frames):
         # Upsample 50Hz phoneme projections to 100Hz frame rate on TPU after emb_phone matmul.
         x = jnp.repeat(x, 2, axis=1)[:, : int(expected_frames), :]
@@ -220,7 +220,7 @@ def text_encoder_forward(
         x_mask = x_mask[:, skip_head:, :]
 
     stats = jnp.asarray(
-        conv1d(x, params["proj"], dtype=prec.compute_dtype, precision=prec.compute_precision), jnp.float32
+        conv1d(x, params["proj"], dtype=jnp.float32, precision=prec.fp32_precision), jnp.float32
     ) * x_mask
     m = stats[..., : cfg.out_channels]
     logs = stats[..., cfg.out_channels :]
@@ -271,7 +271,7 @@ def posterior_encoder_forward(
 ) -> tuple[Array, Array, Array, Array]:
     """Encode linear spectrogram x:(B, T, F) -> (z, m, logs, x_mask) in NWC (B, T, C)."""
     x_mask = sequence_mask(x_lengths, x.shape[1])[..., None]
-    h = jnp.asarray(conv1d(x, params["pre"], dtype=prec.compute_dtype, precision=prec.compute_precision), jnp.float32) * x_mask
+    h = jnp.asarray(conv1d(x, params["pre"], dtype=jnp.float32, precision=prec.fp32_precision), jnp.float32) * x_mask
     wn_cfg = WaveNetConfig(
         hidden_channels=cfg.hidden_channels,
         kernel_size=cfg.kernel_size,
@@ -281,7 +281,7 @@ def posterior_encoder_forward(
         checkpointing=cfg.checkpointing,
     )
     h = wavenet_forward(h, x_mask, params["enc"], wn_cfg, g=g, deterministic=True, prec=prec)
-    stats = jnp.asarray(conv1d(h, params["proj"], dtype=prec.compute_dtype, precision=prec.compute_precision), jnp.float32) * x_mask
+    stats = jnp.asarray(conv1d(h, params["proj"], dtype=jnp.float32, precision=prec.fp32_precision), jnp.float32) * x_mask
     m = stats[..., : cfg.out_channels]
     logs = stats[..., cfg.out_channels :]
     noise = jax.random.normal(rng_key, shape=m.shape, dtype=jnp.float32)

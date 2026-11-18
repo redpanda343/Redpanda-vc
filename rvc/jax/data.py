@@ -629,27 +629,13 @@ class PrefetchBatchLoader:
         self._sample_cache: dict[int, tuple[Any, ...]] = {}
         self._sample_cache_bytes = 0
         self._sample_cache_lock = threading.Lock()
-        self._cache_cv = threading.Condition(self._sample_cache_lock)
         self._sample_cache_limit = max(0, min(int(avail * 0.50), avail - 3 * (1024 ** 3)))
         self._label_cache: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, np.int32, int]] = {}
         self._label_cache_bytes = 0
         self._label_cache_limit = max(0, min(int(avail * 0.65), avail - 2 * (1024 ** 3)))
         self._inflight: dict[int, Future] = {}
-        self._idx_to_bucket: dict[int, int] = {}
-        self._bucket_members: dict[int, list[int]] = {}
-        self._build_bucket_lookup()
-        self._cached_by_bucket: dict[int, list[int]] = {}
-        self._cached_set: set[int] = set()
-        self._fresh_by_bucket: dict[int, deque[int]] = {}
-        self._fresh_set: set[int] = set()
-        self._priority_queue: deque[int] = deque()
-        self._priority_set: set[int] = set()
-        self._sweep_order: list[int] = list(range(len(dataset)))
-        self._sweep_gen = 0
-        self._streamer_done = False
-        self._streamer_error: BaseException | None = None
-        self._streamer_stop = threading.Event()
-        self._streamer_thread: threading.Thread | None = None
+        self._warmup_stop = threading.Event()
+        self._warmup_thread: threading.Thread | None = None
         self._closed = False
         self._mp_pool = None
         # Overlayfs random-read IOPS peaks at ~8-12 threads; higher thread counts degrade throughput.
@@ -663,44 +649,6 @@ class PrefetchBatchLoader:
             if self._pool_workers > 0
             else None
         )
-
-    def _build_bucket_lookup(self) -> None:
-        buckets = getattr(self.sampler, "buckets", None)
-        bounds = getattr(self.sampler, "bucket_upper_bounds", None)
-        if buckets is not None and bounds is not None:
-            for b_idxs, ub in zip(buckets, bounds):
-                b_key = int(ub)
-                members = self._bucket_members.setdefault(b_key, [])
-                for idx in b_idxs:
-                    idx_i = int(idx)
-                    self._idx_to_bucket[idx_i] = b_key
-                    members.append(idx_i)
-
-    def _on_sample_cached_locked(self, idx: int) -> None:
-        if idx not in self._cached_set:
-            self._cached_set.add(idx)
-            b_key = self._idx_to_bucket.get(idx, 0)
-            self._cached_by_bucket.setdefault(b_key, []).append(idx)
-            self._fresh_set.add(idx)
-            self._fresh_by_bucket.setdefault(b_key, deque()).append(idx)
-            self._cache_cv.notify_all()
-
-    def _sync_cache_tracking_locked(self) -> None:
-        if len(self._cached_set) != len(self._sample_cache):
-            shrank = len(self._cached_set) > len(self._sample_cache)
-            self._cached_by_bucket.clear()
-            self._cached_set.clear()
-            self._fresh_by_bucket.clear()
-            self._fresh_set.clear()
-            for c_idx in self._sample_cache:
-                self._cached_set.add(c_idx)
-                b_key = self._idx_to_bucket.get(c_idx, 0)
-                self._cached_by_bucket.setdefault(b_key, []).append(c_idx)
-                self._fresh_set.add(c_idx)
-                self._fresh_by_bucket.setdefault(b_key, deque()).append(c_idx)
-            if shrank:
-                self._sweep_gen += 1
-                self._streamer_done = False
 
     def _get_item(self, idx: int):
         if self._cache is not None:
@@ -724,7 +672,6 @@ class PrefetchBatchLoader:
                     ):
                         self._sample_cache[idx] = item
                         self._sample_cache_bytes += item_bytes
-                        self._on_sample_cached_locked(idx)
                     elif idx not in self._label_cache and (
                         self._sample_cache_bytes + self._label_cache_bytes + lbl_bytes <= self._label_cache_limit
                     ):
@@ -739,7 +686,6 @@ class PrefetchBatchLoader:
                 if idx not in self._sample_cache and self._sample_cache_bytes + item_bytes <= self._sample_cache_limit:
                     self._sample_cache[idx] = item
                     self._sample_cache_bytes += item_bytes
-                    self._on_sample_cached_locked(idx)
         return item
 
     def _load_sample_tracked(self, idx: int):
@@ -767,23 +713,13 @@ class PrefetchBatchLoader:
                 self._inflight[idx] = fut
             return False, fut
 
-    def _build_sweep_order(self, specs: Sequence[tuple[int | None, Sequence[int]]] | None) -> list[int]:
-        order: list[int] = []
-        seen: set[int] = set()
-        if specs:
-            for _, indices in specs:
-                for idx in indices:
-                    idx_i = int(idx)
-                    if idx_i not in seen:
-                        seen.add(idx_i)
-                        order.append(idx_i)
-        for idx_i in range(len(self.dataset)):
-            if idx_i not in seen:
-                seen.add(idx_i)
-                order.append(idx_i)
-        return order
-
-    def _ensure_streamer(self, specs: Sequence[tuple[int | None, Sequence[int]]] | None = None) -> None:
+    def start_warmup(
+        self,
+        epoch: int = 1,
+        start_batch: int = 0,
+        max_samples: int | None = None,
+    ) -> None:
+        """Pre-populate sample/label RAM caches during XLA compile in exact Epoch batch order."""
         if (
             self._sample_cache_limit <= 0
             or self.cache_in_ram
@@ -792,109 +728,63 @@ class PrefetchBatchLoader:
             or self._closed
         ):
             return
-        with self._sample_cache_lock:
-            if not self._idx_to_bucket and specs:
-                for tf, idxs in specs:
-                    bk = int(tf) if tf is not None else 0
-                    members = self._bucket_members.setdefault(bk, [])
-                    seen_m = set(members)
-                    for ix in idxs:
-                        ix_i = int(ix)
-                        self._idx_to_bucket.setdefault(ix_i, bk)
-                        if ix_i not in seen_m:
-                            seen_m.add(ix_i)
-                            members.append(ix_i)
-            self._sync_cache_tracking_locked()
-            if len(self._sample_cache) >= len(self.dataset):
-                self._streamer_done = True
-                return
-            if self._sample_cache_bytes >= int(self._sample_cache_limit * 0.98):
-                self._streamer_done = True
-                return
-            if self._streamer_thread is not None and self._streamer_thread.is_alive():
-                return
-            if specs is not None:
-                self._sweep_order = self._build_sweep_order(specs)
-                self._sweep_gen += 1
-            self._streamer_stop.clear()
-            self._streamer_done = False
-            self._streamer_error = None
-
-            def _streamer_loop() -> None:
-                in_flight: deque[Future] = deque()
-                max_pending = max(8, min(24, self._pool_workers * 2))
-                local_gen = -1
-                sweep_pos = 0
-                order: list[int] = []
-                try:
-                    while not self._streamer_stop.is_set() and not self._closed:
-                        with self._sample_cache_lock:
-                            if local_gen != self._sweep_gen:
-                                local_gen = self._sweep_gen
-                                order = list(self._sweep_order)
-                                sweep_pos = 0
-
-                        while len(in_flight) < max_pending and not self._streamer_stop.is_set() and not self._closed:
-                            if self._sample_cache_bytes >= int(self._sample_cache_limit * 0.98):
-                                break
-                            cand = -1
-                            with self._sample_cache_lock:
-                                while self._priority_queue:
-                                    p_idx = self._priority_queue.popleft()
-                                    self._priority_set.discard(p_idx)
-                                    if p_idx not in self._sample_cache and p_idx not in self._inflight:
-                                        cand = p_idx
-                                        break
-                                if cand == -1:
-                                    while sweep_pos < len(order):
-                                        s_idx = order[sweep_pos]
-                                        sweep_pos += 1
-                                        if s_idx not in self._sample_cache and s_idx not in self._inflight:
-                                            cand = s_idx
-                                            break
-                            if cand == -1:
-                                break
-                            ready, item = self._submit_sample(cand)
-                            if not ready:
-                                in_flight.append(item)
-
-                        if not in_flight:
-                            break
-                        fut = in_flight.popleft()
-                        fut.result()
-                except BaseException as exc:
-                    with self._sample_cache_lock:
-                        self._streamer_error = exc
-                finally:
-                    with self._sample_cache_lock:
-                        self._streamer_done = True
-                        self._cache_cv.notify_all()
-
-            self._streamer_thread = threading.Thread(target=_streamer_loop, daemon=True)
-            self._streamer_thread.start()
-
-    def start_warmup(self, epoch: int, start_batch: int = 0) -> None:
-        """Start persistent background disk streamer in Epoch batch order during XLA compilation."""
-        if (
-            self._sample_cache_limit <= 0
-            or self.cache_in_ram
-            or self.use_multiprocessing
-            or self._pool is None
-            or self._closed
-        ):
+        if self._warmup_thread is not None and self._warmup_thread.is_alive():
             return
         self.sampler.set_epoch(epoch, start_batch)
         specs = list(iter(self.sampler))
-        if specs:
-            self._ensure_streamer(specs)
+        if not specs:
+            return
+
+        order: list[int] = []
+        seen: set[int] = set()
+        limit = int(max_samples) if max_samples is not None else len(self.dataset)
+        for _, indices in specs:
+            for raw_idx in indices:
+                idx_i = int(raw_idx)
+                if idx_i not in seen:
+                    seen.add(idx_i)
+                    order.append(idx_i)
+                    if len(order) >= limit:
+                        break
+            if len(order) >= limit:
+                break
+        if not order:
+            return
+
+        self._warmup_stop.clear()
+
+        def _warmup_loop() -> None:
+            in_flight: deque[Future] = deque()
+            max_pending = max(4, min(24, self._pool_workers * 2))
+            for idx_i in order:
+                if self._warmup_stop.is_set() or self._closed:
+                    break
+                if self._sample_cache_bytes >= int(self._sample_cache_limit * 0.90):
+                    break
+                ready, item = self._submit_sample(idx_i)
+                if not ready:
+                    in_flight.append(item)
+                while len(in_flight) >= max_pending:
+                    fut = in_flight.popleft()
+                    try:
+                        fut.result()
+                    except BaseException:
+                        pass
+            while in_flight and not self._warmup_stop.is_set() and not self._closed:
+                fut = in_flight.popleft()
+                try:
+                    fut.result()
+                except BaseException:
+                    pass
+
+        self._warmup_thread = threading.Thread(target=_warmup_loop, daemon=True)
+        self._warmup_thread.start()
 
     def stop_warmup(self, wait: bool = False) -> None:
-        self._streamer_stop.set()
-        with self._cache_cv:
-            self._cache_cv.notify_all()
-        if wait and self._streamer_thread is not None:
-            self._streamer_thread.join(timeout=5.0)
-            self._streamer_thread = None
+        self._warmup_stop.set()
+        if wait and self._warmup_thread is not None:
+            self._warmup_thread.join(timeout=2.0)
+            self._warmup_thread = None
 
     def _prepare_batch(self, spec_pair: tuple[int | None, list[int]]):
         target_frames, indices = spec_pair
@@ -941,130 +831,19 @@ class PrefetchBatchLoader:
                 yield self._prepare_batch(sp)
             return
 
-        stream_mode = len(self.dataset) > 256 and self._sample_cache_limit > 0 and not self.cache_in_ram
-        if stream_mode:
-            self._ensure_streamer(specs)
+        self.stop_warmup(wait=False)
 
         out_queue: queue.Queue = queue.Queue(maxsize=self.prefetch_batches)
         stop_event = threading.Event()
         sentinel = object()
-        max_sample_budget = max(32, self._pool_workers * 3)
+        max_sample_budget = max(64, self._pool_workers * 4)
         batch_window = max(self.prefetch_batches, 4)
-
-        def _assemble_nonblocking_batch(target_frames: int | None, indices: Sequence[int], cursors: dict[int, int]):
-            b_key = int(target_frames) if target_frames is not None else self._idx_to_bucket.get(indices[0], 0)
-            bucket_total = len(self._bucket_members.get(b_key, indices)) or len(indices)
-            seed_min = min(bucket_total, max(32, len(indices)))
-
-            with self._cache_cv:
-                self._sync_cache_tracking_locked()
-                if len(self._cached_by_bucket.get(b_key, ())) < seed_min:
-                    seed_cands = [int(i) for i in indices]
-                    if len(seed_cands) < seed_min:
-                        for alt in self._bucket_members.get(b_key, ()):
-                            if alt not in seed_cands:
-                                seed_cands.append(alt)
-                                if len(seed_cands) >= seed_min:
-                                    break
-                    for s_idx in reversed(seed_cands):
-                        if s_idx not in self._sample_cache and s_idx not in self._priority_set:
-                            self._priority_set.add(s_idx)
-                            self._priority_queue.appendleft(s_idx)
-                    while (
-                        len(self._cached_by_bucket.get(b_key, ())) < seed_min
-                        and not stop_event.is_set()
-                        and not self._closed
-                        and not self._streamer_done
-                        and self._sample_cache_bytes < int(self._sample_cache_limit * 0.95)
-                    ):
-                        if self._streamer_error is not None:
-                            raise self._streamer_error
-                        self._cache_cv.wait(timeout=0.05)
-
-                if self._streamer_error is not None and not self._cached_by_bucket.get(b_key):
-                    raise self._streamer_error
-
-                used: set[int] = set()
-                slot_idxs = [-1] * len(indices)
-                missing_slots: list[int] = []
-                fresh_q = self._fresh_by_bucket.get(b_key)
-                cached_list = self._cached_by_bucket.get(b_key, ())
-
-                for pos, raw_idx in enumerate(indices):
-                    req_idx = int(raw_idx)
-                    if req_idx in self._sample_cache and req_idx not in used:
-                        slot_idxs[pos] = req_idx
-                        used.add(req_idx)
-                        self._fresh_set.discard(req_idx)
-                    else:
-                        missing_slots.append(pos)
-                        if req_idx not in self._sample_cache and req_idx not in self._priority_set:
-                            self._priority_set.add(req_idx)
-                            self._priority_queue.append(req_idx)
-
-                if missing_slots:
-                    cursor = cursors.get(b_key, 0)
-                    n_cached = len(cached_list)
-                    for pos in missing_slots:
-                        chosen = -1
-                        if fresh_q:
-                            while fresh_q:
-                                cand = fresh_q.popleft()
-                                if cand in self._fresh_set and cand not in used and cand in self._sample_cache:
-                                    self._fresh_set.discard(cand)
-                                    chosen = cand
-                                    break
-                        if chosen == -1 and n_cached > 0:
-                            for step_k in range(n_cached):
-                                cand = cached_list[(cursor + step_k) % n_cached]
-                                if cand not in used and cand in self._sample_cache:
-                                    chosen = cand
-                                    cursor = (cursor + step_k + 1) % n_cached
-                                    break
-                            if chosen == -1:
-                                chosen = cached_list[cursor % n_cached]
-                                cursor = (cursor + 1) % n_cached
-                        slot_idxs[pos] = chosen
-                        if chosen != -1:
-                            used.add(chosen)
-                    cursors[b_key] = cursor
-
-                rows = [
-                    self._sample_cache[chosen] if chosen != -1 and chosen in self._sample_cache else None
-                    for chosen in slot_idxs
-                ]
-
-            for pos, row in enumerate(rows):
-                if row is None:
-                    rows[pos] = self._get_item(int(indices[pos]))
-
-            return collate_nwc_batch(
-                rows,
-                self.hop_length,
-                target_frames=target_frames,
-                allowed_frames=self.allowed_frames,
-                phone_half=self.phone_half,
-            )
 
         def _producer() -> None:
             pending_batches: deque[tuple[int | None, list[tuple[bool, Any]]]] = deque()
             spec_iter = iter(specs)
             in_flight_futs = 0
-            cursors: dict[int, int] = {}
             try:
-                if stream_mode:
-                    for target_frames, indices in specs:
-                        if stop_event.is_set() or self._closed:
-                            break
-                        batch = _assemble_nonblocking_batch(target_frames, indices, cursors)
-                        while not stop_event.is_set():
-                            try:
-                                out_queue.put(batch, timeout=0.05)
-                                break
-                            except queue.Full:
-                                continue
-                    return
-
                 while True:
                     while len(pending_batches) < batch_window and (
                         not pending_batches or in_flight_futs < max_sample_budget
@@ -1073,7 +852,7 @@ class PrefetchBatchLoader:
                         if sp is None:
                             break
                         target_frames, indices = sp
-                        slots = [self._submit_sample(i) for i in indices]
+                        slots = [self._submit_sample(int(i)) for i in indices]
                         in_flight_futs += sum(1 for ready, _ in slots if not ready)
                         pending_batches.append((target_frames, slots))
 
@@ -1111,7 +890,12 @@ class PrefetchBatchLoader:
                     except queue.Full:
                         continue
             finally:
-                out_queue.put(sentinel)
+                while not stop_event.is_set():
+                    try:
+                        out_queue.put(sentinel, timeout=0.05)
+                        break
+                    except queue.Full:
+                        continue
 
         thread = threading.Thread(target=_producer, daemon=True)
         thread.start()
@@ -1135,20 +919,13 @@ class PrefetchBatchLoader:
 
     def close(self) -> None:
         self.stop_warmup(wait=True)
-        with self._cache_cv:
+        with self._sample_cache_lock:
             self._closed = True
             self._inflight.clear()
-            self._cache_cv.notify_all()
         self._sample_cache.clear()
         self._sample_cache_bytes = 0
         self._label_cache.clear()
         self._label_cache_bytes = 0
-        self._cached_by_bucket.clear()
-        self._cached_set.clear()
-        self._fresh_by_bucket.clear()
-        self._fresh_set.clear()
-        self._priority_queue.clear()
-        self._priority_set.clear()
         if self._mp_pool is not None:
             self._mp_pool.close()
             self._mp_pool = None

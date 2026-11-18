@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import glob
 import json
+import math
 import os
 import re
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -26,6 +27,7 @@ from rvc.jax.synthesizers import (
 
 LATEST_CHECKPOINT_SUFFIX = 2333333
 _META_KEY = "__meta_json__"
+_BLOB_KEY = "__packed_blob__"
 
 
 def _normalize_torch_wn_keys(state: Mapping[str, Any]) -> dict[str, Any]:
@@ -131,14 +133,47 @@ def save_jax_checkpoint(
     }
     if extra:
         meta["extra"] = dict(extra)
+    if "model/emb_g/weight" in arrays:
+        meta["spk_embed_dim"] = int(arrays["model/emb_g/weight"].shape[0])
+    meta["model_keys"] = [k[len("model/") :] for k, _ in param_entries]
 
-    meta_bytes = np.frombuffer(json.dumps(meta).encode("utf-8"), dtype=np.uint8)
-    arrays[_META_KEY] = meta_bytes
+    save_payload: dict[str, np.ndarray]
+    if len(arrays) > 16:
+        # Pack hundreds of parameter/optimizer arrays into one contiguous ZIP entry to avoid overlayfs metadata stalls.
+        manifest: dict[str, list[Any]] = {}
+        chunks: list[tuple[int, np.ndarray]] = []
+        cursor = 0
+        for k, arr in arrays.items():
+            orig_shape = list(arr.shape)
+            arr_c = np.ascontiguousarray(arr)
+            nbytes = int(arr_c.nbytes)
+            if nbytes > 0:
+                offset = (cursor + 15) & ~15
+                cursor = offset + nbytes
+                chunks.append((offset, arr_c))
+            else:
+                offset = 0
+            manifest[k] = [arr_c.dtype.str, orig_shape, int(offset), nbytes]
+        blob = bytearray(cursor)
+        blob_mv = memoryview(blob)
+        for offset, arr_c in chunks:
+            raw = np.frombuffer(np.ascontiguousarray(arr_c), dtype=np.uint8)
+            blob_mv[offset : offset + len(raw)] = raw
+        meta["format"] = "redpanda_jax_v2_packed"
+        meta["manifest"] = manifest
+        save_payload = {
+            _META_KEY: np.frombuffer(json.dumps(meta).encode("utf-8"), dtype=np.uint8),
+            _BLOB_KEY: np.frombuffer(blob, dtype=np.uint8),
+        }
+    else:
+        meta_bytes = np.frombuffer(json.dumps(meta).encode("utf-8"), dtype=np.uint8)
+        arrays[_META_KEY] = meta_bytes
+        save_payload = arrays
 
     parent = os.path.dirname(os.path.abspath(path))
     os.makedirs(parent, exist_ok=True)
     tmp_path = f"{path}.tmp.npz"
-    np.savez(tmp_path, **arrays)
+    np.savez(tmp_path, **save_payload)
     os.replace(tmp_path, path)
 
 
@@ -146,9 +181,11 @@ def read_jax_checkpoint_meta(path: str) -> dict[str, Any]:
     """Read JSON metadata header and speaker count without materializing full optimizer state."""
     with np.load(path, allow_pickle=False) as archive:
         meta = json.loads(bytes(archive[_META_KEY]).decode("utf-8"))
-        if "model/emb_g/weight" in archive:
-            meta["spk_embed_dim"] = int(archive["model/emb_g/weight"].shape[0])
-        meta["model_keys"] = [k[len("model/") :] for k in archive.files if k.startswith("model/")]
+        if "manifest" not in meta:
+            if "model/emb_g/weight" in archive:
+                meta["spk_embed_dim"] = int(archive["model/emb_g/weight"].shape[0])
+            meta["model_keys"] = [k[len("model/") :] for k in archive.files if k.startswith("model/")]
+    meta.pop("manifest", None)
     return meta
 
 
@@ -166,7 +203,24 @@ def load_jax_checkpoint(
 
     with np.load(path, allow_pickle=False) as archive:
         meta = json.loads(bytes(archive[_META_KEY]).decode("utf-8"))
-        flat_arrays = {k: np.asarray(archive[k]) for k in archive.files if k != _META_KEY}
+        if _BLOB_KEY in archive and "manifest" in meta:
+            blob = np.asarray(archive[_BLOB_KEY], dtype=np.uint8)
+            raw_buf = memoryview(blob)
+            flat_arrays = {}
+            for k, (dt_str, shape_list, offset, nbytes) in meta["manifest"].items():
+                shape = tuple(int(d) for d in shape_list)
+                dt = np.dtype(dt_str)
+                if int(nbytes) == 0:
+                    flat_arrays[k] = np.empty(shape, dtype=dt)
+                else:
+                    flat_arrays[k] = np.array(
+                        np.frombuffer(
+                            raw_buf, dtype=dt, count=math.prod(shape), offset=int(offset)
+                        ).reshape(shape),
+                        copy=True,
+                    )
+        else:
+            flat_arrays = {k: np.asarray(archive[k]) for k in archive.files if k != _META_KEY}
 
     params = _unflatten_named_pytree(params_template, flat_arrays, prefix="model")
 
