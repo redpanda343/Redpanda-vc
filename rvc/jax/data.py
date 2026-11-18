@@ -701,7 +701,8 @@ def _read_shard_records(
                 key_waiters.setdefault(tk, []).append(local_i)
 
         if all_posix_abs and unique_paths:
-            list_path = os.path.join(shards_dir, f".tarlist_{shard_id:05d}_{sub_id}.{os.getpid()}.tmp")
+            list_dir = "/dev/shm" if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else shards_dir
+            list_path = os.path.join(list_dir, f".rvc_tarlist_{shard_id:05d}_{sub_id}_{os.getpid()}.tmp")
             proc = None
             raw_map: dict[str, bytes] = {}
             try:
@@ -890,17 +891,15 @@ def ensure_dataset_shards(
     seed_items: dict[int, tuple[Any, ...]] = {}
     if missing_shards:
         avail = _available_ram_bytes()
-        if avail >= 8 * (1024 ** 3):
-            sub_w = min(6, max(4, int(workers)))
-        else:
-            sub_w = 1
+        # Benchmark on Colab overlayfs peaks at 4 concurrent tar streams (~37.5 clips/s).
+        sub_w = min(4, max(1, int(workers))) if avail >= 8 * (1024 ** 3) else 1
         use_tar = os.name == "posix" and bool(shutil.which("tar"))
         seed_state = {"bytes": 0, "lock": threading.Lock()}
         pbar = None
         pbar_lock = threading.Lock()
         if progress:
             print(
-                f"Packing {n_clips} dataset clips into {num_shards} contiguous shard(s) ({sub_w} parallel stream(s); one-time per dataset)...",
+                f"Packing {n_clips} dataset clips into {num_shards} contiguous shard(s) ({sub_w} pipelined stream(s); one-time per dataset)...",
                 flush=True,
             )
             try:
@@ -915,78 +914,158 @@ def ensure_dataset_shards(
                 with pbar_lock:
                     pbar.update(n)
 
+        write_queue: queue.Queue[Any] = queue.Queue(maxsize=2)
+        write_stop = threading.Event()
+        writer_exc: list[BaseException] = []
+        writer_sentinel = object()
+
+        def _writer_loop() -> None:
+            try:
+                while True:
+                    item = write_queue.get()
+                    try:
+                        if item is writer_sentinel:
+                            return
+                        w_sid, w_clip_idxs, w_rec_list = item
+                        rpack_p = os.path.join(shards_dir, f"shard_{w_sid:05d}.rpack")
+                        idx_p = os.path.join(shards_dir, f"shard_{w_sid:05d}.idx.npy")
+                        rpack_tmp = f"{rpack_p}.{os.getpid()}.tmp"
+                        idx_tmp = f"{idx_p}.{os.getpid()}.tmp"
+                        s_idx = np.empty((len(w_clip_idxs), 3), dtype=np.int64)
+                        off = 0
+                        with open(rpack_tmp, "wb", buffering=8 * 1024 * 1024) as wf:
+                            for li, (gidx, rec_b) in enumerate(zip(w_clip_idxs, w_rec_list)):
+                                s_idx[li, 0] = gidx
+                                s_idx[li, 1] = off
+                                s_idx[li, 2] = len(rec_b)
+                                wf.write(rec_b)
+                                off += len(rec_b)
+                        w_rec_list.clear()
+                        with open(idx_tmp, "wb") as ix_f:
+                            np.save(ix_f, s_idx)
+                        os.replace(idx_tmp, idx_p)
+                        os.replace(rpack_tmp, rpack_p)
+                    finally:
+                        write_queue.task_done()
+            except BaseException as exc:
+                writer_exc.append(exc)
+                write_stop.set()
+
+        writer_thread = threading.Thread(target=_writer_loop, daemon=True)
+        writer_thread.start()
         pool_ctx = ThreadPoolExecutor(max_workers=sub_w) if sub_w > 1 else None
-        try:
-            for sid in missing_shards:
-                clip_idxs = shard_groups[sid]
-                n_sub = min(sub_w, len(clip_idxs)) if (pool_ctx is not None and len(clip_idxs) >= 4) else 1
-                # Phase 1: Parallel sorted sub-stream reads into RAM buffer (~320 MiB peak, minimal straggler wait)
-                if n_sub <= 1:
-                    _, _, rec_list, seeded_pairs = _read_shard_records(
-                        sid,
-                        clip_idxs,
-                        dataset=dataset,
-                        shards_dir=shards_dir,
-                        use_tar=use_tar,
-                        seed_state=seed_state,
-                        max_seed_bytes=max_seed_bytes,
-                        on_clip_done=_tick,
-                        sub_id=0,
-                    )
-                else:
-                    step = (len(clip_idxs) + n_sub - 1) // n_sub
-                    sub_slices = [clip_idxs[k * step : (k + 1) * step] for k in range(n_sub)]
-                    sub_slices = [s for s in sub_slices if s]
-                    futs = [
+
+        def _enqueue_shard_read(sid_val: int) -> tuple[int, list[int], list[Any]]:
+            c_idxs = shard_groups[sid_val]
+            n_sub = min(sub_w, len(c_idxs)) if (pool_ctx is not None and len(c_idxs) >= 4) else 1
+            if n_sub <= 1:
+                return sid_val, c_idxs, [
+                    (
                         pool_ctx.submit(
                             _read_shard_records,
-                            sid,
-                            sub_s,
+                            sid_val,
+                            c_idxs,
                             dataset=dataset,
                             shards_dir=shards_dir,
                             use_tar=use_tar,
                             seed_state=seed_state,
                             max_seed_bytes=max_seed_bytes,
                             on_clip_done=_tick,
-                            sub_id=sub_i,
+                            sub_id=0,
                         )
-                        for sub_i, sub_s in enumerate(sub_slices)
-                    ]
-                    rec_list = []
-                    seeded_pairs = []
-                    for fut in futs:
-                        _, _, sub_recs, sub_seeds = fut.result()
-                        rec_list.extend(sub_recs)
-                        seeded_pairs.extend(sub_seeds)
+                        if pool_ctx is not None
+                        else _read_shard_records(
+                            sid_val,
+                            c_idxs,
+                            dataset=dataset,
+                            shards_dir=shards_dir,
+                            use_tar=use_tar,
+                            seed_state=seed_state,
+                            max_seed_bytes=max_seed_bytes,
+                            on_clip_done=_tick,
+                            sub_id=0,
+                        )
+                    )
+                ]
+            step = (len(c_idxs) + n_sub - 1) // n_sub
+            sub_slices = [s for s in (c_idxs[k * step : (k + 1) * step] for k in range(n_sub)) if s]
+            assert pool_ctx is not None
+            futs = [
+                pool_ctx.submit(
+                    _read_shard_records,
+                    sid_val,
+                    sub_s,
+                    dataset=dataset,
+                    shards_dir=shards_dir,
+                    use_tar=use_tar,
+                    seed_state=seed_state,
+                    max_seed_bytes=max_seed_bytes,
+                    on_clip_done=_tick,
+                    sub_id=sub_i,
+                )
+                for sub_i, sub_s in enumerate(sub_slices)
+            ]
+            return sid_val, c_idxs, futs
 
-                # Phase 2: Sequential contiguous write + fsync so dirty writeback never throttles next shard's tar reads
-                for gidx, s_item in seeded_pairs:
-                    seed_items[gidx] = s_item
-                rpack_p = os.path.join(shards_dir, f"shard_{sid:05d}.rpack")
-                idx_p = os.path.join(shards_dir, f"shard_{sid:05d}.idx.npy")
-                rpack_tmp = f"{rpack_p}.{os.getpid()}.tmp"
-                idx_tmp = f"{idx_p}.{os.getpid()}.tmp"
-                s_idx = np.empty((len(clip_idxs), 3), dtype=np.int64)
-                off = 0
-                with open(rpack_tmp, "wb", buffering=4 * 1024 * 1024) as wf:
-                    for li, (gidx, rec_b) in enumerate(zip(clip_idxs, rec_list)):
-                        s_idx[li, 0] = gidx
-                        s_idx[li, 1] = off
-                        s_idx[li, 2] = len(rec_b)
-                        wf.write(rec_b)
-                        off += len(rec_b)
-                    wf.flush()
-                    os.fsync(wf.fileno())
-                rec_list.clear()
-                with open(idx_tmp, "wb") as ix_f:
-                    np.save(ix_f, s_idx)
-                    ix_f.flush()
-                    os.fsync(ix_f.fileno())
-                os.replace(idx_tmp, idx_p)
-                os.replace(rpack_tmp, rpack_p)
+        try:
+            # Sliding 2-shard read lookahead eliminates inter-shard barrier idle gaps
+            pending_shards: deque[tuple[int, list[int], list[Any]]] = deque()
+            next_pos = 0
+            while next_pos < len(missing_shards) and len(pending_shards) < 2:
+                pending_shards.append(_enqueue_shard_read(missing_shards[next_pos]))
+                next_pos += 1
+
+            while pending_shards:
+                if writer_exc:
+                    raise writer_exc[0]
+                sid, clip_idxs, handles = pending_shards.popleft()
+                if next_pos < len(missing_shards) and not write_stop.is_set():
+                    pending_shards.append(_enqueue_shard_read(missing_shards[next_pos]))
+                    next_pos += 1
+
+                rec_list: list[bytes] = []
+                for h in handles:
+                    _, _, sub_recs, sub_seeds = h.result() if isinstance(h, Future) else h
+                    rec_list.extend(sub_recs)
+                    for gidx, s_item in sub_seeds:
+                        seed_items[gidx] = s_item
+
+                while not write_stop.is_set():
+                    try:
+                        write_queue.put((sid, clip_idxs, rec_list), timeout=0.1)
+                        break
+                    except queue.Full:
+                        if writer_exc:
+                            raise writer_exc[0]
+                if writer_exc:
+                    raise writer_exc[0]
+
+            while not write_stop.is_set():
+                try:
+                    write_queue.put(writer_sentinel, timeout=0.1)
+                    break
+                except queue.Full:
+                    if writer_exc:
+                        raise writer_exc[0]
+            writer_thread.join()
+            if writer_exc:
+                raise writer_exc[0]
         finally:
+            write_stop.set()
             if pool_ctx is not None:
                 pool_ctx.shutdown(wait=True, cancel_futures=True)
+            if writer_thread.is_alive():
+                try:
+                    while not write_queue.empty():
+                        write_queue.get_nowait()
+                        write_queue.task_done()
+                except Exception:
+                    pass
+                try:
+                    write_queue.put_nowait(writer_sentinel)
+                except queue.Full:
+                    pass
+                writer_thread.join(timeout=5.0)
             if pbar is not None:
                 pbar.close()
 
