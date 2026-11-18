@@ -1,6 +1,7 @@
 """Native JAX/XLA implementation of RVC models and training."""
 
 from dataclasses import dataclass
+import inspect
 import os
 from typing import Any, Sequence
 
@@ -9,8 +10,21 @@ import jax.numpy as jnp
 from jax import lax
 
 # 128-lane / 16-frame aligned bucket upper boundaries for TPU MXU compilation stability.
-# At upsample_rates=(10, 8, 2, 2) or (10, 10, 2, 2), L % 16 == 0 ensures (frames * 8) % 128 == 0.
-JAX_BUCKET_BOUNDARIES: tuple[int, ...] = (50, 304, 608, 912)
+# Using (384, 640, 896) = 3*128, 5*128, 7*128 keeps 3.0s-3.84s clips in bucket 0 and avoids 912->1024 MXU padding.
+JAX_BUCKET_BOUNDARIES: tuple[int, ...] = (50, 384, 640, 896)
+
+
+def resolve_shard_map() -> tuple[Any, dict[str, Any]]:
+    """Return (shard_map_fn, disable_check_kwargs) compatible across JAX 0.4.20 - 0.9+."""
+    smap = getattr(jax, "shard_map", None)
+    if smap is None:
+        from jax.experimental.shard_map import shard_map as smap
+    params = inspect.signature(smap).parameters
+    if "check_vma" in params:
+        return smap, {"check_vma": False}
+    if "check_rep" in params:
+        return smap, {"check_rep": False}
+    return smap, {}
 
 
 def init_jax_compilation_cache(base_dir: str | None = None) -> None:

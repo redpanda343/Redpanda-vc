@@ -239,7 +239,7 @@ def rmvpe_mel_from_audio(audio_bt: Array, audio_lengths: Array) -> Array:
     real, imag = stft_complex(padded, N_FFT, HOP_LENGTH, N_FFT, win, pad_left=0, pad_right=0)
     mag = jnp.sqrt(jnp.maximum(real * real + imag * imag, 1e-24))  # (B, F, TT)
     basis = jnp.asarray(mel_filterbank_np(SAMPLE_RATE, N_FFT, N_MELS, fmin=MEL_FMIN, fmax=MEL_FMAX, htk=True), jnp.float32)
-    mel = jnp.matmul(basis[None, :, :], mag, precision=lax.Precision.HIGHEST)  # (B, 128, TT)
+    mel = jnp.matmul(basis[None, :, :], mag, precision=lax.Precision.HIGH)  # (B, 128, TT)
     log_mel = jnp.log(jnp.maximum(mel, 1e-5))
     return jnp.transpose(log_mel, (0, 2, 1))  # (B, TT, 128)
 

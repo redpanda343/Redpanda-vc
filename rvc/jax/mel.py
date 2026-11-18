@@ -191,7 +191,7 @@ def spec_to_mel_jax(
     """Convert NWC magnitude spectrogram (B, TT, F) to log mel spectrogram (B, TT, num_mels) in FP32."""
     basis = jnp.asarray(mel_filterbank_np(sample_rate, n_fft, num_mels, fmin=fmin, fmax=fmax), jnp.float32)
     spec_f32 = jnp.asarray(spec_nwc, jnp.float32)
-    melspec = jnp.matmul(spec_f32, basis.T, precision=lax.Precision.HIGHEST)
+    melspec = jnp.matmul(spec_f32, basis.T, precision=lax.Precision.HIGH)
     fwd = jnp.log(jnp.maximum(melspec, 2e-6))
     # Bound quiet-bin 1/mel derivative smoothly without shifting the 2e-6 forward floor.
     surrogate = jnp.log(melspec + 1e-4)
@@ -242,7 +242,7 @@ def multi_scale_mel_loss(real: Array, fake: Array, cfg: MultiScaleMelLossConfig)
         real_c, imag_c = stft_complex(both, win_len, hop, win_len, win, pad_left=pad, pad_right=pad)
         mag = jnp.sqrt(real_c * real_c + imag_c * imag_c + 1e-6)  # (2B, F, TT)
         basis = jnp.asarray(mel_filterbank_np(cfg.sample_rate, win_len, n_mels, fmin=0.0, fmax=None), jnp.float32)
-        mels = jnp.matmul(basis[None, :, :], mag, precision=lax.Precision.HIGHEST)
+        mels = jnp.matmul(basis[None, :, :], mag, precision=lax.Precision.HIGH)
         log_mels = jnp.log(jnp.maximum(mels, 1e-5)) / log10_base
         total_loss = total_loss + jnp.mean(jnp.abs(log_mels[:batch] - log_mels[batch:]))
 

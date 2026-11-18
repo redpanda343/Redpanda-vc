@@ -58,6 +58,7 @@ from rvc.jax import (
     PrecisionConfig,
     init_jax_compilation_cache,
     resolve_jax_devices,
+    resolve_shard_map,
     supports_bfloat16,
 )
 from rvc.jax.checkpoint import (
@@ -568,22 +569,27 @@ class JaxTrainer:
         multiscale_mel = self.args.multiscale_mel_loss
         ms_mel_cfg = MultiScaleMelLossConfig(sample_rate=int(data_cfg.sample_rate))
         use_ema = self.args.ema_decay > 0
+        shard_map_fn, smap_check_kwargs = resolve_shard_map()
+        mesh = self.mesh
+        multi_device = self.num_devices > 1
+        rep_spec = PartitionSpec()
+        data_spec = PartitionSpec("data")
 
-        @partial(jax.jit, donate_argnums=(0, 1, 2, 3, 4, 5))
-        def _step(
+        def _local_step(
             params_g,
             opt_state_g,
             params_d,
             opt_state_d,
             ema_params,
             loss_sums,
-            lr_g,
-            lr_d,
-            ema_lerp,
-            compute_grad_norms,
+            step_scalars,
             rng_key,
             batch,
         ):
+            lr_g = step_scalars[0]
+            lr_d = step_scalars[1]
+            ema_lerp = step_scalars[2]
+            compute_grad_norms = step_scalars[3] > jnp.float32(0.5)
             phone, phone_lengths, pitch, pitchf, spec_lengths, wave, wave_lengths, sid = batch
             spec = lax.stop_gradient(
                 spectrogram_jax_padded(
@@ -595,7 +601,12 @@ class JaxTrainer:
                     max_frames=phone.shape[1],
                 )
             )
-            rng_key, step_rng = jax.random.split(rng_key)
+            next_rng_key, step_base_rng = jax.random.split(rng_key)
+            step_rng = (
+                jax.random.fold_in(step_base_rng, lax.axis_index("data"))
+                if multi_device
+                else step_base_rng
+            )
 
             def _gen_diff(p_g):
                 o, ids_slice, x_m, z_m, (_, z_p, m_p, logs_p, _, logs_q) = synthesizer_forward(
@@ -642,6 +653,8 @@ class JaxTrainer:
             opt_state_d = opt_state_d._replace(hyperparams={**opt_state_d.hyperparams, "learning_rate": lr_d})
             for _ in range(d_step_per_g_step):
                 loss_disc, grads_d = jax.value_and_grad(_loss_d)(params_d)
+                if multi_device:
+                    grads_d = lax.pmean(grads_d, axis_name="data")
                 grads_d, gn_d_val = _clip_grads_by_global_norm(grads_d, MAX_GRAD_NORM)
                 upd_d, opt_state_d = opt_d.update(grads_d, opt_state_d, params_d)
                 params_d = optax.apply_updates(params_d, upd_d)
@@ -682,6 +695,8 @@ class JaxTrainer:
                 _loss_from_gen, has_aux=True
             )(diff_out)
             (grads_g,) = gen_vjp(grad_diff_out)
+            if multi_device:
+                grads_g = lax.pmean(grads_g, axis_name="data")
             grads_g, gn_g_val = _clip_grads_by_global_norm(grads_g, MAX_GRAD_NORM)
 
             opt_state_g = opt_state_g._replace(hyperparams={**opt_state_g.hyperparams, "learning_rate": lr_g})
@@ -695,7 +710,11 @@ class JaxTrainer:
             gn_d = jnp.where(compute_grad_norms, gn_d_val, jnp.float32(0.0))
             gn_g = jnp.where(compute_grad_norms, gn_g_val, jnp.float32(0.0))
 
-            loss_sums = loss_sums + jnp.stack([loss_gen_all, loss_disc, loss_gen, loss_fm, loss_mel, loss_kl])
+            loss_vec = jnp.stack([loss_gen_all, loss_disc, loss_gen, loss_fm, loss_mel, loss_kl])
+            if multi_device:
+                loss_vec = lax.pmean(loss_vec, axis_name="data")
+            loss_sums = loss_sums + loss_vec
+            ids_slice_out = ids_slice[:1] if syn_cfg.randomized else jnp.zeros((1,), dtype=jnp.int32)
             return (
                 params_g,
                 opt_state_g,
@@ -705,10 +724,76 @@ class JaxTrainer:
                 loss_sums,
                 gn_d,
                 gn_g,
+                next_rng_key,
+                y_hat[:1],
+                ids_slice_out,
+                spec[:1],
+            )
+
+        @partial(jax.jit, donate_argnums=(0, 1, 2, 3, 4, 5))
+        def _step(
+            params_g,
+            opt_state_g,
+            params_d,
+            opt_state_d,
+            ema_params,
+            loss_sums,
+            step_scalars,
+            rng_key,
+            batch,
+        ):
+            if multi_device:
+                # Run forward, backward, and STFT/MPD per TPU core without GSPMD cross-chip sharding overhead.
+                return shard_map_fn(
+                    _local_step,
+                    mesh=mesh,
+                    in_specs=(
+                        rep_spec,
+                        rep_spec,
+                        rep_spec,
+                        rep_spec,
+                        rep_spec,
+                        rep_spec,
+                        rep_spec,
+                        rep_spec,
+                        data_spec,
+                    ),
+                    out_specs=(
+                        rep_spec,
+                        rep_spec,
+                        rep_spec,
+                        rep_spec,
+                        rep_spec,
+                        rep_spec,
+                        rep_spec,
+                        rep_spec,
+                        rep_spec,
+                        data_spec,
+                        data_spec,
+                        data_spec,
+                    ),
+                    **smap_check_kwargs,
+                )(
+                    params_g,
+                    opt_state_g,
+                    params_d,
+                    opt_state_d,
+                    ema_params,
+                    loss_sums,
+                    step_scalars,
+                    rng_key,
+                    batch,
+                )
+            return _local_step(
+                params_g,
+                opt_state_g,
+                params_d,
+                opt_state_d,
+                ema_params,
+                loss_sums,
+                step_scalars,
                 rng_key,
-                y_hat[0],
-                ids_slice[0],
-                spec[0],
+                batch,
             )
 
         @jax.jit
@@ -746,6 +831,7 @@ class JaxTrainer:
         opt_d_sds = to_sds(self.opt_state_d)
         ema_sds = to_sds(self.ema_params)
         loss_sds = to_sds(self.loss_sums)
+        step_scalars_sds = jax.ShapeDtypeStruct((4,), jnp.float32, sharding=self.replicated_sharding)
         rng_sds = to_sds(self.rng_key)
 
         hop_length = int(self.config.data.hop_length)
@@ -774,10 +860,7 @@ class JaxTrainer:
                 opt_d_sds,
                 ema_sds,
                 loss_sds,
-                jax.ShapeDtypeStruct((), jnp.float32, sharding=self.replicated_sharding),
-                jax.ShapeDtypeStruct((), jnp.float32, sharding=self.replicated_sharding),
-                jax.ShapeDtypeStruct((), jnp.float32, sharding=self.replicated_sharding),
-                jax.ShapeDtypeStruct((), jnp.bool_, sharding=self.replicated_sharding),
+                step_scalars_sds,
                 rng_sds,
                 batch_sds,
             ).compile()
@@ -899,8 +982,8 @@ class JaxTrainer:
         summary_dev = None
         if self.writer is not None and self.last_batch is not None:
             spec_0, id_0, y_hat_0 = self.last_batch
-            yh_m = self._mel_hat_fn(y_hat_0)
-            summary_dev = (yh_m, spec_0, id_0)
+            yh_m = self._mel_hat_fn(jax.device_put(y_hat_0[0], self.replicated_sharding))
+            summary_dev = (yh_m, spec_0[0], id_0[0])
 
         ema_dev = self.ema_params if use_ema else None
         snapshot_dev = (
@@ -1003,6 +1086,21 @@ class JaxTrainer:
             if self.exporter is not None:
                 self.exporter.wait_for_completion()
 
+    def _stage_step_inputs(self, np_batch, epoch: int, base_lr: float) -> tuple[Any, jax.Array, float]:
+        """Dispatch asynchronous H2D transfers for the next batch and packed step controls."""
+        factor = self.current_lr_factor(epoch)
+        lr_g_val = base_lr * g_lr_coeff * factor
+        lr_d_val = base_lr * d_lr_coeff * factor
+        ema_lerp = self._next_ema_lerp()
+        log_norms = (self.global_step + 1) % self.log_interval == 0
+        step_scalars = np.array(
+            [lr_g_val, lr_d_val, ema_lerp, 1.0 if log_norms else 0.0],
+            dtype=np.float32,
+        )
+        cur_dev = self._shard_batch(np_batch)
+        cur_scalars = jax.device_put(step_scalars, self.replicated_sharding)
+        return cur_dev, cur_scalars, lr_g_val
+
     def train_epoch(self, epoch: int, start_batch: int) -> None:
         self.sampler.set_epoch(epoch, start_batch)
         self.epoch = epoch
@@ -1015,29 +1113,15 @@ class JaxTrainer:
             cur_np = next(batch_iter, None)
             if cur_np is None:
                 return
-            cur_dev = self._shard_batch(cur_np)
+            cur_dev, cur_scalars, lr_g_val = self._stage_step_inputs(cur_np, epoch, base_lr)
 
             while cur_dev is not None:
                 if self.exporter is not None:
                     self.exporter.raise_if_failed()
                 if self.ckpt_writer is not None:
                     self.ckpt_writer.raise_if_failed()
-                factor = self.current_lr_factor(epoch)
-                lr_g_val = base_lr * g_lr_coeff * factor
-                lr_d_val = base_lr * d_lr_coeff * factor
-                ema_lerp = self._next_ema_lerp()
-                log_norms = (self.global_step + 1) % self.log_interval == 0
                 step_key = (int(cur_dev[0].shape[0]), int(cur_dev[0].shape[1]), int(cur_dev[5].shape[1]))
                 step_fn = self._compiled_steps.get(step_key, self._step_fn)
-                lr_g_dev, lr_d_dev, ema_dev, log_norms_dev = jax.device_put(
-                    (
-                        np.float32(lr_g_val),
-                        np.float32(lr_d_val),
-                        np.float32(ema_lerp),
-                        np.bool_(log_norms),
-                    ),
-                    self.replicated_sharding,
-                )
 
                 (
                     self.params_g,
@@ -1059,10 +1143,7 @@ class JaxTrainer:
                     self.opt_state_d,
                     self.ema_params,
                     self.loss_sums,
-                    lr_g_dev,
-                    lr_d_dev,
-                    ema_dev,
-                    log_norms_dev,
+                    cur_scalars,
                     self.rng_key,
                     cur_dev,
                 )
@@ -1077,9 +1158,12 @@ class JaxTrainer:
                 if final:
                     break
 
-                # Stage next batch on device while current _step_fn executes asynchronously on TPU.
+                # Stage next batch and packed step controls while TPU executes the current step asynchronously.
                 next_np = next(batch_iter, None)
-                cur_dev = self._shard_batch(next_np) if next_np is not None else None
+                if next_np is None:
+                    cur_dev = None
+                    continue
+                cur_dev, cur_scalars, lr_g_val = self._stage_step_inputs(next_np, epoch, base_lr)
         finally:
             if hasattr(batch_iter, "close"):
                 batch_iter.close()

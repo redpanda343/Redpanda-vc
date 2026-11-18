@@ -21,7 +21,7 @@ import numpy as np
 import soundfile as sf
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
-from rvc.jax import PrecisionConfig, init_jax_compilation_cache, resolve_jax_devices, supports_bfloat16
+from rvc.jax import PrecisionConfig, init_jax_compilation_cache, resolve_jax_devices, resolve_shard_map, supports_bfloat16
 from rvc.jax.hubert import HubertConfig, hubert_forward, load_hubert_from_dir
 from rvc.jax.rmvpe import (
     HOP_LENGTH as RMVPE_HOP,
@@ -302,15 +302,30 @@ def run_jax_extraction(
         expected_dim = 256 if version == "v1" else int(hubert_cfg.hidden_size)
         hubert_params = jax.device_put(h_host, replicated)
 
+    shard_map_fn, smap_check_kwargs = resolve_shard_map() if num_devices > 1 else (None, {})
+
     @partial(jax.jit, static_argnums=(0, 1))
     def _jit_infer(run_f0: bool, run_feat: bool, p_rmvpe, p_hubert, audio_bt, lens_b):
-        f0 = rmvpe_f0_forward(audio_bt, lens_b, p_rmvpe, threshold=threshold_f32, prec=prec) if run_f0 else None
-        feats = (
-            hubert_forward(audio_bt, lens_b, p_hubert, hubert_cfg, version=version, prec=prec)
-            if run_feat and hubert_cfg is not None
-            else None
-        )
-        return f0, feats
+        def _local_infer(p_r, p_h, a_bt, l_b):
+            f0 = rmvpe_f0_forward(a_bt, l_b, p_r, threshold=threshold_f32, prec=prec) if run_f0 else None
+            feats = (
+                hubert_forward(a_bt, l_b, p_h, hubert_cfg, version=version, prec=prec)
+                if run_feat and hubert_cfg is not None
+                else None
+            )
+            return f0, feats
+
+        if shard_map_fn is not None:
+            p_empty = PartitionSpec()
+            p_data = PartitionSpec("data")
+            return shard_map_fn(
+                _local_infer,
+                mesh=mesh,
+                in_specs=(p_empty, p_empty, p_data, p_data),
+                out_specs=(p_data if run_f0 else p_empty, p_data if run_feat else p_empty),
+                **smap_check_kwargs,
+            )(p_rmvpe, p_hubert, audio_bt, lens_b)
+        return _local_infer(p_rmvpe, p_hubert, audio_bt, lens_b)
 
     def _to_sds(tree: Any) -> Any:
         return jax.tree.map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype, sharding=a.sharding), tree)

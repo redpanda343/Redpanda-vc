@@ -69,7 +69,7 @@ class TextAudioDataset:
         self.filter_length = int(data_cfg.filter_length)
         self.hop_length = int(data_cfg.hop_length)
         self.win_length = int(data_cfg.win_length)
-        self.max_sample_frames = 900
+        self.max_sample_frames = 896
         self.compute_spec = bool(compute_spec)
         self.min_text_len = int(getattr(data_cfg, "min_text_len", 1))
         self.max_text_len = int(getattr(data_cfg, "max_text_len", 5000))
