@@ -1,6 +1,7 @@
 """Native JAX/XLA implementation of RVC models and training."""
 
 from dataclasses import dataclass
+import os
 from typing import Any, Sequence
 
 import jax
@@ -10,6 +11,27 @@ from jax import lax
 # 128-lane / 16-frame aligned bucket upper boundaries for TPU MXU compilation stability.
 # At upsample_rates=(10, 8, 2, 2) or (10, 10, 2, 2), L % 16 == 0 ensures (frames * 8) % 128 == 0.
 JAX_BUCKET_BOUNDARIES: tuple[int, ...] = (50, 304, 608, 912)
+
+
+def init_jax_compilation_cache(base_dir: str | None = None) -> None:
+    """Configure persistent XLA/JAX compilation cache before backend/device execution."""
+    root = base_dir or os.getcwd()
+    cache_dir = os.environ.get("JAX_COMPILATION_CACHE_DIR") or os.path.join(root, "assets", "xla_cache")
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        jax.config.update("jax_compilation_cache_dir", cache_dir)
+        jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)
+    except Exception as exc:
+        print(f"Warning: could not configure persistent XLA cache at '{cache_dir}': {exc}")
+        return
+    for key, val in (
+        ("jax_persistent_cache_min_entry_size_bytes", -1),
+        ("jax_persistent_cache_enable_xla_caches", "all"),
+    ):
+        try:
+            jax.config.update(key, val)
+        except Exception:
+            pass
 
 
 @dataclass(frozen=True)

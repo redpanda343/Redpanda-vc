@@ -166,6 +166,20 @@ def spectrogram_jax_padded(
     return jnp.where(frame_idx < valid_frames, spec, 0.0)
 
 
+def spec_to_mel_np(
+    spec_nwc: np.ndarray,
+    n_fft: int,
+    num_mels: int,
+    sample_rate: int,
+    fmin: float,
+    fmax: float | None,
+) -> np.ndarray:
+    """Convert NWC magnitude spectrogram (B, TT, F) to log mel spectrogram (B, TT, num_mels) in NumPy."""
+    basis = mel_filterbank_np(sample_rate, n_fft, num_mels, fmin=fmin, fmax=fmax)
+    melspec = np.asarray(spec_nwc, dtype=np.float32) @ basis.T
+    return np.log(np.maximum(melspec, 2e-6)).astype(np.float32, copy=False)
+
+
 def spec_to_mel_jax(
     spec_nwc: Array,
     n_fft: int,

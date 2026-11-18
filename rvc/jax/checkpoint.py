@@ -41,9 +41,9 @@ def _normalize_torch_wn_keys(state: Mapping[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _flatten_named_pytree(tree: Any, prefix: str = "") -> dict[str, np.ndarray]:
-    """Flatten nested dict/list PyTree into stable string-keyed NumPy float32 arrays."""
-    flat: dict[str, np.ndarray] = {}
+def _collect_named_leaves(tree: Any, prefix: str = "") -> list[tuple[str, Any]]:
+    """Collect (key_path, leaf) pairs from a nested dict/list/tuple PyTree in deterministic order."""
+    entries: list[tuple[str, Any]] = []
 
     def _walk(node: Any, cur: str) -> None:
         if isinstance(node, Mapping):
@@ -55,10 +55,20 @@ def _flatten_named_pytree(tree: Any, prefix: str = "") -> dict[str, np.ndarray]:
                 nxt = f"{cur}/{i}" if cur else str(i)
                 _walk(v, nxt)
         else:
-            flat[cur] = np.asarray(jax.device_get(node))
+            entries.append((cur, node))
 
     _walk(tree, prefix)
-    return flat
+    return entries
+
+
+def _flatten_named_pytree(tree: Any, prefix: str = "") -> dict[str, np.ndarray]:
+    """Flatten nested dict/list PyTree into stable string-keyed NumPy arrays via a single batched D2H copy."""
+    entries = _collect_named_leaves(tree, prefix)
+    if not entries:
+        return {}
+    raw_leaves = [v for _, v in entries]
+    host_leaves = jax.device_get(raw_leaves) if any(not isinstance(x, np.ndarray) for x in raw_leaves) else raw_leaves
+    return {k: np.asarray(h) for (k, _), h in zip(entries, host_leaves)}
 
 
 def _unflatten_named_pytree(template: Any, flat: Mapping[str, np.ndarray], prefix: str = "") -> Any:
@@ -88,21 +98,28 @@ def save_jax_checkpoint(
     ema_params: Mapping[str, Any] | None = None,
 ) -> None:
     """Atomically save JAX model params, Optax state, optional EMA, and metadata to .npz."""
-    arrays: dict[str, np.ndarray] = {}
-    arrays.update(_flatten_named_pytree(params, prefix="model"))
-
+    param_entries = _collect_named_leaves(params, prefix="model")
     opt_leaves = jax.tree_util.tree_leaves(opt_state)
-    for i, leaf in enumerate(opt_leaves):
-        arrays[f"opt/{i}"] = np.asarray(jax.device_get(leaf))
+    ema_entries = _collect_named_leaves(ema_params, prefix="ema") if ema_params is not None else []
 
-    if ema_params is not None:
-        arrays.update(_flatten_named_pytree(ema_params, prefix="ema"))
+    all_raw = [v for _, v in param_entries] + opt_leaves + [v for _, v in ema_entries]
+    all_host = jax.device_get(all_raw) if any(not isinstance(x, np.ndarray) for x in all_raw) else all_raw
+
+    n_p = len(param_entries)
+    n_o = len(opt_leaves)
+    arrays: dict[str, np.ndarray] = {}
+    for (k, _), val in zip(param_entries, all_host[:n_p]):
+        arrays[k] = np.asarray(val)
+    for i, val in enumerate(all_host[n_p : n_p + n_o]):
+        arrays[f"opt/{i}"] = np.asarray(val)
+    for (k, _), val in zip(ema_entries, all_host[n_p + n_o :]):
+        arrays[k] = np.asarray(val)
 
     meta: dict[str, Any] = {
         "format": "redpanda_jax_v1",
         "epoch": int(epoch),
         "learning_rate": float(learning_rate),
-        "opt_leaf_count": len(opt_leaves),
+        "opt_leaf_count": n_o,
         "has_ema": ema_params is not None,
     }
     if extra:
@@ -297,40 +314,33 @@ def checkpoint_step_from_path(path: str) -> int:
     return 0 if step == LATEST_CHECKPOINT_SUFFIX else step
 
 
-class AsyncJaxInferenceExporter:
-    """Stage JAX weights onto host CPU and export inference .pth on a background thread."""
+class _AsyncSingleWorker:
+    """Shared single-thread background executor lifecycle for async exports and checkpoint writes."""
 
-    def __init__(self) -> None:
+    def __init__(self, thread_name_prefix: str) -> None:
         self.executor: ThreadPoolExecutor | None = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="jax-inference-export"
+            max_workers=1, thread_name_prefix=thread_name_prefix
         )
-        self.export_future: Future | None = None
+        self._future: Future | None = None
 
-    def submit(self, params: Mapping[str, Any], cfg: SynthesizerConfig, **export_kwargs: Any) -> None:
+    def _submit_fn(self, fn: Any, *args: Any, **kwargs: Any) -> None:
         self.wait_for_completion()
         if self.executor is None:
             return
-        # Pull arrays onto host CPU cleanly while excluding enc_q before launching worker.
-        host_snapshot = jax.device_get({k: v for k, v in params.items() if k != "enc_q"})
-        self.export_future = self.executor.submit(
-            export_jax_to_inference_pth,
-            host_snapshot,
-            cfg,
-            **export_kwargs,
-        )
+        self._future = self.executor.submit(fn, *args, **kwargs)
 
     def raise_if_failed(self) -> None:
-        if self.export_future is not None and self.export_future.done():
+        if self._future is not None and self._future.done():
             self.wait_for_completion()
 
     def wait_for_completion(self) -> None:
-        fut = self.export_future
+        fut = self._future
         if fut is None:
             return
         try:
             fut.result()
         finally:
-            self.export_future = None
+            self._future = None
 
     def close(self) -> None:
         if self.executor is None:
@@ -340,3 +350,41 @@ class AsyncJaxInferenceExporter:
         finally:
             self.executor.shutdown(wait=True, cancel_futures=False)
             self.executor = None
+
+
+class AsyncJaxInferenceExporter(_AsyncSingleWorker):
+    """Stage JAX weights onto host CPU and export inference .pth on a background thread."""
+
+    def __init__(self) -> None:
+        super().__init__("jax-inference-export")
+
+    def submit(self, params: Mapping[str, Any], cfg: SynthesizerConfig, **export_kwargs: Any) -> None:
+        self.wait_for_completion()
+        if self.executor is None:
+            return
+        # Pull arrays onto host CPU cleanly while excluding enc_q before launching worker.
+        filtered = {k: v for k, v in params.items() if k != "enc_q"}
+        leaves = jax.tree_util.tree_leaves(filtered)
+        host_snapshot = (
+            jax.device_get(filtered) if any(not isinstance(x, np.ndarray) for x in leaves) else filtered
+        )
+        self.submit_host(host_snapshot, cfg, **export_kwargs)
+
+    def submit_host(self, host_snapshot: Mapping[str, Any], cfg: SynthesizerConfig, **export_kwargs: Any) -> None:
+        """Queue an inference .pth export using an already host-resident parameter PyTree."""
+        filtered = {k: v for k, v in host_snapshot.items() if k != "enc_q"}
+        self._submit_fn(export_jax_to_inference_pth, filtered, cfg, **export_kwargs)
+
+
+class AsyncJaxCheckpointWriter(_AsyncSingleWorker):
+    """Write host-staged JAX .npz checkpoints on a background thread without blocking TPU steps."""
+
+    def __init__(self) -> None:
+        super().__init__("jax-checkpoint-write")
+
+    def submit(self, jobs: list[tuple[tuple[Any, ...], dict[str, Any]]]) -> None:
+        def _run_jobs() -> None:
+            for pos_args, kw_args in jobs:
+                save_jax_checkpoint(*pos_args, **kw_args)
+
+        self._submit_fn(_run_jobs)

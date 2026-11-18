@@ -6,7 +6,8 @@ import math
 import os
 import queue
 import threading
-from concurrent.futures import ThreadPoolExecutor
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import partial
 from typing import Any, Sequence
 
@@ -20,7 +21,7 @@ import numpy as np
 import soundfile as sf
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
-from rvc.jax import PrecisionConfig, resolve_jax_devices, supports_bfloat16
+from rvc.jax import PrecisionConfig, init_jax_compilation_cache, resolve_jax_devices, supports_bfloat16
 from rvc.jax.hubert import HubertConfig, hubert_forward, load_hubert_from_dir
 from rvc.jax.rmvpe import (
     HOP_LENGTH as RMVPE_HOP,
@@ -36,7 +37,8 @@ from shared.utils import (
 )
 
 # Exact RMVPE bucket lengths: T_wav = 5120 * K - 160 produces T_mel = 32 * K frames (multiple of 32).
-_BUCKET_KS = (4, 7, 10, 15, 20, 30)
+# Keep 3 coarse standard buckets (3.2s, 6.4s, 9.6s) + 15-step alignment above 9.6s to prevent XLA recompile storms.
+_BUCKET_KS = (10, 20, 30)
 _RMVPE_SEG_SAMPLES = 32 * RMVPE_HOP  # 5120
 
 
@@ -75,28 +77,18 @@ def _bucket_length_for_samples(n_samples: int) -> int:
         cap = _RMVPE_SEG_SAMPLES * k - RMVPE_HOP
         if n_samples <= cap:
             return cap
-    k_dyn = max(1, math.ceil((n_samples + RMVPE_HOP) / _RMVPE_SEG_SAMPLES))
+    k_dyn = max(30, int(math.ceil((n_samples + RMVPE_HOP) / (_RMVPE_SEG_SAMPLES * 15))) * 15)
     return _RMVPE_SEG_SAMPLES * k_dyn - RMVPE_HOP
 
 
 def _batch_per_device_for_bucket(bucket_samples: int) -> int:
-    if bucket_samples <= 35680:
-        return 32
     if bucket_samples <= 51040:
-        return 24
+        return 16
     if bucket_samples <= 102240:
         return 12
-    return 8
-
-
-def _snap_per_device_batch(n_items: int, num_devices: int, max_per_dev: int) -> int:
-    per_dev_needed = max(1, (n_items + num_devices - 1) // num_devices)
-    if per_dev_needed >= max_per_dev:
-        return max_per_dev
-    for tier in (1, 2, 4, 8, 12, 16, 24, 32):
-        if per_dev_needed <= tier <= max_per_dev:
-            return tier
-    return max_per_dev
+    if bucket_samples <= 153440:
+        return 8
+    return 4
 
 
 def _decode_one(item: tuple[int, Sequence[str], bool, bool]) -> tuple[int, Sequence[str], np.ndarray, bool, bool]:
@@ -165,13 +157,7 @@ def run_jax_extraction(
     Reads/resamples each clip once, executes batched BF16-MXU / FP32-critical forward passes
     on static bucket shapes across all JAX devices, and writes .npy outputs asynchronously.
     """
-    cache_dir = os.path.join(os.getcwd(), "assets", "xla_cache")
-    os.makedirs(cache_dir, exist_ok=True)
-    try:
-        jax.config.update("jax_compilation_cache_dir", cache_dir)
-        jax.config.update("jax_persistent_cache_min_compile_time_secs", 1.0)
-    except Exception:
-        pass
+    init_jax_compilation_cache()
 
     devices = resolve_jax_devices(accelerator, "all")
     num_devices = len(devices)
@@ -181,12 +167,26 @@ def run_jax_extraction(
     prec = PrecisionConfig.bfloat16() if supports_bfloat16(devices) else PrecisionConfig.float32()
 
     # Stage 0: Filter work & mark skipped steps cleanly on progress bar
-    pending: list[tuple[int, Sequence[str], bool, bool]] = []
-    skipped_updates = 0
-    for idx, f_info in enumerate(files):
+    def _check_pending(pair):
+        idx, f_info = pair
         _, f0_c, f0_v, feat_p = f_info[:4]
         need_f0 = bool(extract_f0 and (f0_force or not (readable_npy(f0_c) and readable_npy(f0_v))))
         need_feat = bool(extract_features and not readable_npy(feat_p))
+        return idx, f_info, need_f0, need_feat
+
+    cpu_count = os.cpu_count() or 4
+    decode_workers = min(32, max(4, cpu_count * 2))
+    writer_workers = min(16, max(4, cpu_count))
+
+    if len(files) > 32:
+        with ThreadPoolExecutor(max_workers=decode_workers) as check_pool:
+            checked = list(check_pool.map(_check_pending, enumerate(files)))
+    else:
+        checked = [_check_pending(pair) for pair in enumerate(files)]
+
+    pending: list[tuple[int, Sequence[str], bool, bool]] = []
+    skipped_updates = 0
+    for idx, f_info, need_f0, need_feat in checked:
         if extract_f0 and not need_f0:
             skipped_updates += 1
         if extract_features and not need_feat:
@@ -201,15 +201,28 @@ def run_jax_extraction(
 
     need_any_f0 = any(x[2] for x in pending)
     need_any_feat = any(x[3] for x in pending)
-
-    cpu_count = os.cpu_count() or 4
-    decode_workers = min(32, max(4, cpu_count * 2))
-    writer_workers = min(16, max(4, cpu_count))
     threshold_f32 = float(filter_radius)
 
-    batch_queue: queue.Queue = queue.Queue(maxsize=4)
+    # Stage 1: Probe lengths upfront so active buckets are known for AOT warmup while decoding runs.
+    with ThreadPoolExecutor(max_workers=decode_workers) as est_pool:
+        if predecoded_audio:
+            est_lens = [
+                len(predecoded_audio[item[1][0]])
+                if item[1][0] in predecoded_audio
+                else _estimate_16k_samples(item[1][0])
+                for item in pending
+            ]
+        else:
+            est_lens = list(est_pool.map(lambda it: _estimate_16k_samples(it[1][0]), pending))
+
+    # Bucket key: (bucket_T, do_f0, do_feat) using one canonical per-device batch size per bucket.
+    grouped: dict[tuple[int, bool, bool], list[tuple[int, Sequence[str], bool, bool]]] = {}
+    for item, est_n in zip(pending, est_lens):
+        b_len = _bucket_length_for_samples(est_n)
+        grouped.setdefault((b_len, item[2], item[3]), []).append(item)
+
+    batch_queue: queue.Queue = queue.Queue(maxsize=24)
     sentinel = object()
-    spillover: list[tuple[int, Sequence[str], np.ndarray, bool, bool]] = []
     decode_errors: list[BaseException] = []
 
     def _pack_batch(rows, global_bs: int, bucket_samples: int, do_f0: bool, do_feat: bool):
@@ -225,37 +238,39 @@ def run_jax_extraction(
 
     def _produce_batches() -> None:
         try:
+            overflow: dict[tuple[int, bool, bool], list[tuple[Sequence[str], np.ndarray, bool, bool]]] = {}
+
+            def _get_audio(it):
+                if predecoded_audio and it[1][0] in predecoded_audio:
+                    return (*it, predecoded_audio[it[1][0]])
+                idx, fi, audio, df, dft = _decode_one(it)
+                return idx, fi, df, dft, audio
+
             with ThreadPoolExecutor(max_workers=decode_workers) as dec_pool:
-                if predecoded_audio:
-                    est_lens = [
-                        len(predecoded_audio[item[1][0]])
-                        if item[1][0] in predecoded_audio
-                        else _estimate_16k_samples(item[1][0])
-                        for item in pending
-                    ]
-                else:
-                    est_lens = list(dec_pool.map(lambda it: _estimate_16k_samples(it[1][0]), pending))
-
-                # Bucket key: (bucket_T, do_f0, do_feat) so every item in a batch executes identical XLA graphs
-                grouped: dict[tuple[int, bool, bool], list[tuple[int, Sequence[str], bool, bool]]] = {}
-                for item, est_n in zip(pending, est_lens):
-                    b_len = _bucket_length_for_samples(est_n)
-                    grouped.setdefault((b_len, item[2], item[3]), []).append(item)
-
-                def _get_audio(it):
-                    if predecoded_audio and it[1][0] in predecoded_audio:
-                        return (*it, predecoded_audio[it[1][0]])
-                    idx, fi, audio, df, dft = _decode_one(it)
-                    return idx, fi, df, dft, audio
-
-                for (bucket_samples, do_f0, do_feat), items in sorted(grouped.items()):
-                    per_dev = _snap_per_device_batch(len(items), num_devices, _batch_per_device_for_bucket(bucket_samples))
+                keys_ordered = sorted(grouped.keys())
+                idx_cursor = 0
+                while idx_cursor < len(keys_ordered) or overflow:
+                    if idx_cursor < len(keys_ordered):
+                        key = keys_ordered[idx_cursor]
+                        idx_cursor += 1
+                    else:
+                        key = min(overflow.keys())
+                    bucket_samples, do_f0, do_feat = key
+                    items = grouped.get(key, [])
+                    per_dev = _batch_per_device_for_bucket(bucket_samples)
                     global_bs = per_dev * num_devices
-                    cur_rows: list[tuple[Sequence[str], np.ndarray, bool, bool]] = []
+                    cur_rows: list[tuple[Sequence[str], np.ndarray, bool, bool]] = overflow.pop(key, [])
 
-                    for idx, fi, df, dft, audio in dec_pool.map(_get_audio, items):
+                    while len(cur_rows) >= global_bs:
+                        batch_queue.put(_pack_batch(cur_rows[:global_bs], global_bs, bucket_samples, do_f0, do_feat))
+                        cur_rows = cur_rows[global_bs:]
+
+                    futures = [dec_pool.submit(_get_audio, it) for it in items]
+                    for fut in as_completed(futures):
+                        _idx, fi, df, dft, audio = fut.result()
                         if len(audio) > bucket_samples:
-                            spillover.append((idx, fi, audio, df, dft))
+                            target_b = _bucket_length_for_samples(len(audio) + 64)
+                            overflow.setdefault((target_b, df, dft), []).append((fi, audio, df, dft))
                             continue
                         cur_rows.append((fi, audio, df, dft))
                         if len(cur_rows) == global_bs:
@@ -268,7 +283,7 @@ def run_jax_extraction(
         finally:
             batch_queue.put(sentinel)
 
-    # Start host probing + decode in parallel with TPU model loading so CPU/disk hides weight load.
+    # Start host decoding in parallel with TPU weight load + AOT bucket compilation.
     producer = threading.Thread(target=_produce_batches, daemon=True)
     producer.start()
 
@@ -276,10 +291,7 @@ def run_jax_extraction(
     if need_any_f0:
         model_name = "rmvpe.pt" if rectified else "rmvpe_rvc.pt"
         model_path = os.path.join("models", "predictors", model_name)
-        rmvpe_params = jax.device_put(
-            jax.tree.map(jnp.asarray, rmvpe_params_from_torch_file(model_path)),
-            replicated,
-        )
+        rmvpe_params = jax.device_put(rmvpe_params_from_torch_file(model_path), replicated)
 
     hubert_cfg: HubertConfig | None = None
     hubert_params = None
@@ -288,7 +300,7 @@ def run_jax_extraction(
         embed_dir = ensure_embedding_files(embedder_model)
         hubert_cfg, h_host = load_hubert_from_dir(embed_dir)
         expected_dim = 256 if version == "v1" else int(hubert_cfg.hidden_size)
-        hubert_params = jax.device_put(jax.tree.map(jnp.asarray, h_host), replicated)
+        hubert_params = jax.device_put(h_host, replicated)
 
     @partial(jax.jit, static_argnums=(0, 1))
     def _jit_infer(run_f0: bool, run_feat: bool, p_rmvpe, p_hubert, audio_bt, lens_b):
@@ -299,6 +311,36 @@ def run_jax_extraction(
             else None
         )
         return f0, feats
+
+    def _to_sds(tree: Any) -> Any:
+        return jax.tree.map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype, sharding=a.sharding), tree)
+
+    p_rmvpe_sds = _to_sds(rmvpe_params) if rmvpe_params is not None else None
+    p_hubert_sds = _to_sds(hubert_params) if hubert_params is not None else None
+    compiled_infer: dict[tuple[bool, bool, int, int], Any] = {}
+
+    warmup_keys = sorted(grouped.keys())
+    if warmup_keys:
+        print(f"Pre-compiling XLA extraction kernels for {len(warmup_keys)} bucket shape(s)...", flush=True)
+        for idx_w, (b_len, do_f0_w, do_feat_w) in enumerate(warmup_keys, start=1):
+            g_bs = _batch_per_device_for_bucket(b_len) * num_devices
+            t0 = time.perf_counter()
+            audio_sds = jax.ShapeDtypeStruct((g_bs, b_len), jnp.float32, sharding=data_sharding)
+            lens_sds = jax.ShapeDtypeStruct((g_bs,), jnp.int32, sharding=data_sharding)
+            compiled = _jit_infer.lower(
+                do_f0_w,
+                do_feat_w,
+                p_rmvpe_sds,
+                p_hubert_sds,
+                audio_sds,
+                lens_sds,
+            ).compile()
+            compiled_infer[(do_f0_w, do_feat_w, g_bs, b_len)] = compiled
+            dt = time.perf_counter() - t0
+            print(
+                f"  [{idx_w}/{len(warmup_keys)}] compiled (batch={g_bs}, samples={b_len}, f0={do_f0_w}, feat={do_feat_w}) in {dt:.1f}s",
+                flush=True,
+            )
 
     write_futures: list[Any] = []
     pending_result: tuple[Any, Any, list[tuple[Sequence[str], int, bool, bool]]] | None = None
@@ -317,7 +359,7 @@ def run_jax_extraction(
             progress if updates is None else None,
         )
         write_futures.append(fut)
-        while len(write_futures) > 8:
+        while len(write_futures) > 16:
             write_futures.pop(0).result()
 
     with ThreadPoolExecutor(max_workers=writer_workers) as write_pool:
@@ -326,11 +368,14 @@ def run_jax_extraction(
             if item is sentinel:
                 break
             do_f0, do_feat, audio_np, lens_np, meta = item
-            audio_dev = jax.device_put(audio_np, data_sharding if num_devices > 1 else devices[0])
-            lens_dev = jax.device_put(lens_np, data_sharding if num_devices > 1 else devices[0])
+            audio_dev, lens_dev = jax.device_put((audio_np, lens_np), data_sharding)
 
-            # Enqueue next TPU batch asynchronously, then transfer/write previous batch while TPU runs.
-            f0_dev, feat_dev = _jit_infer(do_f0, do_feat, rmvpe_params, hubert_params, audio_dev, lens_dev)
+            infer_key = (do_f0, do_feat, int(audio_np.shape[0]), int(audio_np.shape[1]))
+            infer_fn = compiled_infer.get(infer_key)
+            if infer_fn is not None:
+                f0_dev, feat_dev = infer_fn(do_f0, do_feat, rmvpe_params, hubert_params, audio_dev, lens_dev)
+            else:
+                f0_dev, feat_dev = _jit_infer(do_f0, do_feat, rmvpe_params, hubert_params, audio_dev, lens_dev)
             if pending_result is not None:
                 _flush_pending(*pending_result, write_pool)
             pending_result = (f0_dev, feat_dev, meta)
@@ -342,15 +387,6 @@ def run_jax_extraction(
         producer.join()
         if decode_errors:
             raise decode_errors[0]
-
-        # Handle any unusually long spillover clips whose headers underestimated length
-        for _idx, fi, audio, do_f0, do_feat in spillover:
-            b_len = _bucket_length_for_samples(len(audio) + 64)
-            do_f0_s, do_feat_s, audio_np, lens_np, meta = _pack_batch([(fi, audio, do_f0, do_feat)], num_devices, b_len, do_f0, do_feat)
-            audio_dev = jax.device_put(audio_np, data_sharding if num_devices > 1 else devices[0])
-            lens_dev = jax.device_put(lens_np, data_sharding if num_devices > 1 else devices[0])
-            f0_dev, feat_dev = _jit_infer(do_f0_s, do_feat_s, rmvpe_params, hubert_params, audio_dev, lens_dev)
-            _flush_pending(f0_dev, feat_dev, meta, write_pool)
 
         for fut in write_futures:
             fut.result()

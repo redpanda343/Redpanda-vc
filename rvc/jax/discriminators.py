@@ -171,8 +171,11 @@ def _disc_p_forward(
         dtype=prec.compute_dtype,
         precision=prec.compute_precision,
     )
+    if not transpose_fmap:
+        fmap.append(cur)
+        return cur.reshape(b, -1), fmap
     cur_4d = cur.reshape(b, period, cur.shape[1], cur.shape[2]).transpose(0, 2, 1, 3)
-    fmap.append(cur_4d if transpose_fmap else cur)
+    fmap.append(cur_4d)
     return cur_4d.reshape(b, -1), fmap
 
 

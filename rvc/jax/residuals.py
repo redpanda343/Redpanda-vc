@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -120,6 +121,7 @@ class ResidualCouplingBlockConfig:
     gin_channels: int = 0
     mean_only: bool = True
     p_dropout: float = 0.0
+    checkpointing: bool = False
 
 
 def init_flow_params(rng: np.random.Generator, cfg: ResidualCouplingBlockConfig) -> dict[str, Any]:
@@ -196,14 +198,16 @@ def flow_forward(
     """Apply ResidualCouplingBlock forward or reverse (Flip happens on channels axis -1 in NWC)."""
     cur = jnp.asarray(x, jnp.float32)
     flows = params["flows"]
-    if not reverse:
-        for i in range(cfg.n_flows):
-            cur = _coupling_layer_forward(cur, x_mask, flows[str(i * 2)], cfg, g=g, reverse=False, prec=prec)
-            cur = cur[..., ::-1]
-        return cur
-    for i in range(cfg.n_flows - 1, -1, -1):
-        cur = cur[..., ::-1]
-        cur = _coupling_layer_forward(cur, x_mask, flows[str(i * 2)], cfg, g=g, reverse=True, prec=prec)
+
+    def _run_flow(c: Array, flow_p: Mapping[str, Any]) -> Array:
+        if reverse:
+            return _coupling_layer_forward(c[..., ::-1], x_mask, flow_p, cfg, g=g, reverse=True, prec=prec)
+        return _coupling_layer_forward(c, x_mask, flow_p, cfg, g=g, reverse=False, prec=prec)[..., ::-1]
+
+    indices = range(cfg.n_flows - 1, -1, -1) if reverse else range(cfg.n_flows)
+    for i in indices:
+        flow_p = flows[str(i * 2)]
+        cur = jax.checkpoint(_run_flow)(cur, flow_p) if cfg.checkpointing else _run_flow(cur, flow_p)
     return cur
 
 

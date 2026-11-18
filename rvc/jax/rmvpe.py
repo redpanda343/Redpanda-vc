@@ -225,10 +225,6 @@ def _reflect_pad_batch_right_512(audio_bt: Array, lengths_b: Array) -> Array:
         left = wav[pad:0:-1]
         ext = jnp.concatenate([left, wav, jnp.zeros((pad,), dtype=jnp.float32)], axis=0)
         # Right reflect slice at `pad + length` (from wav[length-2 : length-514 : -1]).
-        # Reverse wav once to gather contiguous right reflection slice cleanly.
-        rev = ext[::-1]
-        # Index `length - 2` in wav corresponds to index `(pad + l_max - 1) - (pad + length - 2)` in `ext[::-1]`?
-        # Simpler: grab 512 samples ending at `pad + length - 2` in `ext`, then reverse them.
         start = jnp.maximum(pad + length - 1 - pad, 0)
         seg = lax.dynamic_slice(ext, (start,), (pad,))[::-1]
         return lax.dynamic_update_slice(ext, seg, (pad + length,))

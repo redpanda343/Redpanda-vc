@@ -108,6 +108,7 @@ class SynthesizerConfig:
             p_dropout=self.p_dropout,
             embedding_dim=self.text_enc_hidden_dim,
             f0=self.use_f0,
+            checkpointing=self.checkpointing,
         )
 
     @property
@@ -120,6 +121,7 @@ class SynthesizerConfig:
             dilation_rate=1,
             n_layers=16,
             gin_channels=self.gin_channels,
+            checkpointing=self.checkpointing,
         )
 
     @property
@@ -133,6 +135,7 @@ class SynthesizerConfig:
             n_flows=4,
             gin_channels=self.gin_channels,
             mean_only=True,
+            checkpointing=self.checkpointing,
         )
 
     @property

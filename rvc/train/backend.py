@@ -122,6 +122,17 @@ def configure_jax_env(accelerator: str = "auto", gpus: str | None = None) -> Non
     ):
         os.environ.setdefault("CUDA_VISIBLE_DEVICES", gpu_str.replace("-", ","))
 
+    # Activate persistent XLA compilation cache before JAX initializes PJRT.
+    cache_dir = os.environ.get("JAX_COMPILATION_CACHE_DIR") or os.path.join(os.getcwd(), "assets", "xla_cache")
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        os.environ.setdefault("JAX_COMPILATION_CACHE_DIR", cache_dir)
+        os.environ.setdefault("JAX_ENABLE_COMPILATION_CACHE", "yes")
+        os.environ.setdefault("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS", "0")
+        os.environ.setdefault("JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES", "-1")
+    except OSError:
+        pass
+
     # Prevent XLA from preallocating 75% GPU VRAM when PyTorch CUDA ops may coexist in the process.
     if not has_jax_tpu_runtime():
         os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")

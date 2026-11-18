@@ -116,11 +116,13 @@ def gelu_1702(x: Array) -> Array:
 
 def fused_add_tanh_sigmoid_multiply(
     input_a: Array,
-    input_b: Array,
+    input_b: Array | None,
     n_channels: int,
 ) -> Array:
     """WaveNet gated activation computed safely in float32 for NWC tensors."""
-    in_act = jnp.asarray(input_a, jnp.float32) + jnp.asarray(input_b, jnp.float32)
+    in_act = jnp.asarray(input_a, jnp.float32)
+    if input_b is not None:
+        in_act = in_act + jnp.asarray(input_b, jnp.float32)
     t_act = jnp.tanh(in_act[..., :n_channels])
     s_act = jax.nn.sigmoid(in_act[..., n_channels:])
     return t_act * s_act
@@ -317,8 +319,8 @@ def weight_norm_compose(weight_g: Array, weight_v: Array, axis: int = -1) -> Arr
     g = jnp.asarray(weight_g, jnp.float32)
     pos_axis = axis % v.ndim
     norm_axes = tuple(i for i in range(v.ndim) if i != pos_axis)
-    v_norm = jnp.sqrt(jnp.maximum(jnp.sum(v * v, axis=norm_axes, keepdims=True), 1e-24))
-    return v * (g / v_norm)
+    v_inv_norm = lax.rsqrt(jnp.maximum(jnp.sum(v * v, axis=norm_axes, keepdims=True), 1e-24))
+    return v * (g * v_inv_norm)
 
 
 def spectral_norm_compose(
@@ -510,13 +512,31 @@ def stft_complex(
         w_right = n_fft - win_length - w_left
         win_arr = jnp.pad(win_arr, (w_left, w_right))
 
-    length = y_f32.shape[1]
-    num_frames = 1 + (length - n_fft) // hop_length
-    starts = jnp.arange(num_frames, dtype=jnp.int32)[:, None] * int(hop_length)
-    offsets = jnp.arange(n_fft, dtype=jnp.int32)[None, :]
-    frames = y_f32[:, starts + offsets]  # (B, TT, n_fft)
+    length = int(y_f32.shape[1])
+    n_fft_i = int(n_fft)
+    hop_i = int(hop_length)
+    num_frames = 1 + (length - n_fft_i) // hop_i
+    if num_frames > 0 and hop_i > 0:
+        # Use static overlapping block slices + concat instead of 2D dynamic gather,
+        # which otherwise compiles to slow ScatterAdd gradients on TPU.
+        overlap_blocks = (n_fft_i + hop_i - 1) // hop_i
+        n_blocks = num_frames + overlap_blocks - 1
+        need_len = n_blocks * hop_i
+        y_src = jnp.pad(y_f32, ((0, 0), (0, need_len - length))) if need_len > length else y_f32[:, :need_len]
+        blocks = y_src.reshape(y_f32.shape[0], n_blocks, hop_i)
+        if overlap_blocks == 1:
+            frames = blocks[:, :num_frames, :n_fft_i]
+        else:
+            frames = jnp.concatenate(
+                [blocks[:, k : k + num_frames, :] for k in range(overlap_blocks)],
+                axis=-1,
+            )[:, :, :n_fft_i]
+    else:
+        starts = jnp.arange(num_frames, dtype=jnp.int32)[:, None] * hop_i
+        offsets = jnp.arange(n_fft_i, dtype=jnp.int32)[None, :]
+        frames = y_f32[:, starts + offsets]  # (B, TT, n_fft)
     windowed = frames * win_arr[None, None, :]
-    spec = jnp.fft.rfft(windowed, n=int(n_fft), axis=-1)  # (B, TT, F)
+    spec = jnp.fft.rfft(windowed, n=n_fft_i, axis=-1)  # (B, TT, F)
     spec_ft = jnp.transpose(spec, (0, 2, 1))  # (B, F, TT)
     return jnp.real(spec_ft), jnp.imag(spec_ft)
 

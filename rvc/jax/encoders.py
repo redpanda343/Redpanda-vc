@@ -61,6 +61,7 @@ class EncoderConfig:
     kernel_size: int = 1
     p_dropout: float = 0.0
     window_size: int = 10
+    checkpointing: bool = False
 
 
 def init_encoder_params(rng: np.random.Generator, cfg: EncoderConfig) -> dict[str, Any]:
@@ -113,18 +114,31 @@ def encoder_forward(
     # (B, T, 1) -> (B, 1, 1, T) matching PyTorch x_mask.unsqueeze(2) on (B, 1, T)
     attn_mask = x_mask[:, None, None, :, 0]
     x_f32 = jnp.asarray(x, jnp.float32) * jnp.asarray(x_mask, jnp.float32)
+    use_dropout = rng_key is not None and not deterministic and cfg.p_dropout > 0.0
+    layer_keys = list(jax.random.split(rng_key, cfg.n_layers)) if use_dropout else [None] * cfg.n_layers
+
+    def _run_layer(cur_x: Array, attn_p: Any, norm1_p: Any, ffn_p: Any, norm2_p: Any, layer_key: Array | None) -> Array:
+        k_attn = k_d1 = k_ffn = k_d2 = None
+        if layer_key is not None:
+            k_attn, k_d1, k_ffn, k_d2 = jax.random.split(layer_key, 4)
+        y = mha_forward(cur_x, cur_x, attn_p, mha_cfg, attn_mask=attn_mask, rng_key=k_attn, deterministic=deterministic, prec=prec)
+        y = dropout(y, k_d1, cfg.p_dropout, deterministic=deterministic)
+        cur_x = layer_norm(cur_x + jnp.asarray(y, jnp.float32), norm1_p)
+
+        y = ffn_forward(cur_x, x_mask, ffn_p, ffn_cfg, rng_key=k_ffn, deterministic=deterministic, prec=prec)
+        y = dropout(y, k_d2, cfg.p_dropout, deterministic=deterministic)
+        return layer_norm(cur_x + jnp.asarray(y, jnp.float32), norm2_p)
 
     for i in range(cfg.n_layers):
-        k_attn = k_d1 = k_ffn = k_d2 = None
-        if rng_key is not None and not deterministic and cfg.p_dropout > 0.0:
-            rng_key, k_attn, k_d1, k_ffn, k_d2 = jax.random.split(rng_key, 5)
-        y = mha_forward(x_f32, x_f32, params["attn_layers"][i], mha_cfg, attn_mask=attn_mask, rng_key=k_attn, deterministic=deterministic, prec=prec)
-        y = dropout(y, k_d1, cfg.p_dropout, deterministic=deterministic)
-        x_f32 = layer_norm(x_f32 + jnp.asarray(y, jnp.float32), params["norm_layers_1"][i])
-
-        y = ffn_forward(x_f32, x_mask, params["ffn_layers"][i], ffn_cfg, rng_key=k_ffn, deterministic=deterministic, prec=prec)
-        y = dropout(y, k_d2, cfg.p_dropout, deterministic=deterministic)
-        x_f32 = layer_norm(x_f32 + jnp.asarray(y, jnp.float32), params["norm_layers_2"][i])
+        args_i = (
+            x_f32,
+            params["attn_layers"][i],
+            params["norm_layers_1"][i],
+            params["ffn_layers"][i],
+            params["norm_layers_2"][i],
+            layer_keys[i],
+        )
+        x_f32 = jax.checkpoint(_run_layer)(*args_i) if cfg.checkpointing else _run_layer(*args_i)
 
     return x_f32 * jnp.asarray(x_mask, jnp.float32)
 
@@ -140,6 +154,7 @@ class TextEncoderConfig:
     p_dropout: float
     embedding_dim: int
     f0: bool = True
+    checkpointing: bool = False
 
 
 def init_text_encoder_params(rng: np.random.Generator, cfg: TextEncoderConfig) -> dict[str, Any]:
@@ -150,6 +165,7 @@ def init_text_encoder_params(rng: np.random.Generator, cfg: TextEncoderConfig) -
         n_layers=cfg.n_layers,
         kernel_size=cfg.kernel_size,
         p_dropout=cfg.p_dropout,
+        checkpointing=cfg.checkpointing,
     )
     proj = init_conv1d_params(rng, cfg.hidden_channels, cfg.out_channels * 2, kernel_size=1)
     # Keep initial prior log-std near 0 (sigma ~= 1) so step-0 KL avoids exp(-2 * logs_p) spikes.
@@ -192,6 +208,7 @@ def text_encoder_forward(
         n_layers=cfg.n_layers,
         kernel_size=cfg.kernel_size,
         p_dropout=cfg.p_dropout,
+        checkpointing=cfg.checkpointing,
     )
     x = encoder_forward(x, x_mask, params["encoder"], enc_cfg, rng_key=rng_key, deterministic=deterministic, prec=prec)
     if skip_head is not None and skip_head > 0:
@@ -215,6 +232,7 @@ class PosteriorEncoderConfig:
     dilation_rate: int
     n_layers: int
     gin_channels: int = 0
+    checkpointing: bool = False
 
 
 def init_posterior_encoder_params(rng: np.random.Generator, cfg: PosteriorEncoderConfig) -> dict[str, Any]:
@@ -224,6 +242,7 @@ def init_posterior_encoder_params(rng: np.random.Generator, cfg: PosteriorEncode
         dilation_rate=cfg.dilation_rate,
         n_layers=cfg.n_layers,
         gin_channels=cfg.gin_channels,
+        checkpointing=cfg.checkpointing,
     )
     pre = init_conv1d_params(rng, cfg.in_channels, cfg.hidden_channels, kernel_size=1)
     # Attenuate initial linear-STFT input projection (raw linear spec peaks > 100) without altering forward().
@@ -255,6 +274,7 @@ def posterior_encoder_forward(
         dilation_rate=cfg.dilation_rate,
         n_layers=cfg.n_layers,
         gin_channels=cfg.gin_channels,
+        checkpointing=cfg.checkpointing,
     )
     h = wavenet_forward(h, x_mask, params["enc"], wn_cfg, g=g, deterministic=True, prec=prec)
     stats = jnp.asarray(conv1d(h, params["proj"], dtype=prec.compute_dtype, precision=prec.compute_precision), jnp.float32) * x_mask
@@ -312,6 +332,7 @@ def posterior_encoder_from_torch_state(state: Mapping[str, Any], prefix: str, cf
         dilation_rate=cfg.dilation_rate,
         n_layers=cfg.n_layers,
         gin_channels=cfg.gin_channels,
+        checkpointing=cfg.checkpointing,
     )
     return {
         "pre": extract_conv_from_torch_state(state, f"{prefix}.pre"),

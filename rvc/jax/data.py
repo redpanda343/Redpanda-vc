@@ -10,6 +10,7 @@ import math
 import os
 import queue
 import threading
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import Iterator, Sequence
 
@@ -48,6 +49,16 @@ def load_filepaths_and_text(filename: str, split: str = "|") -> list[list[str]]:
         return [line.strip().split(split) for line in f if line.strip()]
 
 
+def _probe_audio_frames(audiopath: str, hop_length: int, max_sample_frames: int) -> int:
+    try:
+        info = sf.info(audiopath)
+        if getattr(info, "frames", 0) > 0:
+            return min(int(info.frames) // hop_length, max_sample_frames)
+    except Exception:
+        pass
+    return min(os.path.getsize(audiopath) // (3 * hop_length), max_sample_frames)
+
+
 class TextAudioDataset:
     """Loads WAV audio, optional linear STFT, phoneme features, and pitch for NWC JAX training."""
 
@@ -66,17 +77,22 @@ class TextAudioDataset:
 
     def _filter(self) -> None:
         kept: list[list[str]] = []
-        lengths: list[int] = []
         for entry in self.audiopaths_and_text:
             audiopath, text, pitch, pitchf, dv = entry[:5]
             if self.min_text_len <= len(text) <= self.max_text_len:
                 kept.append([audiopath, text, pitch, pitchf, dv])
-                info = sf.info(audiopath)
-                if info.format == "FLAC" or info.subtype in {"FLOAT", "PCM_16"}:
-                    length = info.frames // self.hop_length
-                else:
-                    length = os.path.getsize(audiopath) // (3 * self.hop_length)
-                lengths.append(min(int(length), self.max_sample_frames))
+
+        if len(kept) > 32:
+            workers = min(16, max(4, os.cpu_count() or 4))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                lengths = list(
+                    pool.map(
+                        lambda row: _probe_audio_frames(row[0], self.hop_length, self.max_sample_frames),
+                        kept,
+                    )
+                )
+        else:
+            lengths = [_probe_audio_frames(row[0], self.hop_length, self.max_sample_frames) for row in kept]
         self.audiopaths_and_text = kept
         self.lengths = lengths
 
@@ -154,6 +170,15 @@ class BucketBatchSampler:
         self.buckets, self.bucket_upper_bounds, self.bucket_batch_sizes, self.num_samples_per_bucket = (
             self._create_buckets()
         )
+        self.allowed_frames: tuple[int, ...] = (
+            tuple(sorted(set(self.bucket_upper_bounds))) if self.static_bucket_padding else ()
+        )
+
+    def unique_batch_shapes(self) -> list[tuple[int, int]]:
+        """Return sorted unique (batch_size, target_frames) static bucket shapes."""
+        if not self.static_bucket_padding:
+            return []
+        return sorted(set(zip(self.bucket_batch_sizes, self.bucket_upper_bounds)))
 
     def _bisect(self, x: int) -> int:
         for i in range(len(self.boundaries) - 1):
@@ -224,10 +249,24 @@ class BucketBatchSampler:
         return iter(batches[self.start_batch :])
 
 
+def _snap_frames_to_bucket(needed: int, target_frames: int | None, allowed_frames: Sequence[int] | None) -> int:
+    if target_frames is None:
+        return needed
+    target = int(target_frames)
+    if needed <= target:
+        return target
+    if allowed_frames:
+        for bound in allowed_frames:
+            if bound >= needed:
+                return int(bound)
+    return needed
+
+
 def collate_nwc_batch(
     rows: Sequence[tuple[np.ndarray | None, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.int32]],
     hop_length: int,
     target_frames: int | None = None,
+    allowed_frames: Sequence[int] | None = None,
 ) -> tuple[np.ndarray, ...]:
     """Collate sample rows into NWC NumPy arrays with optional static XLA bucket padding."""
     has_spec = rows[0][0] is not None
@@ -244,7 +283,7 @@ def collate_nwc_batch(
 
     max_spec = int(spec_lengths.max())
     max_phone = int(phone_lengths.max())
-    frames = max(int(target_frames), max_spec, max_phone) if target_frames is not None else max(max_spec, max_phone)
+    frames = _snap_frames_to_bucket(max(max_spec, max_phone), target_frames, allowed_frames)
     wave_frames = max(frames * int(hop_length), int(wave_lengths.max()))
 
     phone_dim = sorted_rows[0][2].shape[1]
@@ -312,6 +351,7 @@ class PrefetchBatchLoader:
         self.num_workers = max(0, int(num_workers))
         self.prefetch_batches = max(2, int(prefetch_batches))
         self.cache_in_ram = bool(cache_in_ram)
+        self.allowed_frames = getattr(sampler, "allowed_frames", ())
         self._cache: list[tuple[np.ndarray, ...]] | None = None
         self._pool = ThreadPoolExecutor(max_workers=max(1, self.num_workers)) if self.num_workers > 0 else None
 
@@ -323,12 +363,18 @@ class PrefetchBatchLoader:
     def _prepare_batch(self, spec_pair: tuple[int | None, list[int]]):
         target_frames, indices = spec_pair
         rows = [self._get_item(i) for i in indices]
-        return collate_nwc_batch(rows, self.hop_length, target_frames=target_frames)
+        return collate_nwc_batch(
+            rows,
+            self.hop_length,
+            target_frames=target_frames,
+            allowed_frames=self.allowed_frames,
+        )
 
     def _ensure_cache(self) -> None:
         if not self.cache_in_ram or self._cache is not None:
             return
         indices = list(range(len(self.dataset)))
+        print(f"Caching {len(indices)} training samples into host RAM...", flush=True)
         if self._pool is not None:
             self._cache = list(self._pool.map(self.dataset.__getitem__, indices))
         else:
@@ -348,17 +394,32 @@ class PrefetchBatchLoader:
         out_queue: queue.Queue = queue.Queue(maxsize=self.prefetch_batches)
         stop_event = threading.Event()
         sentinel = object()
+        max_in_flight = max(self.prefetch_batches * 2, self.num_workers * 2)
 
         def _producer() -> None:
+            pending: deque = deque()
+            spec_iter = iter(specs)
             try:
-                futures = [self._pool.submit(self._prepare_batch, sp) for sp in specs]
-                for fut in futures:
+                while len(pending) < max_in_flight:
+                    sp = next(spec_iter, None)
+                    if sp is None:
+                        break
+                    pending.append(self._pool.submit(self._prepare_batch, sp))
+
+                while pending and not stop_event.is_set():
+                    fut = pending.popleft()
+                    res = fut.result()
                     if stop_event.is_set():
                         break
-                    out_queue.put(fut.result())
+                    out_queue.put(res)
+                    sp = next(spec_iter, None)
+                    if sp is not None and not stop_event.is_set():
+                        pending.append(self._pool.submit(self._prepare_batch, sp))
             except BaseException as exc:
                 out_queue.put(exc)
             finally:
+                for fut in pending:
+                    fut.cancel()
                 out_queue.put(sentinel)
 
         thread = threading.Thread(target=_producer, daemon=True)
@@ -373,9 +434,15 @@ class PrefetchBatchLoader:
                 yield item
         finally:
             stop_event.set()
+            while True:
+                try:
+                    if out_queue.get_nowait() is sentinel:
+                        break
+                except queue.Empty:
+                    break
             thread.join(timeout=2.0)
 
     def close(self) -> None:
         if self._pool is not None:
-            self._pool.shutdown(wait=True, cancel_futures=False)
+            self._pool.shutdown(wait=True, cancel_futures=True)
             self._pool = None

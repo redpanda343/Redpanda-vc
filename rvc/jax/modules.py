@@ -30,6 +30,7 @@ class WaveNetConfig:
     n_layers: int
     gin_channels: int = 0
     p_dropout: float = 0.0
+    checkpointing: bool = False
 
     def __post_init__(self) -> None:
         if self.kernel_size % 2 != 1:
@@ -78,39 +79,77 @@ def wavenet_forward(
     )
 
     h = cfg.hidden_channels
-    for i in range(cfg.n_layers):
-        dilation = cfg.dilation_rate ** i
+    use_dropout = rng_key is not None and not deterministic and cfg.p_dropout > 0.0
+    sub_keys = list(jax.random.split(rng_key, cfg.n_layers)) if use_dropout else [None] * cfg.n_layers
+
+    def _run_layer(
+        cur_x: Array,
+        cur_out: Array,
+        layer_idx: int,
+        in_p: Mapping[str, Any],
+        rs_p: Mapping[str, Any],
+        g_slice: Array | None,
+        sub_k: Array | None,
+    ) -> tuple[Array, Array]:
+        dilation = cfg.dilation_rate ** layer_idx
         padding = get_padding(cfg.kernel_size, dilation)
         x_in = conv1d(
-            x_f32,
-            params["in_layers"][i],
+            cur_x,
+            in_p,
             padding=padding,
             dilation=dilation,
             dtype=prec.compute_dtype,
             precision=prec.compute_precision,
         )
-        if g_proj is not None:
-            g_l = g_proj[..., i * 2 * h : (i + 1) * 2 * h]
-        else:
-            g_l = jnp.zeros_like(x_in)
-
-        acts = fused_add_tanh_sigmoid_multiply(x_in, g_l, h)
-        if rng_key is not None and not deterministic and cfg.p_dropout > 0.0:
-            rng_key, sub_key = jax.random.split(rng_key)
-        else:
-            sub_key = None
-        acts = dropout(acts, sub_key, cfg.p_dropout, deterministic=deterministic)
-
+        acts = fused_add_tanh_sigmoid_multiply(x_in, g_slice, h)
+        acts = dropout(acts, sub_k, cfg.p_dropout, deterministic=deterministic)
         res_skip_acts = jnp.asarray(
-            conv1d(acts, params["res_skip_layers"][i], dtype=prec.compute_dtype, precision=prec.compute_precision),
+            conv1d(acts, rs_p, dtype=prec.compute_dtype, precision=prec.compute_precision),
             jnp.float32,
         )
-        if i < cfg.n_layers - 1:
-            res_acts = res_skip_acts[..., :h]
-            x_f32 = (x_f32 + res_acts) * mask_f32
-            output = output + res_skip_acts[..., h:]
-        else:
-            output = output + res_skip_acts
+        if layer_idx < cfg.n_layers - 1:
+            return (cur_x + res_skip_acts[..., :h]) * mask_f32, cur_out + res_skip_acts[..., h:]
+        return cur_x, cur_out + res_skip_acts
+
+    def _g_slice(layer_idx: int) -> Array | None:
+        return g_proj[..., layer_idx * 2 * h : (layer_idx + 1) * 2 * h] if g_proj is not None else None
+
+    if cfg.checkpointing and cfg.n_layers > 2:
+        chunk_size = 4
+        for start in range(0, cfg.n_layers, chunk_size):
+            end = min(cfg.n_layers, start + chunk_size)
+            in_chunk = params["in_layers"][start:end]
+            rs_chunk = params["res_skip_layers"][start:end]
+            g_chunk = [_g_slice(idx) for idx in range(start, end)]
+            k_chunk = sub_keys[start:end]
+
+            def _run_chunk(
+                cur_x: Array,
+                cur_out: Array,
+                in_c,
+                rs_c,
+                g_c,
+                k_c,
+                s: int = start,
+            ) -> tuple[Array, Array]:
+                for offset in range(len(in_c)):
+                    cur_x, cur_out = _run_layer(
+                        cur_x, cur_out, s + offset, in_c[offset], rs_c[offset], g_c[offset], k_c[offset]
+                    )
+                return cur_x, cur_out
+
+            x_f32, output = jax.checkpoint(_run_chunk)(x_f32, output, in_chunk, rs_chunk, g_chunk, k_chunk)
+    else:
+        for i in range(cfg.n_layers):
+            x_f32, output = _run_layer(
+                x_f32,
+                output,
+                i,
+                params["in_layers"][i],
+                params["res_skip_layers"][i],
+                _g_slice(i),
+                sub_keys[i],
+            )
 
     return output * mask_f32
 

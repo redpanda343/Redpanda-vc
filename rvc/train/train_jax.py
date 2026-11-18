@@ -37,6 +37,7 @@ import argparse
 import glob
 import json
 import math
+import time
 from functools import partial
 
 import jax
@@ -52,9 +53,16 @@ class JaxDeviceInitError(RuntimeError):
     """Raised when JAX cannot initialize the requested hardware accelerator."""
 
 
-from rvc.jax import JAX_BUCKET_BOUNDARIES, PrecisionConfig, resolve_jax_devices, supports_bfloat16
+from rvc.jax import (
+    JAX_BUCKET_BOUNDARIES,
+    PrecisionConfig,
+    init_jax_compilation_cache,
+    resolve_jax_devices,
+    supports_bfloat16,
+)
 from rvc.jax.checkpoint import (
     LATEST_CHECKPOINT_SUFFIX,
+    AsyncJaxCheckpointWriter,
     AsyncJaxInferenceExporter,
     latest_checkpoint_pair,
     load_jax_checkpoint,
@@ -77,6 +85,7 @@ from rvc.jax.mel import (
     mel_spectrogram_jax,
     multi_scale_mel_loss,
     spec_to_mel_jax,
+    spec_to_mel_np,
     spectrogram_jax_padded,
 )
 from rvc.jax.ops import slice_segments
@@ -110,13 +119,7 @@ def _clip_grads_by_global_norm(grads, max_norm: float):
 
 
 def _init_xla_cache() -> None:
-    cache_dir = os.path.join(now_dir, "assets", "xla_cache")
-    os.makedirs(cache_dir, exist_ok=True)
-    try:
-        jax.config.update("jax_compilation_cache_dir", cache_dir)
-        jax.config.update("jax_persistent_cache_min_compile_time_secs", 1.0)
-    except Exception:
-        pass
+    init_jax_compilation_cache(now_dir)
 
 
 def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
@@ -304,7 +307,7 @@ class JaxTrainer:
         self.data_sharding = NamedSharding(self.mesh, PartitionSpec("data"))
 
         self.segment_frames = int(config.train.segment_size) // int(config.data.hop_length)
-        self.workers = min(8, os.cpu_count() or 1)
+        self.workers = min(16, max(2, os.cpu_count() or 1))
         self.log_interval = 200
         self.global_step = 0
         self.epoch = 1
@@ -312,14 +315,16 @@ class JaxTrainer:
         self.ema_updates = 0
         self.lr_schedule: dict | None = None
         self.logged_losses: tuple[float, float, float] | None = None
-        self.loss_sums = jax.device_put(jnp.zeros((6,), dtype=jnp.float32), self.replicated_sharding)
+        self.loss_sums = jax.device_put(np.zeros((6,), dtype=np.float32), self.replicated_sharding)
         self.batch_count = 0
         self.last_batch: tuple | None = None
         self.rng_key = jax.random.PRNGKey(int(getattr(config.train, "seed", 1234)))
 
         self.writer = None
         self.exporter: AsyncJaxInferenceExporter | None = None
+        self.ckpt_writer: AsyncJaxCheckpointWriter | None = None
         self.progress = None
+        self._compiled_steps: dict[tuple[int, int, int], Any] = {}
 
     def build_data(self) -> None:
         data = self.config.data
@@ -354,7 +359,7 @@ class JaxTrainer:
             self.sampler,
             hop_length=int(data.hop_length),
             num_workers=self.workers,
-            prefetch_batches=8,
+            prefetch_batches=16,
             cache_in_ram=bool(self.args.cache_data_in_gpu),
         )
 
@@ -479,12 +484,34 @@ class JaxTrainer:
             self.host_params_d = load_pretrained_torch_d(self.args.pretrained_d, self.mpd_cfg)
         return 1, 0, {}
 
+    @staticmethod
+    def _to_concrete_host(x: Any) -> Any:
+        if isinstance(x, np.ndarray):
+            return x
+        if isinstance(x, jax.Array):
+            if hasattr(jax.dtypes, "prng_key") and jax.dtypes.issubdtype(x.dtype, jax.dtypes.prng_key):
+                return x
+            return np.asarray(jax.device_get(x))
+        if isinstance(x, bool):
+            return np.bool_(x)
+        if isinstance(x, int):
+            return np.int32(x)
+        if isinstance(x, float):
+            return np.float32(x)
+        if isinstance(x, np.number):
+            return np.asarray(x)
+        return x
+
     def _put_replicated(self) -> None:
-        self.params_g = jax.device_put(jax.tree.map(jnp.asarray, self.host_params_g), self.replicated_sharding)
-        self.opt_state_g = jax.device_put(self.opt_state_g, self.replicated_sharding)
-        self.params_d = jax.device_put(jax.tree.map(jnp.asarray, self.host_params_d), self.replicated_sharding)
-        self.opt_state_d = jax.device_put(self.opt_state_d, self.replicated_sharding)
-        self.ema_params = jax.device_put(jax.tree.map(jnp.asarray, self.ema_params_host), self.replicated_sharding)
+        put_rep = lambda tree: jax.device_put(
+            jax.tree.map(self._to_concrete_host, tree), self.replicated_sharding
+        )
+        self.params_g = put_rep(self.host_params_g)
+        self.opt_state_g = put_rep(self.opt_state_g)
+        self.params_d = put_rep(self.host_params_d)
+        self.opt_state_d = put_rep(self.opt_state_d)
+        self.ema_params = put_rep(self.ema_params_host)
+        self.rng_key = put_rep(self.rng_key)
 
     def build_lr_schedule(self, saved: dict | None) -> None:
         target = {"total_steps": self.args.total_steps, "final_ratio": self.args.lr_final_ratio}
@@ -685,16 +712,7 @@ class JaxTrainer:
             )
 
         @jax.jit
-        def _mel_summary_arrays(spec_0, id_0, y_hat_0):
-            mel_all = spec_to_mel_jax(
-                spec_0[None, ...],
-                int(data_cfg.filter_length),
-                int(data_cfg.n_mel_channels),
-                int(data_cfg.sample_rate),
-                float(data_cfg.mel_fmin),
-                data_cfg.mel_fmax,
-            )
-            y_mel = slice_segments(mel_all, id_0[None], segment_frames) if syn_cfg.randomized else mel_all
+        def _mel_hat_array(y_hat_0):
             y_hat_mel = mel_spectrogram_jax(
                 y_hat_0[None, ...],
                 int(data_cfg.filter_length),
@@ -707,15 +725,79 @@ class JaxTrainer:
                 center=False,
             )
             # Transpose (TT, n_mels) -> (n_mels, TT) to match plot_spectrogram_to_numpy axes.
-            return y_mel[0].T, y_hat_mel[0].T, mel_all[0].T
+            return y_hat_mel[0].T
 
         self._step_fn = _step
-        self._mel_summary_fn = _mel_summary_arrays
+        self._mel_hat_fn = _mel_hat_array
+
+    def _warmup_step_buckets(self) -> None:
+        """Ahead-of-time compile all active static bucket shapes so training never stalls mid-epoch."""
+        self._compiled_steps.clear()
+        bucket_shapes = self.sampler.unique_batch_shapes()
+        if not bucket_shapes:
+            return
+
+        to_sds = lambda tree: jax.tree.map(
+            lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype, sharding=a.sharding), tree
+        )
+        p_g_sds = to_sds(self.params_g)
+        opt_g_sds = to_sds(self.opt_state_g)
+        p_d_sds = to_sds(self.params_d)
+        opt_d_sds = to_sds(self.opt_state_d)
+        ema_sds = to_sds(self.ema_params)
+        loss_sds = to_sds(self.loss_sums)
+        rng_sds = to_sds(self.rng_key)
+
+        hop_length = int(self.config.data.hop_length)
+        phone_dim = int(self.syn_cfg.text_enc_hidden_dim)
+        b_sharding = self.data_sharding
+
+        total = len(bucket_shapes)
+        print(f"Pre-compiling XLA training kernels for {total} bucket shape(s)...", flush=True)
+        for idx, (bs, frames) in enumerate(bucket_shapes, start=1):
+            wave_frames = frames * hop_length
+            batch_sds = (
+                jax.ShapeDtypeStruct((bs, frames, phone_dim), jnp.float32, sharding=b_sharding),
+                jax.ShapeDtypeStruct((bs,), jnp.int32, sharding=b_sharding),
+                jax.ShapeDtypeStruct((bs, frames), jnp.int32, sharding=b_sharding),
+                jax.ShapeDtypeStruct((bs, frames), jnp.float32, sharding=b_sharding),
+                jax.ShapeDtypeStruct((bs,), jnp.int32, sharding=b_sharding),
+                jax.ShapeDtypeStruct((bs, wave_frames, 1), jnp.float32, sharding=b_sharding),
+                jax.ShapeDtypeStruct((bs,), jnp.int32, sharding=b_sharding),
+                jax.ShapeDtypeStruct((bs,), jnp.int32, sharding=b_sharding),
+            )
+            t0 = time.perf_counter()
+            compiled = self._step_fn.lower(
+                p_g_sds,
+                opt_g_sds,
+                p_d_sds,
+                opt_d_sds,
+                ema_sds,
+                loss_sds,
+                jax.ShapeDtypeStruct((), jnp.float32, sharding=self.replicated_sharding),
+                jax.ShapeDtypeStruct((), jnp.float32, sharding=self.replicated_sharding),
+                jax.ShapeDtypeStruct((), jnp.float32, sharding=self.replicated_sharding),
+                jax.ShapeDtypeStruct((), jnp.bool_, sharding=self.replicated_sharding),
+                rng_sds,
+                batch_sds,
+            ).compile()
+            self._compiled_steps[(bs, frames, wave_frames)] = compiled
+            dt = time.perf_counter() - t0
+            print(
+                f"  [{idx}/{total}] compiled (batch={bs}, frames={frames}, wave={wave_frames}) in {dt:.1f}s",
+                flush=True,
+            )
+
+        seg_samples = int(self.config.train.segment_size)
+        try:
+            self._mel_hat_fn.lower(
+                jax.ShapeDtypeStruct((seg_samples, 1), jnp.float32, sharding=self.replicated_sharding)
+            ).compile()
+        except Exception:
+            pass
 
     def _shard_batch(self, np_batch):
-        if self.num_devices == 1:
-            return tuple(jax.device_put(x, self.devices[0]) for x in np_batch)
-        return tuple(jax.device_put(x, self.data_sharding) for x in np_batch)
+        return jax.device_put(np_batch, self.data_sharding)
 
     def _next_ema_lerp(self) -> float:
         if self.args.ema_decay <= 0:
@@ -784,8 +866,9 @@ class JaxTrainer:
         self.batch_count += 1
         if self.global_step % self.log_interval != 0:
             return
-        sums_np = np.asarray(jax.device_get(self.loss_sums), dtype=np.float32) / float(max(1, self.batch_count))
-        self.loss_sums = jax.device_put(jnp.zeros((6,), dtype=jnp.float32), self.replicated_sharding)
+        sums_raw, gn_d_np, gn_g_np = jax.device_get((self.loss_sums, gn_d, gn_g))
+        sums_np = np.asarray(sums_raw, dtype=np.float32) / float(max(1, self.batch_count))
+        self.loss_sums = jax.device_put(np.zeros((6,), dtype=np.float32), self.replicated_sharding)
         self.batch_count = 0
         self.logged_losses = (float(sums_np[0]), float(sums_np[1]), float(sums_np[4]))
         self.update_postfix()
@@ -801,35 +884,77 @@ class JaxTrainer:
                     "loss/g/fm": float(sums_np[3]),
                     "loss/g/mel": float(sums_np[4]),
                     "loss/g/kl": float(sums_np[5]),
-                    "grad/norm_d": float(jax.device_get(gn_d)),
-                    "grad/norm_g": float(jax.device_get(gn_g)),
+                    "grad/norm_d": float(gn_d_np),
+                    "grad/norm_g": float(gn_g_np),
                 },
             )
 
     def save(self, epoch: int, final: bool) -> None:
         args = self.args
+        data_cfg = self.config.data
+        use_ema = args.ema_decay > 0
+        if self.ckpt_writer is not None:
+            self.ckpt_writer.wait_for_completion()
+
+        summary_dev = None
         if self.writer is not None and self.last_batch is not None:
             spec_0, id_0, y_hat_0 = self.last_batch
-            y_m, yh_m, m_all = self._mel_summary_fn(spec_0, id_0, y_hat_0)
-            y_m_np, yh_m_np, m_all_np = jax.device_get((y_m, yh_m, m_all))
+            yh_m = self._mel_hat_fn(y_hat_0)
+            summary_dev = (yh_m, spec_0, id_0)
+
+        ema_dev = self.ema_params if use_ema else None
+        snapshot_dev = (
+            self.params_d,
+            self.opt_state_d,
+            self.params_g,
+            self.opt_state_g,
+            ema_dev,
+            self.rng_key,
+            summary_dev,
+        )
+        (
+            host_params_d,
+            host_opt_d,
+            host_params_g,
+            host_opt_g,
+            host_ema,
+            host_rng_key,
+            host_summary,
+        ) = jax.device_get(snapshot_dev)
+
+        if host_summary is not None and self.writer is not None:
+            yh_m_np, spec_0_np, id_0_np = host_summary
+            mel_all = spec_to_mel_np(
+                np.asarray(spec_0_np, dtype=np.float32)[None, ...],
+                int(data_cfg.filter_length),
+                int(data_cfg.n_mel_channels),
+                int(data_cfg.sample_rate),
+                float(data_cfg.mel_fmin),
+                data_cfg.mel_fmax,
+            )[0]
+            if self.syn_cfg.randomized:
+                start = max(0, min(int(id_0_np), mel_all.shape[0] - self.segment_frames))
+                y_m_np = mel_all[start : start + self.segment_frames].T
+            else:
+                y_m_np = mel_all.T
             summarize(
                 writer=self.writer,
                 global_step=self.global_step,
                 images={
                     "slice/mel_org": plot_spectrogram_to_numpy(y_m_np),
-                    "slice/mel_gen": plot_spectrogram_to_numpy(yh_m_np),
-                    "all/mel": plot_spectrogram_to_numpy(m_all_np),
+                    "slice/mel_gen": plot_spectrogram_to_numpy(np.asarray(yh_m_np, dtype=np.float32)),
+                    "all/mel": plot_spectrogram_to_numpy(mel_all.T),
                 },
             )
 
         weights_path = os.path.join(args.experiment_dir, f"{args.model_name}_{epoch}e_{self.global_step}s.pth")
-        export_src = self.ema_params if args.ema_decay > 0 else self.params_g
+        export_src_host = host_ema if use_ema else host_params_g
         if (args.save_every_weights or final) and not os.path.exists(weights_path):
             assert self.exporter is not None
-            self.exporter.submit(
-                export_src,
+            self.exporter.submit_host(
+                export_src_host,
                 self.syn_cfg,
-                sr=int(self.config.data.sample_rate),
+                sr=int(data_cfg.sample_rate),
                 name=args.model_name,
                 model_path=weights_path,
                 epoch=epoch,
@@ -843,7 +968,7 @@ class JaxTrainer:
             )
 
         suffix = LATEST_CHECKPOINT_SUFFIX if args.save_only_latest else self.global_step
-        rng_words = [int(w) for w in np.asarray(jax.device_get(self.rng_key), dtype=np.uint32).reshape(-1).tolist()]
+        rng_words = [int(w) for w in np.asarray(host_rng_key, dtype=np.uint32).reshape(-1).tolist()]
         gen_extra = {
             "step": self.global_step,
             "epoch_step": self.epoch_step,
@@ -856,25 +981,27 @@ class JaxTrainer:
 
         d_path = os.path.join(args.experiment_dir, f"D_{suffix}.npz")
         g_path = os.path.join(args.experiment_dir, f"G_{suffix}.npz")
-        save_jax_checkpoint(
-            d_path,
-            self.params_d,
-            self.opt_state_d,
-            self.config.train.learning_rate,
-            epoch,
-            extra={"step": self.global_step},
-        )
-        save_jax_checkpoint(
-            g_path,
-            self.params_g,
-            self.opt_state_g,
-            self.config.train.learning_rate,
-            epoch,
-            extra=gen_extra,
-            ema_params=self.ema_params if args.ema_decay > 0 else None,
-        )
-        if final and self.exporter is not None:
-            self.exporter.wait_for_completion()
+        jobs = [
+            (
+                (d_path, host_params_d, host_opt_d, self.config.train.learning_rate, epoch),
+                {"extra": {"step": self.global_step}},
+            ),
+            (
+                (g_path, host_params_g, host_opt_g, self.config.train.learning_rate, epoch),
+                {"extra": gen_extra, "ema_params": host_ema if use_ema else None},
+            ),
+        ]
+        if self.ckpt_writer is not None:
+            self.ckpt_writer.submit(jobs)
+        else:
+            for pos_args, kw_args in jobs:
+                save_jax_checkpoint(*pos_args, **kw_args)
+
+        if final:
+            if self.ckpt_writer is not None:
+                self.ckpt_writer.wait_for_completion()
+            if self.exporter is not None:
+                self.exporter.wait_for_completion()
 
     def train_epoch(self, epoch: int, start_batch: int) -> None:
         self.sampler.set_epoch(epoch, start_batch)
@@ -893,11 +1020,24 @@ class JaxTrainer:
             while cur_dev is not None:
                 if self.exporter is not None:
                     self.exporter.raise_if_failed()
+                if self.ckpt_writer is not None:
+                    self.ckpt_writer.raise_if_failed()
                 factor = self.current_lr_factor(epoch)
                 lr_g_val = base_lr * g_lr_coeff * factor
                 lr_d_val = base_lr * d_lr_coeff * factor
                 ema_lerp = self._next_ema_lerp()
                 log_norms = (self.global_step + 1) % self.log_interval == 0
+                step_key = (int(cur_dev[0].shape[0]), int(cur_dev[0].shape[1]), int(cur_dev[5].shape[1]))
+                step_fn = self._compiled_steps.get(step_key, self._step_fn)
+                lr_g_dev, lr_d_dev, ema_dev, log_norms_dev = jax.device_put(
+                    (
+                        np.float32(lr_g_val),
+                        np.float32(lr_d_val),
+                        np.float32(ema_lerp),
+                        np.bool_(log_norms),
+                    ),
+                    self.replicated_sharding,
+                )
 
                 (
                     self.params_g,
@@ -912,17 +1052,17 @@ class JaxTrainer:
                     y_hat_0,
                     id_0,
                     spec_0,
-                ) = self._step_fn(
+                ) = step_fn(
                     self.params_g,
                     self.opt_state_g,
                     self.params_d,
                     self.opt_state_d,
                     self.ema_params,
                     self.loss_sums,
-                    np.float32(lr_g_val),
-                    np.float32(lr_d_val),
-                    np.float32(ema_lerp),
-                    np.bool_(log_norms),
+                    lr_g_dev,
+                    lr_d_dev,
+                    ema_dev,
+                    log_norms_dev,
                     self.rng_key,
                     cur_dev,
                 )
@@ -959,12 +1099,15 @@ class JaxTrainer:
             purge_step=self.global_step + 1 if self.global_step else 0,
         )
         self.exporter = AsyncJaxInferenceExporter()
+        self.ckpt_writer = AsyncJaxCheckpointWriter()
         print(self.summary(epoch, start_batch, last_g))
 
         total_steps = self.args.total_steps
         finished = self.global_step >= total_steps
         if finished:
             print(f"{self.args.model_name} already reached step {total_steps}. Raise --total-steps to continue training.")
+        else:
+            self._warmup_step_buckets()
 
         self.progress = tqdm(
             total=max(total_steps, self.global_step),
@@ -981,6 +1124,8 @@ class JaxTrainer:
         finally:
             self.progress.close()
             self.loader.close()
+            if self.ckpt_writer is not None:
+                self.ckpt_writer.close()
             if self.exporter is not None:
                 self.exporter.close()
             if self.writer is not None:
