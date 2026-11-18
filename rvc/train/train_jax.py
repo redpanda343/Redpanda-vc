@@ -314,7 +314,7 @@ class JaxTrainer:
         self.data_sharding = NamedSharding(self.mesh, PartitionSpec("data"))
 
         self.segment_frames = int(config.train.segment_size) // int(config.data.hop_length)
-        self.workers = min(8, max(2, effective_cpu_count()))
+        self.workers = min(32, max(4, effective_cpu_count()))
         self.log_interval = 200
         self.global_step = 0
         self.epoch = 1
@@ -372,7 +372,7 @@ class JaxTrainer:
             self.sampler,
             hop_length=int(data.hop_length),
             num_workers=self.workers,
-            prefetch_batches=4,
+            prefetch_batches=12,
             cache_in_ram=bool(self.args.cache_data_in_gpu),
         )
 
@@ -1264,6 +1264,8 @@ class JaxTrainer:
         last_g, last_d = latest_checkpoint_pair(self.args.experiment_dir)
         self.build_models(last_g)
         epoch, start_batch, extra = self.restore(last_g, last_d)
+        if self.global_step < self.args.total_steps:
+            self.loader.start_warmup(epoch, start_batch)
         self._put_replicated()
         if self.args.lr_schedule == "cosine":
             self.build_lr_schedule(extra.get("lr_schedule"))

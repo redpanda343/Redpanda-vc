@@ -12,9 +12,10 @@ import math
 import os
 import queue
 import re
+import struct
 import threading
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Iterator, Mapping, Sequence
 
 import numpy as np
@@ -103,6 +104,62 @@ def _fast_load_npy(path: str, max_rows: int | None = None) -> np.ndarray:
             return arr.reshape((rows,) + tail_shape)
     except Exception:
         return np.load(path, allow_pickle=False)
+
+
+_DEFAULT_SF_READ = sf.read
+_PCM16_INV = np.float32(1.0 / 32768.0)
+
+
+def _fast_load_wav(path: str, max_samples: int | None = None) -> tuple[np.ndarray, int]:
+    """Read uncompressed mono PCM-16/float32 WAV directly without libsndfile seek overhead."""
+    if sf.read is not _DEFAULT_SF_READ or not path.lower().endswith(".wav"):
+        return sf.read(path, dtype="float32")
+    try:
+        with open(path, "rb") as f:
+            head = f.read(12)
+            if len(head) < 12 or head[:4] != b"RIFF" or head[8:12] != b"WAVE":
+                raise ValueError("Not RIFF/WAVE")
+            fmt_code = ch = sr = bits = 0
+            for _ in range(8):
+                chdr = f.read(8)
+                if len(chdr) < 8:
+                    break
+                cid = chdr[:4]
+                csize = int.from_bytes(chdr[4:8], "little")
+                if cid == b"fmt ":
+                    if csize < 16 or csize > 4096:
+                        raise ValueError("Invalid fmt chunk")
+                    fbody = f.read(csize)
+                    if len(fbody) < csize:
+                        raise ValueError("Short fmt chunk")
+                    if csize & 1:
+                        f.read(1)
+                    fmt_code, ch, sr, _, _, bits = struct.unpack("<HHIIHH", fbody[:16])
+                    if ch != 1 or not ((fmt_code == 1 and bits == 16) or (fmt_code == 3 and bits == 32)):
+                        raise ValueError("Unsupported WAV encoding for fast path")
+                elif cid == b"data":
+                    if sr <= 0 or bits <= 0:
+                        raise ValueError("Missing fmt before data")
+                    bw = bits // 8
+                    n_avail = csize // bw
+                    n_read = min(n_avail, int(max_samples)) if max_samples is not None else n_avail
+                    n_bytes = n_read * bw
+                    raw = f.read(n_bytes)
+                    if len(raw) != n_bytes:
+                        raise ValueError("Short WAV data")
+                    if fmt_code == 1:
+                        audio = np.frombuffer(raw, dtype="<i2").astype(np.float32)
+                        audio *= _PCM16_INV
+                    else:
+                        audio = np.array(np.frombuffer(raw, dtype="<f4"), dtype=np.float32, copy=True)
+                    return audio, int(sr)
+                else:
+                    if csize < 0:
+                        raise ValueError("Invalid chunk size")
+                    f.seek(csize + (csize & 1), os.SEEK_CUR)
+    except Exception:
+        pass
+    return sf.read(path, dtype="float32")
 
 
 def _hann_window_np(win_length: int) -> np.ndarray:
@@ -307,7 +364,7 @@ class TextAudioDataset:
         audiopath = self.audiopaths_and_text[index][0]
         phone_half, pitch, pitchf, sid, n_num = labels
 
-        audio, sr = sf.read(audiopath, dtype="float32")
+        audio, sr = _fast_load_wav(audiopath, max_samples=n_num * self.hop_length)
         if audio.ndim > 1:
             audio = audio[:, 0]
         if int(sr) != self.sample_rate:
@@ -572,14 +629,23 @@ class PrefetchBatchLoader:
         self._sample_cache: dict[int, tuple[Any, ...]] = {}
         self._sample_cache_bytes = 0
         self._sample_cache_lock = threading.Lock()
-        self._sample_cache_limit = max(0, min(int(avail * 0.35), avail - 3 * (1024 ** 3)))
+        self._sample_cache_limit = max(0, min(int(avail * 0.50), avail - 3 * (1024 ** 3)))
         self._label_cache: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, np.int32, int]] = {}
         self._label_cache_bytes = 0
-        self._label_cache_limit = max(0, min(int(avail * 0.50), avail - 2 * (1024 ** 3)))
+        self._label_cache_limit = max(0, min(int(avail * 0.65), avail - 2 * (1024 ** 3)))
+        self._inflight: dict[int, Future] = {}
+        self._closed = False
+        self._warmup_stop = threading.Event()
+        self._warmup_thread: threading.Thread | None = None
         self._mp_pool = None
-        self._pool = (
-            ThreadPoolExecutor(max_workers=max(1, self.num_workers))
+        self._pool_workers = (
+            min(64, max(16, self.num_workers * 4, effective_cpu_count() * 2))
             if self.num_workers > 0 and not self.use_multiprocessing
+            else 0
+        )
+        self._pool = (
+            ThreadPoolExecutor(max_workers=self._pool_workers)
+            if self._pool_workers > 0
             else None
         )
 
@@ -621,6 +687,81 @@ class PrefetchBatchLoader:
                     self._sample_cache_bytes += item_bytes
         return item
 
+    def _load_sample_tracked(self, idx: int):
+        try:
+            return self._get_item(idx)
+        finally:
+            with self._sample_cache_lock:
+                self._inflight.pop(idx, None)
+
+    def _submit_sample(self, idx: int) -> tuple[bool, Any]:
+        if self._cache is not None:
+            return True, self._cache[idx]
+        cached = self._sample_cache.get(idx)
+        if cached is not None:
+            return True, cached
+        with self._sample_cache_lock:
+            cached = self._sample_cache.get(idx)
+            if cached is not None:
+                return True, cached
+            if self._closed or self._pool is None:
+                return True, self._get_item(idx)
+            fut = self._inflight.get(idx)
+            if fut is None:
+                fut = self._pool.submit(self._load_sample_tracked, idx)
+                self._inflight[idx] = fut
+            return False, fut
+
+    def start_warmup(self, epoch: int, start_batch: int = 0) -> None:
+        """Pre-populate host RAM cache in Epoch batch order during XLA compilation."""
+        if (
+            self._sample_cache_limit <= 0
+            or self.cache_in_ram
+            or self.use_multiprocessing
+            or self._pool is None
+            or self._closed
+        ):
+            return
+        self.stop_warmup(wait=True)
+        self._warmup_stop.clear()
+        self.sampler.set_epoch(epoch, start_batch)
+        specs = list(iter(self.sampler))
+        if not specs:
+            return
+
+        def _warmup_worker() -> None:
+            seen: set[int] = set()
+            pending: deque[Future] = deque()
+            max_pending = min(96, max(16, self._pool_workers * 2))
+            try:
+                for _, indices in specs:
+                    for idx in indices:
+                        if self._warmup_stop.is_set() or self._closed:
+                            return
+                        if self._sample_cache_bytes >= int(self._sample_cache_limit * 0.98):
+                            return
+                        if idx in seen:
+                            continue
+                        seen.add(idx)
+                        ready, item = self._submit_sample(idx)
+                        if not ready:
+                            pending.append(item)
+                            if len(pending) >= max_pending:
+                                pending.popleft().result()
+                while pending and not self._warmup_stop.is_set() and not self._closed:
+                    pending.popleft().result()
+            except Exception:
+                return
+
+        self._warmup_thread = threading.Thread(target=_warmup_worker, daemon=True)
+        self._warmup_thread.start()
+
+    def stop_warmup(self, wait: bool = False) -> None:
+        self._warmup_stop.set()
+        if wait and self._warmup_thread is not None:
+            self._warmup_thread.join(timeout=5.0)
+            self._warmup_thread = None
+
     def _prepare_batch(self, spec_pair: tuple[int | None, list[int]]):
         target_frames, indices = spec_pair
         rows = [self._get_item(i) for i in indices]
@@ -643,6 +784,7 @@ class PrefetchBatchLoader:
             self._cache = [self.dataset[i] for i in indices]
 
     def __iter__(self):
+        self.stop_warmup(wait=False)
         self._ensure_cache()
         specs = list(iter(self.sampler))
         if not specs:
@@ -669,32 +811,60 @@ class PrefetchBatchLoader:
         out_queue: queue.Queue = queue.Queue(maxsize=self.prefetch_batches)
         stop_event = threading.Event()
         sentinel = object()
-        max_in_flight = self.prefetch_batches
+        max_sample_budget = max(128, self._pool_workers * 3)
+        batch_window = max(self.prefetch_batches, 4)
 
         def _producer() -> None:
-            pending: deque = deque()
+            pending_batches: deque[tuple[int | None, list[tuple[bool, Any]]]] = deque()
             spec_iter = iter(specs)
+            in_flight_futs = 0
             try:
-                while len(pending) < max_in_flight:
-                    sp = next(spec_iter, None)
-                    if sp is None:
-                        break
-                    pending.append(self._pool.submit(self._prepare_batch, sp))
+                while True:
+                    while len(pending_batches) < batch_window and (
+                        not pending_batches or in_flight_futs < max_sample_budget
+                    ):
+                        sp = next(spec_iter, None)
+                        if sp is None:
+                            break
+                        target_frames, indices = sp
+                        slots = [self._submit_sample(i) for i in indices]
+                        in_flight_futs += sum(1 for ready, _ in slots if not ready)
+                        pending_batches.append((target_frames, slots))
 
-                while pending and not stop_event.is_set():
-                    fut = pending.popleft()
-                    res = fut.result()
+                    if not pending_batches or stop_event.is_set():
+                        break
+
+                    target_frames, slots = pending_batches.popleft()
+                    rows = []
+                    for ready, item in slots:
+                        if ready:
+                            rows.append(item)
+                        else:
+                            rows.append(item.result())
+                            in_flight_futs -= 1
                     if stop_event.is_set():
                         break
-                    out_queue.put(res)
-                    sp = next(spec_iter, None)
-                    if sp is not None and not stop_event.is_set():
-                        pending.append(self._pool.submit(self._prepare_batch, sp))
+                    batch = collate_nwc_batch(
+                        rows,
+                        self.hop_length,
+                        target_frames=target_frames,
+                        allowed_frames=self.allowed_frames,
+                        phone_half=self.phone_half,
+                    )
+                    while not stop_event.is_set():
+                        try:
+                            out_queue.put(batch, timeout=0.05)
+                            break
+                        except queue.Full:
+                            continue
             except BaseException as exc:
-                out_queue.put(exc)
+                while not stop_event.is_set():
+                    try:
+                        out_queue.put(exc, timeout=0.05)
+                        break
+                    except queue.Full:
+                        continue
             finally:
-                for fut in pending:
-                    fut.cancel()
                 out_queue.put(sentinel)
 
         thread = threading.Thread(target=_producer, daemon=True)
@@ -718,6 +888,10 @@ class PrefetchBatchLoader:
             thread.join(timeout=2.0)
 
     def close(self) -> None:
+        self.stop_warmup(wait=True)
+        with self._sample_cache_lock:
+            self._closed = True
+            self._inflight.clear()
         self._sample_cache.clear()
         self._sample_cache_bytes = 0
         self._label_cache.clear()
