@@ -339,7 +339,7 @@ class JaxTrainer:
         self.dataset = TextAudioDataset(
             data,
             compute_spec=False,
-            repeat_phone=True,
+            repeat_phone=False,
             phone_dtype=np.float32,
         )
         use_tpu_buckets = self.platform in ("tpu", "gpu")

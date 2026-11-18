@@ -110,7 +110,12 @@ _DEFAULT_SF_READ = sf.read
 _PCM16_INV = np.float32(1.0 / 32768.0)
 
 
-def _fast_load_wav(path: str, max_samples: int | None = None) -> tuple[np.ndarray, int]:
+def _fast_load_wav(
+    path: str,
+    max_samples: int | None = None,
+    *,
+    allow_int16: bool = False,
+) -> tuple[np.ndarray, int]:
     """Read uncompressed mono PCM-16/float32 WAV directly without libsndfile seek overhead."""
     if sf.read is not _DEFAULT_SF_READ or not path.lower().endswith(".wav"):
         return sf.read(path, dtype="float32")
@@ -148,7 +153,10 @@ def _fast_load_wav(path: str, max_samples: int | None = None) -> tuple[np.ndarra
                     if len(raw) != n_bytes:
                         raise ValueError("Short WAV data")
                     if fmt_code == 1:
-                        audio = np.frombuffer(raw, dtype="<i2").astype(np.float32)
+                        pcm = np.frombuffer(raw, dtype="<i2")
+                        if allow_int16:
+                            return np.array(pcm, dtype=np.int16, copy=True), int(sr)
+                        audio = pcm.astype(np.float32)
                         audio *= _PCM16_INV
                     else:
                         audio = np.array(np.frombuffer(raw, dtype="<f4"), dtype=np.float32, copy=True)
@@ -359,12 +367,15 @@ class TextAudioDataset:
         self,
         index: int,
         labels: tuple[np.ndarray, np.ndarray, np.ndarray, np.int32, int],
+        *,
+        allow_pcm16: bool = False,
     ) -> tuple[np.ndarray | None, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.int32]:
         """Load WAV waveform and align with pre-loaded labels."""
         audiopath = self.audiopaths_and_text[index][0]
         phone_half, pitch, pitchf, sid, n_num = labels
 
-        audio, sr = _fast_load_wav(audiopath, max_samples=n_num * self.hop_length)
+        keep_i16 = bool(allow_pcm16 and not self.compute_spec)
+        audio, sr = _fast_load_wav(audiopath, max_samples=n_num * self.hop_length, allow_int16=keep_i16)
         if audio.ndim > 1:
             audio = audio[:, 0]
         if int(sr) != self.sample_rate:
@@ -373,8 +384,11 @@ class TextAudioDataset:
         n_frames_audio = min(len(audio) // self.hop_length, self.max_sample_frames)
         len_min = min(n_num, n_frames_audio)
         len_wav = len_min * self.hop_length
-        audio = np.asarray(audio[:len_wav], dtype=np.float32)
-        wav = audio[:, None]  # (T_wav, 1) NWC
+        if keep_i16 and audio.dtype == np.int16:
+            wav = np.ascontiguousarray(audio[:len_wav], dtype=np.int16)[:, None]
+        else:
+            audio_f32 = np.asarray(audio[:len_wav], dtype=np.float32)
+            wav = audio_f32[:, None]  # (T_wav, 1) NWC
 
         if len_min < n_num:
             phone_use = phone_half[: (len_min + 1) // 2, :]
@@ -385,7 +399,7 @@ class TextAudioDataset:
 
         phone = np.repeat(phone_use, 2, axis=0)[:len_min, :] if self.repeat_phone else phone_use
         spec = (
-            spectrogram_np(np.ascontiguousarray(audio, dtype=np.float32), self.filter_length, self.hop_length, self.win_length)
+            spectrogram_np(np.ascontiguousarray(wav[:, 0], dtype=np.float32), self.filter_length, self.hop_length, self.win_length)
             if self.compute_spec
             else None
         )
@@ -565,7 +579,10 @@ def collate_nwc_batch(
             spec_padded[i, :s_len, :] = spec
             if s_len < frames:
                 spec_padded[i, s_len:, :] = 0.0
-        wave_padded[i, :w_len, :] = wav
+        if wav.dtype == np.int16:
+            np.multiply(wav.astype(np.float32), _PCM16_INV, out=wave_padded[i, :w_len, :])
+        else:
+            wave_padded[i, :w_len, :] = wav
         if w_len < wave_frames:
             wave_padded[i, w_len:, :] = 0.0
         phone_padded[i, :p_len, :] = phone
@@ -602,8 +619,311 @@ def collate_nwc_batch(
     )
 
 
+_PACK_TOC_STRUCT = struct.Struct("<qqiiiiiBBH")
+_DISK_PACK_MIN_CLIPS = 64
+_HAS_PREAD = hasattr(os, "pread")
+
+
+def _dataset_pack_fingerprint(dataset: Any) -> dict[str, Any] | None:
+    """Return metadata fingerprint describing dataset pack compatibility, or None if ineligible."""
+    tf = getattr(dataset, "training_files", "")
+    if not tf or not os.path.isfile(tf) or bool(getattr(dataset, "compute_spec", False)):
+        return None
+    try:
+        st = os.stat(tf)
+    except OSError:
+        return None
+    return {
+        "version": 1,
+        "n_items": len(dataset),
+        "repeat_phone": bool(getattr(dataset, "repeat_phone", True)),
+        "phone_dtype": np.dtype(getattr(dataset, "phone_dtype", np.float32)).name,
+        "filelist_size": int(st.st_size),
+        "filelist_mtime_ns": int(st.st_mtime_ns),
+    }
+
+
+def _pack_payload_nbytes(
+    phone_rows: int,
+    phone_dim: int,
+    wav_len: int,
+    frames_len: int,
+    wav_is_int16: int,
+    phone_is_f16: int,
+) -> int:
+    ph_item = 2 if phone_is_f16 else 4
+    wv_item = 2 if wav_is_int16 else 4
+    return (
+        int(phone_rows) * int(phone_dim) * ph_item
+        + int(wav_len) * wv_item
+        + int(frames_len) * 8  # int32 pitch + float32 pitchf
+    )
+
+
+class _DatasetPackStore:
+    """Append-only contiguous mmap/pread binary cache eliminating loose overlayfs small-file reads."""
+
+    def __init__(self, base_path: str, fingerprint: Mapping[str, Any]) -> None:
+        self.bin_path = f"{base_path}.pack.bin"
+        self.toc_path = f"{base_path}.pack.toc"
+        self.meta_path = f"{base_path}.pack.meta.json"
+        self._fingerprint = dict(fingerprint)
+        self._entries: dict[int, tuple[int, int, int, int, int, int, int, int]] = {}
+        self._queued: set[int] = set()
+        self._lock = threading.Lock()
+        self._read_lock = threading.Lock()
+        self._closed = False
+        self._read_fd = -1
+        self._append_offset = 0
+        self._stop_sentinel = object()
+        self._write_q: queue.Queue = queue.Queue(maxsize=512)
+
+        valid_entries: dict[int, tuple[int, int, int, int, int, int, int, int]] = {}
+        valid_toc_chunks: list[bytes] = []
+        max_end = 0
+        reuse = False
+        n_items = int(fingerprint["n_items"])
+
+        try:
+            if (
+                os.path.isfile(self.meta_path)
+                and os.path.isfile(self.bin_path)
+                and os.path.isfile(self.toc_path)
+            ):
+                with open(self.meta_path, "r", encoding="utf-8") as mf:
+                    existing_meta = json.load(mf)
+                if existing_meta == self._fingerprint:
+                    reuse = True
+                    bin_size = os.path.getsize(self.bin_path)
+                    with open(self.toc_path, "rb") as tf:
+                        toc_raw = tf.read()
+                    usable = (len(toc_raw) // _PACK_TOC_STRUCT.size) * _PACK_TOC_STRUCT.size
+                    need_rewrite = usable != len(toc_raw)
+                    for pos in range(0, usable, _PACK_TOC_STRUCT.size):
+                        rec_bytes = toc_raw[pos : pos + _PACK_TOC_STRUCT.size]
+                        idx_i, off, pr, pd, wl, fl, sid_i, w16, p16, _ = _PACK_TOC_STRUCT.unpack(rec_bytes)
+                        if idx_i < 0 or idx_i >= n_items or off < 0 or pr < 0 or pd <= 0 or wl < 0 or fl < 0:
+                            need_rewrite = True
+                            continue
+                        nbytes = _pack_payload_nbytes(pr, pd, wl, fl, w16, p16)
+                        if off + nbytes > bin_size:
+                            need_rewrite = True
+                            continue
+                        valid_entries[idx_i] = (off, pr, pd, wl, fl, sid_i, w16, p16)
+                        valid_toc_chunks.append(rec_bytes)
+                        if off + nbytes > max_end:
+                            max_end = off + nbytes
+                    if need_rewrite:
+                        with open(self.toc_path, "wb") as tf:
+                            if valid_toc_chunks:
+                                tf.write(b"".join(valid_toc_chunks))
+                        with open(self.bin_path, "r+b") as bf:
+                            bf.truncate(max_end)
+        except Exception:
+            reuse = False
+            valid_entries.clear()
+            max_end = 0
+
+        if not reuse:
+            for p in (self.bin_path, self.toc_path, self.meta_path):
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                except OSError:
+                    pass
+            with open(self.meta_path, "w", encoding="utf-8") as mf:
+                json.dump(self._fingerprint, mf)
+            with open(self.bin_path, "wb"):
+                pass
+            with open(self.toc_path, "wb"):
+                pass
+
+        self._entries = valid_entries
+        self._append_offset = max_end
+        self._read_fd = os.open(self.bin_path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        self._write_bin = open(self.bin_path, "r+b")
+        self._write_bin.seek(self._append_offset)
+        self._write_toc = open(self.toc_path, "r+b")
+        self._write_toc.seek(0, os.SEEK_END)
+        self._writer_thread = threading.Thread(target=self._writer_loop, daemon=True)
+        self._writer_thread.start()
+
+    def _read_exact_at(self, offset: int, nbytes: int) -> bytes | None:
+        fd = self._read_fd
+        if fd < 0 or self._closed:
+            return None
+        if _HAS_PREAD:
+            chunks: list[bytes] = []
+            got = 0
+            while got < nbytes:
+                try:
+                    chunk = os.pread(fd, nbytes - got, offset + got)
+                except OSError:
+                    return None
+                if not chunk:
+                    return None
+                chunks.append(chunk)
+                got += len(chunk)
+            return chunks[0] if len(chunks) == 1 else b"".join(chunks)
+
+        with self._read_lock:
+            fd = self._read_fd
+            if fd < 0 or self._closed:
+                return None
+            try:
+                os.lseek(fd, offset, os.SEEK_SET)
+                chunks = []
+                got = 0
+                while got < nbytes:
+                    chunk = os.read(fd, nbytes - got)
+                    if not chunk:
+                        return None
+                    chunks.append(chunk)
+                    got += len(chunk)
+                return chunks[0] if len(chunks) == 1 else b"".join(chunks)
+            except OSError:
+                return None
+
+    def read_item(self, idx: int) -> tuple[None, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.int32] | None:
+        entry = self._entries.get(idx)
+        if entry is None or self._closed:
+            return None
+        off, pr, pd, wl, fl, sid_i, w16, p16 = entry
+        total_bytes = _pack_payload_nbytes(pr, pd, wl, fl, w16, p16)
+        buf = self._read_exact_at(off, total_bytes)
+        if buf is None or len(buf) != total_bytes:
+            return None
+
+        ph_dt = np.float16 if p16 else np.float32
+        wv_dt = np.int16 if w16 else np.float32
+        ph_bytes = pr * pd * (2 if p16 else 4)
+        wv_bytes = wl * (2 if w16 else 4)
+        pt_bytes = fl * 4
+
+        phone = np.array(np.frombuffer(buf, dtype=ph_dt, count=pr * pd, offset=0).reshape(pr, pd), copy=True)
+        wav = np.array(np.frombuffer(buf, dtype=wv_dt, count=wl, offset=ph_bytes).reshape(wl, 1), copy=True)
+        pitch = np.array(np.frombuffer(buf, dtype=np.int32, count=fl, offset=ph_bytes + wv_bytes), copy=True)
+        pitchf = np.array(np.frombuffer(buf, dtype=np.float32, count=fl, offset=ph_bytes + wv_bytes + pt_bytes), copy=True)
+        return None, wav, phone, pitch, pitchf, np.int32(sid_i)
+
+    def enqueue(self, idx: int, item: tuple[Any, ...]) -> None:
+        if self._closed or idx in self._entries:
+            return
+        with self._lock:
+            if self._closed or idx in self._entries or idx in self._queued:
+                return
+            self._queued.add(idx)
+        try:
+            self._write_q.put_nowait((idx, item))
+        except queue.Full:
+            with self._lock:
+                self._queued.discard(idx)
+
+    def _writer_loop(self) -> None:
+        while True:
+            first = self._write_q.get()
+            if first is self._stop_sentinel:
+                break
+            batch = [first]
+            while len(batch) < 32:
+                try:
+                    nxt = self._write_q.get_nowait()
+                except queue.Empty:
+                    break
+                if nxt is self._stop_sentinel:
+                    self._flush_records(batch)
+                    return
+                batch.append(nxt)
+            self._flush_records(batch)
+
+    def _flush_records(self, batch: list[tuple[int, tuple[Any, ...]]]) -> None:
+        data_chunks: list[bytes] = []
+        toc_chunks: list[bytes] = []
+        staged: list[tuple[int, tuple[int, int, int, int, int, int, int, int]]] = []
+        cursor = self._append_offset
+
+        for idx, item in batch:
+            if idx in self._entries:
+                with self._lock:
+                    self._queued.discard(idx)
+                continue
+            _, wav, phone, pitch, pitchf, sid = item
+            ph_c = np.ascontiguousarray(phone)
+            wv_c = np.ascontiguousarray(wav)
+            pt_c = np.ascontiguousarray(pitch, dtype=np.int32)
+            pf_c = np.ascontiguousarray(pitchf, dtype=np.float32)
+
+            p16 = 1 if ph_c.dtype == np.float16 else 0
+            w16 = 1 if wv_c.dtype == np.int16 else 0
+            if not p16 and ph_c.dtype != np.float32:
+                ph_c = np.ascontiguousarray(ph_c, dtype=np.float32)
+            if not w16 and wv_c.dtype != np.float32:
+                wv_c = np.ascontiguousarray(wv_c, dtype=np.float32)
+
+            pr, pd = int(ph_c.shape[0]), int(ph_c.shape[1])
+            wl = int(wv_c.shape[0])
+            fl = int(pt_c.shape[0])
+            sid_i = int(sid)
+
+            raw_bytes = ph_c.tobytes() + wv_c.tobytes() + pt_c.tobytes() + pf_c.tobytes()
+            data_chunks.append(raw_bytes)
+            toc_chunks.append(_PACK_TOC_STRUCT.pack(idx, cursor, pr, pd, wl, fl, sid_i, w16, p16, 0))
+            staged.append((idx, (cursor, pr, pd, wl, fl, sid_i, w16, p16)))
+            cursor += len(raw_bytes)
+
+        if data_chunks:
+            self._write_bin.write(b"".join(data_chunks))
+            self._write_bin.flush()
+            self._write_toc.write(b"".join(toc_chunks))
+            self._write_toc.flush()
+            self._append_offset = cursor
+            with self._lock:
+                for idx, entry in staged:
+                    self._entries[idx] = entry
+                    self._queued.discard(idx)
+        else:
+            with self._lock:
+                for idx, _ in batch:
+                    self._queued.discard(idx)
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        while True:
+            try:
+                self._write_q.put(self._stop_sentinel, timeout=0.05)
+                break
+            except queue.Full:
+                try:
+                    dropped = self._write_q.get_nowait()
+                    if dropped is self._stop_sentinel:
+                        break
+                except queue.Empty:
+                    pass
+        self._writer_thread.join(timeout=5.0)
+        try:
+            self._write_bin.flush()
+            self._write_bin.close()
+        except OSError:
+            pass
+        try:
+            self._write_toc.flush()
+            self._write_toc.close()
+        except OSError:
+            pass
+        with self._read_lock:
+            if self._read_fd >= 0:
+                try:
+                    os.close(self._read_fd)
+                except OSError:
+                    pass
+                self._read_fd = -1
+
+
 class PrefetchBatchLoader:
-    """Multi-process / threaded NumPy batch prefetcher + optional RAM cache for high TPU throughput."""
+    """Multi-process / threaded NumPy batch prefetcher + optional RAM/mmap pack cache for high TPU throughput."""
 
     def __init__(
         self,
@@ -614,6 +934,7 @@ class PrefetchBatchLoader:
         prefetch_batches: int = 8,
         cache_in_ram: bool = False,
         use_multiprocessing: bool | None = None,
+        enable_disk_pack: bool | None = None,
     ) -> None:
         self.dataset = dataset
         self.sampler = sampler
@@ -629,18 +950,18 @@ class PrefetchBatchLoader:
         self._sample_cache: dict[int, tuple[Any, ...]] = {}
         self._sample_cache_bytes = 0
         self._sample_cache_lock = threading.Lock()
-        self._sample_cache_limit = max(0, min(int(avail * 0.50), avail - 3 * (1024 ** 3)))
+        self._sample_cache_limit = max(0, min(int(avail * 0.65), avail - 4 * (1024 ** 3)))
         self._label_cache: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, np.int32, int]] = {}
         self._label_cache_bytes = 0
-        self._label_cache_limit = max(0, min(int(avail * 0.65), avail - 2 * (1024 ** 3)))
+        self._label_cache_limit = max(0, min(int(avail * 0.72), avail - 3 * (1024 ** 3)))
         self._inflight: dict[int, Future] = {}
         self._warmup_stop = threading.Event()
         self._warmup_thread: threading.Thread | None = None
         self._closed = False
         self._mp_pool = None
-        # Overlayfs random-read IOPS peaks at ~8-12 threads; higher thread counts degrade throughput.
+        # Overlayfs random-read IOPS peaks at ~8 threads; higher thread counts degrade throughput.
         self._pool_workers = (
-            min(12, max(4, self.num_workers))
+            min(8, max(4, self.num_workers))
             if self.num_workers > 0 and not self.use_multiprocessing
             else 0
         )
@@ -649,6 +970,18 @@ class PrefetchBatchLoader:
             if self._pool_workers > 0
             else None
         )
+        self._pack_store: _DatasetPackStore | None = None
+        if not self.use_multiprocessing:
+            fp = _dataset_pack_fingerprint(dataset)
+            should_pack = (
+                fp is not None
+                and (bool(enable_disk_pack) if enable_disk_pack is not None else len(dataset) >= _DISK_PACK_MIN_CLIPS)
+            )
+            if should_pack and fp is not None:
+                try:
+                    self._pack_store = _DatasetPackStore(str(dataset.training_files), fp)
+                except OSError:
+                    self._pack_store = None
 
     def _get_item(self, idx: int):
         if self._cache is not None:
@@ -656,13 +989,26 @@ class PrefetchBatchLoader:
         cached = self._sample_cache.get(idx)
         if cached is not None:
             return cached
+        if self._pack_store is not None:
+            packed = self._pack_store.read_item(idx)
+            if packed is not None:
+                if self._sample_cache_limit > 0 and self._sample_cache_bytes < self._sample_cache_limit:
+                    item_bytes = _sample_nbytes(packed)
+                    with self._sample_cache_lock:
+                        if idx not in self._sample_cache and self._sample_cache_bytes + item_bytes <= self._sample_cache_limit:
+                            self._sample_cache[idx] = packed
+                            self._sample_cache_bytes += item_bytes
+                return packed
+
         cached_lbl = self._label_cache.get(idx)
         if cached_lbl is not None:
-            return self.dataset.load_item_with_cached_labels(idx, cached_lbl)
+            return self.dataset.load_item_with_cached_labels(idx, cached_lbl, allow_pcm16=True)
 
         if hasattr(self.dataset, "load_labels"):
             labels = self.dataset.load_labels(idx)
-            item = self.dataset.load_item_with_cached_labels(idx, labels)
+            item = self.dataset.load_item_with_cached_labels(idx, labels, allow_pcm16=True)
+            if self._pack_store is not None:
+                self._pack_store.enqueue(idx, item)
             if (self._sample_cache_bytes + self._label_cache_bytes) < self._label_cache_limit:
                 item_bytes = _sample_nbytes(item)
                 lbl_bytes = _sample_nbytes(labels[:3])
@@ -797,15 +1143,20 @@ class PrefetchBatchLoader:
             phone_half=self.phone_half,
         )
 
+    def _load_for_cache(self, idx: int):
+        if hasattr(self.dataset, "load_labels"):
+            return self.dataset.load_item_with_cached_labels(idx, self.dataset.load_labels(idx), allow_pcm16=True)
+        return self.dataset[idx]
+
     def _ensure_cache(self) -> None:
         if not self.cache_in_ram or self._cache is not None:
             return
         indices = list(range(len(self.dataset)))
         print(f"Caching {len(indices)} training samples into host RAM...", flush=True)
         if self._pool is not None:
-            self._cache = list(self._pool.map(self.dataset.__getitem__, indices))
+            self._cache = list(self._pool.map(self._load_for_cache, indices))
         else:
-            self._cache = [self.dataset[i] for i in indices]
+            self._cache = [self._load_for_cache(i) for i in indices]
 
     def __iter__(self):
         self._ensure_cache()
@@ -836,8 +1187,8 @@ class PrefetchBatchLoader:
         out_queue: queue.Queue = queue.Queue(maxsize=self.prefetch_batches)
         stop_event = threading.Event()
         sentinel = object()
-        max_sample_budget = max(64, self._pool_workers * 4)
-        batch_window = max(self.prefetch_batches, 4)
+        max_sample_budget = max(192, self._pool_workers * 24)
+        batch_window = max(self.prefetch_batches, 6)
 
         def _producer() -> None:
             pending_batches: deque[tuple[int | None, list[tuple[bool, Any]]]] = deque()
@@ -926,6 +1277,9 @@ class PrefetchBatchLoader:
         self._sample_cache_bytes = 0
         self._label_cache.clear()
         self._label_cache_bytes = 0
+        if self._pack_store is not None:
+            self._pack_store.close()
+            self._pack_store = None
         if self._mp_pool is not None:
             self._mp_pool.close()
             self._mp_pool = None
