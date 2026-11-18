@@ -7,16 +7,26 @@ never touch TPU/PJRT or GPU contexts.
 from __future__ import annotations
 
 import ctypes
+import io
 import json
 import math
 import os
 import queue
 import re
+import shutil
 import struct
+import subprocess
+import tarfile
+import tempfile
 import threading
-from collections import deque
+from collections import Counter, OrderedDict, deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Iterator, Mapping, Sequence
+
+try:
+    import resource
+except ImportError:
+    resource = None
 
 import numpy as np
 import soundfile as sf
@@ -68,46 +78,116 @@ _NPY_FORTRAN_RE = re.compile(r"['\"]fortran_order['\"]\s*:\s*(True|False)")
 _NPY_SHAPE_RE = re.compile(r"['\"]shape['\"]\s*:\s*\(([^)]*)\)")
 
 
+def _parse_npy_fileobj(f, max_rows: int | None = None, *, raw_buf: bytes | None = None) -> np.ndarray:
+    """Parse C-contiguous .npy header from binary stream and read up to `max_rows`."""
+    prefix = f.read(8)
+    if len(prefix) != 8 or prefix[:6] != b"\x93NUMPY":
+        raise ValueError("Not an NPY file")
+    major = prefix[6]
+    if major == 1:
+        hlen = int.from_bytes(f.read(2), "little")
+    elif major == 2:
+        hlen = int.from_bytes(f.read(4), "little")
+    else:
+        raise ValueError(f"Unsupported NPY version {major}")
+    hdr = f.read(hlen).decode("latin1")
+    m_descr = _NPY_DESCR_RE.search(hdr)
+    m_fort = _NPY_FORTRAN_RE.search(hdr)
+    m_shape = _NPY_SHAPE_RE.search(hdr)
+    if not (m_descr and m_fort and m_shape) or m_fort.group(1) != "False":
+        raise ValueError("Non-standard NPY header")
+    dtype = np.dtype(m_descr.group(2))
+    if dtype.hasobject:
+        raise ValueError("Object arrays require np.load validation")
+    dims = [int(tok.strip()) for tok in m_shape.group(1).split(",") if tok.strip()]
+    if not dims:
+        raise ValueError("Empty scalar shape")
+    rows = min(dims[0], int(max_rows)) if max_rows is not None else dims[0]
+    tail_shape = tuple(dims[1:])
+    row_stride = math.prod(tail_shape) if tail_shape else 1
+    count = rows * row_stride
+    if raw_buf is not None:
+        arr = np.frombuffer(raw_buf, dtype=dtype, count=count, offset=f.tell()).copy()
+    else:
+        arr = np.fromfile(f, dtype=dtype, count=count)
+    if arr.size != count:
+        raise ValueError("Short NPY read")
+    return arr.reshape((rows,) + tail_shape)
+
+
 def _fast_load_npy(path: str, max_rows: int | None = None) -> np.ndarray:
     """Parse C-contiguous .npy header directly and read up to `max_rows` without ast.literal_eval."""
     try:
         with open(path, "rb") as f:
-            prefix = f.read(8)
-            if len(prefix) != 8 or prefix[:6] != b"\x93NUMPY":
-                raise ValueError("Not an NPY file")
-            major = prefix[6]
-            if major == 1:
-                hlen = int.from_bytes(f.read(2), "little")
-            elif major == 2:
-                hlen = int.from_bytes(f.read(4), "little")
-            else:
-                raise ValueError(f"Unsupported NPY version {major}")
-            hdr = f.read(hlen).decode("latin1")
-            m_descr = _NPY_DESCR_RE.search(hdr)
-            m_fort = _NPY_FORTRAN_RE.search(hdr)
-            m_shape = _NPY_SHAPE_RE.search(hdr)
-            if not (m_descr and m_fort and m_shape) or m_fort.group(1) != "False":
-                raise ValueError("Non-standard NPY header")
-            dtype = np.dtype(m_descr.group(2))
-            if dtype.hasobject:
-                raise ValueError("Object arrays require np.load validation")
-            dims = [int(tok.strip()) for tok in m_shape.group(1).split(",") if tok.strip()]
-            if not dims:
-                raise ValueError("Empty scalar shape")
-            rows = min(dims[0], int(max_rows)) if max_rows is not None else dims[0]
-            tail_shape = tuple(dims[1:])
-            row_stride = math.prod(tail_shape) if tail_shape else 1
-            count = rows * row_stride
-            arr = np.fromfile(f, dtype=dtype, count=count)
-            if arr.size != count:
-                raise ValueError("Short NPY read")
-            return arr.reshape((rows,) + tail_shape)
+            return _parse_npy_fileobj(f, max_rows=max_rows)
     except Exception:
         return np.load(path, allow_pickle=False)
 
 
+def _fast_load_npy_bytes(raw: bytes, max_rows: int | None = None) -> np.ndarray:
+    """Parse C-contiguous .npy payload directly from an in-memory buffer."""
+    try:
+        return _parse_npy_fileobj(io.BytesIO(raw), max_rows=max_rows, raw_buf=raw)
+    except Exception:
+        return np.load(io.BytesIO(raw), allow_pickle=False)
+
+
 _DEFAULT_SF_READ = sf.read
 _PCM16_INV = np.float32(1.0 / 32768.0)
+
+
+def _parse_wav_fileobj(
+    f,
+    max_samples: int | None = None,
+    *,
+    allow_int16: bool = False,
+) -> tuple[np.ndarray, int]:
+    """Parse uncompressed mono PCM-16/float32 WAV header and data from a binary stream."""
+    head = f.read(12)
+    if len(head) < 12 or head[:4] != b"RIFF" or head[8:12] != b"WAVE":
+        raise ValueError("Not RIFF/WAVE")
+    fmt_code = ch = sr = bits = 0
+    for _ in range(8):
+        chdr = f.read(8)
+        if len(chdr) < 8:
+            break
+        cid = chdr[:4]
+        csize = int.from_bytes(chdr[4:8], "little")
+        if cid == b"fmt ":
+            if csize < 16 or csize > 4096:
+                raise ValueError("Invalid fmt chunk")
+            fbody = f.read(csize)
+            if len(fbody) < csize:
+                raise ValueError("Short fmt chunk")
+            if csize & 1:
+                f.read(1)
+            fmt_code, ch, sr, _, _, bits = struct.unpack("<HHIIHH", fbody[:16])
+            if ch != 1 or not ((fmt_code == 1 and bits == 16) or (fmt_code == 3 and bits == 32)):
+                raise ValueError("Unsupported WAV encoding for fast path")
+        elif cid == b"data":
+            if sr <= 0 or bits <= 0:
+                raise ValueError("Missing fmt before data")
+            bw = bits // 8
+            n_avail = csize // bw
+            n_read = min(n_avail, int(max_samples)) if max_samples is not None else n_avail
+            n_bytes = n_read * bw
+            raw = f.read(n_bytes)
+            if len(raw) != n_bytes:
+                raise ValueError("Short WAV data")
+            if fmt_code == 1:
+                pcm = np.frombuffer(raw, dtype="<i2")
+                if allow_int16:
+                    return np.array(pcm, dtype=np.int16, copy=True), int(sr)
+                audio = pcm.astype(np.float32)
+                audio *= _PCM16_INV
+            else:
+                audio = np.array(np.frombuffer(raw, dtype="<f4"), dtype=np.float32, copy=True)
+            return audio, int(sr)
+        else:
+            if csize < 0:
+                raise ValueError("Invalid chunk size")
+            f.seek(csize + (csize & 1), os.SEEK_CUR)
+    raise ValueError("Missing WAV data chunk")
 
 
 def _fast_load_wav(
@@ -121,53 +201,806 @@ def _fast_load_wav(
         return sf.read(path, dtype="float32")
     try:
         with open(path, "rb") as f:
-            head = f.read(12)
-            if len(head) < 12 or head[:4] != b"RIFF" or head[8:12] != b"WAVE":
-                raise ValueError("Not RIFF/WAVE")
-            fmt_code = ch = sr = bits = 0
-            for _ in range(8):
-                chdr = f.read(8)
-                if len(chdr) < 8:
-                    break
-                cid = chdr[:4]
-                csize = int.from_bytes(chdr[4:8], "little")
-                if cid == b"fmt ":
-                    if csize < 16 or csize > 4096:
-                        raise ValueError("Invalid fmt chunk")
-                    fbody = f.read(csize)
-                    if len(fbody) < csize:
-                        raise ValueError("Short fmt chunk")
-                    if csize & 1:
-                        f.read(1)
-                    fmt_code, ch, sr, _, _, bits = struct.unpack("<HHIIHH", fbody[:16])
-                    if ch != 1 or not ((fmt_code == 1 and bits == 16) or (fmt_code == 3 and bits == 32)):
-                        raise ValueError("Unsupported WAV encoding for fast path")
-                elif cid == b"data":
-                    if sr <= 0 or bits <= 0:
-                        raise ValueError("Missing fmt before data")
-                    bw = bits // 8
-                    n_avail = csize // bw
-                    n_read = min(n_avail, int(max_samples)) if max_samples is not None else n_avail
-                    n_bytes = n_read * bw
-                    raw = f.read(n_bytes)
-                    if len(raw) != n_bytes:
-                        raise ValueError("Short WAV data")
-                    if fmt_code == 1:
-                        pcm = np.frombuffer(raw, dtype="<i2")
-                        if allow_int16:
-                            return np.array(pcm, dtype=np.int16, copy=True), int(sr)
-                        audio = pcm.astype(np.float32)
-                        audio *= _PCM16_INV
-                    else:
-                        audio = np.array(np.frombuffer(raw, dtype="<f4"), dtype=np.float32, copy=True)
-                    return audio, int(sr)
-                else:
-                    if csize < 0:
-                        raise ValueError("Invalid chunk size")
-                    f.seek(csize + (csize & 1), os.SEEK_CUR)
+            return _parse_wav_fileobj(f, max_samples=max_samples, allow_int16=allow_int16)
     except Exception:
         pass
     return sf.read(path, dtype="float32")
+
+
+def _fast_load_wav_bytes(
+    raw: bytes,
+    path_hint: str,
+    max_samples: int | None = None,
+    *,
+    allow_int16: bool = False,
+) -> tuple[np.ndarray, int]:
+    """Decode WAV/audio payload directly from in-memory bytes."""
+    if sf.read is _DEFAULT_SF_READ and path_hint.lower().endswith(".wav"):
+        try:
+            return _parse_wav_fileobj(io.BytesIO(raw), max_samples=max_samples, allow_int16=allow_int16)
+        except Exception:
+            pass
+    if sf.read is _DEFAULT_SF_READ:
+        try:
+            return _DEFAULT_SF_READ(io.BytesIO(raw), dtype="float32")
+        except Exception:
+            pass
+    return sf.read(path_hint, dtype="float32")
+
+
+_SHARD_DIR_SUFFIX = ".shards"
+_SHARD_MANIFEST_NAME = "manifest.json"
+_SHARD_PLAN_NAME = ".plan.json"
+_SHARD_INDEX_NAME = "index.npy"
+_RECORD_MAGIC = b"RVC2"
+_RECORD_HEADER_STRUCT = struct.Struct("<4sIIIIIIi")
+_FLAG_WAV_INT16 = 1
+_DEFAULT_CLIPS_PER_SHARD = 512
+
+
+def _max_open_shard_fds() -> int:
+    if resource is not None and os.name == "posix":
+        try:
+            soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+            if soft and soft > 0:
+                return min(128, max(16, int(soft) // 4))
+        except Exception:
+            pass
+    return 64 if os.name == "nt" else 128
+
+
+def _align_clip_arrays(
+    audio: np.ndarray,
+    sr: int,
+    phone_raw: np.ndarray,
+    pitch: np.ndarray,
+    pitchf: np.ndarray,
+    dv_str: str,
+    *,
+    expected_sr: int,
+    hop_length: int,
+    max_sample_frames: int,
+    audiopath: str,
+) -> tuple[int, np.ndarray, bool, np.ndarray, np.ndarray, np.ndarray, int]:
+    """Align and trim loaded waveform, phoneme, and F0 arrays using canonical dataset rules."""
+    n_num = min(int(phone_raw.shape[0]) * 2, int(pitch.shape[0]), int(pitchf.shape[0]), max_sample_frames)
+    n_phone_half = (n_num + 1) // 2
+    phone_half = np.asarray(phone_raw[:n_phone_half, :], dtype=np.float32)
+    pitch_arr = np.asarray(pitch[:n_num], dtype=np.int32)
+    pitchf_arr = np.asarray(pitchf[:n_num], dtype=np.float32)
+    try:
+        sid = int(dv_str)
+    except ValueError:
+        sid = 0
+
+    if audio.ndim > 1:
+        audio = audio[:, 0]
+    if int(sr) != expected_sr:
+        raise ValueError(f"{sr} SR doesn't match target {expected_sr} SR in '{audiopath}'.")
+
+    n_frames_audio = min(len(audio) // hop_length, max_sample_frames)
+    len_min = min(n_num, n_frames_audio)
+    len_wav = len_min * hop_length
+    if len_min < n_num:
+        phone_half = phone_half[: (len_min + 1) // 2, :]
+        pitch_arr = pitch_arr[:len_min]
+        pitchf_arr = pitchf_arr[:len_min]
+
+    wav_is_int16 = audio.dtype == np.int16
+    wav_1d = np.ascontiguousarray(audio[:len_wav], dtype=np.int16 if wav_is_int16 else np.float32)
+    phone_out = np.ascontiguousarray(phone_half, dtype="<f4")
+    pitch_out = np.ascontiguousarray(pitch_arr, dtype="<i4")
+    pitchf_out = np.ascontiguousarray(pitchf_arr, dtype="<f4")
+    return len_min, wav_1d, wav_is_int16, phone_out, pitch_out, pitchf_out, sid
+
+
+def _encode_clip_record(
+    len_min: int,
+    wav_1d: np.ndarray,
+    wav_is_int16: bool,
+    phone_half: np.ndarray,
+    pitch: np.ndarray,
+    pitchf: np.ndarray,
+    sid: int,
+    sr: int,
+) -> bytes:
+    """Serialize one trimmed clip into a self-describing binary record."""
+    phone_frames = int(phone_half.shape[0])
+    phone_dim = int(phone_half.shape[1]) if phone_half.ndim == 2 else 0
+    wav_le = np.ascontiguousarray(wav_1d, dtype="<i2" if wav_is_int16 else "<f4")
+    header = _RECORD_HEADER_STRUCT.pack(
+        _RECORD_MAGIC,
+        int(len_min),
+        int(wav_le.shape[0]),
+        phone_frames,
+        phone_dim,
+        _FLAG_WAV_INT16 if wav_is_int16 else 0,
+        int(sr),
+        int(sid),
+    )
+    return b"".join((header, wav_le.tobytes(), phone_half.tobytes(), pitch.tobytes(), pitchf.tobytes()))
+
+
+def _decode_clip_record(
+    raw: bytes,
+    *,
+    expected_sr: int,
+    repeat_phone: bool,
+    phone_dtype: np.dtype,
+    compute_spec: bool,
+    allow_pcm16: bool,
+    filter_length: int,
+    hop_length: int,
+    win_length: int,
+) -> tuple[np.ndarray | None, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.int32]:
+    """Deserialize one clip record into owned NumPy arrays matching TextAudioDataset.__getitem__."""
+    if len(raw) < _RECORD_HEADER_STRUCT.size:
+        raise ValueError("Truncated shard record header")
+    magic, len_min, wav_len, phone_frames, phone_dim, flags, sr, sid = _RECORD_HEADER_STRUCT.unpack_from(raw, 0)
+    if magic != _RECORD_MAGIC:
+        raise ValueError("Invalid shard record magic")
+    if int(sr) != int(expected_sr):
+        raise ValueError(f"{sr} SR doesn't match target {expected_sr} SR in shard record.")
+
+    wav_is_int16 = bool(flags & _FLAG_WAV_INT16)
+    wav_dt = np.dtype("<i2") if wav_is_int16 else np.dtype("<f4")
+    pos = _RECORD_HEADER_STRUCT.size
+    wav_end = pos + wav_len * wav_dt.itemsize
+    phone_end = wav_end + phone_frames * phone_dim * 4
+    pitch_end = phone_end + len_min * 4
+    pitchf_end = pitch_end + len_min * 4
+    if pitchf_end != len(raw):
+        raise ValueError(f"Shard record size mismatch: expected {pitchf_end}, got {len(raw)}")
+
+    mv = memoryview(raw)
+    wav_1d = np.frombuffer(mv[pos:wav_end], dtype=wav_dt)
+    if wav_is_int16:
+        if allow_pcm16 and not compute_spec:
+            wav_out = np.ascontiguousarray(wav_1d, dtype=np.int16)[:, None]
+        else:
+            wav_out = np.ascontiguousarray(wav_1d.astype(np.float32) * _PCM16_INV)[:, None]
+    else:
+        wav_out = np.ascontiguousarray(wav_1d, dtype=np.float32)[:, None]
+
+    phone_use = np.array(
+        np.frombuffer(mv[wav_end:phone_end], dtype="<f4").reshape(phone_frames, phone_dim),
+        dtype=phone_dtype,
+        copy=True,
+    )
+    phone = np.repeat(phone_use, 2, axis=0)[:len_min, :] if repeat_phone else phone_use
+    pitch = np.array(np.frombuffer(mv[phone_end:pitch_end], dtype="<i4"), dtype=np.int32, copy=True)
+    pitchf = np.array(np.frombuffer(mv[pitch_end:pitchf_end], dtype="<f4"), dtype=np.float32, copy=True)
+    spec = (
+        spectrogram_np(np.ascontiguousarray(wav_out[:, 0], dtype=np.float32), filter_length, hop_length, win_length)
+        if compute_spec
+        else None
+    )
+    return spec, wav_out, phone, pitch, pitchf, np.int32(sid)
+
+
+def _posix_pread_exact(fd: int, offset: int, nbytes: int) -> bytes:
+    out = bytearray()
+    while len(out) < nbytes:
+        chunk = os.pread(fd, nbytes - len(out), offset + len(out))
+        if not chunk:
+            raise EOFError("Unexpected EOF during shard pread")
+        out.extend(chunk)
+    return bytes(out)
+
+
+class _DatasetShardReader:
+    """Thread-safe LRU file-descriptor reader for contiguous `.rpack` dataset shards."""
+
+    def __init__(self, shards_dir: str, index_arr: np.ndarray, expected_sr: int) -> None:
+        self.shards_dir = shards_dir
+        self.index = index_arr
+        self.expected_sr = int(expected_sr)
+        self._max_fds = _max_open_shard_fds()
+        self._fd_lock = threading.Lock()
+        self._fds: OrderedDict[int, dict[str, Any]] = OrderedDict()
+        self._has_pread = hasattr(os, "pread")
+
+    def _open_flags(self) -> int:
+        return os.O_RDONLY | getattr(os, "O_BINARY", 0)
+
+    def _acquire_entry(self, shard_id: int) -> dict[str, Any]:
+        with self._fd_lock:
+            entry = self._fds.get(shard_id)
+            if entry is not None and not entry["stale"]:
+                entry["ref"] += 1
+                self._fds.move_to_end(shard_id)
+                return entry
+
+        shard_path = os.path.join(self.shards_dir, f"shard_{shard_id:05d}.rpack")
+        new_fd = os.open(shard_path, self._open_flags())
+        to_close: list[int] = []
+        with self._fd_lock:
+            existing = self._fds.get(shard_id)
+            if existing is not None and not existing["stale"]:
+                existing["ref"] += 1
+                self._fds.move_to_end(shard_id)
+                to_close.append(new_fd)
+                entry = existing
+            else:
+                entry = {"fd": new_fd, "ref": 1, "stale": False, "lock": threading.Lock()}
+                self._fds[shard_id] = entry
+                if len(self._fds) > self._max_fds:
+                    for old_sid in list(self._fds.keys()):
+                        if len(self._fds) <= self._max_fds:
+                            break
+                        if old_sid == shard_id:
+                            continue
+                        old_entry = self._fds[old_sid]
+                        if old_entry["ref"] == 0:
+                            self._fds.pop(old_sid)
+                            old_entry["stale"] = True
+                            to_close.append(old_entry["fd"])
+        for fd_c in to_close:
+            try:
+                os.close(fd_c)
+            except OSError:
+                pass
+        return entry
+
+    def _release_entry(self, entry: dict[str, Any]) -> None:
+        close_fd: int | None = None
+        with self._fd_lock:
+            entry["ref"] -= 1
+            if entry["stale"] and entry["ref"] <= 0:
+                close_fd = entry["fd"]
+                entry["fd"] = -1
+        if close_fd is not None and close_fd >= 0:
+            try:
+                os.close(close_fd)
+            except OSError:
+                pass
+
+    def pread_clip(self, index: int) -> bytes:
+        shard_id, offset, nbytes = (int(v) for v in self.index[index])
+        entry = self._acquire_entry(shard_id)
+        try:
+            if self._has_pread:
+                return _posix_pread_exact(entry["fd"], offset, nbytes)
+            with entry["lock"]:
+                os.lseek(entry["fd"], offset, os.SEEK_SET)
+                out = bytearray()
+                while len(out) < nbytes:
+                    chunk = os.read(entry["fd"], nbytes - len(out))
+                    if not chunk:
+                        raise EOFError("Unexpected EOF during shard read")
+                    out.extend(chunk)
+                return bytes(out)
+        finally:
+            self._release_entry(entry)
+
+    def close(self) -> None:
+        to_close: list[int] = []
+        with self._fd_lock:
+            for entry in self._fds.values():
+                entry["stale"] = True
+                if entry["ref"] <= 0 and entry["fd"] >= 0:
+                    to_close.append(entry["fd"])
+                    entry["fd"] = -1
+            self._fds.clear()
+        for fd_c in to_close:
+            try:
+                os.close(fd_c)
+            except OSError:
+                pass
+
+
+def _shard_dir_for_filelist(training_files: str) -> str:
+    return f"{training_files}{_SHARD_DIR_SUFFIX}"
+
+
+def _build_dataset_fingerprint(dataset: "TextAudioDataset") -> dict[str, Any] | None:
+    tf = getattr(dataset, "training_files", "")
+    if not tf or not os.path.isfile(tf):
+        return None
+    try:
+        st = os.stat(tf)
+    except OSError:
+        return None
+    return {
+        "version": 1,
+        "filelist_mtime_ns": int(st.st_mtime_ns),
+        "filelist_size": int(st.st_size),
+        "count": len(dataset.audiopaths_and_text),
+        "sample_rate": int(dataset.sample_rate),
+        "hop_length": int(dataset.hop_length),
+        "max_sample_frames": int(dataset.max_sample_frames),
+    }
+
+
+def _meta_matches_fingerprint(meta: Mapping[str, Any], fp: Mapping[str, Any]) -> bool:
+    return all(meta.get(k) == v for k, v in fp.items())
+
+
+def _open_validated_shard_reader(dataset: "TextAudioDataset") -> _DatasetShardReader | None:
+    fp = _build_dataset_fingerprint(dataset)
+    if fp is None or fp["count"] <= 0:
+        return None
+    shards_dir = _shard_dir_for_filelist(dataset.training_files)
+    manifest_path = os.path.join(shards_dir, _SHARD_MANIFEST_NAME)
+    index_path = os.path.join(shards_dir, _SHARD_INDEX_NAME)
+    if not (os.path.isfile(manifest_path) and os.path.isfile(index_path)):
+        return None
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+        if not _meta_matches_fingerprint(manifest, fp):
+            return None
+        num_shards = int(manifest.get("num_shards", 0))
+        index_arr = np.load(index_path, allow_pickle=False)
+        if index_arr.ndim != 2 or index_arr.shape != (fp["count"], 3):
+            return None
+        if num_shards <= 0:
+            return None
+        for sid in range(num_shards):
+            sp = os.path.join(shards_dir, f"shard_{sid:05d}.rpack")
+            if not os.path.isfile(sp):
+                return None
+        # Spot-check shard sizes cleanly without stat loops if consistent
+        shard_ids = index_arr[:, 0]
+        ends = index_arr[:, 1] + index_arr[:, 2]
+        for sid in range(num_shards):
+            mask = shard_ids == sid
+            if np.any(mask):
+                need_size = int(ends[mask].max())
+                actual_size = os.path.getsize(os.path.join(shards_dir, f"shard_{sid:05d}.rpack"))
+                if actual_size < need_size:
+                    return None
+        return _DatasetShardReader(shards_dir, index_arr, expected_sr=fp["sample_rate"])
+    except Exception:
+        return None
+
+
+def _atomic_write_json(path: str, payload: Any) -> None:
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f)
+    os.replace(tmp, path)
+
+
+def _encode_clip_to_record_and_item(
+    row: Sequence[str],
+    *,
+    dataset: "TextAudioDataset",
+    want_seed_item: bool,
+    raw_map: Mapping[str, bytes] | None = None,
+    key_tuple: tuple[str, str, str, str] | None = None,
+) -> tuple[bytes, tuple[Any, ...] | None]:
+    audiopath, phone_path, pitch_path, pitchf_path, dv_str = row[:5]
+    max_frames = int(dataset.max_sample_frames)
+    max_phone_rows = (max_frames + 1) // 2 + 1
+    if raw_map is not None and key_tuple is not None:
+        k_wav, k_ph, k_pt, k_pf = key_tuple
+        phone_raw = _fast_load_npy_bytes(raw_map[k_ph], max_rows=max_phone_rows)
+        pitch = _fast_load_npy_bytes(raw_map[k_pt], max_rows=max_frames)
+        pitchf = _fast_load_npy_bytes(raw_map[k_pf], max_rows=max_frames)
+        n_est = min(int(phone_raw.shape[0]) * 2, int(pitch.shape[0]), int(pitchf.shape[0]), max_frames)
+        audio, sr = _fast_load_wav_bytes(
+            raw_map[k_wav],
+            audiopath,
+            max_samples=n_est * int(dataset.hop_length),
+            allow_int16=True,
+        )
+    else:
+        phone_raw = _fast_load_npy(phone_path, max_rows=max_phone_rows)
+        pitch = _fast_load_npy(pitch_path, max_rows=max_frames)
+        pitchf = _fast_load_npy(pitchf_path, max_rows=max_frames)
+        n_est = min(int(phone_raw.shape[0]) * 2, int(pitch.shape[0]), int(pitchf.shape[0]), max_frames)
+        audio, sr = _fast_load_wav(
+            audiopath,
+            max_samples=n_est * int(dataset.hop_length),
+            allow_int16=True,
+        )
+
+    len_min, wav_1d, wav_is_int16, phone_out, pitch_out, pitchf_out, sid = _align_clip_arrays(
+        audio,
+        sr,
+        phone_raw,
+        pitch,
+        pitchf,
+        dv_str,
+        expected_sr=int(dataset.sample_rate),
+        hop_length=int(dataset.hop_length),
+        max_sample_frames=max_frames,
+        audiopath=audiopath,
+    )
+    rec = _encode_clip_record(len_min, wav_1d, wav_is_int16, phone_out, pitch_out, pitchf_out, sid, int(sr))
+    seed_item: tuple[Any, ...] | None = None
+    if want_seed_item:
+        if wav_is_int16 and not dataset.compute_spec:
+            wav_col = np.ascontiguousarray(wav_1d, dtype=np.int16)[:, None]
+        elif wav_is_int16:
+            wav_col = np.ascontiguousarray(wav_1d.astype(np.float32) * _PCM16_INV)[:, None]
+        else:
+            wav_col = np.ascontiguousarray(wav_1d, dtype=np.float32)[:, None]
+        ph_typed = np.asarray(phone_out, dtype=dataset.phone_dtype)
+        ph_item = np.repeat(ph_typed, 2, axis=0)[:len_min, :] if dataset.repeat_phone else np.ascontiguousarray(ph_typed)
+        pitch_item = np.ascontiguousarray(pitch_out, dtype=np.int32)
+        pitchf_item = np.ascontiguousarray(pitchf_out, dtype=np.float32)
+        spec_item = (
+            spectrogram_np(
+                np.ascontiguousarray(wav_col[:, 0], dtype=np.float32),
+                dataset.filter_length,
+                dataset.hop_length,
+                dataset.win_length,
+            )
+            if dataset.compute_spec
+            else None
+        )
+        seed_item = (spec_item, wav_col, ph_item, pitch_item, pitchf_item, np.int32(sid))
+    return rec, seed_item
+
+
+def _norm_tar_name(name: str) -> str:
+    while name.startswith("./"):
+        name = name[2:]
+    return name.lstrip("/")
+
+
+def _read_shard_records(
+    shard_id: int,
+    clip_indices: Sequence[int],
+    *,
+    dataset: "TextAudioDataset",
+    shards_dir: str,
+    use_tar: bool,
+    seed_state: dict[str, Any] | None,
+    max_seed_bytes: int,
+    on_clip_done: Any = None,
+) -> tuple[int, list[int], list[bytes], list[tuple[int, tuple[Any, ...]]]]:
+    """Read and encode one sorted shard group into contiguous record bytes in RAM."""
+    n_clips = len(clip_indices)
+    records: list[bytes | None] = [None] * n_clips
+    seeded: list[tuple[int, tuple[Any, ...]]] = []
+
+    def _want_seed() -> bool:
+        if seed_state is None or max_seed_bytes <= 0:
+            return False
+        with seed_state["lock"]:
+            return seed_state["bytes"] < max_seed_bytes
+
+    def _try_reserve_seed(item: tuple[Any, ...] | None, gidx: int) -> None:
+        if item is None or seed_state is None or max_seed_bytes <= 0:
+            return
+        n_b = _sample_nbytes(item)
+        with seed_state["lock"]:
+            if seed_state["bytes"] + n_b <= max_seed_bytes:
+                seed_state["bytes"] += n_b
+                seeded.append((gidx, item))
+
+    if use_tar:
+        tar_keys_per_clip: list[tuple[str, str, str, str] | None] = [None] * n_clips
+        unique_paths: list[str] = []
+        seen_paths: set[str] = set()
+        key_waiters: dict[str, list[int]] = {}
+        ref_counts: Counter[str] = Counter()
+        clip_remaining: list[int] = [0] * n_clips
+        all_posix_abs = True
+
+        for local_i, gidx in enumerate(clip_indices):
+            row = dataset.audiopaths_and_text[gidx]
+            abs_p = [os.path.abspath(p) for p in row[:4]]
+            if not all(ap.startswith("/") for ap in abs_p):
+                all_posix_abs = False
+                break
+            tkeys = tuple(ap.lstrip("/") for ap in abs_p)
+            tar_keys_per_clip[local_i] = tkeys  # type: ignore[assignment]
+            distinct = set(tkeys)
+            clip_remaining[local_i] = len(distinct)
+            for tk in tkeys:
+                ref_counts[tk] += 1
+                if tk not in seen_paths:
+                    seen_paths.add(tk)
+                    unique_paths.append(tk)
+            for tk in distinct:
+                key_waiters.setdefault(tk, []).append(local_i)
+
+        if all_posix_abs and unique_paths:
+            list_path = os.path.join(shards_dir, f".tarlist_{shard_id:05d}.{os.getpid()}.tmp")
+            proc = None
+            raw_map: dict[str, bytes] = {}
+            try:
+                with open(list_path, "w", encoding="utf-8") as lf:
+                    lf.write("\n".join(unique_paths))
+                    lf.write("\n")
+                proc = subprocess.Popen(
+                    ["tar", "-cf", "-", "-C", "/", "-T", list_path],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+                assert proc.stdout is not None
+                with tarfile.open(fileobj=proc.stdout, mode="r|", bufsize=1024 * 1024) as tf:
+                    for member in tf:
+                        if not member.isfile():
+                            continue
+                        mkey = _norm_tar_name(member.name)
+                        if mkey not in key_waiters:
+                            continue
+                        fh = tf.extractfile(member)
+                        if fh is None:
+                            continue
+                        raw_map[mkey] = fh.read()
+                        waiters = key_waiters.pop(mkey, ())
+                        for local_i in waiters:
+                            clip_remaining[local_i] -= 1
+                            if clip_remaining[local_i] == 0:
+                                gidx = int(clip_indices[local_i])
+                                tkeys = tar_keys_per_clip[local_i]
+                                assert tkeys is not None
+                                rec, s_item = _encode_clip_to_record_and_item(
+                                    dataset.audiopaths_and_text[gidx],
+                                    dataset=dataset,
+                                    want_seed_item=_want_seed(),
+                                    raw_map=raw_map,
+                                    key_tuple=tkeys,
+                                )
+                                records[local_i] = rec
+                                _try_reserve_seed(s_item, gidx)
+                                if on_clip_done is not None:
+                                    on_clip_done(1)
+                                for used_k in tkeys:
+                                    ref_counts[used_k] -= 1
+                                    if ref_counts[used_k] <= 0:
+                                        raw_map.pop(used_k, None)
+                proc.wait()
+            except (KeyboardInterrupt, SystemExit):
+                if proc is not None and proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+                raise
+            except Exception:
+                if proc is not None and proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+            finally:
+                raw_map.clear()
+                if os.path.exists(list_path):
+                    try:
+                        os.remove(list_path)
+                    except OSError:
+                        pass
+
+    # Fallback for Windows or any clips skipped by tar
+    for local_i, gidx in enumerate(clip_indices):
+        if records[local_i] is not None:
+            continue
+        rec, s_item = _encode_clip_to_record_and_item(
+            dataset.audiopaths_and_text[int(gidx)],
+            dataset=dataset,
+            want_seed_item=_want_seed(),
+        )
+        records[local_i] = rec
+        _try_reserve_seed(s_item, int(gidx))
+        if on_clip_done is not None:
+            on_clip_done(1)
+
+    final_records: list[bytes] = [r for r in records if r is not None]
+    if len(final_records) != n_clips:
+        raise RuntimeError(f"Shard {shard_id} expected {n_clips} records, encoded {len(final_records)}")
+    return shard_id, [int(i) for i in clip_indices], final_records, seeded
+
+
+def ensure_dataset_shards(
+    dataset: "TextAudioDataset",
+    *,
+    workers: int = 4,
+    progress: bool = True,
+    max_seed_bytes: int = 0,
+    clips_per_shard: int = _DEFAULT_CLIPS_PER_SHARD,
+) -> tuple[_DatasetShardReader | None, dict[int, tuple[Any, ...]]]:
+    """Ensure contiguous `.rpack` dataset shards exist for fast Epoch 1 I/O without concurrent training contention."""
+    fp = _build_dataset_fingerprint(dataset)
+    if fp is None or fp["count"] <= 0:
+        return None, {}
+
+    existing = _open_validated_shard_reader(dataset)
+    if existing is not None:
+        dataset._shard_reader = existing
+        return existing, {}
+
+    shards_dir = _shard_dir_for_filelist(dataset.training_files)
+    os.makedirs(shards_dir, exist_ok=True)
+    # Remove orphaned temp files from any interrupted run
+    for fname in os.listdir(shards_dir):
+        if fname.endswith(".tmp"):
+            try:
+                os.remove(os.path.join(shards_dir, fname))
+            except OSError:
+                pass
+
+    n_clips = fp["count"]
+    per_shard = max(1, min(int(clips_per_shard), n_clips))
+    plan_fp = dict(fp)
+    plan_fp["clips_per_shard"] = per_shard
+    plan_path = os.path.join(shards_dir, _SHARD_PLAN_NAME)
+    plan_valid = False
+    if os.path.isfile(plan_path):
+        try:
+            with open(plan_path, "r", encoding="utf-8") as pf:
+                old_plan = json.load(pf)
+            plan_valid = _meta_matches_fingerprint(old_plan, plan_fp)
+        except Exception:
+            plan_valid = False
+    if not plan_valid:
+        for fname in os.listdir(shards_dir):
+            if fname.endswith((".rpack", ".idx.npy", ".npy", ".json")):
+                try:
+                    os.remove(os.path.join(shards_dir, fname))
+                except OSError:
+                    pass
+        _atomic_write_json(plan_path, plan_fp)
+
+    # Check free disk space cleanly before writing (~1.05x estimate + 4 GiB headroom for large datasets)
+    try:
+        sample_k = min(32, n_clips)
+        sample_bytes = 0
+        for si in range(sample_k):
+            for p in dataset.audiopaths_and_text[si][:4]:
+                if os.path.isfile(p):
+                    sample_bytes += os.path.getsize(p)
+        est_bytes = int((sample_bytes / max(1, sample_k)) * n_clips * 1.05)
+        free_bytes = shutil.disk_usage(shards_dir).free
+        headroom = 4 * (1024 ** 3) if n_clips >= 512 else 0
+        if free_bytes < est_bytes + headroom:
+            print(
+                f"Skipping dataset shard pack: need ~{(est_bytes + headroom)/(1024**3):.1f} GiB free, only {free_bytes/(1024**3):.1f} GiB free.",
+                flush=True,
+            )
+            return None, {}
+    except OSError:
+        pass
+
+    sorted_indices = sorted(
+        range(n_clips),
+        key=lambda i: (
+            os.path.dirname(os.path.abspath(dataset.audiopaths_and_text[i][0])),
+            os.path.basename(dataset.audiopaths_and_text[i][0]),
+            dataset.audiopaths_and_text[i][0],
+        ),
+    )
+    shard_groups = [sorted_indices[s : s + per_shard] for s in range(0, n_clips, per_shard)]
+    num_shards = len(shard_groups)
+
+    missing_shards: list[int] = []
+    done_clips = 0
+    for sid, idxs in enumerate(shard_groups):
+        rpack_p = os.path.join(shards_dir, f"shard_{sid:05d}.rpack")
+        idx_p = os.path.join(shards_dir, f"shard_{sid:05d}.idx.npy")
+        ok = False
+        if os.path.isfile(rpack_p) and os.path.isfile(idx_p):
+            try:
+                s_idx = np.load(idx_p, allow_pickle=False)
+                if s_idx.shape == (len(idxs), 3) and np.array_equal(s_idx[:, 0], np.asarray(idxs, dtype=np.int64)):
+                    need_sz = int((s_idx[:, 1] + s_idx[:, 2]).max()) if len(idxs) > 0 else 0
+                    if os.path.getsize(rpack_p) == need_sz:
+                        ok = True
+            except Exception:
+                ok = False
+        if ok:
+            done_clips += len(idxs)
+        else:
+            missing_shards.append(sid)
+
+    seed_items: dict[int, tuple[Any, ...]] = {}
+    if missing_shards:
+        avail = _available_ram_bytes()
+        if avail >= 16 * (1024 ** 3):
+            macro_w = min(4, max(1, int(workers)))
+        elif avail >= 8 * (1024 ** 3):
+            macro_w = min(2, max(1, int(workers)))
+        else:
+            macro_w = 1
+        use_tar = os.name == "posix" and bool(shutil.which("tar"))
+        seed_state = {"bytes": 0, "lock": threading.Lock()}
+        pbar = None
+        pbar_lock = threading.Lock()
+        if progress:
+            print(
+                f"Packing {n_clips} dataset clips into {num_shards} contiguous shard(s) (one-time per dataset for fast Epoch 1 I/O)...",
+                flush=True,
+            )
+            try:
+                from tqdm import tqdm
+
+                pbar = tqdm(total=n_clips, initial=done_clips, unit="clip", desc="Shard Pack", leave=True)
+            except Exception:
+                pbar = None
+
+        def _tick(n: int) -> None:
+            if pbar is not None:
+                with pbar_lock:
+                    pbar.update(n)
+
+        try:
+            for start_m in range(0, len(missing_shards), macro_w):
+                batch_sids = missing_shards[start_m : start_m + macro_w]
+                # Phase 1: Parallel sorted read into RAM buffers (zero concurrent overlayfs writes)
+                if len(batch_sids) == 1:
+                    built = [
+                        _read_shard_records(
+                            batch_sids[0],
+                            shard_groups[batch_sids[0]],
+                            dataset=dataset,
+                            shards_dir=shards_dir,
+                            use_tar=use_tar,
+                            seed_state=seed_state,
+                            max_seed_bytes=max_seed_bytes,
+                            on_clip_done=_tick,
+                        )
+                    ]
+                else:
+                    with ThreadPoolExecutor(max_workers=len(batch_sids)) as ex:
+                        futs = [
+                            ex.submit(
+                                _read_shard_records,
+                                sid,
+                                shard_groups[sid],
+                                dataset=dataset,
+                                shards_dir=shards_dir,
+                                use_tar=use_tar,
+                                seed_state=seed_state,
+                                max_seed_bytes=max_seed_bytes,
+                                on_clip_done=_tick,
+                            )
+                            for sid in batch_sids
+                        ]
+                        built = [f.result() for f in futs]
+
+                # Phase 2: Sequential contiguous writes (zero concurrent loose-file reads)
+                for sid, clip_idxs, rec_list, seeded_pairs in built:
+                    for gidx, s_item in seeded_pairs:
+                        seed_items[gidx] = s_item
+                    rpack_p = os.path.join(shards_dir, f"shard_{sid:05d}.rpack")
+                    idx_p = os.path.join(shards_dir, f"shard_{sid:05d}.idx.npy")
+                    rpack_tmp = f"{rpack_p}.{os.getpid()}.tmp"
+                    idx_tmp = f"{idx_p}.{os.getpid()}.tmp"
+                    s_idx = np.empty((len(clip_idxs), 3), dtype=np.int64)
+                    off = 0
+                    with open(rpack_tmp, "wb", buffering=4 * 1024 * 1024) as wf:
+                        for li, (gidx, rec_b) in enumerate(zip(clip_idxs, rec_list)):
+                            s_idx[li, 0] = gidx
+                            s_idx[li, 1] = off
+                            s_idx[li, 2] = len(rec_b)
+                            wf.write(rec_b)
+                            off += len(rec_b)
+                    with open(idx_tmp, "wb") as ix_f:
+                        np.save(ix_f, s_idx)
+                    os.replace(idx_tmp, idx_p)
+                    os.replace(rpack_tmp, rpack_p)
+                built.clear()
+        finally:
+            if pbar is not None:
+                pbar.close()
+
+    # Assemble global index.npy and commit manifest.json
+    global_idx = np.empty((n_clips, 3), dtype=np.int64)
+    for sid in range(num_shards):
+        idx_p = os.path.join(shards_dir, f"shard_{sid:05d}.idx.npy")
+        s_idx = np.load(idx_p, allow_pickle=False)
+        g_ids = s_idx[:, 0]
+        global_idx[g_ids, 0] = sid
+        global_idx[g_ids, 1] = s_idx[:, 1]
+        global_idx[g_ids, 2] = s_idx[:, 2]
+
+    index_path = os.path.join(shards_dir, _SHARD_INDEX_NAME)
+    index_tmp = f"{index_path}.{os.getpid()}.tmp"
+    with open(index_tmp, "wb") as gf:
+        np.save(gf, global_idx)
+    os.replace(index_tmp, index_path)
+
+    manifest = dict(fp)
+    manifest["clips_per_shard"] = per_shard
+    manifest["num_shards"] = num_shards
+    _atomic_write_json(os.path.join(shards_dir, _SHARD_MANIFEST_NAME), manifest)
+
+    reader = _DatasetShardReader(shards_dir, global_idx, expected_sr=fp["sample_rate"])
+    dataset._shard_reader = reader
+    return reader, seed_items
 
 
 def _hann_window_np(win_length: int) -> np.ndarray:
@@ -236,6 +1069,7 @@ class TextAudioDataset:
         self.min_text_len = int(getattr(data_cfg, "min_text_len", 1))
         self.max_text_len = int(getattr(data_cfg, "max_text_len", 5000))
         self._filter()
+        self._shard_reader: _DatasetShardReader | None = _open_validated_shard_reader(self)
 
     @classmethod
     def from_cached_entries(cls, cfg_dict: Mapping[str, Any]) -> "TextAudioDataset":
@@ -255,6 +1089,7 @@ class TextAudioDataset:
         obj.phone_dtype = np.dtype(cfg_dict.get("phone_dtype", "float32"))
         obj.min_text_len = int(cfg_dict.get("min_text_len", 1))
         obj.max_text_len = int(cfg_dict.get("max_text_len", 5000))
+        obj._shard_reader = _open_validated_shard_reader(obj)
         return obj
 
     def worker_config(self, hop_length: int, allowed_frames: Sequence[int] = ()) -> dict[str, Any]:
@@ -405,7 +1240,36 @@ class TextAudioDataset:
         )
         return spec, wav, phone, pitch, pitchf, sid
 
+    @property
+    def has_shards(self) -> bool:
+        return getattr(self, "_shard_reader", None) is not None
+
+    def load_item_fast(
+        self,
+        index: int,
+        *,
+        allow_pcm16: bool = False,
+    ) -> tuple[np.ndarray | None, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.int32]:
+        """Read clip directly from contiguous `.rpack` shard when available, else loose files."""
+        reader = getattr(self, "_shard_reader", None)
+        if reader is not None:
+            raw = reader.pread_clip(index)
+            return _decode_clip_record(
+                raw,
+                expected_sr=self.sample_rate,
+                repeat_phone=self.repeat_phone,
+                phone_dtype=self.phone_dtype,
+                compute_spec=self.compute_spec,
+                allow_pcm16=allow_pcm16,
+                filter_length=self.filter_length,
+                hop_length=self.hop_length,
+                win_length=self.win_length,
+            )
+        return self.load_item_with_cached_labels(index, self.load_labels(index), allow_pcm16=allow_pcm16)
+
     def __getitem__(self, index: int) -> tuple[np.ndarray | None, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.int32]:
+        if getattr(self, "_shard_reader", None) is not None:
+            return self.load_item_fast(index, allow_pcm16=False)
         return self.load_item_with_cached_labels(index, self.load_labels(index))
 
 
@@ -633,7 +1497,6 @@ class PrefetchBatchLoader:
         use_multiprocessing: bool | None = None,
         enable_disk_pack: bool | None = None,
     ) -> None:
-        del enable_disk_pack
         self.dataset = dataset
         self.sampler = sampler
         self.hop_length = int(hop_length)
@@ -677,6 +1540,28 @@ class PrefetchBatchLoader:
                         os.remove(stale_p)
                     except OSError:
                         pass
+        if bool(enable_disk_pack) and isinstance(dataset, TextAudioDataset):
+            max_seed = 0 if self.cache_in_ram else int(self._sample_cache_limit * 0.80)
+            _reader, seeded = ensure_dataset_shards(
+                dataset,
+                workers=max(1, self._pool_workers or self.num_workers or 4),
+                progress=True,
+                max_seed_bytes=max_seed,
+            )
+            if seeded:
+                for gidx, s_item in seeded.items():
+                    self._sample_cache[gidx] = s_item
+                    self._sample_cache_bytes += _sample_nbytes(s_item)
+                seeded.clear()
+
+    def _try_cache_sample(self, idx: int, item: tuple[Any, ...]) -> None:
+        if self._sample_cache_limit <= 0 or self._sample_cache_bytes >= self._sample_cache_limit:
+            return
+        item_bytes = _sample_nbytes(item)
+        with self._sample_cache_lock:
+            if idx not in self._sample_cache and self._sample_cache_bytes + item_bytes <= self._sample_cache_limit:
+                self._sample_cache[idx] = item
+                self._sample_cache_bytes += item_bytes
 
     def _get_item(self, idx: int):
         if self._cache is not None:
@@ -684,6 +1569,10 @@ class PrefetchBatchLoader:
         cached = self._sample_cache.get(idx)
         if cached is not None:
             return cached
+        if getattr(self.dataset, "has_shards", False):
+            item = self.dataset.load_item_fast(idx, allow_pcm16=True)
+            self._try_cache_sample(idx, item)
+            return item
         cached_lbl = self._label_cache.get(idx)
         if cached_lbl is not None:
             return self.dataset.load_item_with_cached_labels(idx, cached_lbl, allow_pcm16=True)
@@ -708,12 +1597,7 @@ class PrefetchBatchLoader:
             return item
 
         item = self.dataset[idx]
-        if self._sample_cache_limit > 0 and self._sample_cache_bytes < self._sample_cache_limit:
-            item_bytes = _sample_nbytes(item)
-            with self._sample_cache_lock:
-                if idx not in self._sample_cache and self._sample_cache_bytes + item_bytes <= self._sample_cache_limit:
-                    self._sample_cache[idx] = item
-                    self._sample_cache_bytes += item_bytes
+        self._try_cache_sample(idx, item)
         return item
 
     def _load_sample_tracked(self, idx: int):
@@ -787,6 +1671,8 @@ class PrefetchBatchLoader:
             for idx_i in order:
                 if self._warmup_stop.is_set() or self._closed:
                     break
+                if idx_i in self._sample_cache:
+                    continue
                 if self._sample_cache_bytes >= int(self._sample_cache_limit * 0.90):
                     break
                 ready, item = self._submit_sample(idx_i)
@@ -826,6 +1712,8 @@ class PrefetchBatchLoader:
         )
 
     def _load_for_cache(self, idx: int):
+        if getattr(self.dataset, "has_shards", False):
+            return self.dataset.load_item_fast(idx, allow_pcm16=True)
         if hasattr(self.dataset, "load_labels"):
             return self.dataset.load_item_with_cached_labels(idx, self.dataset.load_labels(idx), allow_pcm16=True)
         return self.dataset[idx]
@@ -965,3 +1853,6 @@ class PrefetchBatchLoader:
         if self._pool is not None:
             self._pool.shutdown(wait=True, cancel_futures=True)
             self._pool = None
+        shard_reader = getattr(self.dataset, "_shard_reader", None)
+        if shard_reader is not None:
+            shard_reader.close()

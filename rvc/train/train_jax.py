@@ -373,6 +373,7 @@ class JaxTrainer:
             num_workers=self.workers,
             prefetch_batches=12,
             cache_in_ram=bool(self.args.cache_data_in_gpu),
+            enable_disk_pack=(os.environ.get("REDPANDA_DISABLE_SHARDS", "0") != "1"),
         )
 
     def build_models(self, last_g: str | None) -> None:
