@@ -11,7 +11,7 @@ for _path in (_repo_root, now_dir):
     if _path and _path not in sys.path:
         sys.path.insert(0, _path)
 
-from rvc.train.backend import configure_jax_env
+from rvc.train.backend import configure_jax_env, effective_cpu_count
 
 
 def _preparse_device_env(argv: list[str] | None) -> None:
@@ -56,6 +56,7 @@ class JaxDeviceInitError(RuntimeError):
 from rvc.jax import (
     JAX_BUCKET_BOUNDARIES,
     PrecisionConfig,
+    device_hbm_bytes,
     init_jax_compilation_cache,
     resolve_jax_devices,
     resolve_shard_map,
@@ -308,7 +309,7 @@ class JaxTrainer:
         self.data_sharding = NamedSharding(self.mesh, PartitionSpec("data"))
 
         self.segment_frames = int(config.train.segment_size) // int(config.data.hop_length)
-        self.workers = min(16, max(2, os.cpu_count() or 1))
+        self.workers = min(8, max(2, effective_cpu_count()))
         self.log_interval = 200
         self.global_step = 0
         self.epoch = 1
@@ -386,6 +387,20 @@ class JaxTrainer:
                 print(f"Failed to read speaker count from checkpoint: {exc}. Using default {spk_dim}.")
 
         config.model.spk_embed_dim = spk_dim
+        if not args.checkpointing and self.platform == "tpu" and getattr(self, "sampler", None) is not None:
+            per_core_bs = max(1, int(args.batch_size) // max(1, self.num_devices))
+            max_frames = max((f for _, f in self.sampler.unique_batch_shapes()), default=384)
+            hbm_bytes = device_hbm_bytes(self.devices) or (8 * (1024 ** 3))
+            hbm_gib = float(hbm_bytes) / float(1024 ** 3)
+            limit = max(8192, int(hbm_gib * 1024))
+            if per_core_bs * max_frames > limit:
+                args.checkpointing = True
+                print(
+                    f"Auto-enabling activation checkpointing (per-core batch={per_core_bs}, "
+                    f"max_frames={max_frames}, HBM={hbm_gib:.1f} GiB) to prevent XLA HBM host-offload stalls.",
+                    flush=True,
+                )
+
         self.syn_cfg = synthesizer_config_from_hparams(
             config,
             vocoder=args.vocoder,

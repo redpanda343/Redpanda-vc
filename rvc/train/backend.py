@@ -5,6 +5,7 @@ from __future__ import annotations
 import glob
 import importlib.metadata
 import importlib.util
+import math
 import os
 import sys
 
@@ -235,3 +236,27 @@ def select_training_backend(accelerator: str, gpus: str) -> tuple[str, str | Non
         return "torch", "Using PyTorch MPS backend."
 
     return ("jax" if has_jax_packages() else "torch"), None
+
+
+def effective_cpu_count() -> int:
+    """Return usable CPU count respecting affinity and Linux cgroup quotas."""
+    count = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+    try:
+        with open("/sys/fs/cgroup/cpu.max", "r", encoding="utf-8") as f:
+            parts = f.read().strip().split()
+            if len(parts) == 2 and parts[0] != "max":
+                quota, period = int(parts[0]), int(parts[1])
+                if quota > 0 and period > 0:
+                    return max(1, min(count, int(math.ceil(quota / period))))
+    except OSError:
+        pass
+    try:
+        with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "r", encoding="utf-8") as fq, open(
+            "/sys/fs/cgroup/cpu/cpu.cfs_period_us", "r", encoding="utf-8"
+        ) as fp:
+            quota, period = int(fq.read().strip()), int(fp.read().strip())
+            if quota > 0 and period > 0:
+                return max(1, min(count, int(math.ceil(quota / period))))
+    except OSError:
+        pass
+    return max(1, int(count))

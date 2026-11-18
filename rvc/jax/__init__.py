@@ -135,3 +135,19 @@ def supports_bfloat16(devices: Sequence[jax.Device]) -> bool:
         non_bf16_kinds = ("t4", "v100", "p100", "p4", "k80", "gtx", "rtx 20", "quadro rtx")
         return not any(tok in kind for tok in non_bf16_kinds)
     return False
+
+
+def device_hbm_bytes(devices: Sequence[jax.Device]) -> int | None:
+    """Return per-device HBM/VRAM limit in bytes when reported by the backend."""
+    if not devices:
+        return None
+    try:
+        stats = devices[0].memory_stats() or {}
+    except Exception:
+        return None
+    limit = stats.get("bytes_limit") or stats.get("bytes_reservable_limit")
+    try:
+        val = int(limit) if limit is not None else 0
+    except (TypeError, ValueError):
+        return None
+    return val if val > 0 else None

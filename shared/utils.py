@@ -156,8 +156,8 @@ def readable_npy(path):
 
 
 def save_npy(path, array):
-    """Atomically write an `.npy` file via temp file in parent directory."""
-    directory = os.path.dirname(os.path.dirname(os.path.abspath(path)))
+    """Atomically write an `.npy` file via temp file in its target directory."""
+    directory = os.path.dirname(os.path.abspath(path))
     handle, temporary = tempfile.mkstemp(dir=directory, prefix=".", suffix=".partial")
     try:
         with os.fdopen(handle, "wb") as file:

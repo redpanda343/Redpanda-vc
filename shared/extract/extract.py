@@ -345,7 +345,9 @@ if __name__ == "__main__":
             and previous_fingerprint != metadata["feature_fingerprint"]
         )
     )
-    for stale_path in glob.glob(os.path.join(exp_dir, ".*.partial")):
+    for stale_path in glob.glob(os.path.join(exp_dir, ".*.partial")) + glob.glob(
+        os.path.join(exp_dir, "*", ".*.partial")
+    ):
         os.remove(stale_path)
     if not feature_contract_changed:
         unreadable = 0

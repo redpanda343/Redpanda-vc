@@ -17,6 +17,8 @@ from typing import Iterator, Sequence
 import numpy as np
 import soundfile as sf
 
+from rvc.train.backend import effective_cpu_count
+
 
 def _hann_window_np(win_length: int) -> np.ndarray:
     if win_length <= 1:
@@ -83,7 +85,7 @@ class TextAudioDataset:
                 kept.append([audiopath, text, pitch, pitchf, dv])
 
         if len(kept) > 32:
-            workers = min(16, max(4, os.cpu_count() or 4))
+            workers = min(8, max(2, effective_cpu_count()))
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 lengths = list(
                     pool.map(
@@ -108,29 +110,28 @@ class TextAudioDataset:
         pitchf = np.load(pitchf_path, allow_pickle=False)
 
         n_num = min(phone.shape[0], pitch.shape[0], pitchf.shape[0], self.max_sample_frames)
-        phone = np.ascontiguousarray(phone[:n_num, :], dtype=np.float32)
-        pitch = np.ascontiguousarray(pitch[:n_num], dtype=np.int32)
-        pitchf = np.ascontiguousarray(pitchf[:n_num], dtype=np.float32)
+        phone = np.asarray(phone[:n_num, :], dtype=np.float32)
+        pitch = np.asarray(pitch[:n_num], dtype=np.int32)
+        pitchf = np.asarray(pitchf[:n_num], dtype=np.float32)
 
         audio, sr = sf.read(audiopath, dtype="float32")
         if audio.ndim > 1:
             audio = audio[:, 0]
         if int(sr) != self.sample_rate:
             raise ValueError(f"{sr} SR doesn't match target {self.sample_rate} SR in '{audiopath}'.")
-        audio = np.ascontiguousarray(audio[: self.max_sample_frames * self.hop_length], dtype=np.float32)
 
-        n_frames_audio = len(audio) // self.hop_length
+        n_frames_audio = min(len(audio) // self.hop_length, self.max_sample_frames)
         len_min = min(phone.shape[0], n_frames_audio)
         len_wav = len_min * self.hop_length
-        audio = np.ascontiguousarray(audio[:len_wav], dtype=np.float32)
+        audio = np.asarray(audio[:len_wav], dtype=np.float32)
         wav = audio[:, None]  # (T_wav, 1) NWC
         if len_min < n_num:
-            phone = np.ascontiguousarray(phone[:len_min, :], dtype=np.float32)
-            pitch = np.ascontiguousarray(pitch[:len_min], dtype=np.int32)
-            pitchf = np.ascontiguousarray(pitchf[:len_min], dtype=np.float32)
+            phone = phone[:len_min, :]
+            pitch = pitch[:len_min]
+            pitchf = pitchf[:len_min]
 
         spec = (
-            spectrogram_np(audio, self.filter_length, self.hop_length, self.win_length)
+            spectrogram_np(np.ascontiguousarray(audio, dtype=np.float32), self.filter_length, self.hop_length, self.win_length)
             if self.compute_spec
             else None
         )
@@ -394,7 +395,7 @@ class PrefetchBatchLoader:
         out_queue: queue.Queue = queue.Queue(maxsize=self.prefetch_batches)
         stop_event = threading.Event()
         sentinel = object()
-        max_in_flight = max(self.prefetch_batches * 2, self.num_workers * 2)
+        max_in_flight = max(self.prefetch_batches, self.num_workers * 2)
 
         def _producer() -> None:
             pending: deque = deque()

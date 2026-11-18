@@ -7,10 +7,10 @@ import os
 import queue
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from typing import Any, Sequence
 
-from rvc.train.backend import configure_jax_env, has_jax_cuda_plugin, has_jax_tpu_runtime
+from rvc.train.backend import configure_jax_env, effective_cpu_count, has_jax_cuda_plugin, has_jax_tpu_runtime
 
 configure_jax_env("auto")
 
@@ -20,7 +20,14 @@ import numpy as np
 import soundfile as sf
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
-from rvc.jax import PrecisionConfig, init_jax_compilation_cache, resolve_jax_devices, resolve_shard_map, supports_bfloat16
+from rvc.jax import (
+    PrecisionConfig,
+    device_hbm_bytes,
+    init_jax_compilation_cache,
+    resolve_jax_devices,
+    resolve_shard_map,
+    supports_bfloat16,
+)
 from rvc.jax.hubert import HubertConfig, hubert_forward, load_hubert_from_dir
 from rvc.jax.rmvpe import (
     HOP_LENGTH as RMVPE_HOP,
@@ -80,14 +87,26 @@ def _bucket_length_for_samples(n_samples: int) -> int:
     return _RMVPE_SEG_SAMPLES * k_dyn - RMVPE_HOP
 
 
-def _batch_per_device_for_bucket(bucket_samples: int) -> int:
+def _batch_per_device_for_bucket(bucket_samples: int, hbm_bytes: int | None = None) -> int:
+    if hbm_bytes is None:
+        caps = (16, 12, 8, 4)
+    else:
+        gib = float(hbm_bytes) / float(1024 ** 3)
+        if gib >= 24.0:
+            caps = (96, 48, 24, 12)
+        elif gib >= 12.0:
+            caps = (64, 32, 16, 8)
+        elif gib >= 7.0:
+            caps = (32, 16, 12, 4)
+        else:
+            caps = (16, 12, 8, 4)
     if bucket_samples <= 51040:
-        return 16
+        return caps[0]
     if bucket_samples <= 102240:
-        return 12
+        return caps[1]
     if bucket_samples <= 153440:
-        return 8
-    return 4
+        return caps[2]
+    return caps[3]
 
 
 def _decode_one(item: tuple[int, Sequence[str], bool, bool]) -> tuple[int, Sequence[str], np.ndarray, bool, bool]:
@@ -103,8 +122,7 @@ def _write_outputs(
     hubert_cfg: HubertConfig | None,
     expected_dim: int | None,
     updates: Any,
-    progress_fallback: Any,
-) -> None:
+) -> int:
     count_updates = 0
     for b_idx, (file_info, wav_len, do_f0, do_feat) in enumerate(tasks_meta):
         wav_path, opt_coarse, opt_full, feat_path = file_info[:4]
@@ -128,12 +146,10 @@ def _write_outputs(
             save_npy(feat_path, feats)
             count_updates += 1
 
-    if count_updates:
-        if updates is not None:
-            for _ in range(count_updates):
-                updates.put(1)
-        elif progress_fallback is not None:
-            progress_fallback.update(count_updates)
+    if count_updates and updates is not None:
+        for _ in range(count_updates):
+            updates.put(1)
+    return count_updates
 
 
 def run_jax_extraction(
@@ -164,6 +180,9 @@ def run_jax_extraction(
     replicated = NamedSharding(mesh, PartitionSpec())
     data_sharding = NamedSharding(mesh, PartitionSpec("data"))
     prec = PrecisionConfig.bfloat16() if supports_bfloat16(devices) else PrecisionConfig.float32()
+    hbm_bytes = device_hbm_bytes(devices)
+    if hbm_bytes is None and devices[0].platform == "tpu":
+        hbm_bytes = 8 * (1024 ** 3)
 
     # Stage 0: Filter work & mark skipped steps cleanly on progress bar
     def _check_pending(pair):
@@ -173,9 +192,9 @@ def run_jax_extraction(
         need_feat = bool(extract_features and not readable_npy(feat_p))
         return idx, f_info, need_f0, need_feat
 
-    cpu_count = os.cpu_count() or 4
-    decode_workers = min(32, max(4, cpu_count * 2))
-    writer_workers = min(16, max(4, cpu_count))
+    eff_cpus = effective_cpu_count()
+    decode_workers = min(8, max(2, eff_cpus))
+    writer_workers = min(4, max(2, eff_cpus))
 
     if len(files) > 32:
         with ThreadPoolExecutor(max_workers=decode_workers) as check_pool:
@@ -220,7 +239,7 @@ def run_jax_extraction(
         b_len = _bucket_length_for_samples(est_n)
         grouped.setdefault((b_len, item[2], item[3]), []).append(item)
 
-    batch_queue: queue.Queue = queue.Queue(maxsize=24)
+    batch_queue: queue.Queue = queue.Queue(maxsize=32)
     sentinel = object()
     decode_errors: list[BaseException] = []
 
@@ -236,6 +255,7 @@ def run_jax_extraction(
         return do_f0, do_feat, audio_arr, lens_arr, meta
 
     def _produce_batches() -> None:
+        in_flight: set[Any] = set()
         try:
             overflow: dict[tuple[int, bool, bool], list[tuple[Sequence[str], np.ndarray, bool, bool]]] = {}
 
@@ -256,7 +276,7 @@ def run_jax_extraction(
                         key = min(overflow.keys())
                     bucket_samples, do_f0, do_feat = key
                     items = grouped.get(key, [])
-                    per_dev = _batch_per_device_for_bucket(bucket_samples)
+                    per_dev = _batch_per_device_for_bucket(bucket_samples, hbm_bytes)
                     global_bs = per_dev * num_devices
                     cur_rows: list[tuple[Sequence[str], np.ndarray, bool, bool]] = overflow.pop(key, [])
 
@@ -264,22 +284,37 @@ def run_jax_extraction(
                         batch_queue.put(_pack_batch(cur_rows[:global_bs], global_bs, bucket_samples, do_f0, do_feat))
                         cur_rows = cur_rows[global_bs:]
 
-                    futures = [dec_pool.submit(_get_audio, it) for it in items]
-                    for fut in as_completed(futures):
-                        _idx, fi, df, dft, audio = fut.result()
-                        if len(audio) > bucket_samples:
-                            target_b = _bucket_length_for_samples(len(audio) + 64)
-                            overflow.setdefault((target_b, df, dft), []).append((fi, audio, df, dft))
-                            continue
-                        cur_rows.append((fi, audio, df, dft))
-                        if len(cur_rows) == global_bs:
-                            batch_queue.put(_pack_batch(cur_rows, global_bs, bucket_samples, do_f0, do_feat))
-                            cur_rows = []
+                    # Bound in-flight decodes so large datasets don't spike RAM or starve the GIL.
+                    item_iter = iter(items)
+                    max_in_flight = max(32, global_bs * 3)
+                    for _ in range(max_in_flight):
+                        nxt = next(item_iter, None)
+                        if nxt is None:
+                            break
+                        in_flight.add(dec_pool.submit(_get_audio, nxt))
+
+                    while in_flight:
+                        done_futs, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
+                        for fut in done_futs:
+                            _idx, fi, df, dft, audio = fut.result()
+                            nxt = next(item_iter, None)
+                            if nxt is not None:
+                                in_flight.add(dec_pool.submit(_get_audio, nxt))
+                            if len(audio) > bucket_samples:
+                                target_b = _bucket_length_for_samples(len(audio) + 64)
+                                overflow.setdefault((target_b, df, dft), []).append((fi, audio, df, dft))
+                                continue
+                            cur_rows.append((fi, audio, df, dft))
+                            if len(cur_rows) == global_bs:
+                                batch_queue.put(_pack_batch(cur_rows, global_bs, bucket_samples, do_f0, do_feat))
+                                cur_rows = []
                     if cur_rows:
                         batch_queue.put(_pack_batch(cur_rows, global_bs, bucket_samples, do_f0, do_feat))
         except BaseException as exc:
             decode_errors.append(exc)
         finally:
+            for fut in in_flight:
+                fut.cancel()
             batch_queue.put(sentinel)
 
     # Start host decoding in parallel with TPU weight load + AOT bucket compilation.
@@ -371,7 +406,7 @@ def run_jax_extraction(
     if warmup_keys:
         print(f"Pre-compiling XLA extraction kernels for {len(warmup_keys)} bucket shape(s)...", flush=True)
         for idx_w, (b_len, do_f0_w, do_feat_w) in enumerate(warmup_keys, start=1):
-            g_bs = _batch_per_device_for_bucket(b_len) * num_devices
+            g_bs = _batch_per_device_for_bucket(b_len, hbm_bytes) * num_devices
             t0 = time.perf_counter()
             audio_sds = jax.ShapeDtypeStruct((g_bs, b_len), jnp.float32, sharding=data_sharding)
             lens_sds = jax.ShapeDtypeStruct((g_bs,), jnp.int32, sharding=data_sharding)
@@ -391,6 +426,12 @@ def run_jax_extraction(
     write_futures: list[Any] = []
     pending_result: tuple[Any, Any, list[tuple[Sequence[str], int, bool, bool]]] | None = None
 
+    def _drain_writes(wait_all: bool = False) -> None:
+        while write_futures and (wait_all or write_futures[0].done()):
+            done_count = write_futures.pop(0).result()
+            if done_count and progress is not None and updates is None:
+                progress.update(done_count)
+
     def _flush_pending(prev_f0, prev_feat, prev_meta, pool):
         f0_h, feat_h = jax.device_get((prev_f0, prev_feat))
         nv = len(prev_meta)
@@ -402,11 +443,13 @@ def run_jax_extraction(
             hubert_cfg,
             expected_dim,
             updates,
-            progress if updates is None else None,
         )
         write_futures.append(fut)
-        while len(write_futures) > 16:
-            write_futures.pop(0).result()
+        while len(write_futures) > 12:
+            done_count = write_futures.pop(0).result()
+            if done_count and progress is not None and updates is None:
+                progress.update(done_count)
+        _drain_writes(wait_all=False)
 
     with ThreadPoolExecutor(max_workers=writer_workers) as write_pool:
         while True:
@@ -431,7 +474,6 @@ def run_jax_extraction(
         if decode_errors:
             raise decode_errors[0]
 
-        for fut in write_futures:
-            fut.result()
+        _drain_writes(wait_all=True)
 
     return {"processed": len(pending), "skipped_steps": skipped_updates}

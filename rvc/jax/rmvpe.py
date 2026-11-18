@@ -209,7 +209,8 @@ def _masked_gru_scan(
         h_next = jnp.where(m, h_next, 0.0)
         return h_next, h_next
 
-    _, out_tbc = lax.scan(_step, jnp.zeros((b, h_dim), dtype=jnp.float32), (x_tbc, m_tb))
+    scan_unroll = 4 if int(x_tbc.shape[0]) >= 4 else 1
+    _, out_tbc = lax.scan(_step, jnp.zeros((b, h_dim), dtype=jnp.float32), (x_tbc, m_tb), unroll=scan_unroll)
     if reverse:
         out_tbc = out_tbc[::-1]
     return jnp.transpose(out_tbc, (1, 0, 2))
