@@ -1108,17 +1108,37 @@ def preload_shards_into_cache(
     for entries in per_shard.values():
         entries.sort(key=lambda t: t[1])
 
+    total_bytes = 0
+    shard_sizes: dict[int, int] = {}
+    for sid in sorted(per_shard.keys()):
+        sp = os.path.join(reader.shards_dir, f"shard_{sid:05d}.rpack")
+        try:
+            sz = os.path.getsize(sp)
+        except OSError:
+            sz = 0
+        shard_sizes[sid] = sz
+        total_bytes += sz
+
     decode_w = min(8, max(2, int(workers)))
     pbar = None
     if progress:
         print(
-            f"Loading {missing_total} clip(s) sequentially from {len(per_shard)} shard(s) into host RAM...",
+            f"Loading {missing_total} clip(s) ({total_bytes / (1024 ** 3):.2f} GiB) sequentially from {len(per_shard)} shard(s) into host RAM...",
             flush=True,
         )
         try:
             from tqdm import tqdm
 
-            pbar = tqdm(total=missing_total, unit="clip", desc="Shard -> RAM", leave=True)
+            pbar = tqdm(
+                total=max(1, total_bytes),
+                unit="B",
+                unit_scale=True,
+                unit_divisor=1024,
+                desc="Shard -> RAM",
+                file=sys.stdout,
+                mininterval=0.25,
+                leave=True,
+            )
         except Exception:
             pbar = None
 
@@ -1138,6 +1158,9 @@ def preload_shards_into_cache(
         return gidx, rec
 
     open_flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    _READ_CHUNK = 8 * 1024 * 1024
+    # Reuse one buffer across shards so 65 shards do not churn 20 GiB of heap allocations
+    reusable_buf = bytearray(max((shard_sizes.values()), default=0))
     try:
         with ThreadPoolExecutor(max_workers=decode_w) as pool:
             for sid in sorted(per_shard.keys()):
@@ -1146,42 +1169,60 @@ def preload_shards_into_cache(
                 entries = per_shard[sid]
                 shard_path = os.path.join(reader.shards_dir, f"shard_{sid:05d}.rpack")
                 fd = os.open(shard_path, open_flags)
-                blob: bytes | None = None
+                fsize = shard_sizes.get(sid, 0)
+                if fsize <= 0:
+                    fsize = os.fstat(fd).st_size
+                if len(reusable_buf) < fsize:
+                    reusable_buf = bytearray(fsize)
+                mv_full = memoryview(reusable_buf)[:fsize]
+                got = 0
                 try:
+                    if hasattr(os, "posix_fadvise"):
+                        try:
+                            os.posix_fadvise(fd, 0, fsize, os.POSIX_FADV_SEQUENTIAL)
+                        except OSError:
+                            pass
                     with os.fdopen(fd, "rb", buffering=0, closefd=False) as rf:
-                        blob = rf.read()
+                        while got < fsize:
+                            end = min(fsize, got + _READ_CHUNK)
+                            n_read = rf.readinto(mv_full[got:end])
+                            if not n_read:
+                                break
+                            got += n_read
+                            if pbar is not None:
+                                pbar.update(n_read)
                     _fadvise_dontneed(fd)
                 finally:
                     os.close(fd)
 
-                mv = memoryview(blob)
+                mv_slice = mv_full[:got]
                 try:
                     if len(entries) <= 4:
-                        decoded_list = [_decode_slice(mv, it) for it in entries]
+                        decoded_list = [_decode_slice(mv_slice, it) for it in entries]
                     else:
-                        decoded_list = list(pool.map(lambda it: _decode_slice(mv, it), entries))
+                        decoded_list = list(pool.map(lambda it: _decode_slice(mv_slice, it), entries))
                 finally:
                     try:
-                        mv.release()
+                        mv_slice.release()
                     except BufferError:
                         pass
-                    del mv, blob
+                    try:
+                        mv_full.release()
+                    except BufferError:
+                        pass
 
-                added = 0
                 for gidx, rec in decoded_list:
                     n_b = _sample_nbytes(rec)
                     if cur_bytes + n_b > max_bytes:
                         break
                     sample_cache[gidx] = rec
                     cur_bytes += n_b
-                    added += 1
-                if pbar is not None and added > 0:
-                    pbar.update(added)
                 if cur_bytes >= max_bytes:
                     break
     finally:
         if pbar is not None:
             pbar.close()
+        del reusable_buf
 
     if len(sample_cache) >= n_items:
         reader.close()
