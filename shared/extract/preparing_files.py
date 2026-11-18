@@ -72,7 +72,17 @@ def generate_filelist(model_path: str, sample_rate: int, include_mutes: int = 2)
         mute_base_path = os.path.join(current_directory, "logs", "mute")
 
     options = []
+    def _rel_posix_dir(path: str) -> str:
+        rel = os.path.relpath(path).replace("\\", "/")
+        return "" if rel == "." else f"{rel.rstrip('/')}/"
+
+    rel_gt_dir = _rel_posix_dir(gt_wavs_dir)
+    rel_feat_dir = _rel_posix_dir(feature_dir)
+    rel_f0_dir = _rel_posix_dir(f0_dir)
+    rel_f0nsf_dir = _rel_posix_dir(f0nsf_dir)
+
     sids = []
+    seen_sids: set[str] = set()
     if dataset_format == "flac":
         audio_files = sorted(
             filename
@@ -82,32 +92,38 @@ def generate_filelist(model_path: str, sample_rate: int, include_mutes: int = 2)
         if not audio_files:
             raise RuntimeError(f"No FLAC training slices found in {gt_wavs_dir}")
 
+        with os.scandir(feature_dir) as entries:
+            existing_feat = {e.name for e in entries if e.is_file()}
+        with os.scandir(f0_dir) as entries:
+            existing_f0 = {e.name for e in entries if e.is_file()}
+        with os.scandir(f0nsf_dir) as entries:
+            existing_f0nsf = {e.name for e in entries if e.is_file()}
+
         for audio_file in audio_files:
             name = os.path.splitext(audio_file)[0]
-            feature_file = f"{audio_file}.npy"
-            f0_file = f"{audio_file}.npy"
-            required_paths = (
-                os.path.join(feature_dir, feature_file),
-                os.path.join(f0_dir, f0_file),
-                os.path.join(f0nsf_dir, f0_file),
-            )
-            missing_paths = [path for path in required_paths if not os.path.isfile(path)]
-            if missing_paths:
-                raise RuntimeError(
-                    "Missing FLAC extraction artifacts: " + ", ".join(missing_paths)
+            out_file = f"{audio_file}.npy"
+            if (
+                out_file not in existing_feat
+                or out_file not in existing_f0
+                or out_file not in existing_f0nsf
+            ):
+                required_paths = (
+                    os.path.join(feature_dir, out_file),
+                    os.path.join(f0_dir, out_file),
+                    os.path.join(f0nsf_dir, out_file),
                 )
+                missing_paths = [path for path in required_paths if not os.path.isfile(path)]
+                if missing_paths:
+                    raise RuntimeError(
+                        "Missing FLAC extraction artifacts: " + ", ".join(missing_paths)
+                    )
 
             sid = name.split("_")[0]
-            if sid not in sids:
+            if sid not in seen_sids:
+                seen_sids.add(sid)
                 sids.append(sid)
-            rel_audio = os.path.relpath(os.path.join(gt_wavs_dir, audio_file))
-            rel_feat = os.path.relpath(required_paths[0])
-            rel_f0 = os.path.relpath(required_paths[1])
-            rel_f0nsf = os.path.relpath(required_paths[2])
             options.append(
-                f"{rel_audio}|{rel_feat}|{rel_f0}|{rel_f0nsf}|{sid}".replace(
-                    "\\", "/"
-                )
+                f"{rel_gt_dir}{audio_file}|{rel_feat_dir}{out_file}|{rel_f0_dir}{out_file}|{rel_f0nsf_dir}{out_file}|{sid}"
             )
     else:
         gt_wavs_files = {
@@ -135,20 +151,13 @@ def generate_filelist(model_path: str, sample_rate: int, include_mutes: int = 2)
 
         for name in names:
             sid = name.split("_")[0]
-            if sid not in sids:
+            if sid not in seen_sids:
+                seen_sids.add(sid)
                 sids.append(sid)
 
             # Preserve the existing WAV paths and naming.
-            rel_wav = os.path.relpath(f"{os.path.join(gt_wavs_dir, name)}.wav")
-            rel_feat = os.path.relpath(f"{os.path.join(feature_dir, name)}.npy")
-            rel_f0 = os.path.relpath(f"{os.path.join(f0_dir, name)}.wav.npy")
-            rel_f0nsf = os.path.relpath(
-                f"{os.path.join(f0nsf_dir, name)}.wav.npy"
-            )
             options.append(
-                f"{rel_wav}|{rel_feat}|{rel_f0}|{rel_f0nsf}|{sid}".replace(
-                    "\\", "/"
-                )
+                f"{rel_gt_dir}{name}.wav|{rel_feat_dir}{name}.npy|{rel_f0_dir}{name}.wav.npy|{rel_f0nsf_dir}{name}.wav.npy|{sid}"
             )
 
     if include_mutes > 0:

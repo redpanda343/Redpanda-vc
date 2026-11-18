@@ -1,9 +1,12 @@
+import ast
 import collections
 import csv
 import functools
 import importlib.metadata
 import inspect
+import math
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -11,7 +14,6 @@ import soxr
 import librosa
 import soundfile as sf
 import numpy as np
-import re
 import unicodedata
 import wget
 from torch import nn
@@ -146,25 +148,104 @@ def load_audio_infer(
     return np.array(audio).flatten()
 
 
-def readable_npy(path):
-    """Return True if `.npy` file exists and its header can be memory-mapped safely."""
+_NPY_HEADER_RE = re.compile(
+    r"^\{\s*'descr'\s*:\s*'([^']+)'\s*,\s*'fortran_order'\s*:\s*(?:True|False)\s*,\s*'shape'\s*:\s*\(([^)]*)\)\s*,?\s*\}\s*$"
+)
+
+
+def npy_header_shape(path):
+    """Return `.npy` shape tuple after validating magic, dtype, and byte length, or None."""
+    if not path or not os.path.isfile(path):
+        return None
     try:
-        np.load(path, mmap_mode="r", allow_pickle=False)
+        with open(path, "rb") as file:
+            file_size = os.fstat(file.fileno()).st_size
+            prefix = file.read(8)
+            if len(prefix) < 8 or prefix[:6] != b"\x93NUMPY":
+                return None
+            major = prefix[6]
+            if major == 1:
+                hlen_bytes = file.read(2)
+                if len(hlen_bytes) < 2:
+                    return None
+                header_offset = 10
+            elif major == 2:
+                hlen_bytes = file.read(4)
+                if len(hlen_bytes) < 4:
+                    return None
+                header_offset = 12
+            else:
+                header_offset = 0
+                hlen_bytes = b""
+
+            if header_offset:
+                header_len = int.from_bytes(hlen_bytes, "little")
+                if header_len <= 0 or header_len > 1048576:
+                    header_offset = 0
+                else:
+                    header_bytes = file.read(header_len)
+                    if len(header_bytes) != header_len:
+                        return None
+                    header_str = header_bytes.decode("latin1")
+                    match = _NPY_HEADER_RE.match(header_str)
+                    if match is not None:
+                        descr = match.group(1)
+                        raw_shape = match.group(2).strip()
+                        if raw_shape:
+                            parts = raw_shape.split(",")
+                            if parts[-1].strip() == "":
+                                parts = parts[:-1]
+                            shape = tuple(int(part.strip()) for part in parts)
+                        else:
+                            shape = ()
+                    else:
+                        meta = ast.literal_eval(header_str.strip())
+                        if not isinstance(meta, dict):
+                            return None
+                        descr = meta["descr"]
+                        raw_dims = meta["shape"]
+                        if not isinstance(raw_dims, tuple) or not all(
+                            isinstance(dim, int) and not isinstance(dim, bool)
+                            for dim in raw_dims
+                        ):
+                            return None
+                        shape = raw_dims
+                    if any(dim < 0 for dim in shape):
+                        return None
+                    dtype = np.dtype(descr)
+                    if dtype.hasobject:
+                        return None
+                    expected_bytes = header_offset + header_len + math.prod(shape) * dtype.itemsize
+                    if file_size < expected_bytes:
+                        return None
+                    return shape
     except Exception:
-        return False
-    return True
+        return None
+
+    try:
+        arr = np.load(path, mmap_mode="r", allow_pickle=False)
+        return tuple(arr.shape)
+    except Exception:
+        return None
+
+
+def readable_npy(path):
+    """Return True if `.npy` file exists and passes header/size validation."""
+    return npy_header_shape(path) is not None
 
 
 def save_npy(path, array):
     """Atomically write an `.npy` file via temp file in its target directory."""
     directory = os.path.dirname(os.path.abspath(path))
     handle, temporary = tempfile.mkstemp(dir=directory, prefix=".", suffix=".partial")
+    replaced = False
     try:
         with os.fdopen(handle, "wb") as file:
             np.save(file, array, allow_pickle=False)
         os.replace(temporary, path)
+        replaced = True
     finally:
-        if os.path.exists(temporary):
+        if not replaced and os.path.exists(temporary):
             os.remove(temporary)
 
 

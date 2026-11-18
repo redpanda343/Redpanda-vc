@@ -27,6 +27,7 @@ from shared.utils import (
     get_embedding_metadata,
     load_audio_16k,
     load_embedding,
+    npy_header_shape,
     readable_npy,
     save_npy,
 )
@@ -351,20 +352,21 @@ if __name__ == "__main__":
         os.remove(stale_path)
     if not feature_contract_changed:
         unreadable = 0
-        for existing_feature_path in glob.glob(
-            os.path.join(exp_dir, "extracted", "*.npy")
-        ):
-            try:
-                existing_shape = np.load(
-                    existing_feature_path, mmap_mode="r", allow_pickle=False
-                ).shape
-            except Exception:
-                os.remove(existing_feature_path)
-                unreadable += 1
-                continue
-            if len(existing_shape) != 2 or existing_shape[1] != metadata["feature_dim"]:
-                feature_contract_changed = True
-                break
+        extracted_dir = os.path.join(exp_dir, "extracted")
+        if os.path.isdir(extracted_dir):
+            with os.scandir(extracted_dir) as entries:
+                for entry in entries:
+                    if entry.name.startswith(".") or not entry.name.endswith(".npy"):
+                        continue
+                    existing_feature_path = entry.path
+                    existing_shape = npy_header_shape(existing_feature_path)
+                    if existing_shape is None:
+                        os.remove(existing_feature_path)
+                        unreadable += 1
+                        continue
+                    if len(existing_shape) != 2 or existing_shape[1] != metadata["feature_dim"]:
+                        feature_contract_changed = True
+                        break
         if unreadable:
             print(f"Removed {unreadable} unreadable feature file(s); they are extracted again.")
     if feature_contract_changed:

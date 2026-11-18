@@ -7,7 +7,8 @@ import os
 import queue
 import threading
 import time
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Sequence
 
 from rvc.train.backend import configure_jax_env, effective_cpu_count, has_jax_cuda_plugin, has_jax_tpu_runtime
@@ -87,7 +88,11 @@ def _bucket_length_for_samples(n_samples: int) -> int:
     return _RMVPE_SEG_SAMPLES * k_dyn - RMVPE_HOP
 
 
-def _batch_per_device_for_bucket(bucket_samples: int, hbm_bytes: int | None = None) -> int:
+def _batch_per_device_for_bucket(
+    bucket_samples: int,
+    hbm_bytes: int | None = None,
+    num_devices: int = 1,
+) -> int:
     if hbm_bytes is None:
         caps = (16, 12, 8, 4)
     else:
@@ -101,12 +106,29 @@ def _batch_per_device_for_bucket(bucket_samples: int, hbm_bytes: int | None = No
         else:
             caps = (16, 12, 8, 4)
     if bucket_samples <= 51040:
-        return caps[0]
-    if bucket_samples <= 102240:
-        return caps[1]
-    if bucket_samples <= 153440:
-        return caps[2]
-    return caps[3]
+        bucket_idx = 0
+    elif bucket_samples <= 102240:
+        bucket_idx = 1
+    elif bucket_samples <= 153440:
+        bucket_idx = 2
+    else:
+        bucket_idx = 3
+    per_dev = caps[bucket_idx]
+    if num_devices >= 4:
+        # Cap multi-chip global batch size to keep startup latency and host RAM bounded.
+        global_cap = (128, 64, 48, 32)[bucket_idx]
+        per_dev = min(per_dev, max(1, global_cap // num_devices))
+    return per_dev
+
+
+def _map_in_chunks(pool: ThreadPoolExecutor, fn, items: Sequence[Any], chunk_size: int = 256) -> list[Any]:
+    if len(items) <= chunk_size:
+        return list(pool.map(fn, items))
+    chunks = [items[i : i + chunk_size] for i in range(0, len(items), chunk_size)]
+    out: list[Any] = []
+    for part in pool.map(lambda chunk: [fn(item) for item in chunk], chunks):
+        out.extend(part)
+    return out
 
 
 def _decode_one(item: tuple[int, Sequence[str], bool, bool]) -> tuple[int, Sequence[str], np.ndarray, bool, bool]:
@@ -193,12 +215,13 @@ def run_jax_extraction(
         return idx, f_info, need_f0, need_feat
 
     eff_cpus = effective_cpu_count()
-    decode_workers = min(8, max(2, eff_cpus))
-    writer_workers = min(4, max(2, eff_cpus))
+    io_workers = min(32, max(8, eff_cpus * 4))
+    decode_workers = min(12, max(4, eff_cpus * 2))
+    writer_workers = min(16, max(4, eff_cpus * 2))
 
     if len(files) > 32:
-        with ThreadPoolExecutor(max_workers=decode_workers) as check_pool:
-            checked = list(check_pool.map(_check_pending, enumerate(files)))
+        with ThreadPoolExecutor(max_workers=io_workers) as check_pool:
+            checked = _map_in_chunks(check_pool, _check_pending, list(enumerate(files)))
     else:
         checked = [_check_pending(pair) for pair in enumerate(files)]
 
@@ -222,16 +245,20 @@ def run_jax_extraction(
     threshold_f32 = float(filter_radius)
 
     # Stage 1: Probe lengths upfront so active buckets are known for AOT warmup while decoding runs.
-    with ThreadPoolExecutor(max_workers=decode_workers) as est_pool:
-        if predecoded_audio:
-            est_lens = [
-                len(predecoded_audio[item[1][0]])
-                if item[1][0] in predecoded_audio
-                else _estimate_16k_samples(item[1][0])
-                for item in pending
-            ]
+    if predecoded_audio and all(item[1][0] in predecoded_audio for item in pending):
+        est_lens = [len(predecoded_audio[item[1][0]]) for item in pending]
+    else:
+        def _est_item(it):
+            p = it[1][0]
+            if predecoded_audio and p in predecoded_audio:
+                return len(predecoded_audio[p])
+            return _estimate_16k_samples(p)
+
+        if len(pending) > 32:
+            with ThreadPoolExecutor(max_workers=io_workers) as est_pool:
+                est_lens = _map_in_chunks(est_pool, _est_item, pending)
         else:
-            est_lens = list(est_pool.map(lambda it: _estimate_16k_samples(it[1][0]), pending))
+            est_lens = [_est_item(item) for item in pending]
 
     # Bucket key: (bucket_T, do_f0, do_feat) using one canonical per-device batch size per bucket.
     grouped: dict[tuple[int, bool, bool], list[tuple[int, Sequence[str], bool, bool]]] = {}
@@ -239,31 +266,29 @@ def run_jax_extraction(
         b_len = _bucket_length_for_samples(est_n)
         grouped.setdefault((b_len, item[2], item[3]), []).append(item)
 
-    batch_queue: queue.Queue = queue.Queue(maxsize=32)
+    batch_queue: queue.Queue = queue.Queue(maxsize=6)
     sentinel = object()
     decode_errors: list[BaseException] = []
 
     def _pack_batch(rows, global_bs: int, bucket_samples: int, do_f0: bool, do_feat: bool):
-        audio_arr = np.zeros((global_bs, bucket_samples), dtype=np.float32)
+        audio_arr = np.empty((global_bs, bucket_samples), dtype=np.float32)
         lens_arr = np.full((global_bs,), max(512, min(bucket_samples, RMVPE_HOP * 4)), dtype=np.int32)
         meta = []
         for bi, (fi, wav, df, dft) in enumerate(rows):
             n = len(wav)
             audio_arr[bi, :n] = wav
+            if n < bucket_samples:
+                audio_arr[bi, n:] = 0.0
             lens_arr[bi] = n
             meta.append((fi, n, df, dft))
+        if len(rows) < global_bs:
+            audio_arr[len(rows) :] = 0.0
         return do_f0, do_feat, audio_arr, lens_arr, meta
 
     def _produce_batches() -> None:
-        in_flight: set[Any] = set()
+        in_flight: deque[Any] = deque()
         try:
             overflow: dict[tuple[int, bool, bool], list[tuple[Sequence[str], np.ndarray, bool, bool]]] = {}
-
-            def _get_audio(it):
-                if predecoded_audio and it[1][0] in predecoded_audio:
-                    return (*it, predecoded_audio[it[1][0]])
-                idx, fi, audio, df, dft = _decode_one(it)
-                return idx, fi, df, dft, audio
 
             with ThreadPoolExecutor(max_workers=decode_workers) as dec_pool:
                 keys_ordered = sorted(grouped.keys())
@@ -276,7 +301,7 @@ def run_jax_extraction(
                         key = min(overflow.keys())
                     bucket_samples, do_f0, do_feat = key
                     items = grouped.get(key, [])
-                    per_dev = _batch_per_device_for_bucket(bucket_samples, hbm_bytes)
+                    per_dev = _batch_per_device_for_bucket(bucket_samples, hbm_bytes, num_devices=num_devices)
                     global_bs = per_dev * num_devices
                     cur_rows: list[tuple[Sequence[str], np.ndarray, bool, bool]] = overflow.pop(key, [])
 
@@ -284,30 +309,36 @@ def run_jax_extraction(
                         batch_queue.put(_pack_batch(cur_rows[:global_bs], global_bs, bucket_samples, do_f0, do_feat))
                         cur_rows = cur_rows[global_bs:]
 
-                    # Bound in-flight decodes so large datasets don't spike RAM or starve the GIL.
-                    item_iter = iter(items)
-                    max_in_flight = max(32, global_bs * 3)
-                    for _ in range(max_in_flight):
-                        nxt = next(item_iter, None)
-                        if nxt is None:
-                            break
-                        in_flight.add(dec_pool.submit(_get_audio, nxt))
+                    def _handle_decoded(fi, df, dft, audio) -> None:
+                        nonlocal cur_rows
+                        if len(audio) > bucket_samples:
+                            target_b = _bucket_length_for_samples(len(audio) + 64)
+                            overflow.setdefault((target_b, df, dft), []).append((fi, audio, df, dft))
+                            return
+                        cur_rows.append((fi, audio, df, dft))
+                        if len(cur_rows) == global_bs:
+                            batch_queue.put(_pack_batch(cur_rows, global_bs, bucket_samples, do_f0, do_feat))
+                            cur_rows = []
 
-                    while in_flight:
-                        done_futs, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
-                        for fut in done_futs:
-                            _idx, fi, df, dft, audio = fut.result()
+                    # Bound in-flight decodes in FIFO order to avoid wait()/FIRST_COMPLETED lock churn.
+                    item_iter = iter(items)
+                    max_in_flight = min(48, max(16, decode_workers * 3))
+                    while True:
+                        while len(in_flight) < max_in_flight:
                             nxt = next(item_iter, None)
-                            if nxt is not None:
-                                in_flight.add(dec_pool.submit(_get_audio, nxt))
-                            if len(audio) > bucket_samples:
-                                target_b = _bucket_length_for_samples(len(audio) + 64)
-                                overflow.setdefault((target_b, df, dft), []).append((fi, audio, df, dft))
+                            if nxt is None:
+                                break
+                            if predecoded_audio and nxt[1][0] in predecoded_audio:
+                                _idx, fi, df, dft = nxt
+                                _handle_decoded(fi, df, dft, predecoded_audio[fi[0]])
                                 continue
-                            cur_rows.append((fi, audio, df, dft))
-                            if len(cur_rows) == global_bs:
-                                batch_queue.put(_pack_batch(cur_rows, global_bs, bucket_samples, do_f0, do_feat))
-                                cur_rows = []
+                            in_flight.append(dec_pool.submit(_decode_one, nxt))
+                        if not in_flight:
+                            break
+                        fut = in_flight.popleft()
+                        _idx, fi, audio, df, dft = fut.result()
+                        _handle_decoded(fi, df, dft, audio)
+
                     if cur_rows:
                         batch_queue.put(_pack_batch(cur_rows, global_bs, bucket_samples, do_f0, do_feat))
         except BaseException as exc:
@@ -406,7 +437,7 @@ def run_jax_extraction(
     if warmup_keys:
         print(f"Pre-compiling XLA extraction kernels for {len(warmup_keys)} bucket shape(s)...", flush=True)
         for idx_w, (b_len, do_f0_w, do_feat_w) in enumerate(warmup_keys, start=1):
-            g_bs = _batch_per_device_for_bucket(b_len, hbm_bytes) * num_devices
+            g_bs = _batch_per_device_for_bucket(b_len, hbm_bytes, num_devices=num_devices) * num_devices
             t0 = time.perf_counter()
             audio_sds = jax.ShapeDtypeStruct((g_bs, b_len), jnp.float32, sharding=data_sharding)
             lens_sds = jax.ShapeDtypeStruct((g_bs,), jnp.int32, sharding=data_sharding)
@@ -423,32 +454,38 @@ def run_jax_extraction(
                 flush=True,
             )
 
-    write_futures: list[Any] = []
+    write_futures: deque[Any] = deque()
+    max_write_futures = max(24, writer_workers * 3)
+    write_chunk_size = 16
     pending_result: tuple[Any, Any, list[tuple[Sequence[str], int, bool, bool]]] | None = None
 
     def _drain_writes(wait_all: bool = False) -> None:
         while write_futures and (wait_all or write_futures[0].done()):
-            done_count = write_futures.pop(0).result()
+            done_count = write_futures.popleft().result()
             if done_count and progress is not None and updates is None:
                 progress.update(done_count)
 
     def _flush_pending(prev_f0, prev_feat, prev_meta, pool):
         f0_h, feat_h = jax.device_get((prev_f0, prev_feat))
         nv = len(prev_meta)
-        fut = pool.submit(
-            _write_outputs,
-            prev_meta,
-            np.asarray(f0_h[:nv]) if f0_h is not None else None,
-            np.asarray(feat_h[:nv]) if feat_h is not None else None,
-            hubert_cfg,
-            expected_dim,
-            updates,
-        )
-        write_futures.append(fut)
-        while len(write_futures) > 12:
-            done_count = write_futures.pop(0).result()
-            if done_count and progress is not None and updates is None:
-                progress.update(done_count)
+        f0_arr = np.asarray(f0_h[:nv]) if f0_h is not None else None
+        feat_arr = np.asarray(feat_h[:nv]) if feat_h is not None else None
+        for start in range(0, nv, write_chunk_size):
+            end = min(start + write_chunk_size, nv)
+            fut = pool.submit(
+                _write_outputs,
+                prev_meta[start:end],
+                f0_arr[start:end] if f0_arr is not None else None,
+                feat_arr[start:end] if feat_arr is not None else None,
+                hubert_cfg,
+                expected_dim,
+                updates,
+            )
+            write_futures.append(fut)
+            while len(write_futures) > max_write_futures:
+                done_count = write_futures.popleft().result()
+                if done_count and progress is not None and updates is None:
+                    progress.update(done_count)
         _drain_writes(wait_all=False)
 
     with ThreadPoolExecutor(max_workers=writer_workers) as write_pool:
