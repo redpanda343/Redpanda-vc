@@ -354,11 +354,11 @@ def _decode_clip_record(
     wav_1d = np.frombuffer(mv[pos:wav_end], dtype=wav_dt)
     if wav_is_int16:
         if allow_pcm16 and not compute_spec:
-            wav_out = np.ascontiguousarray(wav_1d, dtype=np.int16)[:, None]
+            wav_out = np.array(wav_1d, dtype=np.int16, copy=True)[:, None]
         else:
-            wav_out = np.ascontiguousarray(wav_1d.astype(np.float32) * _PCM16_INV)[:, None]
+            wav_out = (np.array(wav_1d, dtype=np.float32, copy=True) * _PCM16_INV)[:, None]
     else:
-        wav_out = np.ascontiguousarray(wav_1d, dtype=np.float32)[:, None]
+        wav_out = np.array(wav_1d, dtype=np.float32, copy=True)[:, None]
 
     phone_use = np.array(
         np.frombuffer(mv[wav_end:phone_end], dtype="<f4").reshape(phone_frames, phone_dim),
@@ -1078,6 +1078,116 @@ def ensure_dataset_shards(
     return reader, seed_items
 
 
+def preload_shards_into_cache(
+    dataset: "TextAudioDataset",
+    sample_cache: dict[int, tuple[Any, ...]],
+    *,
+    max_bytes: int,
+    workers: int = 4,
+    progress: bool = True,
+) -> int:
+    """Sequentially stream whole `.rpack` shards into RAM `_sample_cache`, avoiding slow random 640K seeks."""
+    cur_bytes = sum(_sample_nbytes(v) for v in sample_cache.values())
+    reader = getattr(dataset, "_shard_reader", None)
+    if reader is None or max_bytes <= 0 or cur_bytes >= max_bytes:
+        return cur_bytes
+
+    n_items = len(dataset)
+    idx_arr = reader.index
+    per_shard: dict[int, list[tuple[int, int, int]]] = {}
+    missing_total = 0
+    for gidx in range(n_items):
+        if gidx in sample_cache:
+            continue
+        sid = int(idx_arr[gidx, 0])
+        per_shard.setdefault(sid, []).append((gidx, int(idx_arr[gidx, 1]), int(idx_arr[gidx, 2])))
+        missing_total += 1
+    if not per_shard:
+        return cur_bytes
+
+    for entries in per_shard.values():
+        entries.sort(key=lambda t: t[1])
+
+    decode_w = min(8, max(2, int(workers)))
+    pbar = None
+    if progress:
+        print(
+            f"Loading {missing_total} clip(s) sequentially from {len(per_shard)} shard(s) into host RAM...",
+            flush=True,
+        )
+        try:
+            from tqdm import tqdm
+
+            pbar = tqdm(total=missing_total, unit="clip", desc="Shard -> RAM", leave=True)
+        except Exception:
+            pbar = None
+
+    def _decode_slice(mv_blob: memoryview, item: tuple[int, int, int]):
+        gidx, off, nb = item
+        rec = _decode_clip_record(
+            mv_blob[off : off + nb],
+            expected_sr=dataset.sample_rate,
+            repeat_phone=dataset.repeat_phone,
+            phone_dtype=dataset.phone_dtype,
+            compute_spec=dataset.compute_spec,
+            allow_pcm16=not dataset.compute_spec,
+            filter_length=dataset.filter_length,
+            hop_length=dataset.hop_length,
+            win_length=dataset.win_length,
+        )
+        return gidx, rec
+
+    open_flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+    try:
+        with ThreadPoolExecutor(max_workers=decode_w) as pool:
+            for sid in sorted(per_shard.keys()):
+                if cur_bytes >= max_bytes:
+                    break
+                entries = per_shard[sid]
+                shard_path = os.path.join(reader.shards_dir, f"shard_{sid:05d}.rpack")
+                fd = os.open(shard_path, open_flags)
+                blob: bytes | None = None
+                try:
+                    with os.fdopen(fd, "rb", buffering=0, closefd=False) as rf:
+                        blob = rf.read()
+                    _fadvise_dontneed(fd)
+                finally:
+                    os.close(fd)
+
+                mv = memoryview(blob)
+                try:
+                    if len(entries) <= 4:
+                        decoded_list = [_decode_slice(mv, it) for it in entries]
+                    else:
+                        decoded_list = list(pool.map(lambda it: _decode_slice(mv, it), entries))
+                finally:
+                    try:
+                        mv.release()
+                    except BufferError:
+                        pass
+                    del mv, blob
+
+                added = 0
+                for gidx, rec in decoded_list:
+                    n_b = _sample_nbytes(rec)
+                    if cur_bytes + n_b > max_bytes:
+                        break
+                    sample_cache[gidx] = rec
+                    cur_bytes += n_b
+                    added += 1
+                if pbar is not None and added > 0:
+                    pbar.update(added)
+                if cur_bytes >= max_bytes:
+                    break
+    finally:
+        if pbar is not None:
+            pbar.close()
+
+    if len(sample_cache) >= n_items:
+        reader.close()
+    return cur_bytes
+
+
 def _hann_window_np(win_length: int) -> np.ndarray:
     if win_length <= 1:
         return np.ones((max(1, win_length),), dtype=np.float32)
@@ -1616,7 +1726,7 @@ class PrefetchBatchLoader:
                     except OSError:
                         pass
         if bool(enable_disk_pack) and isinstance(dataset, TextAudioDataset):
-            # Keep RAM/OS page cache free of 20+ GiB heap churn during packing; start_warmup()/pread populates fast afterward.
+            # Build/verify shards without 20+ GiB heap churn, then stream sequential whole shards cleanly into RAM.
             _reader, seeded = ensure_dataset_shards(
                 dataset,
                 workers=max(1, self._pool_workers or self.num_workers or 4),
@@ -1628,6 +1738,20 @@ class PrefetchBatchLoader:
                     self._sample_cache[gidx] = s_item
                     self._sample_cache_bytes += _sample_nbytes(s_item)
                 seeded.clear()
+            if (
+                dataset.has_shards
+                and not self.cache_in_ram
+                and not self.use_multiprocessing
+                and self._sample_cache_limit > 0
+            ):
+                preload_budget = int(self._sample_cache_limit * 0.92)
+                self._sample_cache_bytes = preload_shards_into_cache(
+                    dataset,
+                    self._sample_cache,
+                    max_bytes=preload_budget,
+                    workers=max(1, self._pool_workers or self.num_workers or 4),
+                    progress=True,
+                )
 
     def _try_cache_sample(self, idx: int, item: tuple[Any, ...]) -> None:
         if self._sample_cache_limit <= 0 or self._sample_cache_bytes >= self._sample_cache_limit:
