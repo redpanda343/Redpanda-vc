@@ -8,7 +8,6 @@ import queue
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import partial
 from typing import Any, Sequence
 
 from rvc.train.backend import configure_jax_env, has_jax_cuda_plugin, has_jax_tpu_runtime
@@ -303,29 +302,63 @@ def run_jax_extraction(
         hubert_params = jax.device_put(h_host, replicated)
 
     shard_map_fn, smap_check_kwargs = resolve_shard_map() if num_devices > 1 else (None, {})
+    p_data = PartitionSpec("data")
+    p_empty = PartitionSpec()
+    jit_modes: dict[tuple[bool, bool], Any] = {}
 
-    @partial(jax.jit, static_argnums=(0, 1))
-    def _jit_infer(run_f0: bool, run_feat: bool, p_rmvpe, p_hubert, audio_bt, lens_b):
-        def _local_infer(p_r, p_h, a_bt, l_b):
-            f0 = rmvpe_f0_forward(a_bt, l_b, p_r, threshold=threshold_f32, prec=prec) if run_f0 else None
-            feats = (
-                hubert_forward(a_bt, l_b, p_h, hubert_cfg, version=version, prec=prec)
-                if run_feat and hubert_cfg is not None
-                else None
-            )
-            return f0, feats
-
+    def _call_sharded(local_fn, out_spec, audio_bt, lens_b, *params):
         if shard_map_fn is not None:
-            p_empty = PartitionSpec()
-            p_data = PartitionSpec("data")
             return shard_map_fn(
-                _local_infer,
+                local_fn,
                 mesh=mesh,
-                in_specs=(p_empty, p_empty, p_data, p_data),
-                out_specs=(p_data if run_f0 else p_empty, p_data if run_feat else p_empty),
+                in_specs=(p_data, p_data) + (p_empty,) * len(params),
+                out_specs=out_spec,
                 **smap_check_kwargs,
-            )(p_rmvpe, p_hubert, audio_bt, lens_b)
-        return _local_infer(p_rmvpe, p_hubert, audio_bt, lens_b)
+            )(audio_bt, lens_b, *params)
+        return local_fn(audio_bt, lens_b, *params)
+
+    def _get_jit_infer(run_f0: bool, run_feat: bool):
+        mode = (bool(run_f0), bool(run_feat))
+        fn = jit_modes.get(mode)
+        if fn is not None:
+            return fn
+
+        @jax.jit
+        def _infer(p_rmvpe, p_hubert, audio_bt, lens_b):
+            if run_f0 and run_feat and hubert_cfg is not None:
+                return _call_sharded(
+                    lambda a_bt, l_b, p_r, p_h: (
+                        rmvpe_f0_forward(a_bt, l_b, p_r, threshold=threshold_f32, prec=prec),
+                        hubert_forward(a_bt, l_b, p_h, hubert_cfg, version=version, prec=prec),
+                    ),
+                    (p_data, p_data),
+                    audio_bt,
+                    lens_b,
+                    p_rmvpe,
+                    p_hubert,
+                )
+            if run_f0:
+                f0 = _call_sharded(
+                    lambda a_bt, l_b, p_r: rmvpe_f0_forward(a_bt, l_b, p_r, threshold=threshold_f32, prec=prec),
+                    p_data,
+                    audio_bt,
+                    lens_b,
+                    p_rmvpe,
+                )
+                return f0, None
+            if run_feat and hubert_cfg is not None:
+                feats = _call_sharded(
+                    lambda a_bt, l_b, p_h: hubert_forward(a_bt, l_b, p_h, hubert_cfg, version=version, prec=prec),
+                    p_data,
+                    audio_bt,
+                    lens_b,
+                    p_hubert,
+                )
+                return None, feats
+            return None, None
+
+        jit_modes[mode] = _infer
+        return _infer
 
     def _to_sds(tree: Any) -> Any:
         return jax.tree.map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype, sharding=a.sharding), tree)
@@ -342,9 +375,7 @@ def run_jax_extraction(
             t0 = time.perf_counter()
             audio_sds = jax.ShapeDtypeStruct((g_bs, b_len), jnp.float32, sharding=data_sharding)
             lens_sds = jax.ShapeDtypeStruct((g_bs,), jnp.int32, sharding=data_sharding)
-            compiled = _jit_infer.lower(
-                do_f0_w,
-                do_feat_w,
+            compiled = _get_jit_infer(do_f0_w, do_feat_w).lower(
                 p_rmvpe_sds,
                 p_hubert_sds,
                 audio_sds,
@@ -386,11 +417,8 @@ def run_jax_extraction(
             audio_dev, lens_dev = jax.device_put((audio_np, lens_np), data_sharding)
 
             infer_key = (do_f0, do_feat, int(audio_np.shape[0]), int(audio_np.shape[1]))
-            infer_fn = compiled_infer.get(infer_key)
-            if infer_fn is not None:
-                f0_dev, feat_dev = infer_fn(do_f0, do_feat, rmvpe_params, hubert_params, audio_dev, lens_dev)
-            else:
-                f0_dev, feat_dev = _jit_infer(do_f0, do_feat, rmvpe_params, hubert_params, audio_dev, lens_dev)
+            infer_fn = compiled_infer.get(infer_key) or _get_jit_infer(do_f0, do_feat)
+            f0_dev, feat_dev = infer_fn(rmvpe_params, hubert_params, audio_dev, lens_dev)
             if pending_result is not None:
                 _flush_pending(*pending_result, write_pool)
             pending_result = (f0_dev, feat_dev, meta)
