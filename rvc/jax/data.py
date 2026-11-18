@@ -7,9 +7,11 @@ never touch TPU/PJRT or GPU contexts.
 from __future__ import annotations
 
 import ctypes
+import json
 import math
 import os
 import queue
+import re
 import threading
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -60,6 +62,49 @@ def _sample_nbytes(item: tuple[Any, ...]) -> int:
     return sum(x.nbytes for x in item if isinstance(x, np.ndarray))
 
 
+_NPY_DESCR_RE = re.compile(r"['\"]descr['\"]\s*:\s*(['\"])([^'\"]+)\1")
+_NPY_FORTRAN_RE = re.compile(r"['\"]fortran_order['\"]\s*:\s*(True|False)")
+_NPY_SHAPE_RE = re.compile(r"['\"]shape['\"]\s*:\s*\(([^)]*)\)")
+
+
+def _fast_load_npy(path: str, max_rows: int | None = None) -> np.ndarray:
+    """Parse C-contiguous .npy header directly and read up to `max_rows` without ast.literal_eval."""
+    try:
+        with open(path, "rb") as f:
+            prefix = f.read(8)
+            if len(prefix) != 8 or prefix[:6] != b"\x93NUMPY":
+                raise ValueError("Not an NPY file")
+            major = prefix[6]
+            if major == 1:
+                hlen = int.from_bytes(f.read(2), "little")
+            elif major == 2:
+                hlen = int.from_bytes(f.read(4), "little")
+            else:
+                raise ValueError(f"Unsupported NPY version {major}")
+            hdr = f.read(hlen).decode("latin1")
+            m_descr = _NPY_DESCR_RE.search(hdr)
+            m_fort = _NPY_FORTRAN_RE.search(hdr)
+            m_shape = _NPY_SHAPE_RE.search(hdr)
+            if not (m_descr and m_fort and m_shape) or m_fort.group(1) != "False":
+                raise ValueError("Non-standard NPY header")
+            dtype = np.dtype(m_descr.group(2))
+            if dtype.hasobject:
+                raise ValueError("Object arrays require np.load validation")
+            dims = [int(tok.strip()) for tok in m_shape.group(1).split(",") if tok.strip()]
+            if not dims:
+                raise ValueError("Empty scalar shape")
+            rows = min(dims[0], int(max_rows)) if max_rows is not None else dims[0]
+            tail_shape = tuple(dims[1:])
+            row_stride = math.prod(tail_shape) if tail_shape else 1
+            count = rows * row_stride
+            arr = np.fromfile(f, dtype=dtype, count=count)
+            if arr.size != count:
+                raise ValueError("Short NPY read")
+            return arr.reshape((rows,) + tail_shape)
+    except Exception:
+        return np.load(path, allow_pickle=False)
+
+
 def _hann_window_np(win_length: int) -> np.ndarray:
     if win_length <= 1:
         return np.ones((max(1, win_length),), dtype=np.float32)
@@ -104,8 +149,16 @@ def _probe_audio_frames(audiopath: str, hop_length: int, max_sample_frames: int)
 class TextAudioDataset:
     """Loads WAV audio, optional linear STFT, phoneme features, and pitch for NWC JAX training."""
 
-    def __init__(self, data_cfg, *, compute_spec: bool = True, repeat_phone: bool = True) -> None:
-        self.audiopaths_and_text = load_filepaths_and_text(data_cfg.training_files)
+    def __init__(
+        self,
+        data_cfg,
+        *,
+        compute_spec: bool = True,
+        repeat_phone: bool = True,
+        phone_dtype: Any = np.float32,
+    ) -> None:
+        self.training_files = str(data_cfg.training_files)
+        self.audiopaths_and_text = load_filepaths_and_text(self.training_files)
         self.max_wav_value = float(data_cfg.max_wav_value)
         self.sample_rate = int(data_cfg.sample_rate)
         self.filter_length = int(data_cfg.filter_length)
@@ -114,6 +167,7 @@ class TextAudioDataset:
         self.max_sample_frames = 896
         self.compute_spec = bool(compute_spec)
         self.repeat_phone = bool(repeat_phone)
+        self.phone_dtype = np.dtype(phone_dtype)
         self.min_text_len = int(getattr(data_cfg, "min_text_len", 1))
         self.max_text_len = int(getattr(data_cfg, "max_text_len", 5000))
         self._filter()
@@ -122,6 +176,7 @@ class TextAudioDataset:
     def from_cached_entries(cls, cfg_dict: Mapping[str, Any]) -> "TextAudioDataset":
         """Reconstruct dataset in worker processes using pre-filtered file lists and lengths."""
         obj = cls.__new__(cls)
+        obj.training_files = str(cfg_dict.get("training_files", ""))
         obj.audiopaths_and_text = [list(row) for row in cfg_dict["audiopaths_and_text"]]
         obj.lengths = [int(x) for x in cfg_dict.get("lengths", ())]
         obj.max_wav_value = float(cfg_dict.get("max_wav_value", 32768.0))
@@ -132,6 +187,7 @@ class TextAudioDataset:
         obj.max_sample_frames = int(cfg_dict.get("max_sample_frames", 896))
         obj.compute_spec = bool(cfg_dict.get("compute_spec", False))
         obj.repeat_phone = bool(cfg_dict.get("repeat_phone", True))
+        obj.phone_dtype = np.dtype(cfg_dict.get("phone_dtype", "float32"))
         obj.min_text_len = int(cfg_dict.get("min_text_len", 1))
         obj.max_text_len = int(cfg_dict.get("max_text_len", 5000))
         return obj
@@ -139,6 +195,7 @@ class TextAudioDataset:
     def worker_config(self, hop_length: int, allowed_frames: Sequence[int] = ()) -> dict[str, Any]:
         """Serialize picklable dataset metadata for multi-process batch workers."""
         return {
+            "training_files": getattr(self, "training_files", ""),
             "audiopaths_and_text": self.audiopaths_and_text,
             "lengths": self.lengths,
             "max_wav_value": self.max_wav_value,
@@ -149,6 +206,7 @@ class TextAudioDataset:
             "max_sample_frames": self.max_sample_frames,
             "compute_spec": self.compute_spec,
             "repeat_phone": self.repeat_phone,
+            "phone_dtype": self.phone_dtype.name,
             "min_text_len": self.min_text_len,
             "max_text_len": self.max_text_len,
             "allowed_frames": tuple(int(x) for x in allowed_frames),
@@ -161,8 +219,33 @@ class TextAudioDataset:
             if self.min_text_len <= len(text) <= self.max_text_len:
                 kept.append([audiopath, text, pitch, pitchf, dv])
 
+        training_files = getattr(self, "training_files", "")
+        cache_path = f"{training_files}.lengths.json" if training_files else ""
+        src_stat = None
+        if cache_path and os.path.isfile(training_files):
+            try:
+                src_stat = os.stat(training_files)
+                if os.path.isfile(cache_path):
+                    with open(cache_path, "r", encoding="utf-8") as cf:
+                        meta = json.load(cf)
+                    cached = meta.get("lengths")
+                    if (
+                        meta.get("mtime_ns") == src_stat.st_mtime_ns
+                        and meta.get("size") == src_stat.st_size
+                        and meta.get("count") == len(kept)
+                        and meta.get("hop_length") == self.hop_length
+                        and meta.get("max_sample_frames") == self.max_sample_frames
+                        and isinstance(cached, list)
+                        and len(cached) == len(kept)
+                    ):
+                        self.audiopaths_and_text = kept
+                        self.lengths = [int(x) for x in cached]
+                        return
+            except (OSError, ValueError, TypeError):
+                pass
+
         if len(kept) > 32:
-            workers = min(8, max(2, effective_cpu_count()))
+            workers = min(32, max(4, effective_cpu_count() * 4))
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 lengths = list(
                     pool.map(
@@ -175,17 +258,55 @@ class TextAudioDataset:
         self.audiopaths_and_text = kept
         self.lengths = lengths
 
+        if cache_path and src_stat is not None:
+            try:
+                tmp_path = f"{cache_path}.tmp.{os.getpid()}"
+                with open(tmp_path, "w", encoding="utf-8") as cf:
+                    json.dump(
+                        {
+                            "mtime_ns": src_stat.st_mtime_ns,
+                            "size": src_stat.st_size,
+                            "count": len(kept),
+                            "hop_length": self.hop_length,
+                            "max_sample_frames": self.max_sample_frames,
+                            "lengths": lengths,
+                        },
+                        cf,
+                    )
+                os.replace(tmp_path, cache_path)
+            except OSError:
+                pass
+
     def __len__(self) -> int:
         return len(self.audiopaths_and_text)
 
-    def __getitem__(self, index: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.int32]:
-        audiopath, phone_path, pitch_path, pitchf_path, dv_str = self.audiopaths_and_text[index]
-
-        phone_raw = np.load(phone_path, allow_pickle=False)
-        pitch = np.load(pitch_path, allow_pickle=False)
-        pitchf = np.load(pitchf_path, allow_pickle=False)
+    def load_labels(self, index: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.int32, int]:
+        """Load trimmed 50Hz/100Hz phoneme and F0 labels for sample `index`."""
+        _, phone_path, pitch_path, pitchf_path, dv_str = self.audiopaths_and_text[index]
+        phone_raw = _fast_load_npy(phone_path, max_rows=(self.max_sample_frames + 1) // 2 + 1)
+        pitch = _fast_load_npy(pitch_path, max_rows=self.max_sample_frames)
+        pitchf = _fast_load_npy(pitchf_path, max_rows=self.max_sample_frames)
 
         n_num = min(int(phone_raw.shape[0]) * 2, int(pitch.shape[0]), int(pitchf.shape[0]), self.max_sample_frames)
+        n_phone_half = (n_num + 1) // 2
+        phone_half = np.asarray(phone_raw[:n_phone_half, :], dtype=self.phone_dtype)
+        pitch_arr = np.asarray(pitch[:n_num], dtype=np.int32)
+        pitchf_arr = np.asarray(pitchf[:n_num], dtype=np.float32)
+        try:
+            sid = np.int32(int(dv_str))
+        except ValueError:
+            sid = np.int32(0)
+        return phone_half, pitch_arr, pitchf_arr, sid, n_num
+
+    def load_item_with_cached_labels(
+        self,
+        index: int,
+        labels: tuple[np.ndarray, np.ndarray, np.ndarray, np.int32, int],
+    ) -> tuple[np.ndarray | None, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.int32]:
+        """Load WAV waveform and align with pre-loaded labels."""
+        audiopath = self.audiopaths_and_text[index][0]
+        phone_half, pitch, pitchf, sid, n_num = labels
+
         audio, sr = sf.read(audiopath, dtype="float32")
         if audio.ndim > 1:
             audio = audio[:, 0]
@@ -198,24 +319,23 @@ class TextAudioDataset:
         audio = np.asarray(audio[:len_wav], dtype=np.float32)
         wav = audio[:, None]  # (T_wav, 1) NWC
 
-        n_phone_half = (len_min + 1) // 2
-        phone_half = np.asarray(phone_raw[:n_phone_half, :], dtype=np.float32)
-        phone = np.repeat(phone_half, 2, axis=0)[:len_min, :] if self.repeat_phone else phone_half
-        pitch = np.asarray(pitch[:len_min], dtype=np.int32)
-        pitchf = np.asarray(pitchf[:len_min], dtype=np.float32)
+        if len_min < n_num:
+            phone_use = phone_half[: (len_min + 1) // 2, :]
+            pitch = pitch[:len_min]
+            pitchf = pitchf[:len_min]
+        else:
+            phone_use = phone_half
 
+        phone = np.repeat(phone_use, 2, axis=0)[:len_min, :] if self.repeat_phone else phone_use
         spec = (
             spectrogram_np(np.ascontiguousarray(audio, dtype=np.float32), self.filter_length, self.hop_length, self.win_length)
             if self.compute_spec
             else None
         )
-
-        try:
-            sid = np.int32(int(dv_str))
-        except ValueError:
-            sid = np.int32(0)
-
         return spec, wav, phone, pitch, pitchf, sid
+
+    def __getitem__(self, index: int) -> tuple[np.ndarray | None, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.int32]:
+        return self.load_item_with_cached_labels(index, self.load_labels(index))
 
 
 class BucketBatchSampler:
@@ -367,7 +487,7 @@ def collate_nwc_batch(
     phone_dim = sorted_rows[0][2].shape[1]
     phone_frames = (frames + 1) // 2 if phone_half else frames
 
-    phone_padded = np.empty((batch_size, phone_frames, phone_dim), dtype=np.float32)
+    phone_padded = np.empty((batch_size, phone_frames, phone_dim), dtype=sorted_rows[0][2].dtype)
     pitch_padded = np.empty((batch_size, frames), dtype=np.int32)
     pitchf_padded = np.empty((batch_size, frames), dtype=np.float32)
     wave_padded = np.empty((batch_size, wave_frames, 1), dtype=np.float32)
@@ -453,6 +573,9 @@ class PrefetchBatchLoader:
         self._sample_cache_bytes = 0
         self._sample_cache_lock = threading.Lock()
         self._sample_cache_limit = max(0, min(int(avail * 0.35), avail - 3 * (1024 ** 3)))
+        self._label_cache: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray, np.int32, int]] = {}
+        self._label_cache_bytes = 0
+        self._label_cache_limit = max(0, min(int(avail * 0.50), avail - 2 * (1024 ** 3)))
         self._mp_pool = None
         self._pool = (
             ThreadPoolExecutor(max_workers=max(1, self.num_workers))
@@ -466,6 +589,29 @@ class PrefetchBatchLoader:
         cached = self._sample_cache.get(idx)
         if cached is not None:
             return cached
+        cached_lbl = self._label_cache.get(idx)
+        if cached_lbl is not None:
+            return self.dataset.load_item_with_cached_labels(idx, cached_lbl)
+
+        if hasattr(self.dataset, "load_labels"):
+            labels = self.dataset.load_labels(idx)
+            item = self.dataset.load_item_with_cached_labels(idx, labels)
+            if (self._sample_cache_bytes + self._label_cache_bytes) < self._label_cache_limit:
+                item_bytes = _sample_nbytes(item)
+                lbl_bytes = _sample_nbytes(labels[:3])
+                with self._sample_cache_lock:
+                    if idx not in self._sample_cache and (
+                        self._sample_cache_bytes + item_bytes <= self._sample_cache_limit
+                    ):
+                        self._sample_cache[idx] = item
+                        self._sample_cache_bytes += item_bytes
+                    elif idx not in self._label_cache and (
+                        self._sample_cache_bytes + self._label_cache_bytes + lbl_bytes <= self._label_cache_limit
+                    ):
+                        self._label_cache[idx] = labels
+                        self._label_cache_bytes += lbl_bytes
+            return item
+
         item = self.dataset[idx]
         if self._sample_cache_limit > 0 and self._sample_cache_bytes < self._sample_cache_limit:
             item_bytes = _sample_nbytes(item)
@@ -574,6 +720,8 @@ class PrefetchBatchLoader:
     def close(self) -> None:
         self._sample_cache.clear()
         self._sample_cache_bytes = 0
+        self._label_cache.clear()
+        self._label_cache_bytes = 0
         if self._mp_pool is not None:
             self._mp_pool.close()
             self._mp_pool = None

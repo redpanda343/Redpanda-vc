@@ -336,7 +336,13 @@ class JaxTrainer:
     def build_data(self) -> None:
         data = self.config.data
         max_frames = int(self.args.max_batch_seconds * data.sample_rate / data.hop_length)
-        self.dataset = TextAudioDataset(data, compute_spec=False, repeat_phone=False)
+        phone_dtype = np.float16 if getattr(self, "precision_label", "FP32") == "BF16" else np.float32
+        self.dataset = TextAudioDataset(
+            data,
+            compute_spec=False,
+            repeat_phone=False,
+            phone_dtype=phone_dtype,
+        )
         use_tpu_buckets = self.platform in ("tpu", "gpu")
         boundaries = list(BUCKET_BOUNDARIES if use_tpu_buckets else LEGACY_BUCKET_BOUNDARIES)
         # Ensure tiny test clips are also representable if user didn't filter or if dataset has short clips
@@ -894,14 +900,17 @@ class JaxTrainer:
         phone_dim = int(self.syn_cfg.text_enc_hidden_dim)
         b_sharding = self.data_sharding
 
-        phone_half = not bool(getattr(getattr(self, "dataset", None), "repeat_phone", True))
+        ds_obj = getattr(self, "dataset", None)
+        phone_half = not bool(getattr(ds_obj, "repeat_phone", True))
+        ds_phone_dtype = getattr(ds_obj, "phone_dtype", np.float32)
+        phone_jnp_dtype = jnp.float16 if np.dtype(ds_phone_dtype) == np.float16 else jnp.float32
         total = len(bucket_shapes)
         print(f"Pre-compiling XLA training kernels for {total} bucket shape(s)...", flush=True)
         for idx, (bs, frames) in enumerate(bucket_shapes, start=1):
             wave_frames = frames * hop_length
             phone_frames = (frames + 1) // 2 if phone_half else frames
             batch_sds = (
-                jax.ShapeDtypeStruct((bs, phone_frames, phone_dim), jnp.float32, sharding=b_sharding),
+                jax.ShapeDtypeStruct((bs, phone_frames, phone_dim), phone_jnp_dtype, sharding=b_sharding),
                 jax.ShapeDtypeStruct((bs,), jnp.int32, sharding=b_sharding),
                 jax.ShapeDtypeStruct((bs, frames), jnp.int32, sharding=b_sharding),
                 jax.ShapeDtypeStruct((bs, frames), jnp.float32, sharding=b_sharding),
