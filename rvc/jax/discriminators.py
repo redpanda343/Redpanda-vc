@@ -111,15 +111,23 @@ def init_mpd_params(rng: np.random.Generator, cfg: MultiPeriodDiscriminatorConfi
     return {"discriminators": discs}
 
 
-def _disc_s_forward(x: Array, params: Mapping[str, Any], prec: PrecisionConfig) -> tuple[Array, list[Array]]:
+def _disc_s_forward(
+    x: Array,
+    params: Mapping[str, Any],
+    prec: PrecisionConfig,
+    *,
+    return_fmap: bool = True,
+) -> tuple[Array, list[Array]]:
     fmap: list[Array] = []
     cur = jnp.asarray(x, prec.compute_dtype)
     for layer_p, (_, _, _, stride, pad, groups) in zip(params["convs"], _DISCRIMINATOR_S_SPECS):
         cur = conv1d(cur, layer_p, stride=stride, padding=pad, groups=groups, dtype=prec.compute_dtype, precision=prec.compute_precision)
         cur = leaky_relu(cur, LRELU_SLOPE)
-        fmap.append(cur)
+        if return_fmap:
+            fmap.append(cur)
     cur = conv1d(cur, params["conv_post"], stride=1, padding=1, dtype=prec.compute_dtype, precision=prec.compute_precision)
-    fmap.append(cur)
+    if return_fmap:
+        fmap.append(cur)
     return cur.reshape(cur.shape[0], -1), fmap
 
 
@@ -140,6 +148,7 @@ def _disc_p_forward(
     kernel_size: int = 5,
     *,
     transpose_fmap: bool = True,
+    return_fmap: bool = True,
 ) -> tuple[Array, list[Array]]:
     """Run period discriminator in packed 1D NWC (B*P, T//P, C) to avoid narrow W-tile padding on TPU."""
     fmap: list[Array] = []
@@ -162,7 +171,8 @@ def _disc_p_forward(
             precision=prec.compute_precision,
         )
         cur = leaky_relu(cur, LRELU_SLOPE)
-        fmap.append(cur.reshape(b, period, cur.shape[1], cur.shape[2]).transpose(0, 2, 1, 3) if transpose_fmap else cur)
+        if return_fmap:
+            fmap.append(cur.reshape(b, period, cur.shape[1], cur.shape[2]).transpose(0, 2, 1, 3) if transpose_fmap else cur)
     cur = conv1d(
         cur,
         _disc_p_1d_layer_params(params["conv_post"]),
@@ -172,10 +182,12 @@ def _disc_p_forward(
         precision=prec.compute_precision,
     )
     if not transpose_fmap:
-        fmap.append(cur)
+        if return_fmap:
+            fmap.append(cur)
         return cur.reshape(b, -1), fmap
     cur_4d = cur.reshape(b, period, cur.shape[1], cur.shape[2]).transpose(0, 2, 1, 3)
-    fmap.append(cur_4d)
+    if return_fmap:
+        fmap.append(cur_4d)
     return cur_4d.reshape(b, -1), fmap
 
 
@@ -194,15 +206,19 @@ def _disc_r_forward(
     params: Mapping[str, Any],
     resolution: tuple[int, int, int],
     prec: PrecisionConfig,
+    *,
+    return_fmap: bool = True,
 ) -> tuple[Array, list[Array]]:
     fmap: list[Array] = []
     cur = jnp.asarray(_disc_r_spectrogram(x, resolution), prec.compute_dtype)
     for layer_p, (_, _, _, stride, pad) in zip(params["convs"], _DISCRIMINATOR_R_SPECS):
         cur = conv2d(cur, layer_p, stride=stride, padding=pad, dtype=prec.compute_dtype, precision=prec.compute_precision)
         cur = leaky_relu(cur, 0.1)
-        fmap.append(cur)
+        if return_fmap:
+            fmap.append(cur)
     cur = conv2d(cur, params["conv_post"], stride=(1, 1), padding=(1, 1), dtype=prec.compute_dtype, precision=prec.compute_precision)
-    fmap.append(cur)
+    if return_fmap:
+        fmap.append(cur)
     return cur.reshape(cur.shape[0], -1), fmap
 
 
@@ -277,6 +293,7 @@ def mpd_forward(
     prec: PrecisionConfig = PrecisionConfig(),
     *,
     transpose_fmap: bool = True,
+    return_fmap: bool = True,
 ) -> tuple[list[Array], list[Array], list[list[Array]], list[list[Array]]]:
     """Batched 2B discriminator forward for (y, y_hat) maximizing TPU MXU utilization."""
     batch = y.shape[0]
@@ -292,34 +309,45 @@ def mpd_forward(
         return jax.checkpoint(fn)(x_in, p_sub) if cfg.checkpointing else fn(x_in, p_sub)
 
     # Index 0: DiscriminatorS
-    logits_s, fmap_s = _run_sub(lambda x_, p_: _disc_s_forward(x_, p_, prec), discs[0], y_both)
+    logits_s, fmap_s = _run_sub(
+        lambda x_, p_: _disc_s_forward(x_, p_, prec, return_fmap=return_fmap), discs[0], y_both
+    )
     y_d_rs.append(logits_s[:batch])
     y_d_gs.append(logits_s[batch:])
-    fmap_rs.append([f[:batch] for f in fmap_s])
-    fmap_gs.append([f[batch:] for f in fmap_s])
+    if return_fmap:
+        fmap_rs.append([f[:batch] for f in fmap_s])
+        fmap_gs.append([f[batch:] for f in fmap_s])
 
     idx = 1
     for period in cfg.periods:
         p_val = int(period)
         logits_p, fmap_p = _run_sub(
-            lambda x_, p_, per=p_val: _disc_p_forward(x_, p_, per, prec, transpose_fmap=transpose_fmap),
+            lambda x_, p_, per=p_val: _disc_p_forward(
+                x_, p_, per, prec, transpose_fmap=transpose_fmap, return_fmap=return_fmap
+            ),
             discs[idx],
             y_both,
         )
         y_d_rs.append(logits_p[:batch])
         y_d_gs.append(logits_p[batch:])
-        split = batch if transpose_fmap else batch * p_val
-        fmap_rs.append([f[:split] for f in fmap_p])
-        fmap_gs.append([f[split:] for f in fmap_p])
+        if return_fmap:
+            split = batch if transpose_fmap else batch * p_val
+            fmap_rs.append([f[:split] for f in fmap_p])
+            fmap_gs.append([f[split:] for f in fmap_p])
         idx += 1
 
     for resolution in cfg.resolutions:
         res_t = tuple(int(v) for v in resolution)
-        logits_r, fmap_r = _run_sub(lambda x_, p_, res=res_t: _disc_r_forward(x_, p_, res, prec), discs[idx], y_both)
+        logits_r, fmap_r = _run_sub(
+            lambda x_, p_, res=res_t: _disc_r_forward(x_, p_, res, prec, return_fmap=return_fmap),
+            discs[idx],
+            y_both,
+        )
         y_d_rs.append(logits_r[:batch])
         y_d_gs.append(logits_r[batch:])
-        fmap_rs.append([f[:batch] for f in fmap_r])
-        fmap_gs.append([f[batch:] for f in fmap_r])
+        if return_fmap:
+            fmap_rs.append([f[:batch] for f in fmap_r])
+            fmap_gs.append([f[batch:] for f in fmap_r])
         idx += 1
 
     return y_d_rs, y_d_gs, fmap_rs, fmap_gs

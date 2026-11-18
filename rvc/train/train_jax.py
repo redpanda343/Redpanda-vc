@@ -251,7 +251,12 @@ def check_dataset_sample_rate(args: argparse.Namespace, config: HParams) -> None
     if not wavs:
         print(f"No {dataset_format} file found.")
         return
-    _, sr = load_wav_to_torch(wavs[0])
+    try:
+        import soundfile as sf
+
+        sr = int(sf.info(wavs[0]).samplerate)
+    except Exception:
+        _, sr = load_wav_to_torch(wavs[0])
     if sr != config.data.sample_rate:
         print(f"Error: Pretrained model sample rate ({config.data.sample_rate} Hz) does not match dataset audio sample rate ({sr} Hz).")
         sys.exit(1)
@@ -361,7 +366,7 @@ class JaxTrainer:
             self.sampler,
             hop_length=int(data.hop_length),
             num_workers=self.workers,
-            prefetch_batches=16,
+            prefetch_batches=4,
             cache_in_ram=bool(self.args.cache_data_in_gpu),
         )
 
@@ -423,13 +428,22 @@ class JaxTrainer:
         eps = float(config.train.eps)
         base_lr = float(config.train.learning_rate)
         self.opt_g = optax.inject_hyperparams(optax.adamw)(
-            learning_rate=base_lr * g_lr_coeff, b1=b1, b2=b2, eps=eps, weight_decay=0.0
+            learning_rate=np.float32(base_lr * g_lr_coeff),
+            b1=np.float32(b1),
+            b2=np.float32(b2),
+            eps=np.float32(eps),
+            weight_decay=np.float32(0.0),
         )
         self.opt_d = optax.inject_hyperparams(optax.adamw)(
-            learning_rate=base_lr * d_lr_coeff, b1=b1, b2=b2, eps=eps, weight_decay=0.0
+            learning_rate=np.float32(base_lr * d_lr_coeff),
+            b1=np.float32(b1),
+            b2=np.float32(b2),
+            eps=np.float32(eps),
+            weight_decay=np.float32(0.0),
         )
-        self.opt_state_g = self.opt_g.init(self.host_params_g)
-        self.opt_state_d = self.opt_d.init(self.host_params_d)
+        self.opt_state_g, self.opt_state_d = jax.device_get(
+            (self.opt_g.init(self.host_params_g), self.opt_d.init(self.host_params_d))
+        )
         self.ema_params_host = (
             {k: jax.tree.map(np.copy, v) for k, v in self.host_params_g.items() if k != "enc_q"}
             if args.ema_decay > 0
@@ -477,8 +491,9 @@ class JaxTrainer:
             g_ckpt = torch.load(last_g, map_location="cpu", weights_only=True)
             self.host_params_d = load_pretrained_torch_d(last_d, self.mpd_cfg)
             self.host_params_g = load_pretrained_torch_g(last_g, self.syn_cfg, self.host_params_g, match_speakers=False)
-            self.opt_state_g = self.opt_g.init(self.host_params_g)
-            self.opt_state_d = self.opt_d.init(self.host_params_d)
+            self.opt_state_g, self.opt_state_d = jax.device_get(
+                (self.opt_g.init(self.host_params_g), self.opt_d.init(self.host_params_d))
+            )
             if self.args.ema_decay > 0:
                 self.ema_params_host = {k: jax.tree.map(np.copy, v) for k, v in self.host_params_g.items() if k != "enc_q"}
             epoch = int(g_ckpt.get("iteration", 1))
@@ -503,11 +518,12 @@ class JaxTrainer:
     @staticmethod
     def _to_concrete_host(x: Any) -> Any:
         if isinstance(x, np.ndarray):
-            return x
+            return x.astype(np.float32, copy=False) if x.dtype == np.float64 else x
         if isinstance(x, jax.Array):
             if hasattr(jax.dtypes, "prng_key") and jax.dtypes.issubdtype(x.dtype, jax.dtypes.prng_key):
                 return x
-            return np.asarray(jax.device_get(x))
+            arr = np.asarray(jax.device_get(x))
+            return arr.astype(np.float32, copy=False) if arr.dtype == np.float64 else arr
         if isinstance(x, bool):
             return np.bool_(x)
         if isinstance(x, int):
@@ -515,19 +531,42 @@ class JaxTrainer:
         if isinstance(x, float):
             return np.float32(x)
         if isinstance(x, np.number):
-            return np.asarray(x)
+            arr = np.asarray(x)
+            return arr.astype(np.float32, copy=False) if arr.dtype == np.float64 else arr
         return x
 
     def _put_replicated(self) -> None:
-        put_rep = lambda tree: jax.device_put(
-            jax.tree.map(self._to_concrete_host, tree), self.replicated_sharding
+        def _is_non_key_jax(x: Any) -> bool:
+            if not isinstance(x, jax.Array):
+                return False
+            if hasattr(jax.dtypes, "prng_key") and jax.dtypes.issubdtype(x.dtype, jax.dtypes.prng_key):
+                return False
+            return True
+
+        trees = (
+            self.host_params_g,
+            self.opt_state_g,
+            self.host_params_d,
+            self.opt_state_d,
+            self.ema_params_host,
+            self.rng_key,
         )
-        self.params_g = put_rep(self.host_params_g)
-        self.opt_state_g = put_rep(self.opt_state_g)
-        self.params_d = put_rep(self.host_params_d)
-        self.opt_state_d = put_rep(self.opt_state_d)
-        self.ema_params = put_rep(self.ema_params_host)
-        self.rng_key = put_rep(self.rng_key)
+        if any(_is_non_key_jax(leaf) for leaf in jax.tree.leaves(trees)):
+            trees = tuple(
+                jax.device_get(t)
+                if any(_is_non_key_jax(leaf) for leaf in jax.tree.leaves(t))
+                else t
+                for t in trees
+            )
+        concrete = jax.tree.map(self._to_concrete_host, trees)
+        (
+            self.params_g,
+            self.opt_state_g,
+            self.params_d,
+            self.opt_state_d,
+            self.ema_params,
+            self.rng_key,
+        ) = jax.device_put(concrete, self.replicated_sharding)
 
     def build_lr_schedule(self, saved: dict | None) -> None:
         target = {"total_steps": self.args.total_steps, "final_ratio": self.args.lr_final_ratio}
@@ -659,7 +698,9 @@ class JaxTrainer:
             y_hat_det = lax.stop_gradient(y_hat)
 
             def _loss_d(p_d):
-                yr, yg, _, _ = mpd_forward(p_d, mpd_cfg, wave_slice_f32, y_hat_det, prec=prec, transpose_fmap=False)
+                yr, yg, _, _ = mpd_forward(
+                    p_d, mpd_cfg, wave_slice_f32, y_hat_det, prec=prec, transpose_fmap=False, return_fmap=False
+                )
                 l_d, _, _ = discriminator_loss(yr, yg)
                 return l_d
 
@@ -1115,8 +1156,10 @@ class JaxTrainer:
             [lr_g_val, lr_d_val, ema_lerp, 1.0 if log_norms else 0.0],
             dtype=np.float32,
         )
-        cur_dev = self._shard_batch(np_batch)
-        cur_scalars = jax.device_put(step_scalars, self.replicated_sharding)
+        cur_dev, cur_scalars = jax.device_put(
+            (np_batch, step_scalars),
+            (self.data_sharding, self.replicated_sharding),
+        )
         return cur_dev, cur_scalars, lr_g_val
 
     def train_epoch(self, epoch: int, start_batch: int) -> None:
@@ -1183,12 +1226,8 @@ class JaxTrainer:
                 if final:
                     break
 
-                # Stage t+1 H2D while t executes asynchronously, then pace t-1 to keep a 2-deep TPU queue.
+                # Pull next CPU batch first, let step t-1 finish to free HBM, then stage t+1 H2D while t runs.
                 next_np = next(batch_iter, None)
-                if next_np is not None:
-                    cur_dev, cur_scalars, lr_g_val = self._stage_step_inputs(next_np, epoch, base_lr)
-                else:
-                    cur_dev = None
                 if not did_sync:
                     if prev_sync is not None:
                         jax.block_until_ready(prev_sync)
@@ -1197,6 +1236,10 @@ class JaxTrainer:
                             self.progress.update(done_now)
                             pending_ticks -= done_now
                     prev_sync = self.rng_key
+                if next_np is not None:
+                    cur_dev, cur_scalars, lr_g_val = self._stage_step_inputs(next_np, epoch, base_lr)
+                else:
+                    cur_dev = None
 
             if prev_sync is not None:
                 jax.block_until_ready(prev_sync)

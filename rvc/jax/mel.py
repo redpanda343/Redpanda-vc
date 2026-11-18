@@ -128,9 +128,8 @@ def spectrogram_jax(
     win = hann_window_np(win_size)
     # Match spectrogram_torch(y, center=False) which manually reflect-pads before center=False stft.
     total_pad = pad + (n_fft // 2 if center else 0)
-    real, imag = stft_complex(y, n_fft, hop_size, win_size, win, pad_left=total_pad, pad_right=total_pad)
-    spec = jnp.sqrt(real * real + imag * imag + 2e-7)  # (B, F, TT)
-    return jnp.transpose(spec, (0, 2, 1))
+    real, imag = stft_complex(y, n_fft, hop_size, win_size, win, pad_left=total_pad, pad_right=total_pad, time_first=True)
+    return jnp.sqrt(real * real + imag * imag + 2e-7)  # (B, TT, F)
 
 
 def spectrogram_jax_padded(
@@ -157,8 +156,8 @@ def spectrogram_jax_padded(
 
     y_padded = jax.vmap(_pad_one, in_axes=(0, 0))(y_bt, lengths)
     win = hann_window_np(win_size)
-    real, imag = stft_complex(y_padded, n_fft, hop_size, win_size, win, pad_left=0, pad_right=0)
-    spec = jnp.transpose(jnp.sqrt(real * real + imag * imag + 2e-7), (0, 2, 1))  # (B, TT, F)
+    real, imag = stft_complex(y_padded, n_fft, hop_size, win_size, win, pad_left=0, pad_right=0, time_first=True)
+    spec = jnp.sqrt(real * real + imag * imag + 2e-7)  # (B, TT, F)
     if max_frames is not None:
         spec = spec[:, : int(max_frames), :]
     valid_frames = (lengths // int(hop_size))[:, None, None]

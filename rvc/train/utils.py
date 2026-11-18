@@ -1,5 +1,6 @@
 import os
 import glob
+import threading
 import torch
 import numpy as np
 import soundfile as sf
@@ -7,6 +8,8 @@ from collections import OrderedDict
 import matplotlib.pyplot as plt
 
 MATPLOTLIB_FLAG = False
+_SPEC_PLOT_LOCK = threading.Lock()
+_SPEC_PLOT_CACHE = None
 
 
 def replace_keys_in_dict(d, old_key_part, new_key_part):
@@ -189,24 +192,39 @@ def plot_spectrogram_to_numpy(spectrogram):
     Args:
         spectrogram (numpy.ndarray): The spectrogram to plot.
     """
-    global MATPLOTLIB_FLAG
-    if not MATPLOTLIB_FLAG:
-        plt.switch_backend("Agg")
-        MATPLOTLIB_FLAG = True
+    global MATPLOTLIB_FLAG, _SPEC_PLOT_CACHE
+    arr = np.asarray(spectrogram)
+    rows, cols = arr.shape[:2]
+    vmin = float(np.min(arr)) if arr.size else 0.0
+    vmax = float(np.max(arr)) if arr.size else 1.0
+    if vmax <= vmin:
+        vmax = vmin + 1e-6
 
-    fig, ax = plt.subplots(figsize=(10, 2))
-    im = ax.imshow(spectrogram, aspect="auto", origin="lower", interpolation="none")
-    plt.colorbar(im, ax=ax)
-    plt.xlabel("Frames")
-    plt.ylabel("Channels")
-    plt.tight_layout()
+    with _SPEC_PLOT_LOCK:
+        if not MATPLOTLIB_FLAG:
+            plt.switch_backend("Agg")
+            MATPLOTLIB_FLAG = True
 
-    fig.canvas.draw()
-    buf = fig.canvas.renderer.buffer_rgba()
-    w, h = fig.canvas.get_width_height()
-    data = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 4)[..., :3]
+        if _SPEC_PLOT_CACHE is None or not plt.fignum_exists(_SPEC_PLOT_CACHE[0].number):
+            fig, ax = plt.subplots(figsize=(10, 2))
+            im = ax.imshow(arr, aspect="auto", origin="lower", interpolation="none")
+            plt.colorbar(im, ax=ax)
+            plt.xlabel("Frames")
+            plt.ylabel("Channels")
+            fig.tight_layout()
+            _SPEC_PLOT_CACHE = (fig, ax, im)
+        else:
+            fig, ax, im = _SPEC_PLOT_CACHE
+            im.set_data(arr)
 
-    plt.close(fig)
+        im.set_clim(vmin, vmax)
+        im.set_extent((-0.5, cols - 0.5, -0.5, rows - 0.5))
+        ax.set_xlim(-0.5, cols - 0.5)
+        ax.set_ylim(-0.5, rows - 0.5)
+        fig.canvas.draw()
+        buf = fig.canvas.renderer.buffer_rgba()
+        w, h = fig.canvas.get_width_height()
+        data = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 4)[..., :3].copy()
     return data
 
 

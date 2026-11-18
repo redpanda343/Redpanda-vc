@@ -6,6 +6,7 @@ never touch TPU/PJRT or GPU contexts.
 
 from __future__ import annotations
 
+import ctypes
 import math
 import os
 import queue
@@ -18,6 +19,45 @@ import numpy as np
 import soundfile as sf
 
 from rvc.train.backend import effective_cpu_count
+
+
+def _available_ram_bytes() -> int:
+    """Return available host physical memory in bytes for bounded dataset sample caching."""
+    try:
+        with open("/proc/meminfo", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        return int(parts[1]) * 1024
+    except OSError:
+        pass
+    if os.name == "nt":
+        try:
+            class _MemoryStatusEx(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_uint32),
+                    ("dwMemoryLoad", ctypes.c_uint32),
+                    ("ullTotalPhys", ctypes.c_uint64),
+                    ("ullAvailPhys", ctypes.c_uint64),
+                    ("ullTotalPageFile", ctypes.c_uint64),
+                    ("ullAvailPageFile", ctypes.c_uint64),
+                    ("ullTotalVirtual", ctypes.c_uint64),
+                    ("ullAvailVirtual", ctypes.c_uint64),
+                    ("ullAvailExtendedVirtual", ctypes.c_uint64),
+                ]
+
+            stat = _MemoryStatusEx()
+            stat.dwLength = ctypes.sizeof(_MemoryStatusEx)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                return int(stat.ullAvailPhys)
+        except Exception:
+            pass
+    return 4 * (1024 ** 3)
+
+
+def _sample_nbytes(item: tuple[Any, ...]) -> int:
+    return sum(x.nbytes for x in item if isinstance(x, np.ndarray))
 
 
 def _hann_window_np(win_length: int) -> np.ndarray:
@@ -327,13 +367,13 @@ def collate_nwc_batch(
     phone_dim = sorted_rows[0][2].shape[1]
     phone_frames = (frames + 1) // 2 if phone_half else frames
 
-    phone_padded = np.zeros((batch_size, phone_frames, phone_dim), dtype=np.float32)
-    pitch_padded = np.zeros((batch_size, frames), dtype=np.int32)
-    pitchf_padded = np.zeros((batch_size, frames), dtype=np.float32)
-    wave_padded = np.zeros((batch_size, wave_frames, 1), dtype=np.float32)
+    phone_padded = np.empty((batch_size, phone_frames, phone_dim), dtype=np.float32)
+    pitch_padded = np.empty((batch_size, frames), dtype=np.int32)
+    pitchf_padded = np.empty((batch_size, frames), dtype=np.float32)
+    wave_padded = np.empty((batch_size, wave_frames, 1), dtype=np.float32)
     sid = np.asarray([int(r[5]) for r in sorted_rows], dtype=np.int32)
     spec_padded = (
-        np.zeros((batch_size, frames, sorted_rows[0][0].shape[1]), dtype=np.float32)
+        np.empty((batch_size, frames, sorted_rows[0][0].shape[1]), dtype=np.float32)
         if has_spec
         else None
     )
@@ -341,12 +381,25 @@ def collate_nwc_batch(
     for i, (spec, wav, phone, pitch, pitchf, _) in enumerate(sorted_rows):
         w_len = wav.shape[0]
         p_len = phone.shape[0]
+        pt_len = pitch.shape[0]
+        pf_len = pitchf.shape[0]
         if has_spec and spec_padded is not None and spec is not None:
-            spec_padded[i, : spec.shape[0], :] = spec
+            s_len = spec.shape[0]
+            spec_padded[i, :s_len, :] = spec
+            if s_len < frames:
+                spec_padded[i, s_len:, :] = 0.0
         wave_padded[i, :w_len, :] = wav
+        if w_len < wave_frames:
+            wave_padded[i, w_len:, :] = 0.0
         phone_padded[i, :p_len, :] = phone
-        pitch_padded[i, : pitch.shape[0]] = pitch
-        pitchf_padded[i, : pitchf.shape[0]] = pitchf
+        if p_len < phone_frames:
+            phone_padded[i, p_len:, :] = 0.0
+        pitch_padded[i, :pt_len] = pitch
+        if pt_len < frames:
+            pitch_padded[i, pt_len:] = 0
+        pitchf_padded[i, :pf_len] = pitchf
+        if pf_len < frames:
+            pitchf_padded[i, pf_len:] = 0.0
 
     if has_spec and spec_padded is not None:
         return (
@@ -393,16 +446,13 @@ class PrefetchBatchLoader:
         self.cache_in_ram = bool(cache_in_ram)
         self.allowed_frames = getattr(sampler, "allowed_frames", ())
         self.phone_half = not bool(getattr(dataset, "repeat_phone", True))
-        if use_multiprocessing is None:
-            self.use_multiprocessing = (
-                os.name != "nt"
-                and not self.cache_in_ram
-                and self.num_workers > 0
-                and len(dataset) >= 32
-            )
-        else:
-            self.use_multiprocessing = bool(use_multiprocessing) and (not self.cache_in_ram) and (self.num_workers > 0)
+        self.use_multiprocessing = bool(use_multiprocessing) and (not self.cache_in_ram) and (self.num_workers > 0)
         self._cache: list[tuple[np.ndarray, ...]] | None = None
+        avail = _available_ram_bytes()
+        self._sample_cache: dict[int, tuple[Any, ...]] = {}
+        self._sample_cache_bytes = 0
+        self._sample_cache_lock = threading.Lock()
+        self._sample_cache_limit = max(0, min(int(avail * 0.35), avail - 3 * (1024 ** 3)))
         self._mp_pool = None
         self._pool = (
             ThreadPoolExecutor(max_workers=max(1, self.num_workers))
@@ -413,7 +463,17 @@ class PrefetchBatchLoader:
     def _get_item(self, idx: int):
         if self._cache is not None:
             return self._cache[idx]
-        return self.dataset[idx]
+        cached = self._sample_cache.get(idx)
+        if cached is not None:
+            return cached
+        item = self.dataset[idx]
+        if self._sample_cache_limit > 0 and self._sample_cache_bytes < self._sample_cache_limit:
+            item_bytes = _sample_nbytes(item)
+            with self._sample_cache_lock:
+                if idx not in self._sample_cache and self._sample_cache_bytes + item_bytes <= self._sample_cache_limit:
+                    self._sample_cache[idx] = item
+                    self._sample_cache_bytes += item_bytes
+        return item
 
     def _prepare_batch(self, spec_pair: tuple[int | None, list[int]]):
         target_frames, indices = spec_pair
@@ -463,7 +523,7 @@ class PrefetchBatchLoader:
         out_queue: queue.Queue = queue.Queue(maxsize=self.prefetch_batches)
         stop_event = threading.Event()
         sentinel = object()
-        max_in_flight = max(self.prefetch_batches, self.num_workers * 2)
+        max_in_flight = self.prefetch_batches
 
         def _producer() -> None:
             pending: deque = deque()
@@ -512,6 +572,8 @@ class PrefetchBatchLoader:
             thread.join(timeout=2.0)
 
     def close(self) -> None:
+        self._sample_cache.clear()
+        self._sample_cache_bytes = 0
         if self._mp_pool is not None:
             self._mp_pool.close()
             self._mp_pool = None

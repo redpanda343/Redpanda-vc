@@ -497,6 +497,7 @@ def stft_complex(
     *,
     pad_left: int = 0,
     pad_right: int = 0,
+    time_first: bool = False,
 ) -> tuple[Array, Array]:
     """Strictly FP32 real-input STFT matching torch.stft(..., center=False) after optional reflect pad."""
     y_f32 = jnp.asarray(y, jnp.float32)
@@ -537,6 +538,8 @@ def stft_complex(
         frames = y_f32[:, starts + offsets]  # (B, TT, n_fft)
     windowed = frames * win_arr[None, None, :]
     spec = jnp.fft.rfft(windowed, n=n_fft_i, axis=-1)  # (B, TT, F)
+    if time_first:
+        return jnp.real(spec), jnp.imag(spec)
     spec_ft = jnp.transpose(spec, (0, 2, 1))  # (B, F, TT)
     return jnp.real(spec_ft), jnp.imag(spec_ft)
 

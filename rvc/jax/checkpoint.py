@@ -61,13 +61,20 @@ def _collect_named_leaves(tree: Any, prefix: str = "") -> list[tuple[str, Any]]:
     return entries
 
 
+def _needs_device_get(x: Any) -> bool:
+    jax_arr = getattr(jax, "Array", None)
+    if jax_arr is not None and isinstance(x, jax_arr):
+        return True
+    return not isinstance(x, (np.ndarray, np.generic, int, float, bool))
+
+
 def _flatten_named_pytree(tree: Any, prefix: str = "") -> dict[str, np.ndarray]:
     """Flatten nested dict/list PyTree into stable string-keyed NumPy arrays via a single batched D2H copy."""
     entries = _collect_named_leaves(tree, prefix)
     if not entries:
         return {}
     raw_leaves = [v for _, v in entries]
-    host_leaves = jax.device_get(raw_leaves) if any(not isinstance(x, np.ndarray) for x in raw_leaves) else raw_leaves
+    host_leaves = jax.device_get(raw_leaves) if any(_needs_device_get(x) for x in raw_leaves) else raw_leaves
     return {k: np.asarray(h) for (k, _), h in zip(entries, host_leaves)}
 
 
@@ -103,7 +110,7 @@ def save_jax_checkpoint(
     ema_entries = _collect_named_leaves(ema_params, prefix="ema") if ema_params is not None else []
 
     all_raw = [v for _, v in param_entries] + opt_leaves + [v for _, v in ema_entries]
-    all_host = jax.device_get(all_raw) if any(not isinstance(x, np.ndarray) for x in all_raw) else all_raw
+    all_host = jax.device_get(all_raw) if any(_needs_device_get(x) for x in all_raw) else all_raw
 
     n_p = len(param_entries)
     n_o = len(opt_leaves)
@@ -171,12 +178,21 @@ def load_jax_checkpoint(
             restored_leaves = []
             for i, tmpl_leaf in enumerate(template_leaves):
                 arr = flat_arrays[f"opt/{i}"]
-                if tuple(arr.shape) != tuple(np.asarray(tmpl_leaf).shape):
+                tmpl_shape = tuple(tmpl_leaf.shape) if hasattr(tmpl_leaf, "shape") else ()
+                if tuple(arr.shape) != tmpl_shape:
                     raise ValueError(
                         f"Optimizer state leaf {i} shape mismatch in '{path}': "
-                        f"got {arr.shape}, expected {np.asarray(tmpl_leaf).shape}."
+                        f"got {arr.shape}, expected {tmpl_shape}."
                     )
-                restored_leaves.append(arr.astype(np.asarray(tmpl_leaf).dtype, copy=False))
+                if isinstance(tmpl_leaf, (bool, np.bool_)):
+                    tmpl_dtype = np.bool_
+                elif isinstance(tmpl_leaf, int):
+                    tmpl_dtype = np.int32
+                else:
+                    tmpl_dtype = getattr(tmpl_leaf, "dtype", np.float32)
+                    if tmpl_dtype == np.float64:
+                        tmpl_dtype = np.float32
+                restored_leaves.append(arr.astype(tmpl_dtype, copy=False))
             opt_state = jax.tree_util.tree_unflatten(treedef, restored_leaves)
         else:
             print(f"Warning: optimizer state structure in '{path}' did not match; starting optimizer fresh.")
