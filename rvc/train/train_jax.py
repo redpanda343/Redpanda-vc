@@ -434,18 +434,18 @@ class JaxTrainer:
         eps = float(config.train.eps)
         base_lr = float(config.train.learning_rate)
         self.opt_g = optax.inject_hyperparams(optax.adamw)(
-            learning_rate=np.float32(base_lr * g_lr_coeff),
-            b1=np.float32(b1),
-            b2=np.float32(b2),
-            eps=np.float32(eps),
-            weight_decay=np.float32(0.0),
+            learning_rate=base_lr * g_lr_coeff,
+            b1=b1,
+            b2=b2,
+            eps=eps,
+            weight_decay=0.0,
         )
         self.opt_d = optax.inject_hyperparams(optax.adamw)(
-            learning_rate=np.float32(base_lr * d_lr_coeff),
-            b1=np.float32(b1),
-            b2=np.float32(b2),
-            eps=np.float32(eps),
-            weight_decay=np.float32(0.0),
+            learning_rate=base_lr * d_lr_coeff,
+            b1=b1,
+            b2=b2,
+            eps=eps,
+            weight_decay=0.0,
         )
         self.opt_state_g, self.opt_state_d = jax.device_get(
             (self.opt_g.init(self.host_params_g), self.opt_d.init(self.host_params_d))
