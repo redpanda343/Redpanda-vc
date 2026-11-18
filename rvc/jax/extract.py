@@ -391,11 +391,12 @@ def run_jax_extraction(
 
         @jax.jit
         def _infer(p_rmvpe, p_hubert, audio_bt, lens_b):
+            feat_prec = PrecisionConfig.float32()
             if run_f0 and run_feat and hubert_cfg is not None:
                 return _call_sharded(
                     lambda a_bt, l_b, p_r, p_h: (
                         rmvpe_f0_forward(a_bt, l_b, p_r, threshold=threshold_f32, prec=prec),
-                        hubert_forward(a_bt, l_b, p_h, hubert_cfg, version=version, prec=prec),
+                        hubert_forward(a_bt, l_b, p_h, hubert_cfg, version=version, prec=feat_prec),
                     ),
                     (p_data, p_data),
                     audio_bt,
@@ -414,7 +415,7 @@ def run_jax_extraction(
                 return f0, None
             if run_feat and hubert_cfg is not None:
                 feats = _call_sharded(
-                    lambda a_bt, l_b, p_h: hubert_forward(a_bt, l_b, p_h, hubert_cfg, version=version, prec=prec),
+                    lambda a_bt, l_b, p_h: hubert_forward(a_bt, l_b, p_h, hubert_cfg, version=version, prec=feat_prec),
                     p_data,
                     audio_bt,
                     lens_b,

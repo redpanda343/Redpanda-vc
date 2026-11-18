@@ -34,7 +34,6 @@ def _worker_main(cfg_dict: dict[str, Any], shared_gen: Any, task_q: Any, res_q: 
     ds = data_mod.TextAudioDataset.from_cached_entries(cfg_dict)
     hop_length = int(cfg_dict["hop_length"])
     allowed_frames = tuple(cfg_dict.get("allowed_frames") or ())
-    phone_half = not bool(cfg_dict.get("repeat_phone", True))
 
     while True:
         item = task_q.get()
@@ -52,7 +51,6 @@ def _worker_main(cfg_dict: dict[str, Any], shared_gen: Any, task_q: Any, res_q: 
                 hop_length,
                 target_frames=target_frames,
                 allowed_frames=allowed_frames,
-                phone_half=phone_half,
             )
             res_q.put((gen, True, batch))
         except BaseException as exc:

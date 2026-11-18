@@ -130,7 +130,7 @@ def kl_loss(z_p, logs_q, m_p, logs_p, z_mask):
         z_p.float(),
         logs_q.float(),
         m_p.float(),
-        logs_p.float().clamp(min=-10.0),
+        logs_p.float(),
         z_mask.float(),
     )
     kl = logs_p - logs_q - 0.5 + 0.5 * ((z_p - m_p) ** 2) * torch.exp(-2 * logs_p)

@@ -167,15 +167,10 @@ def init_text_encoder_params(rng: np.random.Generator, cfg: TextEncoderConfig) -
         p_dropout=cfg.p_dropout,
         checkpointing=cfg.checkpointing,
     )
-    proj = init_conv1d_params(rng, cfg.hidden_channels, cfg.out_channels * 2, kernel_size=1)
-    # Keep initial prior log-std near 0 (sigma ~= 1) so step-0 KL avoids exp(-2 * logs_p) spikes.
-    proj["weight"][..., cfg.out_channels :] *= 0.05
-    if "bias" in proj:
-        proj["bias"][cfg.out_channels :] = 0.0
     params: dict[str, Any] = {
         "emb_phone": init_linear_params(rng, cfg.embedding_dim, cfg.hidden_channels),
         "encoder": init_encoder_params(rng, enc_cfg),
-        "proj": proj,
+        "proj": init_conv1d_params(rng, cfg.hidden_channels, cfg.out_channels * 2, kernel_size=1),
     }
     if cfg.f0:
         params["emb_pitch"] = init_embedding_params(rng, 256, cfg.hidden_channels)
@@ -192,13 +187,11 @@ def text_encoder_forward(
     rng_key: Array | None = None,
     deterministic: bool = True,
     prec: PrecisionConfig = PrecisionConfig(),
-    expected_frames: int | None = None,
 ) -> tuple[Array, Array, Array]:
     """Encode phoneme features and quantized pitch -> (m, logs, x_mask) in NWC (B, T, C)."""
-    x = jnp.asarray(linear(phone, params["emb_phone"], dtype=jnp.float32, precision=prec.fp32_precision), jnp.float32)
-    if expected_frames is not None and x.shape[1] < int(expected_frames):
-        # Upsample 50Hz phoneme projections to 100Hz frame rate on TPU after emb_phone matmul.
-        x = jnp.repeat(x, 2, axis=1)[:, : int(expected_frames), :]
+    # Run frame-rate TextEncoder strictly in FP32 so phoneme embeddings and attention match main cleanly on TPU.
+    fp32_prec = PrecisionConfig.float32()
+    x = jnp.asarray(linear(phone, params["emb_phone"], dtype=jnp.float32, precision=fp32_prec.fp32_precision), jnp.float32)
     if pitch is not None and cfg.f0 and "emb_pitch" in params:
         x = x + embedding(pitch, params["emb_pitch"]["weight"])
     x = x * math.sqrt(cfg.hidden_channels)
@@ -214,13 +207,13 @@ def text_encoder_forward(
         p_dropout=cfg.p_dropout,
         checkpointing=cfg.checkpointing,
     )
-    x = encoder_forward(x, x_mask, params["encoder"], enc_cfg, rng_key=rng_key, deterministic=deterministic, prec=prec)
+    x = encoder_forward(x, x_mask, params["encoder"], enc_cfg, rng_key=rng_key, deterministic=deterministic, prec=fp32_prec)
     if skip_head is not None and skip_head > 0:
         x = x[:, skip_head:, :]
         x_mask = x_mask[:, skip_head:, :]
 
     stats = jnp.asarray(
-        conv1d(x, params["proj"], dtype=jnp.float32, precision=prec.fp32_precision), jnp.float32
+        conv1d(x, params["proj"], dtype=jnp.float32, precision=fp32_prec.fp32_precision), jnp.float32
     ) * x_mask
     m = stats[..., : cfg.out_channels]
     logs = stats[..., cfg.out_channels :]
@@ -248,13 +241,8 @@ def init_posterior_encoder_params(rng: np.random.Generator, cfg: PosteriorEncode
         gin_channels=cfg.gin_channels,
         checkpointing=cfg.checkpointing,
     )
-    pre = init_conv1d_params(rng, cfg.in_channels, cfg.hidden_channels, kernel_size=1)
-    # Attenuate initial linear-STFT input projection (raw linear spec peaks > 100) without altering forward().
-    pre["weight"] *= 0.1
-    if "bias" in pre:
-        pre["bias"].fill(0.0)
     return {
-        "pre": pre,
+        "pre": init_conv1d_params(rng, cfg.in_channels, cfg.hidden_channels, kernel_size=1),
         "enc": init_wavenet_params(rng, wn_cfg),
         "proj": init_conv1d_params(rng, cfg.hidden_channels, cfg.out_channels * 2, kernel_size=1),
     }
@@ -270,8 +258,9 @@ def posterior_encoder_forward(
     prec: PrecisionConfig = PrecisionConfig(),
 ) -> tuple[Array, Array, Array, Array]:
     """Encode linear spectrogram x:(B, T, F) -> (z, m, logs, x_mask) in NWC (B, T, C)."""
+    fp32_prec = PrecisionConfig.float32()
     x_mask = sequence_mask(x_lengths, x.shape[1])[..., None]
-    h = jnp.asarray(conv1d(x, params["pre"], dtype=jnp.float32, precision=prec.fp32_precision), jnp.float32) * x_mask
+    h = jnp.asarray(conv1d(x, params["pre"], dtype=jnp.float32, precision=fp32_prec.fp32_precision), jnp.float32) * x_mask
     wn_cfg = WaveNetConfig(
         hidden_channels=cfg.hidden_channels,
         kernel_size=cfg.kernel_size,
@@ -280,8 +269,8 @@ def posterior_encoder_forward(
         gin_channels=cfg.gin_channels,
         checkpointing=cfg.checkpointing,
     )
-    h = wavenet_forward(h, x_mask, params["enc"], wn_cfg, g=g, deterministic=True, prec=prec)
-    stats = jnp.asarray(conv1d(h, params["proj"], dtype=jnp.float32, precision=prec.fp32_precision), jnp.float32) * x_mask
+    h = wavenet_forward(h, x_mask, params["enc"], wn_cfg, g=g, deterministic=True, prec=fp32_prec)
+    stats = jnp.asarray(conv1d(h, params["proj"], dtype=jnp.float32, precision=fp32_prec.fp32_precision), jnp.float32) * x_mask
     m = stats[..., : cfg.out_channels]
     logs = stats[..., cfg.out_channels :]
     noise = jax.random.normal(rng_key, shape=m.shape, dtype=jnp.float32)

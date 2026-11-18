@@ -652,7 +652,7 @@ def _build_train_command(
     checkpointing: bool = False,
     save_every_steps: int = 1000,
     version: str = "v2",
-    warmup_steps: int = 50,
+    warmup_steps: int = 0,
     lr_decay_steps: int = 0,
     max_batch_seconds: float = 0.0,
     ema_decay: float = 0.999,
@@ -776,7 +776,7 @@ def run_train_script(
     shutdown_check: bool = False,
     save_every_steps: int = 1000,
     version: str = "v2",
-    warmup_steps: int = 50,
+    warmup_steps: int = 0,
     lr_decay_steps: int = 0,
     max_batch_seconds: float = 0.0,
     ema_decay: float = 0.999,
@@ -1552,7 +1552,7 @@ def extract(**kwargs):
 @click.option(
     "--warmup-steps",
     type=click.IntRange(min=0),
-    default=50,
+    default=0,
     help="Ramp the learning rate up over this many steps.",
 )
 @click.option(

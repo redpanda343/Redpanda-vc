@@ -49,15 +49,12 @@ LR_SCHEDULES = ("exponential", "cosine")
 BUCKET_BOUNDARIES = (100, 200, 300, 400, 500, 600, 700, 800, 900)
 LATEST_CHECKPOINT_SUFFIX = 2333333
 
-# experimental settings balanced for from-scratch NSF stability and healthy FM learning
+# experimental settings
 randomized = True
-d_lr_coeff = 0.5
+d_lr_coeff = 1.0
 g_lr_coeff = 1.0
 d_step_per_g_step = 1
 bf16_adamw = False
-MAX_GRAD_NORM = 500.0
-# Scale single-scale log-mel weight so mel gradients stay balanced against adversarial/FM instead of pinning at clip.
-SINGLE_SCALE_MEL_SCALE = 25.0 / 45.0
 
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = os.name == "nt"
@@ -264,7 +261,7 @@ def parse_arguments(argv=None):
     parser.add_argument(
         "--warmup-steps",
         type=int,
-        default=50,
+        default=0,
         help="Ramp the learning rate up over this many steps.",
     )
     parser.add_argument(
@@ -1024,9 +1021,10 @@ class Trainer:
     def optimizer_step(self, optimizer, net, loss, log_grad_norm, update_scaler, before_step=None):
         optimizer.zero_grad()
         self.scaler.scale(loss).backward()
-        self.scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(net.parameters(), MAX_GRAD_NORM)
-        norm = commons.grad_norm(net.parameters()) if log_grad_norm else None
+        norm = None
+        if log_grad_norm:
+            self.scaler.unscale_(optimizer)
+            norm = commons.grad_norm(net.parameters())
         if before_step is not None:
             before_step()
         self.scaler.step(optimizer)
@@ -1056,7 +1054,7 @@ class Trainer:
             config.data.mel_fmin,
             config.data.mel_fmax,
         )
-        return self.fn_mel_loss(wave_mel, y_hat_mel) * (config.train.c_mel * SINGLE_SCALE_MEL_SCALE)
+        return self.fn_mel_loss(wave_mel, y_hat_mel) * config.train.c_mel
 
     def train_step(self, batch):
         config = self.config

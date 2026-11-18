@@ -801,7 +801,7 @@ def rvc_train_tab():
                 warmup_steps = gr.Slider(
                     0,
                     10000,
-                    50,
+                    0,
                     step=1,
                     label=i18n("Warmup Steps"),
                     info=i18n(

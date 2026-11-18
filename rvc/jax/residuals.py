@@ -155,12 +155,13 @@ def _coupling_layer_forward(
     prec: PrecisionConfig = PrecisionConfig(),
 ) -> Array:
     half = cfg.channels // 2
+    fp32_prec = PrecisionConfig.float32()
     x_f32 = jnp.asarray(x, jnp.float32)
     mask_f32 = jnp.asarray(x_mask, jnp.float32)
     x0 = x_f32[..., :half]
     x1 = x_f32[..., half:]
 
-    h = jnp.asarray(conv1d(x0, params["pre"], dtype=prec.compute_dtype, precision=prec.compute_precision), jnp.float32) * mask_f32
+    h = jnp.asarray(conv1d(x0, params["pre"], dtype=jnp.float32, precision=fp32_prec.fp32_precision), jnp.float32) * mask_f32
     wn_cfg = WaveNetConfig(
         hidden_channels=cfg.hidden_channels,
         kernel_size=cfg.kernel_size,
@@ -169,8 +170,8 @@ def _coupling_layer_forward(
         gin_channels=cfg.gin_channels,
         p_dropout=cfg.p_dropout,
     )
-    h = wavenet_forward(h, mask_f32, params["enc"], wn_cfg, g=g, deterministic=True, prec=prec)
-    stats = jnp.asarray(conv1d(h, params["post"], dtype=prec.compute_dtype, precision=prec.compute_precision), jnp.float32) * mask_f32
+    h = wavenet_forward(h, mask_f32, params["enc"], wn_cfg, g=g, deterministic=True, prec=fp32_prec)
+    stats = jnp.asarray(conv1d(h, params["post"], dtype=jnp.float32, precision=fp32_prec.fp32_precision), jnp.float32) * mask_f32
 
     if cfg.mean_only:
         if not reverse:

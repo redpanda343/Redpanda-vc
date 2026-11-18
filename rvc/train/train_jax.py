@@ -103,21 +103,11 @@ LR_SCHEDULES = ("exponential", "cosine")
 BUCKET_BOUNDARIES = JAX_BUCKET_BOUNDARIES
 LEGACY_BUCKET_BOUNDARIES = (100, 200, 300, 400, 500, 600, 700, 800, 900)
 
-# Experimental settings balanced for from-scratch NSF stability and healthy FM learning
+# Experimental settings matching main
 randomized = True
-d_lr_coeff = 0.5
+d_lr_coeff = 1.0
 g_lr_coeff = 1.0
 d_step_per_g_step = 1
-MAX_GRAD_NORM = 500.0
-# Scale single-scale log-mel weight so mel gradients stay balanced against adversarial/FM instead of pinning at clip.
-SINGLE_SCALE_MEL_SCALE = 25.0 / 45.0
-
-
-def _clip_grads_by_global_norm(grads, max_norm: float):
-    norm = optax.global_norm(grads)
-    scale = jnp.minimum(jnp.float32(1.0), jnp.float32(max_norm) / jnp.maximum(norm, jnp.float32(1e-6)))
-    clipped = jax.tree.map(lambda g: g * scale, grads)
-    return clipped, jnp.minimum(norm, jnp.float32(max_norm))
 
 
 def _init_xla_cache() -> None:
@@ -162,7 +152,7 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
         help="When resuming, start optimizers without their saved moments.",
     )
     parser.add_argument("--checkpointing", action="store_true")
-    parser.add_argument("--warmup-steps", type=int, default=50)
+    parser.add_argument("--warmup-steps", type=int, default=0)
     parser.add_argument("--lr-decay-steps", type=int, default=0)
     parser.add_argument("--lr-schedule", choices=LR_SCHEDULES, default="exponential")
     parser.add_argument("--lr-final-ratio", type=float, default=0.1)
@@ -339,7 +329,7 @@ class JaxTrainer:
         self.dataset = TextAudioDataset(
             data,
             compute_spec=False,
-            repeat_phone=False,
+            repeat_phone=True,
             phone_dtype=np.float32,
         )
         use_tpu_buckets = self.platform in ("tpu", "gpu")
@@ -438,14 +428,14 @@ class JaxTrainer:
             b1=b1,
             b2=b2,
             eps=eps,
-            weight_decay=0.0,
+            weight_decay=0.01,
         )
         self.opt_d = optax.inject_hyperparams(optax.adamw)(
             learning_rate=base_lr * d_lr_coeff,
             b1=b1,
             b2=b2,
             eps=eps,
-            weight_decay=0.0,
+            weight_decay=0.01,
         )
         self.opt_state_g, self.opt_state_d = jax.device_get(
             (self.opt_g.init(self.host_params_g), self.opt_d.init(self.host_params_d))
@@ -658,7 +648,7 @@ class JaxTrainer:
                     int(data_cfg.filter_length),
                     hop_length,
                     int(data_cfg.win_length),
-                    max_frames=pitch.shape[1],
+                    max_frames=phone.shape[1],
                 )
             )
             next_rng_key, step_base_rng = jax.random.split(rng_key)
@@ -711,13 +701,12 @@ class JaxTrainer:
                 return l_d
 
             loss_disc = jnp.float32(0.0)
-            gn_d_val = jnp.float32(0.0)
+            grads_d = None
             opt_state_d = opt_state_d._replace(hyperparams={**opt_state_d.hyperparams, "learning_rate": lr_d})
             for _ in range(d_step_per_g_step):
                 loss_disc, grads_d = jax.value_and_grad(_loss_d)(params_d)
                 if multi_device:
                     grads_d = lax.pmean(grads_d, axis_name="data")
-                grads_d, gn_d_val = _clip_grads_by_global_norm(grads_d, MAX_GRAD_NORM)
                 upd_d, opt_state_d = opt_d.update(grads_d, opt_state_d, params_d)
                 params_d = optax.apply_updates(params_d, upd_d)
 
@@ -746,7 +735,7 @@ class JaxTrainer:
                         data_cfg.mel_fmax,
                         center=False,
                     )
-                    l_mel = jnp.mean(jnp.abs(wave_mel_ref - y_h_mel)) * (c_mel * SINGLE_SCALE_MEL_SCALE)
+                    l_mel = jnp.mean(jnp.abs(wave_mel_ref - y_h_mel)) * c_mel
                 l_kl = kl_loss(z_p_v, logs_q_v, m_p_v, logs_p_v, z_mask_sg) * c_kl
                 l_fm = feature_loss(fmap_r, fmap_g)
                 l_gen, _ = generator_loss(y_d_g)
@@ -759,7 +748,6 @@ class JaxTrainer:
             (grads_g,) = gen_vjp(grad_diff_out)
             if multi_device:
                 grads_g = lax.pmean(grads_g, axis_name="data")
-            grads_g, gn_g_val = _clip_grads_by_global_norm(grads_g, MAX_GRAD_NORM)
 
             opt_state_g = opt_state_g._replace(hyperparams={**opt_state_g.hyperparams, "learning_rate": lr_g})
             upd_g, opt_state_g = opt_g.update(grads_g, opt_state_g, params_g)
@@ -769,8 +757,12 @@ class JaxTrainer:
                 gen_view = {k: v for k, v in params_g.items() if k != "enc_q"}
                 ema_params = jax.tree.map(lambda e, p: e + ema_lerp * (p - e), ema_params, gen_view)
 
-            gn_d = jnp.where(compute_grad_norms, gn_d_val, jnp.float32(0.0))
-            gn_g = jnp.where(compute_grad_norms, gn_g_val, jnp.float32(0.0))
+            gn_d, gn_g = lax.cond(
+                compute_grad_norms,
+                lambda _: (optax.global_norm(grads_d), optax.global_norm(grads_g)),
+                lambda _: (jnp.float32(0.0), jnp.float32(0.0)),
+                None,
+            )
 
             loss_vec = jnp.stack([loss_gen_all, loss_disc, loss_gen, loss_fm, loss_mel, loss_kl])
             if multi_device:
@@ -883,17 +875,12 @@ class JaxTrainer:
         phone_dim = int(self.syn_cfg.text_enc_hidden_dim)
         b_sharding = self.data_sharding
 
-        ds_obj = getattr(self, "dataset", None)
-        phone_half = not bool(getattr(ds_obj, "repeat_phone", True))
-        ds_phone_dtype = getattr(ds_obj, "phone_dtype", np.float32)
-        phone_jnp_dtype = jnp.float16 if np.dtype(ds_phone_dtype) == np.float16 else jnp.float32
         total = len(bucket_shapes)
         print(f"Pre-compiling XLA training kernels for {total} bucket shape(s)...", flush=True)
         for idx, (bs, frames) in enumerate(bucket_shapes, start=1):
             wave_frames = frames * hop_length
-            phone_frames = (frames + 1) // 2 if phone_half else frames
             batch_sds = (
-                jax.ShapeDtypeStruct((bs, phone_frames, phone_dim), phone_jnp_dtype, sharding=b_sharding),
+                jax.ShapeDtypeStruct((bs, frames, phone_dim), jnp.float32, sharding=b_sharding),
                 jax.ShapeDtypeStruct((bs,), jnp.int32, sharding=b_sharding),
                 jax.ShapeDtypeStruct((bs, frames), jnp.int32, sharding=b_sharding),
                 jax.ShapeDtypeStruct((bs, frames), jnp.float32, sharding=b_sharding),

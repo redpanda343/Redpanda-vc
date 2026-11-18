@@ -256,7 +256,6 @@ def synthesizer_forward(
         rng_key=k_p,
         deterministic=deterministic,
         prec=prec,
-        expected_frames=int(y.shape[1]),
     )
     z, m_q, logs_q, y_mask = posterior_encoder_forward(
         y,

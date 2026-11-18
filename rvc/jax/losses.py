@@ -86,8 +86,7 @@ def kl_loss(
     z_p_f = jnp.asarray(z_p, jnp.float32)
     logs_q_f = jnp.asarray(logs_q, jnp.float32)
     m_p_f = jnp.asarray(m_p, jnp.float32)
-    # Guard only against numerical exp(-2 * logs_p) overflow without capping learned prior variance.
-    logs_p_f = jnp.maximum(jnp.asarray(logs_p, jnp.float32), -10.0)
+    logs_p_f = jnp.asarray(logs_p, jnp.float32)
     mask_f = jnp.asarray(z_mask, jnp.float32)
     kl = logs_p_f - logs_q_f - 0.5 + 0.5 * jnp.square(z_p_f - m_p_f) * jnp.exp(-2.0 * logs_p_f)
     return jnp.sum(kl * mask_f) / jnp.maximum(jnp.sum(mask_f), 1.0)

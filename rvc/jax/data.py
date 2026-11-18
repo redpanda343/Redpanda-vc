@@ -1085,8 +1085,10 @@ def preload_shards_into_cache(
     max_bytes: int,
     workers: int = 4,
     progress: bool = True,
+    repeat_phone: bool | None = None,
 ) -> int:
     """Sequentially stream whole `.rpack` shards into RAM `_sample_cache`, avoiding slow random 640K seeks."""
+    use_repeat = bool(getattr(dataset, "repeat_phone", True)) if repeat_phone is None else bool(repeat_phone)
     cur_bytes = sum(_sample_nbytes(v) for v in sample_cache.values())
     reader = getattr(dataset, "_shard_reader", None)
     if reader is None or max_bytes <= 0 or cur_bytes >= max_bytes:
@@ -1147,7 +1149,7 @@ def preload_shards_into_cache(
         rec = _decode_clip_record(
             mv_blob[off : off + nb],
             expected_sr=dataset.sample_rate,
-            repeat_phone=dataset.repeat_phone,
+            repeat_phone=use_repeat,
             phone_dtype=dataset.phone_dtype,
             compute_spec=dataset.compute_spec,
             allow_pcm16=not dataset.compute_spec,
@@ -1430,12 +1432,14 @@ class TextAudioDataset:
         labels: tuple[np.ndarray, np.ndarray, np.ndarray, np.int32, int],
         *,
         allow_pcm16: bool = False,
+        repeat_phone: bool | None = None,
     ) -> tuple[np.ndarray | None, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.int32]:
         """Load WAV waveform and align with pre-loaded labels."""
         audiopath = self.audiopaths_and_text[index][0]
         phone_half, pitch, pitchf, sid, n_num = labels
 
         keep_i16 = bool(allow_pcm16 and not self.compute_spec)
+        use_repeat = self.repeat_phone if repeat_phone is None else bool(repeat_phone)
         audio, sr = _fast_load_wav(audiopath, max_samples=n_num * self.hop_length, allow_int16=keep_i16)
         if audio.ndim > 1:
             audio = audio[:, 0]
@@ -1458,7 +1462,7 @@ class TextAudioDataset:
         else:
             phone_use = phone_half
 
-        phone = np.repeat(phone_use, 2, axis=0)[:len_min, :] if self.repeat_phone else phone_use
+        phone = np.repeat(phone_use, 2, axis=0)[:len_min, :] if use_repeat else phone_use
         spec = (
             spectrogram_np(np.ascontiguousarray(wav[:, 0], dtype=np.float32), self.filter_length, self.hop_length, self.win_length)
             if self.compute_spec
@@ -1475,15 +1479,17 @@ class TextAudioDataset:
         index: int,
         *,
         allow_pcm16: bool = False,
+        repeat_phone: bool | None = None,
     ) -> tuple[np.ndarray | None, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.int32]:
         """Read clip directly from contiguous `.rpack` shard when available, else loose files."""
+        use_repeat = self.repeat_phone if repeat_phone is None else bool(repeat_phone)
         reader = getattr(self, "_shard_reader", None)
         if reader is not None:
             raw = reader.pread_clip(index)
             return _decode_clip_record(
                 raw,
                 expected_sr=self.sample_rate,
-                repeat_phone=self.repeat_phone,
+                repeat_phone=use_repeat,
                 phone_dtype=self.phone_dtype,
                 compute_spec=self.compute_spec,
                 allow_pcm16=allow_pcm16,
@@ -1491,7 +1497,12 @@ class TextAudioDataset:
                 hop_length=self.hop_length,
                 win_length=self.win_length,
             )
-        return self.load_item_with_cached_labels(index, self.load_labels(index), allow_pcm16=allow_pcm16)
+        return self.load_item_with_cached_labels(
+            index,
+            self.load_labels(index),
+            allow_pcm16=allow_pcm16,
+            repeat_phone=use_repeat,
+        )
 
     def __getitem__(self, index: int) -> tuple[np.ndarray | None, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.int32]:
         if getattr(self, "_shard_reader", None) is not None:
@@ -1626,13 +1637,13 @@ def collate_nwc_batch(
     phone_half: bool = False,
 ) -> tuple[np.ndarray, ...]:
     """Collate sample rows into NWC NumPy arrays with optional static XLA bucket padding."""
+    del phone_half
     has_spec = rows[0][0] is not None
-    # Half-rate phoneme rows store 50Hz frames; pitch (index 3) always tracks full 100Hz frame count.
-    len_idx = 3 if phone_half else 2
-    sorted_rows = sorted(rows, key=lambda r: r[len_idx].shape[0], reverse=True)
+    # Pitch (index 3) always tracks full 100Hz frame count even when RAM cache stores compact unrepeated phones.
+    sorted_rows = sorted(rows, key=lambda r: r[3].shape[0], reverse=True)
     batch_size = len(sorted_rows)
 
-    phone_lengths = np.asarray([r[len_idx].shape[0] for r in sorted_rows], dtype=np.int32)
+    phone_lengths = np.asarray([r[3].shape[0] for r in sorted_rows], dtype=np.int32)
     wave_lengths = np.asarray([r[1].shape[0] for r in sorted_rows], dtype=np.int32)
     spec_lengths = (
         np.asarray([r[0].shape[0] for r in sorted_rows], dtype=np.int32)
@@ -1646,9 +1657,8 @@ def collate_nwc_batch(
     wave_frames = max(frames * int(hop_length), int(wave_lengths.max()))
 
     phone_dim = sorted_rows[0][2].shape[1]
-    phone_frames = (frames + 1) // 2 if phone_half else frames
 
-    phone_padded = np.empty((batch_size, phone_frames, phone_dim), dtype=sorted_rows[0][2].dtype)
+    phone_padded = np.empty((batch_size, frames, phone_dim), dtype=sorted_rows[0][2].dtype)
     pitch_padded = np.empty((batch_size, frames), dtype=np.int32)
     pitchf_padded = np.empty((batch_size, frames), dtype=np.float32)
     wave_padded = np.empty((batch_size, wave_frames, 1), dtype=np.float32)
@@ -1675,9 +1685,19 @@ def collate_nwc_batch(
             wave_padded[i, :w_len, :] = wav
         if w_len < wave_frames:
             wave_padded[i, w_len:, :] = 0.0
-        phone_padded[i, :p_len, :] = phone
-        if p_len < phone_frames:
-            phone_padded[i, p_len:, :] = 0.0
+        if p_len == pt_len:
+            phone_padded[i, :p_len, :] = phone
+        elif p_len < pt_len and p_len == (pt_len + 1) // 2:
+            # Expand compact unrepeated cache entry directly into 100Hz frame slots (identical to np.repeat(..., 2)[:pt_len]).
+            even_n = (pt_len + 1) // 2
+            odd_n = pt_len // 2
+            phone_padded[i, 0:pt_len:2, :] = phone[:even_n]
+            phone_padded[i, 1:pt_len:2, :] = phone[:odd_n]
+        else:
+            rep = np.repeat(phone, 2, axis=0) if p_len < pt_len else phone
+            phone_padded[i, :pt_len, :] = rep[:pt_len]
+        if pt_len < frames:
+            phone_padded[i, pt_len:, :] = 0.0
         pitch_padded[i, :pt_len] = pitch
         if pt_len < frames:
             pitch_padded[i, pt_len:] = 0
@@ -1730,7 +1750,6 @@ class PrefetchBatchLoader:
         self.prefetch_batches = max(2, int(prefetch_batches))
         self.cache_in_ram = bool(cache_in_ram)
         self.allowed_frames = getattr(sampler, "allowed_frames", ())
-        self.phone_half = not bool(getattr(dataset, "repeat_phone", True))
         self.use_multiprocessing = bool(use_multiprocessing) and (not self.cache_in_ram) and (self.num_workers > 0)
         self._cache: list[tuple[np.ndarray, ...]] | None = None
         avail = _available_ram_bytes()
@@ -1792,6 +1811,7 @@ class PrefetchBatchLoader:
                     max_bytes=preload_budget,
                     workers=max(1, self._pool_workers or self.num_workers or 4),
                     progress=True,
+                    repeat_phone=False,
                 )
 
     def _try_cache_sample(self, idx: int, item: tuple[Any, ...]) -> None:
@@ -1810,16 +1830,20 @@ class PrefetchBatchLoader:
         if cached is not None:
             return cached
         if getattr(self.dataset, "has_shards", False):
-            item = self.dataset.load_item_fast(idx, allow_pcm16=True)
+            item = self.dataset.load_item_fast(idx, allow_pcm16=True, repeat_phone=False)
             self._try_cache_sample(idx, item)
             return item
         cached_lbl = self._label_cache.get(idx)
         if cached_lbl is not None:
-            return self.dataset.load_item_with_cached_labels(idx, cached_lbl, allow_pcm16=True)
+            return self.dataset.load_item_with_cached_labels(
+                idx, cached_lbl, allow_pcm16=True, repeat_phone=False
+            )
 
         if hasattr(self.dataset, "load_labels"):
             labels = self.dataset.load_labels(idx)
-            item = self.dataset.load_item_with_cached_labels(idx, labels, allow_pcm16=True)
+            item = self.dataset.load_item_with_cached_labels(
+                idx, labels, allow_pcm16=True, repeat_phone=False
+            )
             if (self._sample_cache_bytes + self._label_cache_bytes) < self._label_cache_limit:
                 item_bytes = _sample_nbytes(item)
                 lbl_bytes = _sample_nbytes(labels[:3])
@@ -1948,14 +1972,15 @@ class PrefetchBatchLoader:
             self.hop_length,
             target_frames=target_frames,
             allowed_frames=self.allowed_frames,
-            phone_half=self.phone_half,
         )
 
     def _load_for_cache(self, idx: int):
         if getattr(self.dataset, "has_shards", False):
-            return self.dataset.load_item_fast(idx, allow_pcm16=True)
+            return self.dataset.load_item_fast(idx, allow_pcm16=True, repeat_phone=False)
         if hasattr(self.dataset, "load_labels"):
-            return self.dataset.load_item_with_cached_labels(idx, self.dataset.load_labels(idx), allow_pcm16=True)
+            return self.dataset.load_item_with_cached_labels(
+                idx, self.dataset.load_labels(idx), allow_pcm16=True, repeat_phone=False
+            )
         return self.dataset[idx]
 
     def _ensure_cache(self) -> None:
@@ -2035,7 +2060,6 @@ class PrefetchBatchLoader:
                         self.hop_length,
                         target_frames=target_frames,
                         allowed_frames=self.allowed_frames,
-                        phone_half=self.phone_half,
                     )
                     while not stop_event.is_set():
                         try:

@@ -124,10 +124,6 @@ class TextEncoder(torch.nn.Module):
             hidden_channels, filter_channels, n_heads, n_layers, kernel_size, p_dropout
         )
         self.proj = torch.nn.Conv1d(hidden_channels, out_channels * 2, 1)
-        with torch.no_grad():
-            self.proj.weight[out_channels:].mul_(0.05)
-            if self.proj.bias is not None:
-                self.proj.bias[out_channels:].zero_()
 
     def forward(
         self,
@@ -182,10 +178,6 @@ class PosteriorEncoder(torch.nn.Module):
         super().__init__()
         self.out_channels = out_channels
         self.pre = torch.nn.Conv1d(in_channels, hidden_channels, 1)
-        with torch.no_grad():
-            self.pre.weight.mul_(0.1)
-            if self.pre.bias is not None:
-                self.pre.bias.zero_()
         self.enc = WaveNet(
             hidden_channels,
             kernel_size,
