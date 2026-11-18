@@ -15,11 +15,9 @@ import queue
 import re
 import shutil
 import struct
-import subprocess
-import tarfile
-import tempfile
+import sys
 import threading
-from collections import Counter, OrderedDict, deque
+from collections import OrderedDict, deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Iterator, Mapping, Sequence
 
@@ -562,25 +560,114 @@ def _atomic_write_json(path: str, payload: Any) -> None:
     os.replace(tmp, path)
 
 
+_SYNC_FILE_RANGE_WRITE = 2
+_SYNC_FILE_RANGE_FN: Any = False  # Lazy sentinel: False=uninitialized, None=unavailable
+
+
+def _get_sync_file_range():
+    """Return Linux 64-bit libc sync_file_range(fd, offset, nbytes, flags) or None."""
+    global _SYNC_FILE_RANGE_FN
+    if _SYNC_FILE_RANGE_FN is not False:
+        return _SYNC_FILE_RANGE_FN
+    if not sys.platform.startswith("linux") or ctypes.sizeof(ctypes.c_void_p) != 8:
+        _SYNC_FILE_RANGE_FN = None
+        return None
+    try:
+        fn = ctypes.CDLL(None).sync_file_range
+        fn.argtypes = [ctypes.c_int, ctypes.c_int64, ctypes.c_int64, ctypes.c_uint]
+        fn.restype = ctypes.c_int
+        _SYNC_FILE_RANGE_FN = fn
+    except Exception:
+        _SYNC_FILE_RANGE_FN = None
+    return _SYNC_FILE_RANGE_FN
+
+
+def _fadvise_dontneed(fd: int) -> None:
+    """Hint Linux to drop one-shot file pages from cache cleanly to avoid memory bloat."""
+    if hasattr(os, "posix_fadvise"):
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        except OSError:
+            pass
+
+
+class _DirFdCache:
+    """Thread-safe cache of open directory file descriptors for fast dir_fd openat()."""
+
+    def __init__(self) -> None:
+        self._supported = os.open in getattr(os, "supports_dir_fd", set())
+        self._lock = threading.Lock()
+        self._fds: dict[str, int] = {}
+
+    def open_read(self, path: str) -> tuple[int, bool]:
+        """Return (fd, is_regular_open); falls back to full path when dir_fd is unsupported."""
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        if not self._supported:
+            return os.open(path, flags), False
+        d, fn = os.path.split(path)
+        if not fn:
+            return os.open(path, flags), False
+        d_key = d or "."
+        dfd = self._fds.get(d_key)
+        if dfd is None:
+            new_dfd = os.open(d_key, os.O_RDONLY)
+            with self._lock:
+                dfd = self._fds.get(d_key)
+                if dfd is None:
+                    self._fds[d_key] = new_dfd
+                    dfd = new_dfd
+                else:
+                    try:
+                        os.close(new_dfd)
+                    except OSError:
+                        pass
+        return os.open(fn, flags, dir_fd=dfd), True
+
+    def close(self) -> None:
+        with self._lock:
+            for dfd in self._fds.values():
+                try:
+                    os.close(dfd)
+                except OSError:
+                    pass
+            self._fds.clear()
+
+
+def _read_file_nocache(path: str, dir_fds: _DirFdCache | None) -> bytes:
+    """Read file payload with optional dir_fd openat() and drop OS page cache immediately."""
+    if dir_fds is not None:
+        fd, _ = dir_fds.open_read(path)
+    else:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    try:
+        with os.fdopen(fd, "rb", buffering=0, closefd=False) as rf:
+            data = rf.read()
+        _fadvise_dontneed(fd)
+        return data
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
 def _encode_clip_to_record_and_item(
     row: Sequence[str],
     *,
     dataset: "TextAudioDataset",
     want_seed_item: bool,
-    raw_map: Mapping[str, bytes] | None = None,
-    key_tuple: tuple[str, str, str, str] | None = None,
+    dir_fds: _DirFdCache | None = None,
 ) -> tuple[bytes, tuple[Any, ...] | None]:
     audiopath, phone_path, pitch_path, pitchf_path, dv_str = row[:5]
     max_frames = int(dataset.max_sample_frames)
     max_phone_rows = (max_frames + 1) // 2 + 1
-    if raw_map is not None and key_tuple is not None:
-        k_wav, k_ph, k_pt, k_pf = key_tuple
-        phone_raw = _fast_load_npy_bytes(raw_map[k_ph], max_rows=max_phone_rows)
-        pitch = _fast_load_npy_bytes(raw_map[k_pt], max_rows=max_frames)
-        pitchf = _fast_load_npy_bytes(raw_map[k_pf], max_rows=max_frames)
+    if dir_fds is not None and sf.read is _DEFAULT_SF_READ:
+        phone_raw = _fast_load_npy_bytes(_read_file_nocache(phone_path, dir_fds), max_rows=max_phone_rows)
+        pitch = _fast_load_npy_bytes(_read_file_nocache(pitch_path, dir_fds), max_rows=max_frames)
+        pitchf = _fast_load_npy_bytes(_read_file_nocache(pitchf_path, dir_fds), max_rows=max_frames)
         n_est = min(int(phone_raw.shape[0]) * 2, int(pitch.shape[0]), int(pitchf.shape[0]), max_frames)
         audio, sr = _fast_load_wav_bytes(
-            raw_map[k_wav],
+            _read_file_nocache(audiopath, dir_fds),
             audiopath,
             max_samples=n_est * int(dataset.hop_length),
             allow_int16=True,
@@ -635,156 +722,43 @@ def _encode_clip_to_record_and_item(
     return rec, seed_item
 
 
-def _norm_tar_name(name: str) -> str:
-    while name.startswith("./"):
-        name = name[2:]
-    return name.lstrip("/")
-
-
 def _read_shard_records(
     shard_id: int,
     clip_indices: Sequence[int],
     *,
     dataset: "TextAudioDataset",
-    shards_dir: str,
-    use_tar: bool,
     seed_state: dict[str, Any] | None,
     max_seed_bytes: int,
+    dir_fds: _DirFdCache | None = None,
     on_clip_done: Any = None,
-    sub_id: int = 0,
 ) -> tuple[int, list[int], list[bytes], list[tuple[int, tuple[Any, ...]]]]:
-    """Read and encode one sorted shard group into contiguous record bytes in RAM."""
-    n_clips = len(clip_indices)
-    records: list[bytes | None] = [None] * n_clips
+    """Read and encode one sorted clip chunk via dir_fd openat() without OS cache pollution."""
+    records: list[bytes] = []
     seeded: list[tuple[int, tuple[Any, ...]]] = []
 
-    def _want_seed() -> bool:
-        if seed_state is None or max_seed_bytes <= 0:
-            return False
-        with seed_state["lock"]:
-            return seed_state["bytes"] < max_seed_bytes
-
-    def _try_reserve_seed(item: tuple[Any, ...] | None, gidx: int) -> None:
-        if item is None or seed_state is None or max_seed_bytes <= 0:
-            return
-        n_b = _sample_nbytes(item)
-        with seed_state["lock"]:
-            if seed_state["bytes"] + n_b <= max_seed_bytes:
-                seed_state["bytes"] += n_b
-                seeded.append((gidx, item))
-
-    if use_tar:
-        tar_keys_per_clip: list[tuple[str, str, str, str] | None] = [None] * n_clips
-        unique_paths: list[str] = []
-        seen_paths: set[str] = set()
-        key_waiters: dict[str, list[int]] = {}
-        ref_counts: Counter[str] = Counter()
-        clip_remaining: list[int] = [0] * n_clips
-        all_posix_abs = True
-
-        for local_i, gidx in enumerate(clip_indices):
-            row = dataset.audiopaths_and_text[gidx]
-            abs_p = [os.path.abspath(p) for p in row[:4]]
-            if not all(ap.startswith("/") for ap in abs_p):
-                all_posix_abs = False
-                break
-            tkeys = tuple(ap.lstrip("/") for ap in abs_p)
-            tar_keys_per_clip[local_i] = tkeys  # type: ignore[assignment]
-            distinct = set(tkeys)
-            clip_remaining[local_i] = len(distinct)
-            for tk in tkeys:
-                ref_counts[tk] += 1
-                if tk not in seen_paths:
-                    seen_paths.add(tk)
-                    unique_paths.append(tk)
-            for tk in distinct:
-                key_waiters.setdefault(tk, []).append(local_i)
-
-        if all_posix_abs and unique_paths:
-            list_dir = "/dev/shm" if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else shards_dir
-            list_path = os.path.join(list_dir, f".rvc_tarlist_{shard_id:05d}_{sub_id}_{os.getpid()}.tmp")
-            proc = None
-            raw_map: dict[str, bytes] = {}
-            try:
-                with open(list_path, "w", encoding="utf-8") as lf:
-                    lf.write("\n".join(unique_paths))
-                    lf.write("\n")
-                proc = subprocess.Popen(
-                    ["tar", "-cf", "-", "-C", "/", "-T", list_path],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                )
-                assert proc.stdout is not None
-                with tarfile.open(fileobj=proc.stdout, mode="r|", bufsize=1024 * 1024) as tf:
-                    for member in tf:
-                        if not member.isfile():
-                            continue
-                        mkey = _norm_tar_name(member.name)
-                        if mkey not in key_waiters:
-                            continue
-                        fh = tf.extractfile(member)
-                        if fh is None:
-                            continue
-                        raw_map[mkey] = fh.read()
-                        waiters = key_waiters.pop(mkey, ())
-                        for local_i in waiters:
-                            clip_remaining[local_i] -= 1
-                            if clip_remaining[local_i] == 0:
-                                gidx = int(clip_indices[local_i])
-                                tkeys = tar_keys_per_clip[local_i]
-                                assert tkeys is not None
-                                rec, s_item = _encode_clip_to_record_and_item(
-                                    dataset.audiopaths_and_text[gidx],
-                                    dataset=dataset,
-                                    want_seed_item=_want_seed(),
-                                    raw_map=raw_map,
-                                    key_tuple=tkeys,
-                                )
-                                records[local_i] = rec
-                                _try_reserve_seed(s_item, gidx)
-                                if on_clip_done is not None:
-                                    on_clip_done(1)
-                                for used_k in tkeys:
-                                    ref_counts[used_k] -= 1
-                                    if ref_counts[used_k] <= 0:
-                                        raw_map.pop(used_k, None)
-                proc.wait()
-            except (KeyboardInterrupt, SystemExit):
-                if proc is not None and proc.poll() is None:
-                    proc.kill()
-                    proc.wait()
-                raise
-            except Exception:
-                if proc is not None and proc.poll() is None:
-                    proc.kill()
-                    proc.wait()
-            finally:
-                raw_map.clear()
-                if os.path.exists(list_path):
-                    try:
-                        os.remove(list_path)
-                    except OSError:
-                        pass
-
-    # Fallback for Windows or any clips skipped by tar
-    for local_i, gidx in enumerate(clip_indices):
-        if records[local_i] is not None:
-            continue
+    for gidx in clip_indices:
+        gidx_i = int(gidx)
+        want_seed = False
+        if seed_state is not None and max_seed_bytes > 0:
+            with seed_state["lock"]:
+                want_seed = seed_state["bytes"] < max_seed_bytes
         rec, s_item = _encode_clip_to_record_and_item(
-            dataset.audiopaths_and_text[int(gidx)],
+            dataset.audiopaths_and_text[gidx_i],
             dataset=dataset,
-            want_seed_item=_want_seed(),
+            want_seed_item=want_seed,
+            dir_fds=dir_fds,
         )
-        records[local_i] = rec
-        _try_reserve_seed(s_item, int(gidx))
+        records.append(rec)
+        if s_item is not None and seed_state is not None and max_seed_bytes > 0:
+            n_b = _sample_nbytes(s_item)
+            with seed_state["lock"]:
+                if seed_state["bytes"] + n_b <= max_seed_bytes:
+                    seed_state["bytes"] += n_b
+                    seeded.append((gidx_i, s_item))
         if on_clip_done is not None:
             on_clip_done(1)
 
-    final_records: list[bytes] = [r for r in records if r is not None]
-    if len(final_records) != n_clips:
-        raise RuntimeError(f"Shard {shard_id} expected {n_clips} records, encoded {len(final_records)}")
-    return shard_id, [int(i) for i in clip_indices], final_records, seeded
+    return shard_id, [int(i) for i in clip_indices], records, seeded
 
 
 def ensure_dataset_shards(
@@ -891,15 +865,16 @@ def ensure_dataset_shards(
     seed_items: dict[int, tuple[Any, ...]] = {}
     if missing_shards:
         avail = _available_ram_bytes()
-        # Benchmark on Colab overlayfs peaks at 4 concurrent tar streams (~37.5 clips/s).
-        sub_w = min(4, max(1, int(workers))) if avail >= 8 * (1024 ** 3) else 1
-        use_tar = os.name == "posix" and bool(shutil.which("tar"))
+        # Keep CPU, RAM, and GCE disk gentle: 4-6 dir_fd openat() threads + paced background writeback.
+        sub_w = min(6, max(4, int(workers))) if avail >= 8 * (1024 ** 3) else min(2, max(1, int(workers)))
+        dir_fds = _DirFdCache()
+        sync_range_fn = _get_sync_file_range()
         seed_state = {"bytes": 0, "lock": threading.Lock()}
         pbar = None
         pbar_lock = threading.Lock()
         if progress:
             print(
-                f"Packing {n_clips} dataset clips into {num_shards} contiguous shard(s) ({sub_w} pipelined stream(s); one-time per dataset)...",
+                f"Packing {n_clips} dataset clips into {num_shards} contiguous shard(s) ({sub_w} low-overhead thread(s); one-time per dataset)...",
                 flush=True,
             )
             try:
@@ -914,10 +889,11 @@ def ensure_dataset_shards(
                 with pbar_lock:
                     pbar.update(n)
 
-        write_queue: queue.Queue[Any] = queue.Queue(maxsize=2)
+        write_queue: queue.Queue[Any] = queue.Queue(maxsize=1)
         write_stop = threading.Event()
         writer_exc: list[BaseException] = []
         writer_sentinel = object()
+        _SYNC_CHUNK = 16 * 1024 * 1024
 
         def _writer_loop() -> None:
             try:
@@ -933,13 +909,25 @@ def ensure_dataset_shards(
                         idx_tmp = f"{idx_p}.{os.getpid()}.tmp"
                         s_idx = np.empty((len(w_clip_idxs), 3), dtype=np.int64)
                         off = 0
-                        with open(rpack_tmp, "wb", buffering=8 * 1024 * 1024) as wf:
+                        flushed_off = 0
+                        with open(rpack_tmp, "wb", buffering=4 * 1024 * 1024) as wf:
+                            w_fd = wf.fileno()
                             for li, (gidx, rec_b) in enumerate(zip(w_clip_idxs, w_rec_list)):
                                 s_idx[li, 0] = gidx
                                 s_idx[li, 1] = off
                                 s_idx[li, 2] = len(rec_b)
                                 wf.write(rec_b)
                                 off += len(rec_b)
+                                if sync_range_fn is not None and (off - flushed_off) >= _SYNC_CHUNK:
+                                    wf.flush()
+                                    sync_range_fn(w_fd, flushed_off, off - flushed_off, _SYNC_FILE_RANGE_WRITE)
+                                    flushed_off = off
+                            wf.flush()
+                            if hasattr(os, "fdatasync"):
+                                os.fdatasync(w_fd)
+                            else:
+                                os.fsync(w_fd)
+                            _fadvise_dontneed(w_fd)
                         w_rec_list.clear()
                         with open(idx_tmp, "wb") as ix_f:
                             np.save(ix_f, s_idx)
@@ -966,24 +954,20 @@ def ensure_dataset_shards(
                             sid_val,
                             c_idxs,
                             dataset=dataset,
-                            shards_dir=shards_dir,
-                            use_tar=use_tar,
                             seed_state=seed_state,
                             max_seed_bytes=max_seed_bytes,
+                            dir_fds=dir_fds,
                             on_clip_done=_tick,
-                            sub_id=0,
                         )
                         if pool_ctx is not None
                         else _read_shard_records(
                             sid_val,
                             c_idxs,
                             dataset=dataset,
-                            shards_dir=shards_dir,
-                            use_tar=use_tar,
                             seed_state=seed_state,
                             max_seed_bytes=max_seed_bytes,
+                            dir_fds=dir_fds,
                             on_clip_done=_tick,
-                            sub_id=0,
                         )
                     )
                 ]
@@ -996,19 +980,17 @@ def ensure_dataset_shards(
                     sid_val,
                     sub_s,
                     dataset=dataset,
-                    shards_dir=shards_dir,
-                    use_tar=use_tar,
                     seed_state=seed_state,
                     max_seed_bytes=max_seed_bytes,
+                    dir_fds=dir_fds,
                     on_clip_done=_tick,
-                    sub_id=sub_i,
                 )
-                for sub_i, sub_s in enumerate(sub_slices)
+                for sub_s in sub_slices
             ]
             return sid_val, c_idxs, futs
 
         try:
-            # Sliding 2-shard read lookahead eliminates inter-shard barrier idle gaps
+            # 1-shard lookahead keeps heap small (< ~450 MiB) while removing barrier gaps
             pending_shards: deque[tuple[int, list[int], list[Any]]] = deque()
             next_pos = 0
             while next_pos < len(missing_shards) and len(pending_shards) < 2:
@@ -1066,6 +1048,7 @@ def ensure_dataset_shards(
                 except queue.Full:
                     pass
                 writer_thread.join(timeout=5.0)
+            dir_fds.close()
             if pbar is not None:
                 pbar.close()
 
