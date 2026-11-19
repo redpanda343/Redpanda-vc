@@ -612,27 +612,84 @@ def conv_transpose1d(
     dtype: Any = jnp.float32,
     precision: Any = None,
 ) -> Array:
-    """1D transposed convolution on NWC tensor (B, T, C_in) matching PyTorch ConvTranspose1d."""
+    """1D transposed convolution on NWC tensor (B, T, C_in) matching PyTorch ConvTranspose1d.
+
+    For dilation == 1, uses exact polyphase dense matmuls instead of lax.conv_transpose
+    to avoid XLA TPU silent backward weight-gradient corruption on lhs_dilation convolutions
+    and to improve TPU MXU tile utilization.
+    """
     if groups != 1:
         raise ValueError(f"Grouped conv_transpose1d is unsupported (got groups={groups}).")
     w = resolve_kernel(params)
-    k = w.shape[0]
-    k_eff = (k - 1) * int(dilation) + 1
-    pad_left = k_eff - 1 - int(padding)
-    pad_right = k_eff - 1 - int(padding) + int(output_padding)
+    k = int(w.shape[0])
+    s = int(stride)
+    p = int(padding)
+    op = int(output_padding)
+    d = int(dilation)
     x_c = jnp.asarray(x, dtype)
     w_c = jnp.asarray(w, dtype)
-    y = lax.conv_transpose(
-        lhs=x_c,
-        rhs=w_c,
-        strides=(int(stride),),
-        padding=((pad_left, pad_right),),
-        rhs_dilation=(int(dilation),),
-        dimension_numbers=("NWC", "WIO", "NWC"),
-        transpose_kernel=True,
-        precision=precision,
-        preferred_element_type=jnp.float32,
-    )
+
+    if d == 1:
+        b, t_in, c_in = x_c.shape
+        c_out = int(w_c.shape[1])
+        l_out = (t_in - 1) * s - 2 * p + k + op
+        q_start = p // s
+        q_end = (p + l_out - 1) // s
+        q_len = q_end - q_start + 1
+        m_taps = (k + s - 1) // s
+
+        pad_w_right = m_taps * s - k
+        w_pad = jnp.pad(w_c, ((0, pad_w_right), (0, 0), (0, 0))) if pad_w_right > 0 else w_c
+        # (M, s, C_out, C_in) -> flip M -> (M, C_in, s * C_out)
+        w_poly = jnp.transpose(w_pad.reshape(m_taps, s, c_out, c_in)[::-1], (0, 3, 1, 2)).reshape(
+            m_taps, c_in, s * c_out
+        )
+
+        pad_x_l = (m_taps - 1) - q_start
+        pad_x_r = q_len + q_start - t_in
+        x_src = x_c
+        eff_l, eff_r = pad_x_l, pad_x_r
+        if eff_l < 0:
+            x_src = x_src[:, -eff_l:, :]
+            eff_l = 0
+        if eff_r < 0:
+            x_src = x_src[:, : x_src.shape[1] + eff_r, :]
+            eff_r = 0
+        if eff_l > 0 or eff_r > 0:
+            x_src = jnp.pad(x_src, ((0, 0), (eff_l, eff_r), (0, 0)))
+
+        acc = jnp.matmul(
+            x_src[:, 0:q_len, :],
+            w_poly[0],
+            precision=precision,
+            preferred_element_type=jnp.float32,
+        )
+        for m in range(1, m_taps):
+            acc = acc + jnp.matmul(
+                x_src[:, m : m + q_len, :],
+                w_poly[m],
+                precision=precision,
+                preferred_element_type=jnp.float32,
+            )
+
+        y_flat = acc.reshape(b, q_len * s, c_out)
+        offset = p - q_start * s
+        y = y_flat[:, offset : offset + l_out, :]
+    else:
+        k_eff = (k - 1) * d + 1
+        pad_left = k_eff - 1 - p
+        pad_right = k_eff - 1 - p + op
+        y = lax.conv_transpose(
+            lhs=x_c,
+            rhs=w_c,
+            strides=(s,),
+            padding=((pad_left, pad_right),),
+            rhs_dilation=(d,),
+            dimension_numbers=("NWC", "WIO", "NWC"),
+            transpose_kernel=True,
+            precision=precision,
+            preferred_element_type=jnp.float32,
+        )
     if "bias" in params and params["bias"] is not None:
         y = y + jnp.asarray(params["bias"], jnp.float32)
     return y
