@@ -156,16 +156,27 @@ def rmvpe_params_from_torch_file(model_path: str) -> dict[str, Any]:
     }
 
 
-def _conv_block_res_forward(x: Array, params: Mapping[str, Any], prec: PrecisionConfig) -> Array:
+def _conv_block_res_forward(
+    x: Array,
+    params: Mapping[str, Any],
+    prec: PrecisionConfig,
+    *,
+    mask_bt11: Array | None = None,
+) -> Array:
     h = conv2d(x, params["conv1"], padding=(1, 1), dtype=prec.compute_dtype, precision=prec.compute_precision)
     h = jax.nn.relu(h)
+    if mask_bt11 is not None:
+        h = h * mask_bt11
     h = conv2d(h, params["conv2"], padding=(1, 1), dtype=prec.compute_dtype, precision=prec.compute_precision)
     h = jax.nn.relu(h)
-    res = (
-        conv2d(x, params["shortcut"], padding=(0, 0), dtype=prec.compute_dtype, precision=prec.compute_precision)
-        if "shortcut" in params
-        else jnp.asarray(x, prec.compute_dtype)
-    )
+    if mask_bt11 is not None:
+        h = h * mask_bt11
+    if "shortcut" in params:
+        res = conv2d(x, params["shortcut"], padding=(0, 0), dtype=prec.compute_dtype, precision=prec.compute_precision)
+        if mask_bt11 is not None:
+            res = res * mask_bt11
+    else:
+        res = jnp.asarray(x, jnp.float32)
     return h + res
 
 
@@ -184,10 +195,14 @@ def _masked_gru_scan(
     b, t, _ = x.shape
     h_dim = b_hh.shape[0] // 3
     # One batched MXU matmul across all timesteps (B, T, 3*H) -> compute once cleanly!
-    x_proj = jnp.asarray(
-        jnp.matmul(jnp.asarray(x, prec.compute_dtype), jnp.asarray(w_ih, prec.compute_dtype), precision=prec.compute_precision)
-        + jnp.asarray(b_ih, prec.compute_dtype),
-        jnp.float32,
+    x_proj = (
+        jnp.matmul(
+            jnp.asarray(x, prec.compute_dtype),
+            jnp.asarray(w_ih, prec.compute_dtype),
+            precision=prec.compute_precision,
+            preferred_element_type=jnp.float32,
+        )
+        + jnp.asarray(b_ih, jnp.float32)
     )
     w_hh_f32 = jnp.asarray(w_hh, jnp.float32)
     b_hh_f32 = jnp.asarray(b_hh, jnp.float32)
@@ -240,7 +255,7 @@ def rmvpe_mel_from_audio(audio_bt: Array, audio_lengths: Array) -> Array:
     real, imag = stft_complex(padded, N_FFT, HOP_LENGTH, N_FFT, win, pad_left=0, pad_right=0)
     mag = jnp.sqrt(jnp.maximum(real * real + imag * imag, 1e-24))  # (B, F, TT)
     basis = jnp.asarray(mel_filterbank_np(SAMPLE_RATE, N_FFT, N_MELS, fmin=MEL_FMIN, fmax=MEL_FMAX, htk=True), jnp.float32)
-    mel = jnp.matmul(basis[None, :, :], mag, precision=lax.Precision.HIGH)  # (B, 128, TT)
+    mel = jnp.matmul(basis[None, :, :], mag, precision=lax.Precision.HIGHEST)  # (B, 128, TT)
     log_mel = jnp.log(jnp.maximum(mel, 1e-5))
     return jnp.transpose(log_mel, (0, 2, 1))  # (B, TT, 128)
 
@@ -268,29 +283,40 @@ def rmvpe_salience_forward(
 ) -> Array:
     """Compute batched RMVPE salience probabilities (B, T_mel, 360) strictly in FP32 out."""
     mel_raw = rmvpe_mel_from_audio(audio_bt, audio_lengths)  # (B, T_mel_bucket, 128), T_mel_bucket % 32 == 0
+    t_mel = int(mel_raw.shape[1])
     n_frames = jnp.asarray(audio_lengths, jnp.int32) // HOP_LENGTH + 1
-    pad32 = 32 * ((n_frames - 1) // 32 + 1)
+    pad32 = jnp.minimum(32 * ((n_frames - 1) // 32 + 1), t_mel)
     mel = _reflect_pad_mel_to_len(mel_raw, n_frames, pad32)
 
-    # Apply input BatchNorm2d(1) strictly in FP32
+    # Exact per-level valid masks (B, T_lvl, 1, 1) so padded bucket tail [pad32:] stays strictly
+    # zero across every conv/bn bias and never bleeds into valid frames (exact match to unbatched PyTorch).
+    lvl_masks = [
+        (jnp.arange(t_mel >> lvl, dtype=jnp.int32)[None, :] < (pad32 >> lvl)[:, None]).astype(jnp.float32)[:, :, None, None]
+        for lvl in range(6)
+    ]
+
+    # Apply input BatchNorm2d(1) strictly in FP32 and zero padded tail
     x = mel[..., None]  # (B, T, 128, 1) NHWC
-    x = x * jnp.asarray(params["bn_in"]["scale"], jnp.float32) + jnp.asarray(params["bn_in"]["bias"], jnp.float32)
+    x = (x * jnp.asarray(params["bn_in"]["scale"], jnp.float32) + jnp.asarray(params["bn_in"]["bias"], jnp.float32)) * lvl_masks[0]
 
     # DeepUnet Encoder (5 levels)
     skips: list[Array] = []
-    for lvl_blocks in params["encoder"]:
+    for lvl_idx, lvl_blocks in enumerate(params["encoder"]):
+        m_lvl = lvl_masks[lvl_idx]
         for blk in lvl_blocks:
-            x = _conv_block_res_forward(x, blk, prec)
+            x = _conv_block_res_forward(x, blk, prec, mask_bt11=m_lvl)
         skips.append(x)
         x = avg_pool2d(x, (2, 2), (2, 2))
 
     # Intermediate (4 levels)
+    m_inter = lvl_masks[5]
     for lvl_blocks in params["intermediate"]:
         for blk in lvl_blocks:
-            x = _conv_block_res_forward(x, blk, prec)
+            x = _conv_block_res_forward(x, blk, prec, mask_bt11=m_inter)
 
     # Decoder (5 levels)
-    for dec_lvl, skip in zip(params["decoder"], reversed(skips)):
+    for dec_idx, (dec_lvl, skip) in enumerate(zip(params["decoder"], reversed(skips))):
+        m_lvl = lvl_masks[4 - dec_idx]
         x = conv_transpose2d(
             x,
             dec_lvl["conv1"],
@@ -300,13 +326,13 @@ def rmvpe_salience_forward(
             dtype=prec.compute_dtype,
             precision=prec.compute_precision,
         )
-        x = jax.nn.relu(x)
+        x = jax.nn.relu(x) * m_lvl
         x = jnp.concatenate([x, skip], axis=-1)
         for blk in dec_lvl["conv2"]:
-            x = _conv_block_res_forward(x, blk, prec)
+            x = _conv_block_res_forward(x, blk, prec, mask_bt11=m_lvl)
 
     # cnn: Conv2d(16 -> 3), then transpose (B, T, 128, 3) -> (B, T, 3, 128) -> (B, T, 384)
-    x = conv2d(x, params["cnn"], padding=(1, 1), dtype=prec.compute_dtype, precision=prec.compute_precision)
+    x = conv2d(x, params["cnn"], padding=(1, 1), dtype=prec.compute_dtype, precision=prec.compute_precision) * lvl_masks[0]
     b_dim, t_dim = x.shape[0], x.shape[1]
     x_flat = jnp.transpose(x, (0, 1, 3, 2)).reshape(b_dim, t_dim, 3 * N_MELS)
 

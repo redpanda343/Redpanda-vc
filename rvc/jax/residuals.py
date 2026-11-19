@@ -36,13 +36,13 @@ def init_resblock_params(
     kernel_size: int = 3,
     dilations: Sequence[int] = (1, 3, 5),
 ) -> dict[str, Any]:
-    """Initialize ResBlock weight_norm conv1d parameters (init_std=0.01 matching init_weights)."""
+    """Initialize ResBlock weight_norm conv1d parameters matching PyTorch parametrizations.weight_norm Kaiming init."""
     convs1 = [
-        init_conv1d_params(rng, channels, channels, kernel_size, weight_norm=True, init_std=0.01)
+        init_conv1d_params(rng, channels, channels, kernel_size, weight_norm=True)
         for _ in dilations
     ]
     convs2 = [
-        init_conv1d_params(rng, channels, channels, kernel_size, weight_norm=True, init_std=0.01)
+        init_conv1d_params(rng, channels, channels, kernel_size, weight_norm=True)
         for _ in dilations
     ]
     return {"convs1": convs1, "convs2": convs2}
@@ -57,9 +57,9 @@ def resblock_forward(
     leaky_relu_slope: float = LRELU_SLOPE,
     prec: PrecisionConfig = PrecisionConfig(),
 ) -> Array:
-    """Apply ResBlock on NWC input (B, T, C)."""
-    cur = jnp.asarray(x, prec.compute_dtype)
-    mask = jnp.asarray(x_mask, prec.compute_dtype) if x_mask is not None else None
+    """Apply ResBlock on NWC input (B, T, C) with FP32 residual stream and MXU conv compute."""
+    cur = jnp.asarray(x, jnp.float32)
+    mask = jnp.asarray(x_mask, jnp.float32) if x_mask is not None else None
     for i, d in enumerate(dilations):
         x_res = cur
         h = leaky_relu(cur, leaky_relu_slope)

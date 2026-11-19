@@ -76,9 +76,10 @@ def conv_transpose2d(
         dimension_numbers=("NHWC", "HWIO", "NHWC"),
         transpose_kernel=True,
         precision=precision,
+        preferred_element_type=jnp.float32,
     )
     if "bias" in params and params["bias"] is not None:
-        y = y + jnp.asarray(params["bias"], dtype)
+        y = y + jnp.asarray(params["bias"], jnp.float32)
     return y
 
 
@@ -404,7 +405,7 @@ def init_conv1d_params(
         u /= max(1e-12, float(np.linalg.norm(u)))
         out["sn_u"] = u
     if bias:
-        if zero_init or init_std is not None:
+        if zero_init:
             out["bias"] = np.zeros((out_channels,), dtype=np.float32)
         else:
             out["bias"] = _init_bias_uniform(rng, fan_in, out_channels)
@@ -421,20 +422,18 @@ def init_conv_transpose1d_params(
     weight_norm: bool = False,
     init_std: float | None = None,
 ) -> dict[str, np.ndarray]:
-    """Initialize ConvTranspose1d parameters in JAX shape (K, C_out//g, C_in)."""
+    """Initialize ConvTranspose1d parameters in JAX shape (K, C_out//g, C_in) matching PyTorch _ConvNd."""
     c_out_per_group = out_channels // groups
     shape = (kernel_size, c_out_per_group, in_channels)
-    fan_in = in_channels * kernel_size
+    # PyTorch ConvTranspose1d weight is (C_in, C_out//g, K); _calculate_fan_in_and_fan_out uses dim 1 * K.
+    fan_in = c_out_per_group * kernel_size
     if init_std is not None:
         w = rng.normal(0.0, float(init_std), size=shape).astype(np.float32)
     else:
         w = _kaiming_uniform(rng, shape, fan_in=fan_in)
     out: dict[str, np.ndarray] = weight_norm_decompose_np(w, axis=-1) if weight_norm else {"weight": w}
     if bias:
-        if init_std is not None:
-            out["bias"] = np.zeros((out_channels,), dtype=np.float32)
-        else:
-            out["bias"] = _init_bias_uniform(rng, c_out_per_group * kernel_size, out_channels)
+        out["bias"] = _init_bias_uniform(rng, fan_in, out_channels)
     return out
 
 
@@ -577,7 +576,11 @@ def conv1d(
     dtype: Any = jnp.float32,
     precision: Any = None,
 ) -> Array:
-    """1D convolution on NWC tensor (B, T, C_in) with weight WIO (K, C_in//g, C_out)."""
+    """1D convolution on NWC tensor (B, T, C_in) with weight WIO (K, C_in//g, C_out).
+
+    Accumulates and returns FP32 via preferred_element_type so BF16 MXU matmuls never
+    truncate bias additions, residual streams, or backward bias sums to 7-bit BF16.
+    """
     w = resolve_kernel(params)
     pad_pair = (padding, padding) if isinstance(padding, int) else tuple(padding)
     x_c = jnp.asarray(x, dtype)
@@ -591,9 +594,10 @@ def conv1d(
         feature_group_count=int(groups),
         dimension_numbers=("NWC", "WIO", "NWC"),
         precision=precision,
+        preferred_element_type=jnp.float32,
     )
     if "bias" in params and params["bias"] is not None:
-        y = y + jnp.asarray(params["bias"], dtype)
+        y = y + jnp.asarray(params["bias"], jnp.float32)
     return y
 
 
@@ -627,9 +631,10 @@ def conv_transpose1d(
         dimension_numbers=("NWC", "WIO", "NWC"),
         transpose_kernel=True,
         precision=precision,
+        preferred_element_type=jnp.float32,
     )
     if "bias" in params and params["bias"] is not None:
-        y = y + jnp.asarray(params["bias"], dtype)
+        y = y + jnp.asarray(params["bias"], jnp.float32)
     return y
 
 
@@ -666,9 +671,10 @@ def conv2d(
         feature_group_count=int(groups),
         dimension_numbers=("NHWC", "HWIO", "NHWC"),
         precision=precision,
+        preferred_element_type=jnp.float32,
     )
     if "bias" in params and params["bias"] is not None:
-        y = y + jnp.asarray(params["bias"], dtype)
+        y = y + jnp.asarray(params["bias"], jnp.float32)
     return y
 
 
@@ -678,12 +684,12 @@ def linear(
     dtype: Any = jnp.float32,
     precision: Any = None,
 ) -> Array:
-    """Affine linear transformation y = x @ W + b along last axis."""
+    """Affine linear transformation y = x @ W + b along last axis with FP32 accumulation."""
     x_c = jnp.asarray(x, dtype)
     w_c = jnp.asarray(params["weight"], dtype)
-    y = jnp.matmul(x_c, w_c, precision=precision)
+    y = jnp.matmul(x_c, w_c, precision=precision, preferred_element_type=jnp.float32)
     if "bias" in params and params["bias"] is not None:
-        y = y + jnp.asarray(params["bias"], dtype)
+        y = y + jnp.asarray(params["bias"], jnp.float32)
     return y
 
 

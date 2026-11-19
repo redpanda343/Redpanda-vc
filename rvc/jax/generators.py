@@ -157,7 +157,7 @@ def init_hifigan_params(rng: np.random.Generator, cfg: HiFiGANConfig) -> dict[st
     for i, (u, k) in enumerate(zip(cfg.upsample_rates, cfg.upsample_kernel_sizes)):
         in_ch = cfg.upsample_initial_channel // (2 ** i)
         ch = cfg.upsample_initial_channel // (2 ** (i + 1))
-        ups.append(init_conv_transpose1d_params(rng, in_ch, ch, k, weight_norm=True, init_std=0.01))
+        ups.append(init_conv_transpose1d_params(rng, in_ch, ch, k, weight_norm=True))
         for rk, rd in zip(cfg.resblock_kernel_sizes, cfg.resblock_dilation_sizes):
             resblocks.append(init_resblock_params(rng, ch, rk, rd))
 
@@ -208,7 +208,7 @@ def hifigan_forward(
         h = jax.checkpoint(_stage)(h, p_i, rbs_i) if cfg.checkpointing else _stage(h, p_i, rbs_i)
 
     h = leaky_relu(h, 0.01)
-    h = conv1d(h, params["conv_post"], padding=3, dtype=prec.compute_dtype, precision=prec.compute_precision)
+    h = conv1d(h, params["conv_post"], padding=3, dtype=jnp.float32, precision=prec.fp32_precision)
     return jnp.tanh(jnp.asarray(h, jnp.float32))
 
 
@@ -242,7 +242,7 @@ def init_hifigan_nsf_params(rng: np.random.Generator, cfg: HiFiGANNSFConfig) -> 
     for i, (u, k) in enumerate(zip(cfg.upsample_rates, cfg.upsample_kernel_sizes)):
         in_ch = cfg.upsample_initial_channel // (2 ** i)
         ch = cfg.upsample_initial_channel // (2 ** (i + 1))
-        ups.append(init_conv_transpose1d_params(rng, in_ch, ch, k, weight_norm=True, init_std=0.01))
+        ups.append(init_conv_transpose1d_params(rng, in_ch, ch, k, weight_norm=True))
         nk, _ = _noise_conv_shape(stride_f0s[i])
         noise_convs.append(init_conv1d_params(rng, 1, ch, nk))
         for rk, rd in zip(cfg.resblock_kernel_sizes, cfg.resblock_dilation_sizes):
@@ -294,6 +294,7 @@ def hifigan_nsf_forward(
 
         def _stage(
             cur_h: Array,
+            har_in: Array,
             up_p: Mapping[str, Any],
             nc_p: Mapping[str, Any],
             rb_ps: list[Mapping[str, Any]],
@@ -309,12 +310,12 @@ def hifigan_nsf_forward(
                 precision=prec.compute_precision,
             )
             cur_h = cur_h + conv1d(
-                har_source,
+                har_in,
                 nc_p,
                 stride=n_stride,
                 padding=n_pad,
-                dtype=prec.compute_dtype,
-                precision=prec.compute_precision,
+                dtype=jnp.float32,
+                precision=prec.fp32_precision,
             )
             acc = None
             for j, (rk, rd) in enumerate(zip(cfg.resblock_kernel_sizes, cfg.resblock_dilation_sizes)):
@@ -325,10 +326,14 @@ def hifigan_nsf_forward(
         p_up = params["ups"][i]
         p_nc = params["noise_convs"][i]
         p_rbs = params["resblocks"][i * num_kernels : (i + 1) * num_kernels]
-        h = jax.checkpoint(_stage)(h, p_up, p_nc, p_rbs) if cfg.checkpointing else _stage(h, p_up, p_nc, p_rbs)
+        h = (
+            jax.checkpoint(_stage)(h, har_source, p_up, p_nc, p_rbs)
+            if cfg.checkpointing
+            else _stage(h, har_source, p_up, p_nc, p_rbs)
+        )
 
     h = leaky_relu(h, 0.01)
-    h = conv1d(h, params["conv_post"], padding=3, dtype=prec.compute_dtype, precision=prec.compute_precision)
+    h = conv1d(h, params["conv_post"], padding=3, dtype=jnp.float32, precision=prec.fp32_precision)
     return jnp.tanh(jnp.asarray(h, jnp.float32))
 
 
@@ -400,7 +405,7 @@ def _mrf_block_forward(
     dilations: Sequence[int],
     prec: PrecisionConfig,
 ) -> Array:
-    cur = jnp.asarray(x, prec.compute_dtype)
+    cur = jnp.asarray(x, jnp.float32)
     for l_idx, d in enumerate(dilations):
         layer_p = params["layers"][l_idx]
         y = leaky_relu(cur, LRELU_SLOPE)
@@ -465,6 +470,7 @@ def hifigan_mrf_forward(
 
         def _stage(
             cur_h: Array,
+            har_in: Array,
             up_p: Mapping[str, Any],
             nc_p: Mapping[str, Any],
             mrf_ps: list[Mapping[str, Any]],
@@ -480,12 +486,12 @@ def hifigan_mrf_forward(
                 precision=prec.compute_precision,
             )
             cur_h = cur_h + conv1d(
-                har_source,
+                har_in,
                 nc_p,
                 stride=n_stride,
                 padding=n_pad,
-                dtype=prec.compute_dtype,
-                precision=prec.compute_precision,
+                dtype=jnp.float32,
+                precision=prec.fp32_precision,
             )
             acc = None
             for j, (rk, rds) in enumerate(zip(cfg.resblock_kernel_sizes, cfg.resblock_dilations)):
@@ -496,10 +502,14 @@ def hifigan_mrf_forward(
         p_up = params["upsamples"][i]
         p_nc = params["noise_convs"][i]
         p_mrfs = params["mrfs"][i]
-        h = jax.checkpoint(_stage)(h, p_up, p_nc, p_mrfs) if cfg.checkpointing else _stage(h, p_up, p_nc, p_mrfs)
+        h = (
+            jax.checkpoint(_stage)(h, har_source, p_up, p_nc, p_mrfs)
+            if cfg.checkpointing
+            else _stage(h, har_source, p_up, p_nc, p_mrfs)
+        )
 
     h = leaky_relu(h, 0.01)
-    h = conv1d(h, params["conv_post"], padding=3, dtype=prec.compute_dtype, precision=prec.compute_precision)
+    h = conv1d(h, params["conv_post"], padding=3, dtype=jnp.float32, precision=prec.fp32_precision)
     return jnp.tanh(jnp.asarray(h, jnp.float32))
 
 
@@ -555,9 +565,9 @@ def init_refinegan_params(rng: np.random.Generator, cfg: RefineGANConfig) -> dic
         "m_source": {"merge": {"weight": init_linear_params(rng, 1, 1, bias=False)["weight"]}},
         "pre_conv": init_conv1d_params(rng, 1, 16, 7, weight_norm=True),
         "downsample_blocks": downsample_blocks,
-        "mel_conv": init_conv1d_params(rng, cfg.num_mels, cfg.upsample_initial_channel // 2, 7, weight_norm=True, init_std=0.01),
+        "mel_conv": init_conv1d_params(rng, cfg.num_mels, cfg.upsample_initial_channel // 2, 7, weight_norm=True),
         "upsample_conv_blocks": upsample_conv_blocks,
-        "conv_post": init_conv1d_params(rng, up_ch, 1, 7, bias=False, weight_norm=True, init_std=0.01),
+        "conv_post": init_conv1d_params(rng, up_ch, 1, 7, bias=False, weight_norm=True),
     }
     if cfg.gin_channels != 0:
         params["cond"] = init_conv1d_params(rng, 256, cfg.upsample_initial_channel // 2, 1)
@@ -623,7 +633,7 @@ def refinegan_forward(
     )
     har_source = jnp.tanh(linear(sine_waves, params["m_source"]["merge"], dtype=jnp.float32, precision=prec.fp32_precision))
 
-    x = conv1d(har_source, params["pre_conv"], padding=3, dtype=prec.compute_dtype, precision=prec.compute_precision)
+    x = conv1d(har_source, params["pre_conv"], padding=3, dtype=jnp.float32, precision=prec.fp32_precision)
 
     # Downsample factor ratios match df0 = [size, new_size] (independent of frame count f0_size).
     size = upp
@@ -640,7 +650,7 @@ def refinegan_forward(
     if g is not None and "cond" in params:
         mel_h = mel_h + conv1d(g, params["cond"], dtype=prec.compute_dtype, precision=prec.compute_precision)
 
-    cur = jnp.concatenate([jnp.asarray(mel_h, prec.compute_dtype), jnp.asarray(x, prec.compute_dtype)], axis=-1)
+    cur = jnp.concatenate([jnp.asarray(mel_h, jnp.float32), jnp.asarray(x, jnp.float32)], axis=-1)
 
     for rate, blk_p, down in zip(cfg.upsample_rates, params["upsample_conv_blocks"], reversed(downs)):
         if rng_key is not None and not deterministic:
@@ -650,8 +660,8 @@ def refinegan_forward(
 
         def _up_stage(cur_in: Array, down_in: Array, p_blk: Mapping[str, Any], k_sub: Array | None) -> Array:
             h_up = leaky_relu(cur_in, cfg.leaky_relu_slope)
-            h_up = jnp.asarray(upsample_linear_1d(h_up, int(rate)), prec.compute_dtype)
-            h_cat = jnp.concatenate([h_up, jnp.asarray(down_in, prec.compute_dtype)], axis=-1)
+            h_up = upsample_linear_1d(h_up, int(rate))
+            h_cat = jnp.concatenate([h_up, jnp.asarray(down_in, jnp.float32)], axis=-1)
             return _parallel_resblock_forward(h_cat, p_blk, cfg.leaky_relu_slope, k_sub, deterministic, prec)
 
         cur = (
@@ -661,7 +671,7 @@ def refinegan_forward(
         )
 
     cur = leaky_relu(cur, cfg.leaky_relu_slope)
-    cur = conv1d(cur, params["conv_post"], padding=3, dtype=prec.compute_dtype, precision=prec.compute_precision)
+    cur = conv1d(cur, params["conv_post"], padding=3, dtype=jnp.float32, precision=prec.fp32_precision)
     return jnp.tanh(jnp.asarray(cur, jnp.float32))
 
 

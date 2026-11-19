@@ -27,7 +27,6 @@ from rvc.jax import (
     init_jax_compilation_cache,
     resolve_jax_devices,
     resolve_shard_map,
-    supports_bfloat16,
 )
 from rvc.jax.hubert import HubertConfig, hubert_forward, load_hubert_from_dir
 from rvc.jax.rmvpe import (
@@ -191,7 +190,7 @@ def run_jax_extraction(
 ) -> dict[str, int]:
     """Run pipelined multi-chip JAX extraction for RMVPE F0 and/or HuBERT features.
 
-    Reads/resamples each clip once, executes batched BF16-MXU / FP32-critical forward passes
+    Reads/resamples each clip once, executes batched FP32 forward passes
     on static bucket shapes across all JAX devices, and writes .npy outputs asynchronously.
     """
     init_jax_compilation_cache()
@@ -201,7 +200,7 @@ def run_jax_extraction(
     mesh = Mesh(np.array(devices), ("data",))
     replicated = NamedSharding(mesh, PartitionSpec())
     data_sharding = NamedSharding(mesh, PartitionSpec("data"))
-    prec = PrecisionConfig.bfloat16() if supports_bfloat16(devices) else PrecisionConfig.float32()
+    prec = PrecisionConfig.float32()
     hbm_bytes = device_hbm_bytes(devices)
     if hbm_bytes is None and devices[0].platform == "tpu":
         hbm_bytes = 8 * (1024 ** 3)
@@ -391,12 +390,11 @@ def run_jax_extraction(
 
         @jax.jit
         def _infer(p_rmvpe, p_hubert, audio_bt, lens_b):
-            feat_prec = PrecisionConfig.float32()
             if run_f0 and run_feat and hubert_cfg is not None:
                 return _call_sharded(
                     lambda a_bt, l_b, p_r, p_h: (
                         rmvpe_f0_forward(a_bt, l_b, p_r, threshold=threshold_f32, prec=prec),
-                        hubert_forward(a_bt, l_b, p_h, hubert_cfg, version=version, prec=feat_prec),
+                        hubert_forward(a_bt, l_b, p_h, hubert_cfg, version=version, prec=prec),
                     ),
                     (p_data, p_data),
                     audio_bt,
@@ -415,7 +413,7 @@ def run_jax_extraction(
                 return f0, None
             if run_feat and hubert_cfg is not None:
                 feats = _call_sharded(
-                    lambda a_bt, l_b, p_h: hubert_forward(a_bt, l_b, p_h, hubert_cfg, version=version, prec=feat_prec),
+                    lambda a_bt, l_b, p_h: hubert_forward(a_bt, l_b, p_h, hubert_cfg, version=version, prec=prec),
                     p_data,
                     audio_bt,
                     lens_b,

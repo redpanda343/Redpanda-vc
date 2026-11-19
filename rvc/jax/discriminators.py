@@ -119,13 +119,15 @@ def _disc_s_forward(
     return_fmap: bool = True,
 ) -> tuple[Array, list[Array]]:
     fmap: list[Array] = []
-    cur = jnp.asarray(x, prec.compute_dtype)
-    for layer_p, (_, _, _, stride, pad, groups) in zip(params["convs"], _DISCRIMINATOR_S_SPECS):
-        cur = conv1d(cur, layer_p, stride=stride, padding=pad, groups=groups, dtype=prec.compute_dtype, precision=prec.compute_precision)
+    cur = jnp.asarray(x, jnp.float32)
+    for idx, (layer_p, (_, _, _, stride, pad, groups)) in enumerate(zip(params["convs"], _DISCRIMINATOR_S_SPECS)):
+        l_dtype = jnp.float32 if idx == 0 else prec.compute_dtype
+        l_prec = prec.fp32_precision if idx == 0 else prec.compute_precision
+        cur = conv1d(cur, layer_p, stride=stride, padding=pad, groups=groups, dtype=l_dtype, precision=l_prec)
         cur = leaky_relu(cur, LRELU_SLOPE)
         if return_fmap:
             fmap.append(cur)
-    cur = conv1d(cur, params["conv_post"], stride=1, padding=1, dtype=prec.compute_dtype, precision=prec.compute_precision)
+    cur = conv1d(cur, params["conv_post"], stride=1, padding=1, dtype=jnp.float32, precision=prec.fp32_precision)
     if return_fmap:
         fmap.append(cur)
     return cur.reshape(cur.shape[0], -1), fmap
@@ -159,16 +161,18 @@ def _disc_p_forward(
         t = t + n_pad
     t_sub = t // period
     cur = jnp.transpose(x.reshape(b, t_sub, period, c), (0, 2, 1, 3)).reshape(b * period, t_sub, c)
-    cur = jnp.asarray(cur, prec.compute_dtype)
+    cur = jnp.asarray(cur, jnp.float32)
     pad_h = get_padding(kernel_size, 1)
-    for layer_p, (_, _, stride) in zip(params["convs"], _DISCRIMINATOR_P_SPECS):
+    for idx, (layer_p, (_, _, stride)) in enumerate(zip(params["convs"], _DISCRIMINATOR_P_SPECS)):
+        l_dtype = jnp.float32 if idx == 0 else prec.compute_dtype
+        l_prec = prec.fp32_precision if idx == 0 else prec.compute_precision
         cur = conv1d(
             cur,
             _disc_p_1d_layer_params(layer_p),
             stride=stride,
             padding=pad_h,
-            dtype=prec.compute_dtype,
-            precision=prec.compute_precision,
+            dtype=l_dtype,
+            precision=l_prec,
         )
         cur = leaky_relu(cur, LRELU_SLOPE)
         if return_fmap:
@@ -178,8 +182,8 @@ def _disc_p_forward(
         _disc_p_1d_layer_params(params["conv_post"]),
         stride=1,
         padding=1,
-        dtype=prec.compute_dtype,
-        precision=prec.compute_precision,
+        dtype=jnp.float32,
+        precision=prec.fp32_precision,
     )
     if not transpose_fmap:
         if return_fmap:
@@ -210,13 +214,15 @@ def _disc_r_forward(
     return_fmap: bool = True,
 ) -> tuple[Array, list[Array]]:
     fmap: list[Array] = []
-    cur = jnp.asarray(_disc_r_spectrogram(x, resolution), prec.compute_dtype)
-    for layer_p, (_, _, _, stride, pad) in zip(params["convs"], _DISCRIMINATOR_R_SPECS):
-        cur = conv2d(cur, layer_p, stride=stride, padding=pad, dtype=prec.compute_dtype, precision=prec.compute_precision)
+    cur = jnp.asarray(_disc_r_spectrogram(x, resolution), jnp.float32)
+    for idx, (layer_p, (_, _, _, stride, pad)) in enumerate(zip(params["convs"], _DISCRIMINATOR_R_SPECS)):
+        l_dtype = jnp.float32 if idx == 0 else prec.compute_dtype
+        l_prec = prec.fp32_precision if idx == 0 else prec.compute_precision
+        cur = conv2d(cur, layer_p, stride=stride, padding=pad, dtype=l_dtype, precision=l_prec)
         cur = leaky_relu(cur, 0.1)
         if return_fmap:
             fmap.append(cur)
-    cur = conv2d(cur, params["conv_post"], stride=(1, 1), padding=(1, 1), dtype=prec.compute_dtype, precision=prec.compute_precision)
+    cur = conv2d(cur, params["conv_post"], stride=(1, 1), padding=(1, 1), dtype=jnp.float32, precision=prec.fp32_precision)
     if return_fmap:
         fmap.append(cur)
     return cur.reshape(cur.shape[0], -1), fmap
