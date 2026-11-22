@@ -174,8 +174,7 @@ def main() -> None:
             "--save-every", str(a.save_every or max(1, a.steps // 4)), "--device", a.device,
             "--voice", f"{a.name}={a.audio}", "--only", a.name, "--index-bank", str(index_bank),
             "--perturb", str(a.perturb), "--energy-loss", str(a.energy_loss), "--decorr", str(a.decorr), "--noise-aug", str(a.noise_aug)]
-    argv += ["--init", str((base_dir / "last.pt").resolve())]
-    argv += ["--resume"] if done is not None else []
+    argv += ["--resume"] if done is not None else ["--init", str((base_dir / "last.pt").resolve())]
     argv += ["--rates", *(str(r) for r in base["rates"])] if base.get("rates") else []
     argv += ["--antialias"] if base.get("antialias") else []
     argv += ["--glide-next"] if base.get("glide_next") else ["--glide"] if base.get("glide") else []

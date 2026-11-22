@@ -40,8 +40,8 @@ def is_causal_voice(path):
     return str(path).lower().endswith(VOICE_SUFFIXES)
 
 
-def voice_settings(path, fallback=None):
-    values = {**VOICE_DEFAULTS, **(fallback or {})}
+def voice_settings(path):
+    values = VOICE_DEFAULTS.copy()
     if not is_causal_voice(path):
         return values
     try:

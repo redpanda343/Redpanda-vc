@@ -1157,8 +1157,7 @@ class RealtimeGUI:
             if causal_path:
                 matches_saved = causal_path == self.saved.get("model_path")
                 local = self.saved.get("causal_voice_settings") if matches_saved else None
-                fallback = self.rvc_voice_settings if matches_saved and local is None else None
-                values = voice_settings(causal_path, fallback)
+                values = voice_settings(causal_path)
                 if isinstance(local, dict):
                     values.update({key: local[key] for key in values.keys() & local.keys()})
             else:

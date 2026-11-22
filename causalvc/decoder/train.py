@@ -355,19 +355,15 @@ def main(on_save=None, *, stop_file=None, default_base_reg=0.0) -> None:
         return
     args_path = out / "args.json"
     last = out / "last.pt"
-    if args.resume and args.only and last.is_file() and args_path.is_file():
+    if args.resume and args.only and last.is_file():
         try:
             previous = json.loads(args_path.read_text())
-        except (OSError, ValueError):
-            previous = {}
-        if isinstance(previous, dict):
-            original_base = previous.get("init")
-            if isinstance(original_base, str) and original_base and Path(original_base).is_file():
-                args.init = original_base
+            if args.init is None:
+                args.init = previous["init"]
             if args.base_reg is None:
-                saved_base_reg = previous.get("base_reg")
-                if isinstance(saved_base_reg, (int, float)):
-                    args.base_reg = saved_base_reg
+                args.base_reg = previous["base_reg"]
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            ap.error(f"cannot resume without the saved training settings in {args_path}: {error}")
     if args.base_reg is None:
         args.base_reg = default_base_reg
     if args.base_reg > 0 and args.only and not (args.init and Path(args.init).is_file()):
