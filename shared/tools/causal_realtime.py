@@ -7,17 +7,22 @@ from causalvc.limiter import soft_clip
 from causalvc.noise_gate import NoiseGate
 from causalvc.realtime_backend import CausalVC, SAMPLE_RATE
 from causalvc.treble_softener import DELAY_SECONDS, TrebleSoftener
+from shared.tools.causal_voices import PITCH_MAP_DEFAULTS, VOICE_DEFAULTS, voice_settings
 
 
 class CausalRealtime:
     def __init__(self, settings, device):
+        if not VOICE_DEFAULTS.keys() <= settings.keys():
+            for key, value in voice_settings(settings["model_path"]).items():
+                settings.setdefault(key, value)
         self.settings = settings
         self.device = device
         self.lock = Lock()
         self.voice = CausalVC(
-            key=settings["pitch"],
-            model_path=settings["model_path"],
-            device=device,
+            settings["pitch"],
+            settings["model_path"],
+            device,
+            *(settings[key] for key in PITCH_MAP_DEFAULTS),
             cuda_graphs=True,
             index_rate=settings["index_rate"],
         )
@@ -51,6 +56,10 @@ class CausalRealtime:
     def change_index_rate(self, rate):
         with self.lock:
             self.voice.change_index_rate(rate)
+
+    def change_pitch_map(self):
+        with self.lock:
+            self.voice.change_pitch_map(*(self.settings[key] for key in PITCH_MAP_DEFAULTS))
 
     @staticmethod
     def output_gain(samples, gain):

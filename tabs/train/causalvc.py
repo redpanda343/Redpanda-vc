@@ -24,7 +24,7 @@ def _poll_job():
             break
         if line is None:
             code = _job.proc.returncode
-            _phase = "Stopped" if _job.stopping else "Finished" if code == 0 else f"Failed (exit {code})"
+            _phase = "Stopped" if _job.stopped else "Finished" if code == 0 else f"Failed (exit {code})"
         else:
             _log.append(line)
     active = _phase in {"Training", "Stopping"}

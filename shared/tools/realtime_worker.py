@@ -9,7 +9,7 @@ import threading
 import traceback
 from pathlib import Path
 
-from shared.tools.causal_voices import is_cvc
+from shared.tools.causal_voices import PITCH_MAP_DEFAULTS, is_causal_voice
 
 
 MAX_MESSAGE_BYTES = 64 << 20
@@ -117,7 +117,7 @@ class RealtimeWorker:
         self.error_reader.start()
         self.reader.start()
         try:
-            timeout = CAUSAL_LOAD_TIMEOUT if is_cvc(settings["model_path"]) else START_TIMEOUT
+            timeout = CAUSAL_LOAD_TIMEOUT if is_causal_voice(settings["model_path"]) else START_TIMEOUT
             self._call("load", settings, timeout=timeout)
         except Exception:
             self.close()
@@ -297,6 +297,8 @@ def _run_worker():
                         processor.update_pitch(payload["pitch"])
                     if "index_rate" in payload:
                         processor.update_index_rate(payload["index_rate"])
+                    if PITCH_MAP_DEFAULTS.keys() & payload.keys():
+                        processor.update_pitch_map()
                 else:
                     raise ValueError(f"Unknown inference worker command: {command}")
                 _send(outgoing, {"ok": True, "result": result})

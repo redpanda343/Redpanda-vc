@@ -27,7 +27,7 @@ from causalvc.augment import add_noise, add_silent_transients, colour
 from causalvc.decoder.model import tone as tone_of
 from causalvc.infer import CausalVC, extract_all, load_encoder
 from causalvc.pitch import Rmvpe
-from causalvc.progress import Progress
+from causalvc.progress import Progress, stop_before_training
 
 
 def speaker_files(args) -> dict[str, list[str]]:
@@ -289,7 +289,7 @@ def _quiet_worker(_: int) -> None:
     signal.signal(signal.SIGINT, signal.SIG_IGN)  # Ctrl-C is handled by the main process, which saves first
 
 
-def main(on_save=None) -> None:
+def main(on_save=None, *, stop_file=None, default_base_reg=0.0) -> None:
     """on_save(step, path) is called after each checkpoint of a voice build with that checkpoint's own decoder file."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--name", required=True)
@@ -341,7 +341,7 @@ def main(on_save=None) -> None:
                     "the value is the spread (dB) of a random per-crop offset that hides the source's own overall tone")
     ap.add_argument("--expressive", action="store_true", help="continuous voicing confidence (0..1), 32-1400 Hz log-F0 register conditioning, and silence/click floor training")
     ap.add_argument("--silence-share", type=float, default=-1.0, help="share of crops that are digital silence or fade-to-silence (default: 0.06 with --expressive, else 0)")
-    ap.add_argument("--base-reg", type=float, default=0.0, help="L2-SP weight anchoring shared layers toward --init during single-voice builds so laughs, whispers and extreme registers do not drift")
+    ap.add_argument("--base-reg", type=float, help="L2-SP weight anchoring shared layers toward --init during single-voice builds so laughs, whispers and extreme registers do not drift")
     ap.add_argument("--voice", nargs="+", help="NAME=folder-or-file: new voices added to the base's speaker table (use with --init and --only)")
     args = ap.parse_args()
 
@@ -350,9 +350,32 @@ def main(on_save=None) -> None:
     dev = args.device
     out = Path(args.out) / args.name
     out.mkdir(parents=True, exist_ok=True)
-    (out / "args.json").write_text(json.dumps(vars(args), indent=1))
-
+    stop_file = stop_file if stop_file is not None else out / "stop"
+    if stop_before_training(stop_file):
+        return
+    args_path = out / "args.json"
     last = out / "last.pt"
+    if args.resume and args.only and last.is_file() and args_path.is_file():
+        try:
+            previous = json.loads(args_path.read_text())
+        except (OSError, ValueError):
+            previous = {}
+        if isinstance(previous, dict):
+            original_base = previous.get("init")
+            if isinstance(original_base, str) and original_base and Path(original_base).is_file():
+                args.init = original_base
+            if args.base_reg is None:
+                saved_base_reg = previous.get("base_reg")
+                if isinstance(saved_base_reg, (int, float)):
+                    args.base_reg = saved_base_reg
+    if args.base_reg is None:
+        args.base_reg = default_base_reg
+    if args.base_reg > 0 and args.only and not (args.init and Path(args.init).is_file()):
+        ap.error("base regularization requires the original base checkpoint (--init)")
+    args_partial = args_path.with_suffix(".json.part")
+    args_partial.write_text(json.dumps(vars(args), indent=1))
+    args_partial.replace(args_path)
+
     if args.voice and (args.init or args.resume):
         # Building a voice needs only its own audio: the base's speaker list comes from the checkpoint,
         # so the datasets the base was trained on do not have to be on this machine.
@@ -458,21 +481,17 @@ def main(on_save=None) -> None:
 
     base_anchor: list[tuple[torch.nn.Parameter, torch.Tensor]] = []
     anchor_numel = 0
-    if args.base_reg > 0 and (args.init or (args.resume and args.only)):
-        ref_path = args.init
-        if not ref_path and (out / "args.json").is_file():
-            ref_path = json.loads((out / "args.json").read_text()).get("init")
-        if ref_path and Path(ref_path).is_file():
-            ref_gen = torch.load(ref_path, map_location=dev)["generator"]
-            for pname, param in gen.named_parameters():
-                if pname.startswith(("speaker.", "pre_cond.", "post.")) or ".cond." in pname:
-                    continue
-                if pname in ref_gen and ref_gen[pname].shape == param.shape:
-                    base_anchor.append((param, ref_gen[pname].detach().float().clone()))
-                    anchor_numel += param.numel()
-            del ref_gen
-            if anchor_numel:
-                print(f"L2-SP base anchor active on {len(base_anchor)} shared tensors ({anchor_numel / 1e6:.1f}M params, weight={args.base_reg})", flush=True)
+    if args.base_reg > 0 and args.init:
+        ref_gen = torch.load(args.init, map_location=dev)["generator"]
+        for pname, param in gen.named_parameters():
+            if pname.startswith(("speaker.", "pre_cond.", "post.")) or ".cond." in pname:
+                continue
+            if pname in ref_gen and ref_gen[pname].shape == param.shape:
+                base_anchor.append((param, ref_gen[pname].detach().float().clone()))
+                anchor_numel += param.numel()
+        del ref_gen
+        if anchor_numel:
+            print(f"L2-SP base anchor active on {len(base_anchor)} shared tensors ({anchor_numel / 1e6:.1f}M params, weight={args.base_reg})", flush=True)
 
     silence_share = (0.06 if args.expressive else 0.0) if args.silence_share < 0 else args.silence_share
     loader = torch.utils.data.DataLoader(
@@ -517,13 +536,14 @@ def main(on_save=None) -> None:
         stop["now"] = True
 
     signal.signal(signal.SIGINT, _stop), signal.signal(signal.SIGTERM, _stop)
-    stop_file = out / "stop"  # creating this file asks for the same thing; it works where signals cannot (Windows, a GUI)
-    stop_file.unlink(missing_ok=True)
+    if stop_before_training(stop_file):
+        return
+    starting_step = step
     for wav, s in loader:
         if step >= args.steps:
             break
-        if step % 10 == 0 and stop_file.exists():
-            stop["now"] = True
+        if step == starting_step and stop_before_training(stop_file):
+            return
         wav, s = wav.to(dev, non_blocking=True), s.to(dev)
         src = wav
         if args.noise_aug:  # what the microphone hears (src) differs from what should come out (wav)
@@ -623,6 +643,8 @@ def main(on_save=None) -> None:
         if step % 100 == 0:
             shown, log = " ".join(f"{a} {b:.3f}" for a, b in log.items()), {}
         prog.update(step, shown)
+        if stop_file.is_file():
+            stop["now"] = True
         if step % args.save_every == 0 or step == args.steps or stop["now"]:
             prog.pause()
             ck = {
@@ -632,7 +654,9 @@ def main(on_save=None) -> None:
             }
             if ema is not None:
                 ck["ema"] = ema
-            torch.save(ck, last)
+            last_partial = last.with_suffix(".pt.part")
+            torch.save(ck, last_partial)
+            last_partial.replace(last)
             slim = {a: b for a, b in ck.items() if a not in ("discriminator", "opt_g", "opt_d", "ema")}
             if ema is not None:
                 slim["generator"] = {**ck["generator"], **ema}

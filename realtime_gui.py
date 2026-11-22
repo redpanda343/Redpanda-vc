@@ -37,7 +37,10 @@ import sounddevice as sd
 
 from rvc.infer.realtime_engine import RealtimeProcessor, db_to_linear
 from shared.platform import migrate_models_folder
-from shared.tools.causal_voices import SAMPLE_RATE as CAUSAL_SAMPLE_RATE, is_cvc
+from shared.tools.causal_voices import (
+    PITCH_MAP_CONTROLS, PITCH_MAP_DEFAULTS, SAMPLE_RATE as CAUSAL_SAMPLE_RATE,
+    VOICE_DEFAULTS, VOICE_SUFFIXES, is_causal_voice, voice_settings,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -784,8 +787,8 @@ class RealtimeGUI:
         self._apply_theme(self.saved.get("theme") or system_theme())
         self._build()
         self._load_devices(rescan=False)
-        self._refresh_states()
-        self.model_path.trace_add("write", self._refresh_states)
+        self._model_changed()
+        self.model_path.trace_add("write", self._model_changed)
         for variable in (
             self.pitch, self.index_rate, self.rms_mix_rate, self.threshold, self.f0_method,
             self.passthrough,
@@ -793,6 +796,8 @@ class RealtimeGUI:
             self.input_noise_reduce, self.output_noise_reduce,
         ):
             variable.trace_add("write", self._hot_update)
+        for variable in self.pitch_map.values():
+            variable.trace_add("write", self._hot_pitch_map)
         self.root.update_idletasks()
         self.root.minsize(self.root.winfo_reqwidth(), self.root.winfo_reqheight())
         self.root.after(100, self._poll)
@@ -822,14 +827,25 @@ class RealtimeGUI:
         legacy_exclusive = value.get("wasapi_exclusive", False)
         self.exclusive_input = tk.BooleanVar(value=value.get("exclusive_input", legacy_exclusive))
         self.exclusive_output = tk.BooleanVar(value=value.get("exclusive_output", legacy_exclusive))
-        self.pitch = tk.IntVar(value=value.get("pitch", 0))
+        self.pitch = tk.DoubleVar(value=value.get("pitch", 0))
         self.speaker_id = tk.IntVar(value=value.get("speaker_id", 0))
         self.index_rate = tk.DoubleVar(value=value.get("index_rate", 0.0))
         self.rms_mix_rate = tk.DoubleVar(value=value.get("rms_mix_rate", 0.0))
-        self.threshold = tk.IntVar(value=value.get("threshold", -60))
+        self.threshold = tk.DoubleVar(value=value.get("threshold", -60))
         self.input_gain_db = tk.DoubleVar(value=value.get("input_gain_db", 0.0))
         self.output_gain_db = tk.DoubleVar(value=value.get("output_gain_db", 0.0))
         self.monitor_gain_db = tk.DoubleVar(value=value.get("monitor_gain_db", 0.0))
+        self.pitch_map = {key: tk.DoubleVar(value=default) for key, default in PITCH_MAP_DEFAULTS.items()}
+        self.voice_variables = {
+            "pitch": self.pitch,
+            "index_rate": self.index_rate,
+            "threshold": self.threshold,
+            "input_gain_db": self.input_gain_db,
+            "output_gain_db": self.output_gain_db,
+            "monitor_gain_db": self.monitor_gain_db,
+        }
+        self.rvc_voice_settings = {}
+        self.active_causal_path = ""
         self.input_noise_reduce = tk.BooleanVar(value=value.get("input_noise_reduce", False))
         self.output_noise_reduce = tk.BooleanVar(value=value.get("output_noise_reduce", False))
         f0_method = value.get("f0_method", "rmvpe")
@@ -967,7 +983,10 @@ class RealtimeGUI:
 
         def show(*_):
             try:
-                value.configure(text=f"{variable.get():.{digits}f}")
+                current = variable.get()
+                value.configure(text=f"{current:.{digits}f}")
+                if scale.get() != current:
+                    scale.configure(value=current)
             except tk.TclError:
                 pass
 
@@ -1026,7 +1045,9 @@ class RealtimeGUI:
 
     def _build_voice(self, parent):
         frame = self._card(parent, "Voice")
-        self._slider(frame, 0, "Pitch", self.pitch, -24, 24, 1, tooltip="Shift in semitones. +12 is one octave up.")
+        pitch_help = "Shift in semitones. +12 is one octave up."
+        self.rvc_voice_widgets = self._slider(frame, 0, "Pitch", self.pitch, -24, 24, 1, tooltip=pitch_help)
+        self.causal_voice_widgets = self._slider(frame, 0, "Pitch", self.pitch, -24, 24, 0.1, tooltip=pitch_help)
         self._slider(
             frame, 1, "Index rate", self.index_rate, 0, 1, 0.01,
             tooltip="How strongly the feature index pulls the voice toward the training data.",
@@ -1036,10 +1057,12 @@ class RealtimeGUI:
             tooltip="0 follows your input loudness, 1 keeps the model's own loudness.",
         )
         self.rvc_widgets.update(rms_widgets)
-        self._slider(
+        gate_help = "Input quieter than this (dB) is muted. -60 turns the gate off."
+        self.rvc_voice_widgets += self._slider(
             frame, 3, "Noise gate", self.threshold, -60, 0, 1,
-            tooltip="Input quieter than this (dB) is muted. -60 turns the gate off.",
+            tooltip=gate_help,
         )
+        self.causal_voice_widgets += self._slider(frame, 3, "Noise gate", self.threshold, -60, 0, 0.1, tooltip=gate_help)
         toggles = ttk.Frame(frame)
         toggles.grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
         input_nr = ttk.Checkbutton(toggles, text="Input noise reduction", variable=self.input_noise_reduce)
@@ -1047,6 +1070,13 @@ class RealtimeGUI:
         output_nr = ttk.Checkbutton(toggles, text="Output noise reduction", variable=self.output_noise_reduce)
         output_nr.pack(side="left", padx=(16, 0))
         self.rvc_widgets.update((input_nr, output_nr))
+        pitch_range = ttk.LabelFrame(frame, text="Pitch range", padding=8)
+        pitch_range.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        pitch_range.columnconfigure(1, weight=1)
+        for row, (key, (label, minimum, maximum, step)) in enumerate(PITCH_MAP_CONTROLS.items()):
+            help_text = "Set to 0 Hz to turn it off." if key in {"pitch_floor_hz", "pitch_ceiling_hz"} else None
+            self._slider(pitch_range, row, label, self.pitch_map[key], minimum, maximum, step, tooltip=help_text)
+        self.causal_voice_widgets.append(pitch_range)
         return frame
 
     def _build_performance(self, parent):
@@ -1118,9 +1148,33 @@ class RealtimeGUI:
         frame.bind("<Configure>", lambda event: status.configure(wraplength=max(200, event.width)))
         return frame
 
-    def _refresh_states(self, *_):
-        causal = is_cvc(self.model_path.get().strip())
-        for widgets, visible in ((self.rvc_block_widgets, not causal), (self.causal_block_widgets, causal)):
+    def _model_changed(self, *_):
+        path = self.model_path.get().strip().strip('"')
+        causal_path = path if is_causal_voice(path) else ""
+        if self.active_causal_path != causal_path:
+            if not self.active_causal_path:
+                self.rvc_voice_settings = {key: variable.get() for key, variable in self.voice_variables.items()}
+            if causal_path:
+                matches_saved = causal_path == self.saved.get("model_path")
+                local = self.saved.get("causal_voice_settings") if matches_saved else None
+                fallback = self.rvc_voice_settings if matches_saved and local is None else None
+                values = voice_settings(causal_path, fallback)
+                if isinstance(local, dict):
+                    values.update({key: local[key] for key in values.keys() & local.keys()})
+            else:
+                values = self.rvc_voice_settings
+            variables = {**self.voice_variables, **self.pitch_map}
+            for key, value in values.items():
+                variables[key].set(value)
+            self.active_causal_path = causal_path
+        self._refresh_states()
+
+    def _refresh_states(self):
+        causal = bool(self.active_causal_path)
+        for widgets, visible in (
+            (self.rvc_block_widgets + self.rvc_voice_widgets, not causal),
+            (self.causal_block_widgets + self.causal_voice_widgets, causal),
+        ):
             for widget in widgets:
                 if visible:
                     widget.grid()
@@ -1131,12 +1185,13 @@ class RealtimeGUI:
             widget.state(["disabled"] if disabled else ["!disabled"])
 
     def _browse_model(self):
+        causal_patterns = " ".join(f"*{suffix}" for suffix in VOICE_SUFFIXES)
         path = filedialog.askopenfilename(
             initialdir=ROOT / "logs",
             filetypes=(
-                ("Voice models", "*.pth *.cvc"),
+                ("Voice models", f"*.pth {causal_patterns}"),
                 ("RVC voice model", "*.pth"),
-                ("Causal Voice Changer voice", "*.cvc"),
+                ("Causal Voice Changer voice", causal_patterns),
                 ("All files", "*.*"),
             ),
         )
@@ -1222,7 +1277,7 @@ class RealtimeGUI:
         )
 
     def _settings(self):
-        model = self.model_path.get().strip()
+        model = self.model_path.get().strip().strip('"')
         if not model:
             raise ValueError("Select a voice model.")
         if self.input_device.get() not in self.input_devices:
@@ -1230,6 +1285,7 @@ class RealtimeGUI:
         if self.output_device.get() not in self.output_devices:
             raise ValueError("Select an output device.")
         monitor = self.monitor_device.get()
+        causal = is_causal_voice(model)
         return {
             "model_path": model,
             "index_path": self.index_path.get().strip(),
@@ -1246,27 +1302,33 @@ class RealtimeGUI:
             "show_legacy_devices": self.show_legacy_devices.get(),
             "exclusive_input": self.exclusive_input.get(),
             "exclusive_output": self.exclusive_output.get(),
-            "pitch": self.pitch.get(),
+            "pitch": self.pitch.get() if causal else int(self.pitch.get()),
             "speaker_id": self.speaker_id.get(),
             "index_rate": self.index_rate.get(),
             "rms_mix_rate": self.rms_mix_rate.get(),
-            "threshold": self.threshold.get(),
+            "threshold": self.threshold.get() if causal else int(self.threshold.get()),
             "input_gain_db": self.input_gain_db.get(),
             "output_gain_db": self.output_gain_db.get(),
             "monitor_gain_db": self.monitor_gain_db.get(),
             "input_noise_reduce": self.input_noise_reduce.get(),
             "output_noise_reduce": self.output_noise_reduce.get(),
             "f0_method": self.f0_method.get(),
-            "block_time": self.causal_block_time.get() if is_cvc(model) else self.block_time.get(),
+            "block_time": self.causal_block_time.get() if causal else self.block_time.get(),
             "causal_block_time": self.causal_block_time.get(),
             "crossfade_time": self.crossfade_time.get(),
             "extra_time": self.extra_time.get(),
             "use_fp32": self.use_fp32.get(),
             "passthrough": self.passthrough.get(),
+            **({key: variable.get() for key, variable in self.pitch_map.items()} if causal else {}),
         }
 
     def _save_config(self, settings):
         saved = dict(settings)
+        if is_causal_voice(settings["model_path"]):
+            saved["causal_voice_settings"] = {key: settings[key] for key in VOICE_DEFAULTS}
+            for key in PITCH_MAP_DEFAULTS:
+                saved.pop(key)
+            saved.update(self.rvc_voice_settings)
         saved["block_time"] = self.block_time.get()
         saved["input_device"] = saved.pop("input_device_label")
         saved["output_device"] = saved.pop("output_device_label")
@@ -1277,6 +1339,7 @@ class RealtimeGUI:
         saved["passthrough_hotkey"] = self.hotkey
         saved["passthrough_hold"] = self.passthrough_hold.get()
         self._write_config(saved)
+        self.saved = saved
 
     def _toggle(self):
         if self.engine.running:
@@ -1327,7 +1390,8 @@ class RealtimeGUI:
         if not self.engine.running:
             return
         try:
-            self.engine.update_pitch(self.pitch.get())
+            pitch = self.pitch.get()
+            self.engine.update_pitch(pitch if self.engine.causal is not None else int(pitch))
             self.engine.update_index_rate(self.index_rate.get())
             for key, variable in (
                 ("rms_mix_rate", self.rms_mix_rate),
@@ -1344,6 +1408,12 @@ class RealtimeGUI:
             self.engine._refresh_latency()
         except (tk.TclError, ValueError) as error:
             self.status.set(str(error))
+
+    def _hot_pitch_map(self, *_):
+        if not self.engine.running or self.engine.causal is None:
+            return
+        self.engine.settings.update({key: variable.get() for key, variable in self.pitch_map.items()})
+        self.engine.update_pitch_map()
 
     def _show_hotkey(self):
         if self.hotkey_capture is not None:

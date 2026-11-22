@@ -44,6 +44,7 @@ import re
 import subprocess
 import sys
 import threading
+import uuid
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -121,7 +122,9 @@ class Job:
         self.proc: subprocess.Popen | None = None
         self.lines: queue.Queue[str | None] = queue.Queue()
         self.run_dir: Path | None = None
+        self.stop_file: Path | None = None
         self.stopping = False
+        self.stopped = False
 
     def running(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
@@ -130,6 +133,8 @@ class Job:
               restart: bool = False, app_models: str = "", fixes: bool = True, noise: bool = False,
               colour: bool = True) -> None:
         self.run_dir, self.stopping = ROOT / "runs" / "models" / f"voice-{name}", False
+        self.stop_file = self.run_dir / f".stop-{uuid.uuid4().hex}"
+        self.stopped = False
         cmd = [sys.executable, "-u", "-m", "causalvc.build", "--name", name, "--audio", audio, "--batch", str(batch),
                "--steps", str(steps), "--save-every", str(save_every), "--base", base, "--device", device]
         cmd += ["--restart"] if restart else []
@@ -145,7 +150,8 @@ class Job:
         # Trained to stay quiet through clicks, snaps, claps and background noise; costs a little on whispers and laughs.
         cmd += ["--noise-aug", "0.6"] if noise else []
         cmd += ["--app-models", app_models] if app_models else []
-        env = dict(os.environ, PYTHONPATH=str(ROOT), CAUSALVC_PROGRESS_SECONDS="1", PYTHONIOENCODING="utf-8")
+        env = dict(os.environ, PYTHONPATH=str(ROOT), CAUSALVC_PROGRESS_SECONDS="1", PYTHONIOENCODING="utf-8",
+                   CAUSALVC_STOP_FILE=str(self.stop_file))
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         self.proc = subprocess.Popen(cmd, cwd=ROOT, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                      stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
@@ -154,9 +160,14 @@ class Job:
 
     def _read(self) -> None:
         for line in self.proc.stdout:
+            if line.startswith(("stopped before training", "stopped at step ")):
+                self.stopped = True
             self.lines.put(line.rstrip("\n"))
         self.proc.wait()
-        self.lines.put(None)  # finished
+        try:
+            self.stop_file.unlink(missing_ok=True)
+        finally:
+            self.lines.put(None)  # finished
 
     def stop(self) -> None:
         """First call: ask for a checkpoint and a clean exit. Second call: end the process now."""
@@ -164,10 +175,13 @@ class Job:
             return
         if self.stopping:
             self.proc.kill()
+            self.stopped = True
             return
         self.stopping = True
         self.run_dir.mkdir(parents=True, exist_ok=True)
-        (self.run_dir / "stop").touch()
+        self.stop_file.touch()
+        if not self.running():
+            self.stop_file.unlink(missing_ok=True)
 
 
 class ConfigError(ValueError):
@@ -384,7 +398,7 @@ class Service:
             if line is None:
                 code = self.job.proc.returncode
                 self.exit_code = code
-                self.phase = "stopped" if self.job.stopping else "finished" if code == 0 else "failed"
+                self.phase = "stopped" if self.job.stopped else "finished" if code == 0 else "failed"
                 if self.next is not None:
                     chosen, self.next = self.next, None
                     self.launch(chosen)

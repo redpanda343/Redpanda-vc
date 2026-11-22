@@ -11,9 +11,18 @@ from __future__ import annotations
 import os
 import sys
 import time
+from pathlib import Path
 
 FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 COLOURS = (196, 202, 208, 214, 220, 190, 118, 48, 51, 45, 39, 63, 99, 135, 171, 207)
+
+
+def stop_before_training(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    path.unlink(missing_ok=True)
+    print("stopped before training", flush=True)
+    return True
 
 
 def clock(seconds: float) -> str:

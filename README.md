@@ -14,7 +14,7 @@ Browser realtime audio uses a binary WebSocket connection, including with `--sha
 
 **Training → Causal Voice Changer** accepts an audio file or folder and fine-tunes the upstream decoder. Set a voice name and the number of steps. Start again with the same name and a higher step target to resume. Exported `.cvc` voices are written to `runs/models/voice-<name>/voices/`.
 
-In the browser's **Real-time** tab, refresh the Causal Voice Changer voice list or paste a `.cvc` path. In the desktop realtime GUI, browse for the `.cvc` file. Causal Voice Changer runs at 48 kHz and uses its own pitch tracker, encoder and streaming state. The desktop audio devices need to support 48 kHz.
+In the browser's **Real-time** tab, refresh the Causal Voice Changer voice list or paste a voice path. In the desktop realtime GUI, browse for the voice file. Both accept `.cvc`, `.causalvc.json` and `.nextvc.json` voices and load their saved pitch, gain, gate and index settings. Use **Pitch range** to adjust the Hz offset, floor and ceiling while running. Causal Voice Changer uses its own pitch tracker, encoder and streaming state at 48 kHz. The desktop audio devices need to support 48 kHz.
 
 The default pretrained files download on first use. To reuse an existing Causal Voice Changer weights folder, set `CAUSALVC_WEIGHTS` to its path. The upstream project marks the default base and its fine-tunes for noncommercial use.
 

@@ -9,7 +9,7 @@ from torchaudio.transforms import Resample
 
 from rvc.infer.realtime import RealTimeRVC
 from rvc.infer.realtime_graph import RealtimeGraph
-from shared.tools.causal_voices import SAMPLE_RATE as CAUSAL_SAMPLE_RATE, is_cvc
+from shared.tools.causal_voices import SAMPLE_RATE as CAUSAL_SAMPLE_RATE, is_causal_voice
 
 
 AUTOTUNE_HEADROOM = 1 << 30
@@ -96,7 +96,7 @@ class RealtimeProcessor:
 
     def load_model(self, settings):
         self.settings = settings
-        if is_cvc(settings["model_path"]):
+        if is_causal_voice(settings["model_path"]):
             from rvc.configs.config import Config
             from shared.tools.causal_realtime import CausalRealtime
 
@@ -260,6 +260,10 @@ class RealtimeProcessor:
             self.causal.change_index_rate(index_rate)
         elif self.rvc is not None:
             self.rvc.change_index_rate(index_rate)
+
+    def update_pitch_map(self):
+        if self.causal is not None:
+            self.causal.change_pitch_map()
 
     def _gate(self, indata):
         indata = np.append(self.rms_buffer, indata)

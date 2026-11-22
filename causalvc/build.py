@@ -121,10 +121,17 @@ def main() -> None:
 
     if not Path(a.audio).exists():
         raise SystemExit(f"audio not found: {a.audio}")
-    base_dir = resolve_base(a.base)
-    base = json.loads((base_dir / "args.json").read_text())
+    from causalvc.progress import stop_before_training
+
     run = a.run or f"voice-{a.name}"
     run_dir = ROOT / "runs/models" / run
+    stop_file = Path(os.environ.get("CAUSALVC_STOP_FILE", run_dir / "stop"))
+    if stop_before_training(stop_file):
+        return
+    base_dir = resolve_base(a.base)
+    if stop_before_training(stop_file):
+        return
+    base = json.loads((base_dir / "args.json").read_text())
 
     def beside(name: str, fallback: str) -> str:
         """A file shipped inside the base folder, if it is there; otherwise the path the base was trained with."""
@@ -155,7 +162,7 @@ def main() -> None:
     if done is not None and done >= a.steps:
         print(f"{run} is already trained to step {done}; raise --steps to continue or pass --restart", flush=True)
         return
-    if done:
+    if done is not None:
         print(f"resuming {run} from step {done}", flush=True)
     index_bank = max(0, a.index_bank)
     exc = a.exc or ("bandlimit" if base.get("exc", "full") == "full" else base["exc"])
@@ -167,23 +174,27 @@ def main() -> None:
             "--save-every", str(a.save_every or max(1, a.steps // 4)), "--device", a.device,
             "--voice", f"{a.name}={a.audio}", "--only", a.name, "--index-bank", str(index_bank),
             "--perturb", str(a.perturb), "--energy-loss", str(a.energy_loss), "--decorr", str(a.decorr), "--noise-aug", str(a.noise_aug)]
-    argv += ["--resume"] if done else ["--init", str(base_dir / "last.pt")]
+    argv += ["--init", str((base_dir / "last.pt").resolve())]
+    argv += ["--resume"] if done is not None else []
     argv += ["--rates", *(str(r) for r in base["rates"])] if base.get("rates") else []
     argv += ["--antialias"] if base.get("antialias") else []
     argv += ["--glide-next"] if base.get("glide_next") else ["--glide"] if base.get("glide") else []
     argv += ["--smooth-in", smooth_in] if smooth_in else []
     argv += ["--tone", str(base["tone"])] if base.get("tone") else []
     argv += ["--expressive"] if base.get("expressive") else []
-    base_reg = (25.0 if base.get("expressive") else 0.0) if a.base_reg is None else a.base_reg
-    argv += ["--base-reg", str(base_reg)] if base_reg > 0 else []
+    argv += ["--base-reg", str(max(0.0, a.base_reg))] if a.base_reg is not None else []
     argv += ["--bf16"] if a.bf16 else []
     argv += ["--colour-aug", str(a.colour_aug)] if a.colour_aug else []
     argv += ["--ema", str(a.ema)] if a.ema else []
+    if stop_before_training(stop_file):
+        return
     make_index(run_dir, encoder, a.audio, a.device)
+    if stop_before_training(stop_file):
+        return
     from causalvc.decoder import train
 
     sys.argv = [sys.argv[0], *argv]
-    train.main(on_save=register)
+    train.main(on_save=register, stop_file=stop_file, default_base_reg=25.0 if base.get("expressive") else 0.0)
 
 
 if __name__ == "__main__":

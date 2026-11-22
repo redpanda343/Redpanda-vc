@@ -4,7 +4,9 @@ import gradio as gr
 
 from assets.i18n.i18n import I18nAuto
 from shared.tools import realtime_server
-from shared.tools.causal_voices import available_voices, is_cvc
+from shared.tools.causal_voices import (
+    PITCH_MAP_CONTROLS, VOICE_DEFAULTS, available_voices, is_causal_voice, voice_settings,
+)
 
 i18n = I18nAuto()
 now_dir = os.getcwd()
@@ -806,8 +808,21 @@ def _user(request):
     return (request.username if request is not None else None) or "local"
 
 
+CAUSAL_WEB_SETTINGS = tuple(key for key in VOICE_DEFAULTS if key != "monitor_gain_db")
+
+
+def _causal_path(voice):
+    voice = (voice or "").strip().strip('"')
+    return os.path.abspath(os.path.join(now_dir, voice)) if voice else ""
+
+
+def _causal_overrides(values):
+    return {key: float(value) for key, value in zip(CAUSAL_WEB_SETTINGS, values) if value is not None}
+
+
 def start_realtime(
     causal_voice,
+    start_request,
     model,
     index,
     pitch,
@@ -828,13 +843,14 @@ def start_realtime(
     use_fp32,
     inference_device,
     previous_token,
-    start_request,
+    causal_settings_path,
     request: gr.Request,
+    *causal_values,
 ):
-    causal_voice = (causal_voice or "").strip().strip('"')
+    causal_voice = _causal_path(causal_voice)
     if causal_voice:
-        if not is_cvc(causal_voice):
-            raise gr.Error("Select a Causal Voice Changer .cvc file.")
+        if not is_causal_voice(causal_voice):
+            raise gr.Error("Select a .cvc voice or a .causalvc.json or .nextvc.json voice description.")
         model = causal_voice
         block_time = causal_block_time
     if not model:
@@ -860,6 +876,10 @@ def start_realtime(
         "output_noise_reduce": bool(output_noise_reduce),
         "passthrough": False,
     }
+    if causal_voice:
+        settings.update(voice_settings(causal_voice))
+        if causal_settings_path == causal_voice:
+            settings.update(_causal_overrides(causal_values))
     try:
         return realtime_server.create_session(_user(request), settings, previous_token=previous_token), start_request
     except Exception as error:
@@ -885,11 +905,10 @@ def update_realtime(
     output_noise_reduce,
     request: gr.Request,
 ):
-    if not token:
+    session = realtime_server.get_session(token, _user(request))
+    if session is None or is_causal_voice(session.settings["model_path"]):
         return
-    realtime_server.update_session(
-        token,
-        _user(request),
+    session.update(
         pitch=int(pitch),
         index_rate=float(index_rate),
         f0_method=f0_method,
@@ -902,6 +921,14 @@ def update_realtime(
     )
 
 
+def update_causal_realtime(token, voice, loaded_path, request: gr.Request, *values):
+    if not loaded_path or _causal_path(voice) != loaded_path:
+        return
+    session = realtime_server.get_session(token, _user(request))
+    if session is not None and session.settings["model_path"] == loaded_path:
+        session.update(**_causal_overrides(values))
+
+
 def realtime_tab(model_file, index_file, pitch_choices):
     gr.Markdown(
         i18n(
@@ -910,10 +937,10 @@ def realtime_tab(model_file, index_file, pitch_choices):
     )
     with gr.Row():
         causal_voice = gr.Dropdown(
-            label="Causal Voice Changer voice (.cvc)",
+            label="Causal Voice Changer voice",
             choices=available_voices(),
             allow_custom_value=True,
-            info="Select a voice or paste its file path. Leave empty to use the RVC model above.",
+            info="Select a voice or paste the path to a .cvc or legacy voice description. Leave empty to use RVC.",
             scale=5,
         )
         refresh_voices = gr.Button("Refresh voices", scale=1)
@@ -926,6 +953,7 @@ def realtime_tab(model_file, index_file, pitch_choices):
         stop_button = gr.Button(i18n("Stop"))
     token = gr.Textbox(visible=False)
     start_request = gr.Textbox(visible=False)
+    causal_settings_path = gr.State("")
     inference_device = gr.Dropdown(
         label=i18n("Inference Device"),
         choices=[(i18n("Automatic"), "auto")]
@@ -934,7 +962,7 @@ def realtime_tab(model_file, index_file, pitch_choices):
         info=i18n("Automatic spreads concurrent sessions across GPUs. Each stream stays on one GPU to keep audio blocks in order."),
         interactive=True,
     )
-    with gr.Row():
+    with gr.Row() as rvc_voice:
         pitch = gr.Slider(
             minimum=-24,
             maximum=24,
@@ -953,7 +981,7 @@ def realtime_tab(model_file, index_file, pitch_choices):
             info=i18n("How strongly the feature index pulls the voice toward the training data."),
             interactive=True,
         )
-    with gr.Row():
+    with gr.Row() as rvc_model:
         f0_method = gr.Radio(
             label=i18n("Pitch extraction algorithm"),
             choices=pitch_choices,
@@ -974,7 +1002,7 @@ def realtime_tab(model_file, index_file, pitch_choices):
             minimum=0,
             interactive=True,
         )
-    with gr.Accordion(i18n("Audio"), open=False):
+    with gr.Accordion(i18n("Audio"), open=False) as rvc_audio:
         with gr.Row():
             threshold = gr.Slider(
                 minimum=-60,
@@ -1004,6 +1032,22 @@ def realtime_tab(model_file, index_file, pitch_choices):
         with gr.Row():
             input_noise_reduce = gr.Checkbox(label=i18n("Input Noise Reduction"), value=False, interactive=True)
             output_noise_reduce = gr.Checkbox(label=i18n("Output Noise Reduction"), value=False, interactive=True)
+    with gr.Group(visible=False) as causal_controls:
+        with gr.Row():
+            causal_pitch = gr.Number(value=0, label="Pitch (semitones)")
+            causal_index = gr.Slider(0, 1, step=0.01, value=0, label=i18n("Index Rate"))
+        with gr.Accordion(i18n("Audio"), open=False):
+            with gr.Row():
+                causal_gate = gr.Number(value=-60, label="Noise gate (dB)", info="−60 dB turns the gate off.")
+                causal_input_gain = gr.Number(value=0, label=i18n("Input Gain (dB)"))
+                causal_output_gain = gr.Number(value=0, label=i18n("Output Gain (dB)"))
+        with gr.Accordion("Pitch range", open=False):
+            gr.Markdown("Set the floor or ceiling to 0 Hz to turn it off.")
+            causal_pitch_map = [
+                gr.Slider(minimum, maximum, step=step, value=VOICE_DEFAULTS[key], label=label)
+                for key, (label, minimum, maximum, step) in PITCH_MAP_CONTROLS.items()
+            ]
+    causal_values = [causal_pitch, causal_index, causal_gate, causal_input_gain, causal_output_gain, *causal_pitch_map]
     with gr.Accordion(i18n("Performance"), open=False):
         with gr.Row():
             block_time = gr.Slider(
@@ -1055,13 +1099,26 @@ def realtime_tab(model_file, index_file, pitch_choices):
                 value=False,
                 interactive=True,
             )
-    rvc_controls = [f0_method, embedder_model, speaker_id, rms_mix_rate, input_noise_reduce,
-                    output_noise_reduce, block_time, crossfade_time, extra_time, use_fp32]
+    rvc_controls = [rvc_voice, rvc_model, rvc_audio, block_time, crossfade_time, extra_time, use_fp32]
 
     def update_voice_controls(voice):
-        return [gr.update(visible=not voice) for _ in rvc_controls] + [gr.update(visible=bool(voice))]
+        path = _causal_path(voice)
+        causal = is_causal_voice(path)
+        values = voice_settings(path)
+        return (
+            *[gr.update(visible=not causal) for _ in rvc_controls],
+            gr.update(visible=causal),
+            gr.update(visible=causal),
+            path if causal else "",
+            *(values[key] for key in CAUSAL_WEB_SETTINGS),
+        )
 
-    causal_voice.change(update_voice_controls, causal_voice, [*rvc_controls, causal_block_time], show_progress="hidden")
+    causal_voice.change(
+        update_voice_controls,
+        causal_voice,
+        [*rvc_controls, causal_controls, causal_block_time, causal_settings_path, *causal_values],
+        show_progress="hidden",
+    )
 
     gr.Markdown(
         i18n(
@@ -1073,6 +1130,7 @@ def realtime_tab(model_file, index_file, pitch_choices):
         fn=start_realtime,
         inputs=[
             causal_voice,
+            start_request,
             model_file,
             index_file,
             pitch,
@@ -1093,10 +1151,11 @@ def realtime_tab(model_file, index_file, pitch_choices):
             use_fp32,
             inference_device,
             token,
-            start_request,
+            causal_settings_path,
+            *causal_values,
         ],
         outputs=[token, start_request],
-        js="(...args) => { if (window.redpandaRealtime) args[args.length - 1] = window.redpandaRealtime.beginStart(args[0]); return args; }",
+        js="(...args) => { if (window.redpandaRealtime) args[1] = window.redpandaRealtime.beginStart(args[0]); return args; }",
     ).success(
         fn=None,
         inputs=[token, buffer_time, start_request],
@@ -1122,6 +1181,13 @@ def realtime_tab(model_file, index_file, pitch_choices):
     ]
     for component in live:
         component.change(fn=update_realtime, inputs=[token, *live], outputs=None, show_progress="hidden")
+    gr.on(
+        triggers=[component.input for component in causal_values],
+        fn=update_causal_realtime,
+        inputs=[token, causal_voice, causal_settings_path, *causal_values],
+        outputs=None,
+        show_progress="hidden",
+    )
     buffer_time.change(
         fn=None,
         inputs=[buffer_time],

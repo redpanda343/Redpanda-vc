@@ -13,6 +13,7 @@ import numpy as np
 from fastapi import Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 
+from shared.tools.causal_voices import PITCH_MAP_DEFAULTS
 from shared.tools.realtime_worker import RealtimeWorker, realtime_devices
 from shared.tools.web_auth import current_user
 
@@ -29,6 +30,7 @@ NO_STORE = {"Cache-Control": "no-store"}
 LIVE_SETTINGS = (
     "pitch", "index_rate", "rms_mix_rate", "threshold", "input_gain_db", "output_gain_db",
     "input_noise_reduce", "output_noise_reduce", "f0_method",
+    *PITCH_MAP_DEFAULTS,
 )
 
 _sessions = {}
