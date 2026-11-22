@@ -1667,8 +1667,8 @@ def download(**kwargs):
 @click.option("--exe/--no-exe", default=True, help="Download required executables.")
 @click.option(
     "--beatrice/--no-beatrice",
-    default=True,
-    help="Download Beatrice Trainer with its pretrained models.",
+    default=False,
+    help="Download Beatrice Trainer and its pretrained models ahead of the first training run.",
 )
 @click.option(
     "--vocoders/--no-vocoders",

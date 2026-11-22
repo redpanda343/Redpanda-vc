@@ -236,12 +236,12 @@ def main():
     args = parser.parse_args()
     select_device(args.device)
     experiment = ROOT / 'logs' / args.model_name
-    ensure_trainer()
     if (experiment / CHECKPOINT).is_file() and (experiment / 'beatrice_embedder.json').is_file():
         raise SystemExit(f'{experiment.name} was trained with a custom embedder, which is no longer supported. '
                          'Use a new model name.')
-    tidy_experiment(experiment)
     speakers = dataset_speakers(experiment, args.dataset)
+    ensure_trainer()
+    tidy_experiment(experiment)
     data_dir = build_dataset(experiment, speakers, args)
     config = write_config(experiment, args)
     arguments = ['-d', str(data_dir), '-o', str(experiment), '-c', str(config)]
