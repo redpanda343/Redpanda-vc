@@ -10,6 +10,10 @@ def pretrained_selector(vocoder, sample_rate, version="v2"):
         base_path = os.path.join(
             "models", "pretraineds", "hifi-gan", "v1"
         )
+    elif vocoder.lower() == "refinegan" and int(sample_rate) in (24000, 32000):
+        from shared.tools.prerequisites_download import ensure_refinegan_pretrained
+
+        return ensure_refinegan_pretrained(int(sample_rate))
     else:
         base_path = os.path.join("models", "pretraineds", f"{vocoder.lower()}")
 

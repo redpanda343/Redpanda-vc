@@ -33,17 +33,6 @@ pretraineds_hifigan_list = [
         ],
     ),
 ]
-pretraineds_refinegan_list = [
-    (
-        "refinegan/",
-        [
-            "f0D24k.pth",
-            "f0G24k.pth",
-            "f0D32k.pth",
-            "f0G32k.pth",
-        ],
-    ),
-]
 models_list = [
     ("predictors/", ["rmvpe.pt", "rmvpe_rvc.pt"]),
     ("FireRedVAD/AED/", ["model.pth.tar", "cmvn.ark"]),
@@ -266,6 +255,24 @@ def download_mapping_files(file_mapping_list, global_bar):
             future.result()
 
 
+def ensure_refinegan_pretrained(sample_rate):
+    remote_folder = "refinegan/"
+    suffix = f"{sample_rate // 1000}k.pth"
+    files = [f"f0G{suffix}", f"f0D{suffix}"]
+    mapping = [(remote_folder, files)]
+    if _files_need_download(mapping):
+        from tqdm import tqdm
+
+        with tqdm(
+            total=get_file_size_if_missing(mapping),
+            unit="iB",
+            unit_scale=True,
+            desc="Downloading RefineGAN weights",
+        ) as progress:
+            download_mapping_files(mapping, progress)
+    return tuple(os.path.join(folder_mapping_list[remote_folder], file) for file in files)
+
+
 def split_pretraineds(pretrained_list):
     f0_list = []
     non_f0_list = []
@@ -297,8 +304,6 @@ def calculate_total_size(
     if exe and os.name == "nt":
         total_size += get_file_size_if_missing(executables_list)
     total_size += get_file_size_if_missing(pretraineds_hifigan)
-    if pretraineds_hifigan:
-        total_size += get_file_size_if_missing(pretraineds_refinegan_list)
     return total_size
 
 
@@ -332,13 +337,7 @@ def prequisites_download_pipeline(
             )
         )
         or (exe and os.name == "nt" and _files_need_download(executables_list))
-        or (
-            pretraineds_hifigan
-            and (
-                _files_need_download(pretraineds_hifigan_list)
-                or _files_need_download(pretraineds_refinegan_list)
-            )
-        )
+        or (pretraineds_hifigan and _files_need_download(pretraineds_hifigan_list))
     )
 
     if files_need_download:
@@ -357,7 +356,6 @@ def prequisites_download_pipeline(
                     global_bar.write("No executables needed")
             if pretraineds_hifigan:
                 download_mapping_files(pretraineds_hifigan_list, global_bar)
-                download_mapping_files(pretraineds_refinegan_list, global_bar)
     if vocoders:
         from nsf_hifigan.resources import pretrained_path
         from rectified_flow.resources import VOCODERS, vocoder_path

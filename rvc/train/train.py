@@ -232,6 +232,11 @@ def parse_arguments(argv=None):
     parser.add_argument("--gpus", default="0", help="CUDA device indices joined by -, such as 0-1.")
     parser.add_argument("--pretrained-g", default="")
     parser.add_argument("--pretrained-d", default="")
+    parser.add_argument(
+        "--default-pretrained",
+        action="store_true",
+        help="Use the project's default pretrained weights for a fresh run.",
+    )
     parser.add_argument("--vocoder", choices=VOCODERS, default="HiFi-GAN")
     parser.add_argument("--version", choices=("v1", "v2"), default="v2")
     parser.add_argument("--save-only-latest", action="store_true")
@@ -286,6 +291,8 @@ def parse_arguments(argv=None):
     )
     args = parser.parse_args(argv)
 
+    if args.default_pretrained and (args.pretrained_g or args.pretrained_d):
+        parser.error("Choose either --default-pretrained or explicit pretrained paths.")
     for name in ("total_steps", "save_every_steps", "batch_size"):
         if getattr(args, name) < 1:
             parser.error(f"--{name.replace('_', '-')} must be at least 1.")
@@ -449,6 +456,15 @@ def main():
     else:
         device_type = "cpu"
         device_ids = [0]
+
+    if args.default_pretrained and (
+        args.cleanup or not any(latest_checkpoint_pair(args.experiment_dir))
+    ):
+        from shared.tools.pretrained_selector import pretrained_selector
+
+        args.pretrained_g, args.pretrained_d = pretrained_selector(
+            args.vocoder, args.sample_rate, args.version
+        )
 
     if args.cleanup:
         remove_previous_attempt(args.experiment_dir)

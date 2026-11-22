@@ -680,19 +680,11 @@ def _build_train_command(
             f"but this experiment uses {feature_dim}. Re-extract the experiment with "
             f"RVC {version}."
         )
-    if pretrained == True:
-        from shared.tools.pretrained_selector import pretrained_selector
-
-        if custom_pretrained == False:
-            pg, pd = pretrained_selector(str(vocoder), int(sample_rate), version)
-        else:
-            if g_pretrained_path is None or d_pretrained_path is None:
-                raise ValueError(
-                    "Please provide the path to the pretrained G and D models."
-                )
-            pg, pd = g_pretrained_path, d_pretrained_path
-    else:
-        pg, pd = "", ""
+    pg, pd = "", ""
+    if pretrained and custom_pretrained:
+        if g_pretrained_path is None or d_pretrained_path is None:
+            raise ValueError("Please provide the path to the pretrained G and D models.")
+        pg, pd = g_pretrained_path, d_pretrained_path
 
     train_script_path = os.path.join("rvc", "train", "train.py")
     command = [
@@ -732,6 +724,7 @@ def _build_train_command(
     if pd:
         command += ["--pretrained-d", pd]
     for flag, enabled in (
+        ("--default-pretrained", pretrained and not custom_pretrained),
         ("--save-only-latest", save_only_latest),
         ("--save-every-weights", save_every_weights),
         ("--cache-data-in-gpu", cache_data_in_gpu),
@@ -1661,7 +1654,7 @@ def download(**kwargs):
 @click.option(
     "--pretraineds-hifigan/--no-pretraineds-hifigan",
     default=True,
-    help="Download the pretrained HiFi-GAN and RefineGAN RVC models.",
+    help="Download the pretrained HiFi-GAN RVC models.",
 )
 @click.option("--models/--no-models", default=True, help="Download additional models.")
 @click.option("--exe/--no-exe", default=True, help="Download required executables.")
