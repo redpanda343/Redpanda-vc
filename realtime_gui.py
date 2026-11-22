@@ -37,6 +37,7 @@ import sounddevice as sd
 
 from rvc.infer.realtime_engine import RealtimeProcessor, db_to_linear
 from shared.platform import migrate_models_folder
+from shared.tools.causal_voices import SAMPLE_RATE as CAUSAL_SAMPLE_RATE, is_cvc
 
 
 ROOT = Path(__file__).resolve().parent
@@ -327,9 +328,8 @@ class AudioEngine(RealtimeProcessor):
             output_latency = self.output_stream.latency
         else:
             output_latency = self._stream_latency(self.asio_stream, 1)
-        model_latency = (self.crossfade_frame + self.sola_search_frame) / self.sample_rate
         self.device_latency_ms = (input_latency + output_latency) * 1000
-        self.base_latency_ms = self.device_latency_ms + (self.block_frame / self.sample_rate + model_latency) * 1000
+        self.base_latency_ms = self.device_latency_ms + 1000 * self.block_frame / self.sample_rate
         self._refresh_latency()
 
     def _channels(self, device, key, selectors=None):
@@ -373,6 +373,8 @@ class AudioEngine(RealtimeProcessor):
             40000,
         ):
             rate = int(round(rate))
+            if self.causal is not None and rate != CAUSAL_SAMPLE_RATE:
+                continue
             if rate > 0 and rate not in candidates:
                 candidates.append(rate)
         errors = []
@@ -404,6 +406,8 @@ class AudioEngine(RealtimeProcessor):
                 return rate
             except sd.PortAudioError as error:
                 errors.append(f"{rate} Hz: {error}")
+        if self.causal is not None:
+            raise ValueError("Causal Voice Changer needs a 48 kHz input and output route.\n" + "\n".join(errors))
         raise ValueError(
             "The selected input, output and monitor devices have no common sample rate. "
             "Set them to the same rate (usually 48 kHz or 44.1 kHz).\n" + "\n".join(errors[-3:])
@@ -555,9 +559,7 @@ class AudioEngine(RealtimeProcessor):
             buffer_ms = 1000 * direct.prefill / self.sample_rate if direct is not None else 0
             self.algorithm_latency_ms = round(self.device_latency_ms + buffer_ms)
             return
-        pitch_delay_ms = 0
-        if self.rvc is not None:
-            pitch_delay_ms = 10 * self.rvc.pitch_lookahead_frames(self.settings["f0_method"])
+        conversion_delay_ms = 1000 * self.conversion_delay
         noise_reduction_ms = 0
         if self.settings["input_noise_reduce"]:
             noise_reduction_ms = 1000 * self.sola_buffer_frame / self.sample_rate
@@ -566,7 +568,7 @@ class AudioEngine(RealtimeProcessor):
         if output_fifo is not None and self.sample_rate:
             prefill_ms = 1000 * output_fifo.prefill / self.sample_rate
         self.algorithm_latency_ms = round(
-            self.base_latency_ms + pitch_delay_ms + noise_reduction_ms + prefill_ms + self.last_block_ms
+            self.base_latency_ms + conversion_delay_ms + noise_reduction_ms + prefill_ms + self.last_block_ms
         )
 
     def stop(self):
@@ -775,6 +777,7 @@ class RealtimeGUI:
         self.output_selectors = {}
         self.device_names = {}
         self.locked_widgets = set()
+        self.rvc_widgets = set()
         self.meter_values = {"input": 0.0, "output": 0.0, "monitor": 0.0}
         self.saved = self._load_config()
         self._make_variables()
@@ -782,6 +785,7 @@ class RealtimeGUI:
         self._build()
         self._load_devices(rescan=False)
         self._refresh_states()
+        self.model_path.trace_add("write", self._refresh_states)
         for variable in (
             self.pitch, self.index_rate, self.rms_mix_rate, self.threshold, self.f0_method,
             self.passthrough,
@@ -831,6 +835,7 @@ class RealtimeGUI:
         f0_method = value.get("f0_method", "rmvpe")
         self.f0_method = tk.StringVar(value=f0_method if f0_method in PITCH_METHODS.values() else "rmvpe")
         self.block_time = tk.DoubleVar(value=value.get("block_time", 0.3))
+        self.causal_block_time = tk.DoubleVar(value=value.get("causal_block_time", 0.04))
         self.crossfade_time = tk.DoubleVar(value=min(value.get("crossfade_time", 0.01), MAX_CROSSFADE_TIME))
         self.extra_time = tk.DoubleVar(value=value.get("extra_time", 3.0))
         self.use_fp32 = tk.BooleanVar(value=value.get("use_fp32", False))
@@ -904,6 +909,7 @@ class RealtimeGUI:
         self.locked_widgets.update(self._path_row(frame, 0, "Voice model", self.model_path, self._browse_model))
         index_row = self._path_row(frame, 1, "Feature index", self.index_path, self._browse_index)
         self.locked_widgets.update(index_row)
+        self.rvc_widgets.update(index_row)
         embedder_label = ttk.Label(frame, text="Embedder")
         embedder_label.grid(row=2, column=0, sticky="w", padx=(0, 12), pady=3)
         options = ttk.Frame(frame)
@@ -914,7 +920,9 @@ class RealtimeGUI:
         embedder.grid(row=0, column=0, sticky="w")
         self.locked_widgets.add(embedder)
         ttk.Label(options, text="Speaker ID").grid(row=0, column=1, sticky="w", padx=(20, 8))
-        ttk.Spinbox(options, from_=0, to=255, textvariable=self.speaker_id, width=5).grid(row=0, column=2, sticky="w")
+        speaker = ttk.Spinbox(options, from_=0, to=255, textvariable=self.speaker_id, width=5)
+        speaker.grid(row=0, column=2, sticky="w")
+        self.rvc_widgets.update((embedder, speaker))
         return frame
 
     def _path_row(self, parent, row, label, variable, command):
@@ -1023,20 +1031,22 @@ class RealtimeGUI:
             frame, 1, "Index rate", self.index_rate, 0, 1, 0.01,
             tooltip="How strongly the feature index pulls the voice toward the training data.",
         )
-        self._slider(
+        rms_widgets = self._slider(
             frame, 2, "RMS mix", self.rms_mix_rate, 0, 1, 0.01,
             tooltip="0 follows your input loudness, 1 keeps the model's own loudness.",
         )
+        self.rvc_widgets.update(rms_widgets)
         self._slider(
             frame, 3, "Noise gate", self.threshold, -60, 0, 1,
             tooltip="Input quieter than this (dB) is muted. -60 turns the gate off.",
         )
         toggles = ttk.Frame(frame)
         toggles.grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
-        ttk.Checkbutton(toggles, text="Input noise reduction", variable=self.input_noise_reduce).pack(side="left")
-        ttk.Checkbutton(toggles, text="Output noise reduction", variable=self.output_noise_reduce).pack(
-            side="left", padx=(16, 0)
-        )
+        input_nr = ttk.Checkbutton(toggles, text="Input noise reduction", variable=self.input_noise_reduce)
+        input_nr.pack(side="left")
+        output_nr = ttk.Checkbutton(toggles, text="Output noise reduction", variable=self.output_noise_reduce)
+        output_nr.pack(side="left", padx=(16, 0))
+        self.rvc_widgets.update((input_nr, output_nr))
         return frame
 
     def _build_performance(self, parent):
@@ -1047,7 +1057,12 @@ class RealtimeGUI:
         )
         self.block_time_slider = block_widgets[-2]
         self.block_time_slider.configure(variable=self.block_time)
-        self.locked_widgets.update(block_widgets)
+        self.rvc_block_widgets = block_widgets
+        self.causal_block_widgets = self._slider(
+            frame, 0, "Block time", self.causal_block_time, 0.01, 0.5, 0.01,
+            tooltip="Causal Voice Changer uses whole 10 or 20 ms frames.",
+        )
+        self.locked_widgets.update(block_widgets + self.causal_block_widgets)
         crossfade = self._slider(
             frame, 1, "Crossfade", self.crossfade_time, 0.01, MAX_CROSSFADE_TIME, 0.01,
             tooltip=(
@@ -1064,6 +1079,7 @@ class RealtimeGUI:
         Tooltip(precision, "Use full precision. Otherwise compatible NVIDIA GPUs use FP16 for RVC. "
                            "CPU and GTX 16-series use FP32. Applies on the next Start.")
         self.locked_widgets.update(crossfade + extra + [precision])
+        self.rvc_widgets.update(crossfade + extra + [precision])
         pitch_label = ttk.Label(frame, text="Pitch extraction")
         pitch_label.grid(row=4, column=0, sticky="w", padx=(0, 12), pady=(6, 3))
         methods = ttk.Frame(frame)
@@ -1071,6 +1087,7 @@ class RealtimeGUI:
         for label, method in PITCH_METHODS.items():
             radio = ttk.Radiobutton(methods, text=label, variable=self.f0_method, value=method)
             radio.pack(side="left", padx=(0, 12))
+            self.rvc_widgets.add(radio)
         return frame
 
     def _build_actions(self, parent):
@@ -1101,16 +1118,25 @@ class RealtimeGUI:
         frame.bind("<Configure>", lambda event: status.configure(wraplength=max(200, event.width)))
         return frame
 
-    def _refresh_states(self):
-        state = ["disabled"] if self.engine.running else ["!disabled"]
-        for widget in self.locked_widgets:
-            widget.state(state)
+    def _refresh_states(self, *_):
+        causal = is_cvc(self.model_path.get().strip())
+        for widgets, visible in ((self.rvc_block_widgets, not causal), (self.causal_block_widgets, causal)):
+            for widget in widgets:
+                if visible:
+                    widget.grid()
+                else:
+                    widget.grid_remove()
+        for widget in self.locked_widgets | self.rvc_widgets:
+            disabled = (self.engine.running and widget in self.locked_widgets) or (causal and widget in self.rvc_widgets)
+            widget.state(["disabled"] if disabled else ["!disabled"])
 
     def _browse_model(self):
         path = filedialog.askopenfilename(
             initialdir=ROOT / "logs",
             filetypes=(
+                ("Voice models", "*.pth *.cvc"),
                 ("RVC voice model", "*.pth"),
+                ("Causal Voice Changer voice", "*.cvc"),
                 ("All files", "*.*"),
             ),
         )
@@ -1196,7 +1222,8 @@ class RealtimeGUI:
         )
 
     def _settings(self):
-        if not self.model_path.get().strip():
+        model = self.model_path.get().strip()
+        if not model:
             raise ValueError("Select a voice model.")
         if self.input_device.get() not in self.input_devices:
             raise ValueError("Select an input device.")
@@ -1204,7 +1231,7 @@ class RealtimeGUI:
             raise ValueError("Select an output device.")
         monitor = self.monitor_device.get()
         return {
-            "model_path": self.model_path.get().strip(),
+            "model_path": model,
             "index_path": self.index_path.get().strip(),
             "embedder_model": self.embedder_model.get(),
             "input_device": self.input_devices[self.input_device.get()],
@@ -1230,7 +1257,8 @@ class RealtimeGUI:
             "input_noise_reduce": self.input_noise_reduce.get(),
             "output_noise_reduce": self.output_noise_reduce.get(),
             "f0_method": self.f0_method.get(),
-            "block_time": self.block_time.get(),
+            "block_time": self.causal_block_time.get() if is_cvc(model) else self.block_time.get(),
+            "causal_block_time": self.causal_block_time.get(),
             "crossfade_time": self.crossfade_time.get(),
             "extra_time": self.extra_time.get(),
             "use_fp32": self.use_fp32.get(),
@@ -1239,6 +1267,7 @@ class RealtimeGUI:
 
     def _save_config(self, settings):
         saved = dict(settings)
+        saved["block_time"] = self.block_time.get()
         saved["input_device"] = saved.pop("input_device_label")
         saved["output_device"] = saved.pop("output_device_label")
         saved["monitor_device"] = saved.pop("monitor_device_label")
@@ -1268,11 +1297,14 @@ class RealtimeGUI:
             self.root.update_idletasks()
             self.engine.start(settings)
             self._save_config(settings)
-            status = (
-                f"Running {self.engine.rvc.vocoder} with "
-                f"{self.engine.rvc.embedder_name} in FP32 at "
-                f"{self.engine.sample_rate} Hz"
-            )
+            if self.engine.causal is not None:
+                status = f"Running Causal Voice Changer at {self.engine.sample_rate} Hz"
+            else:
+                status = (
+                    f"Running {self.engine.rvc.vocoder} with "
+                    f"{self.engine.rvc.embedder_name} in FP32 at "
+                    f"{self.engine.sample_rate} Hz"
+                )
             if self.engine.shared_fallbacks:
                 status += "; WASAPI exclusive unavailable, shared mode for " + ", ".join(
                     self.engine.shared_fallbacks

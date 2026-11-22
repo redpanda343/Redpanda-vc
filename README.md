@@ -10,9 +10,18 @@ The WebUI realtime tab supports multiple GPUs through isolated inference workers
 
 Browser realtime audio uses a binary WebSocket connection, including with `--share`, and falls back to HTTP streaming when WebSockets are unavailable. Audio queues are bounded to avoid accumulating delay on slow connections. Install the updated requirements before launching.
 
+## Causal Voice Changer
+
+**Training → Causal Voice Changer** accepts an audio file or folder and fine-tunes the upstream decoder. Set a voice name and the number of steps. Start again with the same name and a higher step target to resume. Exported `.cvc` voices are written to `runs/models/voice-<name>/voices/`.
+
+In the browser's **Real-time** tab, refresh the Causal Voice Changer voice list or paste a `.cvc` path. In the desktop realtime GUI, browse for the `.cvc` file. Causal Voice Changer runs at 48 kHz and uses its own pitch tracker, encoder and streaming state. The desktop audio devices need to support 48 kHz.
+
+The default pretrained files download on first use. To reuse an existing Causal Voice Changer weights folder, set `CAUSALVC_WEIGHTS` to its path. The upstream project marks the default base and its fine-tunes for noncommercial use.
+
 ## Credits
 
 - [Applio](https://github.com/IAHispano/Applio)
+- [Causal Voice Changer v0.4.0](https://github.com/mojowozo/Causal-Voice-Changer/tree/50dce9236854fef17f550571413367217e235155) by Mojobones (MIT)
 - [ContentVec](https://github.com/auspicious3000/contentvec/)
 - [FireRedVAD](https://github.com/FireRedTeam/FireRedVAD)
 - [Retrieval-based-Voice-Conversion-WebUI](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI)

@@ -24,3 +24,7 @@ assets/datasets
 assets/config.json
 logs
 models
+runs
+weights
+custom-base
+*.cvc

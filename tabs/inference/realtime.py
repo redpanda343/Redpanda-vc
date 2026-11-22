@@ -4,6 +4,7 @@ import gradio as gr
 
 from assets.i18n.i18n import I18nAuto
 from shared.tools import realtime_server
+from shared.tools.causal_voices import available_voices, is_cvc
 
 i18n = I18nAuto()
 now_dir = os.getcwd()
@@ -177,6 +178,7 @@ if (!window.redpandaRealtime) {
     const state = {
         root: null,
         context: null,
+        requestedRate: 0,
         module: null,
         workletUrl: "",
         node: null,
@@ -650,20 +652,27 @@ if (!window.redpandaRealtime) {
         }
     };
 
-    const unlock = () => {
+    const unlock = (rate = state.requestedRate) => {
         try {
+            if (state.context && state.requestedRate !== rate) {
+                state.context.close().catch(() => {});
+                state.context = null;
+            }
+            state.requestedRate = rate;
             if (!state.context || state.context.state === "closed") {
-                state.context = new AudioContext({ latencyHint: "interactive" });
+                const options = { latencyHint: "interactive" };
+                if (rate) options.sampleRate = rate;
+                state.context = new AudioContext(options);
                 state.module = null;
             }
             state.context.resume();
         } catch (error) {}
     };
 
-    const beginStart = () => {
+    const beginStart = (causalVoice) => {
         stop();
         state.pendingStart = Date.now().toString(36) + "-" + Math.random().toString(36).slice(2);
-        unlock();
+        unlock(causalVoice ? 48000 : 0);
         setStatus("Preparing real-time conversion...");
         return state.pendingStart;
     };
@@ -798,6 +807,7 @@ def _user(request):
 
 
 def start_realtime(
+    causal_voice,
     model,
     index,
     pitch,
@@ -812,6 +822,7 @@ def start_realtime(
     input_noise_reduce,
     output_noise_reduce,
     block_time,
+    causal_block_time,
     crossfade_time,
     extra_time,
     use_fp32,
@@ -820,6 +831,12 @@ def start_realtime(
     start_request,
     request: gr.Request,
 ):
+    causal_voice = (causal_voice or "").strip().strip('"')
+    if causal_voice:
+        if not is_cvc(causal_voice):
+            raise gr.Error("Select a Causal Voice Changer .cvc file.")
+        model = causal_voice
+        block_time = causal_block_time
     if not model:
         raise gr.Error(i18n("Select a voice model first."))
     settings = {
@@ -890,6 +907,18 @@ def realtime_tab(model_file, index_file, pitch_choices):
         i18n(
             "Converts your microphone in real time through this browser, also over a public share link. The browser only allows the microphone on HTTPS pages or on localhost, so open the share link or http://127.0.0.1. Use headphones so the converted voice does not reach the microphone."
         )
+    )
+    with gr.Row():
+        causal_voice = gr.Dropdown(
+            label="Causal Voice Changer voice (.cvc)",
+            choices=available_voices(),
+            allow_custom_value=True,
+            info="Select a voice or paste its file path. Leave empty to use the RVC model above.",
+            scale=5,
+        )
+        refresh_voices = gr.Button("Refresh voices", scale=1)
+    refresh_voices.click(
+        lambda: gr.update(choices=available_voices()), outputs=causal_voice, show_progress="hidden",
     )
     gr.HTML(value="", js_on_load=REALTIME_JS, css_template=REALTIME_CSS, elem_id="realtime-panel")
     with gr.Row():
@@ -986,6 +1015,11 @@ def realtime_tab(model_file, index_file, pitch_choices):
                 info=i18n("Seconds of audio per step. Lower is less delay but more GPU load."),
                 interactive=True,
             )
+            causal_block_time = gr.Slider(
+                0.01, 0.5, value=0.04, step=0.01,
+                label="Block Time", info="Causal Voice Changer uses whole 10 or 20 ms frames.",
+                visible=False,
+            )
             buffer_time = gr.Slider(
                 minimum=0.02,
                 maximum=1.0,
@@ -1021,6 +1055,14 @@ def realtime_tab(model_file, index_file, pitch_choices):
                 value=False,
                 interactive=True,
             )
+    rvc_controls = [f0_method, embedder_model, speaker_id, rms_mix_rate, input_noise_reduce,
+                    output_noise_reduce, block_time, crossfade_time, extra_time, use_fp32]
+
+    def update_voice_controls(voice):
+        return [gr.update(visible=not voice) for _ in rvc_controls] + [gr.update(visible=bool(voice))]
+
+    causal_voice.change(update_voice_controls, causal_voice, [*rvc_controls, causal_block_time], show_progress="hidden")
+
     gr.Markdown(
         i18n(
             "Inference Device, FP32 inference, Block Time, Crossfade, Extra Context, the embedder and the speaker apply on the next Start. Pitch, Index Rate, the pitch algorithm and the Audio settings apply while running."
@@ -1030,6 +1072,7 @@ def realtime_tab(model_file, index_file, pitch_choices):
     start_button.click(
         fn=start_realtime,
         inputs=[
+            causal_voice,
             model_file,
             index_file,
             pitch,
@@ -1044,6 +1087,7 @@ def realtime_tab(model_file, index_file, pitch_choices):
             input_noise_reduce,
             output_noise_reduce,
             block_time,
+            causal_block_time,
             crossfade_time,
             extra_time,
             use_fp32,
@@ -1052,7 +1096,7 @@ def realtime_tab(model_file, index_file, pitch_choices):
             start_request,
         ],
         outputs=[token, start_request],
-        js="(...args) => { if (window.redpandaRealtime) args[args.length - 1] = window.redpandaRealtime.beginStart(); return args; }",
+        js="(...args) => { if (window.redpandaRealtime) args[args.length - 1] = window.redpandaRealtime.beginStart(args[0]); return args; }",
     ).success(
         fn=None,
         inputs=[token, buffer_time, start_request],

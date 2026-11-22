@@ -9,10 +9,13 @@ import threading
 import traceback
 from pathlib import Path
 
+from shared.tools.causal_voices import is_cvc
+
 
 MAX_MESSAGE_BYTES = 64 << 20
 MAX_ERROR_BYTES = 16384
 START_TIMEOUT = 180
+CAUSAL_LOAD_TIMEOUT = 900
 PROCESS_TIMEOUT = 30
 
 
@@ -114,7 +117,8 @@ class RealtimeWorker:
         self.error_reader.start()
         self.reader.start()
         try:
-            self._call("load", settings, timeout=START_TIMEOUT)
+            timeout = CAUSAL_LOAD_TIMEOUT if is_cvc(settings["model_path"]) else START_TIMEOUT
+            self._call("load", settings, timeout=timeout)
         except Exception:
             self.close()
             raise
@@ -280,9 +284,9 @@ def _run_worker():
                     processor.channels = 1
                     with torch.inference_mode():
                         processor.prepare()
-                    lookahead = processor.rvc.pitch_lookahead_frames(processor.settings["f0_method"])
-                    delay = (processor.crossfade_frame + processor.sola_search_frame) / payload + lookahead / 100
-                    result = {"block": processor.block_frame, "sampleRate": payload, "delay": delay}
+                    result = {
+                        "block": processor.block_frame, "sampleRate": payload, "delay": processor.conversion_delay,
+                    }
                 elif command == "process":
                     with torch.inference_mode():
                         output = processor.process(payload[:, None])

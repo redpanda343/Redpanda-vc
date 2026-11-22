@@ -9,6 +9,7 @@ from torchaudio.transforms import Resample
 
 from rvc.infer.realtime import RealTimeRVC
 from rvc.infer.realtime_graph import RealtimeGraph
+from shared.tools.causal_voices import SAMPLE_RATE as CAUSAL_SAMPLE_RATE, is_cvc
 
 
 AUTOTUNE_HEADROOM = 1 << 30
@@ -83,6 +84,7 @@ def db_to_linear(db):
 class RealtimeProcessor:
     def __init__(self):
         self.rvc = None
+        self.causal = None
         self.settings = {}
         self.sample_rate = 0
         self.channels = 1
@@ -94,6 +96,13 @@ class RealtimeProcessor:
 
     def load_model(self, settings):
         self.settings = settings
+        if is_cvc(settings["model_path"]):
+            from rvc.configs.config import Config
+            from shared.tools.causal_realtime import CausalRealtime
+
+            self.device = torch.device(Config().device)
+            self.causal = CausalRealtime(settings, self.device)
+            return CAUSAL_SAMPLE_RATE
         self.rvc = RealTimeRVC(
             model_path=settings["model_path"],
             index_path=settings["index_path"],
@@ -108,8 +117,20 @@ class RealtimeProcessor:
 
     @torch.inference_mode()
     def prepare(self):
+        if self.causal is not None:
+            self.block_frame = self.causal.prepare(self.sample_rate)
+            self.zc = self.sample_rate // 100
+            self.sola_buffer_frame = 0
+            return
         self._prepare_buffers()
         self._prewarm()
+
+    @property
+    def conversion_delay(self):
+        if self.causal is not None:
+            return self.causal.delay_seconds
+        lookahead = self.rvc.pitch_lookahead_frames(self.settings["f0_method"])
+        return (self.crossfade_frame + self.sola_search_frame) / self.sample_rate + lookahead / 100
 
     def _prepare_buffers(self):
         settings = self.settings
@@ -221,6 +242,7 @@ class RealtimeProcessor:
 
     def _release_models(self):
         self.rvc = None
+        self.causal = None
         for name in DEVICE_BUFFERS:
             setattr(self, name, None)
         gc.collect()
@@ -228,11 +250,15 @@ class RealtimeProcessor:
             torch.cuda.empty_cache()
 
     def update_pitch(self, pitch):
-        if self.rvc is not None:
+        if self.causal is not None:
+            self.causal.change_pitch(pitch)
+        elif self.rvc is not None:
             self.rvc.change_pitch(pitch)
 
     def update_index_rate(self, index_rate):
-        if self.rvc is not None:
+        if self.causal is not None:
+            self.causal.change_index_rate(index_rate)
+        elif self.rvc is not None:
             self.rvc.change_index_rate(index_rate)
 
     def _gate(self, indata):
@@ -279,6 +305,8 @@ class RealtimeProcessor:
         indata *= np.float32(db_to_linear(settings["input_gain_db"]))
         np.clip(indata, -1.0, 1.0, out=indata)
         self.input_level = float(np.abs(indata).max(initial=0.0))
+        if self.causal is not None:
+            return self._process_causal(indata, started)
         if settings["threshold"] > -60:
             indata = self._gate(indata)
         self.input_wav[: -self.block_frame] = self.input_wav[self.block_frame :].clone()
@@ -339,6 +367,19 @@ class RealtimeProcessor:
         if not silent:
             self.last_infer_ms = round(infer_seconds * 1000)
             self.last_block_ms = round((time.perf_counter() - started) * 1000)
+        self._refresh_latency()
+        return output
+
+    def _process_causal(self, samples, started):
+        output = self.causal.process(samples)
+        self.last_infer_ms = round((time.perf_counter() - started) * 1000)
+        if self.settings["passthrough"]:
+            # The desktop audio driver supplies the unconverted monitoring signal.
+            output = np.zeros_like(output)
+        else:
+            output = self.causal.output_gain(output, db_to_linear(self.settings["output_gain_db"]))
+            self.output_level = float(np.abs(output).max(initial=0.0))
+        self.last_block_ms = round((time.perf_counter() - started) * 1000)
         self._refresh_latency()
         return output
 

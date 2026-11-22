@@ -34,3 +34,8 @@ env
 venv
 .venv
 
+/runs/
+/weights/
+/custom-base/
+*.cvc
+
