@@ -18,8 +18,7 @@ sys.path.append(os.path.join(now_dir))
 # Zluda hijack
 import shared.zluda
 from rvc.configs.config import Config
-from beatrice.resources import ensure_pitch_estimator
-from shared.predictors.f0 import RMVPE, RVCRMVPE, BeatricePitch, Swift
+from shared.predictors.f0 import RVCRMVPE, Swift
 from shared.predictors.swift_dependencies import ensure_swift_f0
 from shared.utils import (
     extract_embedding_features,
@@ -55,7 +54,7 @@ mp.set_start_method("spawn", force=True)
 
 
 class FeatureInput:
-    def __init__(self, f0_method="rmvpe", device="cpu", rectified=False):
+    def __init__(self, f0_method="rmvpe", device="cpu"):
         self.hop_size = 160  # default
         self.sample_rate = 16000  # default
         self.f0_bin = 256
@@ -65,16 +64,11 @@ class FeatureInput:
         self.f0_mel_max = 1127 * np.log(1 + self.f0_max / 700)
         self.device = device
         if f0_method == "rmvpe":
-            rmvpe_class = RMVPE if rectified else RVCRMVPE
-            self.model = rmvpe_class(
+            self.model = RVCRMVPE(
                 device=self.device, sample_rate=self.sample_rate, hop_size=self.hop_size
             )
         elif f0_method == "swift":
             self.model = Swift(
-                device=self.device, sample_rate=self.sample_rate, hop_size=self.hop_size
-            )
-        elif f0_method == "beatrice":
-            self.model = BeatricePitch(
                 device=self.device, sample_rate=self.sample_rate, hop_size=self.hop_size
             )
         elif f0_method != "pm":
@@ -92,8 +86,6 @@ class FeatureInput:
             f0 = self.model.get_f0(
                 x, p_len=p_len, f0_min=self.f0_min, f0_max=self.f0_max
             )
-        elif self.f0_method == "beatrice":
-            f0 = self.model.get_f0(x, p_len)
         return np.asarray(f0).copy()
 
     def get_pm(self, x, p_len):
@@ -149,8 +141,8 @@ class FeatureInput:
             ) from error
 
 
-def process_files(files, f0_method, device, force, updates, rectified):
-    fe = FeatureInput(f0_method=f0_method, device=device, rectified=rectified)
+def process_files(files, f0_method, device, force, updates):
+    fe = FeatureInput(f0_method=f0_method, device=device)
     for file_info in files:
         fe.process_file(file_info, force=force)
         updates.put(1)
@@ -169,7 +161,7 @@ def follow_progress(tasks, updates, progress):
                 break
 
 
-def run_pitch_extraction(files, devices, f0_method, threads, progress, updates, force=False, rectified=False):
+def run_pitch_extraction(files, devices, f0_method, threads, progress, updates, force=False):
     if not files:
         return
     if not devices:
@@ -181,8 +173,6 @@ def run_pitch_extraction(files, devices, f0_method, threads, progress, updates, 
         raise RuntimeError("SwiftF0 training extraction requires a CUDA GPU. Select a GPU or use RMVPE.")
     if f0_method == "swift":
         ensure_swift_f0()
-    if f0_method == "beatrice":
-        ensure_pitch_estimator()
     threads = max(1, int(threads))
     if f0_method == "pm":
         worker_count = min(threads, len(files))
@@ -201,7 +191,6 @@ def run_pitch_extraction(files, devices, f0_method, threads, progress, updates, 
                 worker_devices[i],
                 force,
                 updates,
-                rectified,
             )
             for i in range(worker_count)
         ]
@@ -275,9 +264,6 @@ if __name__ == "__main__":
     embedder_model = sys.argv[6]
     include_mutes = int(sys.argv[7]) if len(sys.argv) > 7 else 2
     version = sys.argv[8] if len(sys.argv) > 8 else "v2"
-    rectified = len(sys.argv) > 9 and sys.argv[9] == "--rectified"
-    if rectified and (version != "v2" or f0_method not in ("pm", "rmvpe")):
-        raise ValueError("Rectified flow extraction requires v2 features and Parselmouth or RMVPE F0.")
 
     wav_path = os.path.join(exp_dir, "sliced_audios")
 
@@ -355,7 +341,7 @@ if __name__ == "__main__":
         for stale_path in glob.glob(os.path.join(exp_dir, "*.index")):
             os.remove(stale_path)
         print("Embedder changed; removed stale features and indexes.")
-    f0_model = "rmvpe_rvc" if f0_method == "rmvpe" and not rectified else f0_method
+    f0_model = "rmvpe_rvc" if f0_method == "rmvpe" else f0_method
     force_pitch_extraction = (
         data.get("f0_method") != f0_method
         or data.get("f0_model", data.get("f0_method")) != f0_model
@@ -397,7 +383,6 @@ if __name__ == "__main__":
         run_pitch_extraction(
             files, devices, f0_method, num_processes, progress, updates,
             force=force_pitch_extraction,
-            rectified=rectified,
         )
         data["f0_method"] = f0_method
         data["f0_model"] = f0_model
@@ -408,8 +393,5 @@ if __name__ == "__main__":
             files, devices, embedder_model, version, num_processes, progress, updates
         )
 
-    if rectified:
-        generate_filelist(exp_dir, sample_rate, 0)
-    else:
-        generate_config(sample_rate, exp_dir, version)
-        generate_filelist(exp_dir, sample_rate, include_mutes)
+    generate_config(sample_rate, exp_dir, version)
+    generate_filelist(exp_dir, sample_rate, include_mutes)

@@ -800,7 +800,6 @@ def _user(request):
 def start_realtime(
     model,
     index,
-    vocoder,
     pitch,
     index_rate,
     f0_method,
@@ -826,15 +825,10 @@ def start_realtime(
     settings = {
         "model_path": os.path.abspath(os.path.join(now_dir, model)),
         "index_path": os.path.abspath(os.path.join(now_dir, index)) if index else "",
-        "rectified_vocoder_path": vocoder or "",
-        "rectified_steps": 0,
-        "rectified_flow_window": True,
         "embedder_model": embedder_model,
         "index_rate": float(index_rate),
         "pitch": int(pitch),
         "speaker_id": int(speaker_id or 0),
-        "formant_shift": 0.0,
-        "vq_neighbors": 0,
         "f0_method": f0_method,
         "block_time": float(block_time),
         "crossfade_time": float(crossfade_time),
@@ -891,7 +885,7 @@ def update_realtime(
     )
 
 
-def realtime_tab(model_file, index_file, rectified_vocoder_path, pitch_choices):
+def realtime_tab(model_file, index_file, pitch_choices):
     gr.Markdown(
         i18n(
             "Converts your microphone in real time through this browser, also over a public share link. The browser only allows the microphone on HTTPS pages or on localhost, so open the share link or http://127.0.0.1. Use headphones so the converted voice does not reach the microphone."
@@ -1023,7 +1017,7 @@ def realtime_tab(model_file, index_file, rectified_vocoder_path, pitch_choices):
         with gr.Row():
             use_fp32 = gr.Checkbox(
                 label=i18n("FP32 inference"),
-                info=i18n("Use full precision. Otherwise compatible NVIDIA GPUs use FP16 for RVC. CPU, GTX 16-series and Flow models use FP32."),
+                info=i18n("Use full precision. Otherwise compatible NVIDIA GPUs use FP16 for RVC. CPU and GTX 16-series use FP32."),
                 value=False,
                 interactive=True,
             )
@@ -1038,7 +1032,6 @@ def realtime_tab(model_file, index_file, rectified_vocoder_path, pitch_choices):
         inputs=[
             model_file,
             index_file,
-            rectified_vocoder_path,
             pitch,
             index_rate,
             f0_method,
@@ -1091,4 +1084,3 @@ def realtime_tab(model_file, index_file, rectified_vocoder_path, pitch_choices):
         outputs=None,
         js="(buffer) => { window.redpandaRealtime && window.redpandaRealtime.setBuffer(buffer); }",
     )
-    return f0_method

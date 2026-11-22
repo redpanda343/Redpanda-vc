@@ -11,7 +11,7 @@ from torch import Tensor
 now_dir = os.getcwd()
 sys.path.append(now_dir)
 
-from shared.predictors.f0 import BeatricePitch, RVCRMVPE, Swift
+from shared.predictors.f0 import RVCRMVPE, Swift
 from rvc.infer.feature_index import FeatureIndex
 from rvc.infer.pm import extract_pm
 from shared.utils import extract_embedding_features
@@ -129,14 +129,6 @@ class Pipeline:
                     hop_size=self.window,
                 )
             f0 = self.model_swift.get_f0(x, p_len)
-        elif f0_method == "beatrice":
-            if not hasattr(self, "model_beatrice"):
-                self.model_beatrice = BeatricePitch(
-                    device=self.device,
-                    sample_rate=self.sample_rate,
-                    hop_size=self.window,
-                )
-            f0 = self.model_beatrice.get_f0(x, p_len)
         else:
             raise ValueError(f"Unsupported pitch extraction method: {f0_method}")
 

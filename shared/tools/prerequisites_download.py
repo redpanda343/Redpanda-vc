@@ -311,7 +311,6 @@ def prequisites_download_pipeline(
     pretraineds_hifigan,
     models,
     exe,
-    vocoders=False,
 ):
     """
     Manage the download pipeline for different categories of files.
@@ -356,15 +355,3 @@ def prequisites_download_pipeline(
                     global_bar.write("No executables needed")
             if pretraineds_hifigan:
                 download_mapping_files(pretraineds_hifigan_list, global_bar)
-    if vocoders:
-        from nsf_hifigan.resources import pretrained_path
-        from rectified_flow.resources import VOCODERS, vocoder_path
-
-        pretrained_path()
-        for name, spec in VOCODERS.items():
-            if spec['kind'] not in ('vocos', 'pupu', 'bigvgan', 'nsf_bigvgan'):
-                continue
-            try:
-                vocoder_path(name)
-            except Exception as error:
-                print(f"{spec['title']} download failed: {error}. It is retried when a flow uses it.")

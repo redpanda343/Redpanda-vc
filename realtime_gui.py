@@ -9,7 +9,6 @@ import threading
 import time
 import traceback
 from collections import deque
-from functools import lru_cache
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -33,24 +32,21 @@ from shared.cuda_sync import use_blocking_cuda_sync
 
 use_blocking_cuda_sync()
 
-import torch
 import numpy as np
 import sounddevice as sd
 
-from beatrice.inference import find_paraphernalia
-from rvc.infer.realtime_engine import BEATRICE_BLOCK_TIME, RealtimeProcessor, db_to_linear
+from rvc.infer.realtime_engine import RealtimeProcessor, db_to_linear
 from shared.platform import migrate_models_folder
 
 
 ROOT = Path(__file__).resolve().parent
 migrate_models_folder(ROOT)
 CONFIG_PATH = ROOT / "assets" / "realtime_config.json"
-BEATRICE_THREADS = 1
 MAX_CROSSFADE_TIME = 0.1
 MONITOR_DISABLED = "Disabled"
 MAIN_HOST_APIS = ("ASIO", "Windows WASAPI")
 EMBEDDERS = ("contentvec", "spin-v2")
-PITCH_METHODS = {"rmvpe": "rmvpe", "swift": "swift", "beatrice": "beatrice", "parselmouth": "pm"}
+PITCH_METHODS = {"rmvpe": "rmvpe", "swift": "swift", "parselmouth": "pm"}
 METER_FLOOR_DB = -60.0
 HOTKEYS = sys.platform == "win32"
 HOTKEY_POLL_MS = 15
@@ -87,24 +83,6 @@ def key_name(vk):
     if user32.GetKeyNameTextW(((scan & 0xFF) << 16) | extended, buffer, len(buffer)):
         return buffer.value.title()
     return f"Key {vk}"
-
-
-@lru_cache(maxsize=8)
-def _rectified_checkpoint(path, modified, size):
-    from nsf_hifigan.infer import load_checkpoint
-
-    checkpoint = load_checkpoint(path)
-    return isinstance(checkpoint, dict) and checkpoint.get("kind") == "rectified_flow"
-
-
-def is_rectified_model(path):
-    if not path.lower().endswith(".pth"):
-        return False
-    try:
-        stat = os.stat(path)
-        return _rectified_checkpoint(os.path.abspath(path), stat.st_mtime_ns, stat.st_size)
-    except Exception:
-        return False
 
 
 class AudioFrameFifo:
@@ -266,7 +244,7 @@ class AudioEngine(RealtimeProcessor):
 
     def start(self, settings):
         self.stop()
-        model_rate, beatrice_path = self.load_model(settings)
+        model_rate = self.load_model(settings)
         self.input_device = settings["input_device"]
         self.output_device = settings["output_device"]
         self.monitor_device = settings.get("monitor_device")
@@ -299,7 +277,7 @@ class AudioEngine(RealtimeProcessor):
             else 0
         )
         self.sample_rate = self._routing_samplerate(model_rate)
-        self.prepare(beatrice_path)
+        self.prepare()
         self.reported_statuses = set()
         self.asio_callback_frames = 0
         self.prefill_margin = max(self.block_frame // 4, self.zc)
@@ -349,10 +327,7 @@ class AudioEngine(RealtimeProcessor):
             output_latency = self.output_stream.latency
         else:
             output_latency = self._stream_latency(self.asio_stream, 1)
-        if self.beatrice is not None:
-            model_latency = self.beatrice.latency_seconds
-        else:
-            model_latency = (self.crossfade_frame + self.sola_search_frame) / self.sample_rate
+        model_latency = (self.crossfade_frame + self.sola_search_frame) / self.sample_rate
         self.device_latency_ms = (input_latency + output_latency) * 1000
         self.base_latency_ms = self.device_latency_ms + (self.block_frame / self.sample_rate + model_latency) * 1000
         self._refresh_latency()
@@ -560,8 +535,6 @@ class AudioEngine(RealtimeProcessor):
         self.worker.start()
 
     def _worker(self, fifo, wakeup, stop):
-        if self.beatrice is not None:
-            torch.set_num_threads(BEATRICE_THREADS)
         while not stop.is_set():
             wakeup.wait(0.05)
             wakeup.clear()
@@ -801,7 +774,6 @@ class RealtimeGUI:
         self.input_selectors = {}
         self.output_selectors = {}
         self.device_names = {}
-        self.rvc_widgets = set()
         self.locked_widgets = set()
         self.meter_values = {"input": 0.0, "output": 0.0, "monitor": 0.0}
         self.saved = self._load_config()
@@ -812,12 +784,11 @@ class RealtimeGUI:
         self._refresh_states()
         for variable in (
             self.pitch, self.index_rate, self.rms_mix_rate, self.threshold, self.f0_method,
-            self.passthrough, self.speaker_id, self.formant_shift, self.vq_neighbors,
+            self.passthrough,
             self.input_gain_db, self.output_gain_db, self.monitor_gain_db,
             self.input_noise_reduce, self.output_noise_reduce,
         ):
             variable.trace_add("write", self._hot_update)
-        self.model_path.trace_add("write", self._refresh_states)
         self.root.update_idletasks()
         self.root.minsize(self.root.winfo_reqwidth(), self.root.winfo_reqheight())
         self.root.after(100, self._poll)
@@ -838,15 +809,6 @@ class RealtimeGUI:
         value = self.saved
         self.model_path = tk.StringVar(value=value.get("model_path", ""))
         self.index_path = tk.StringVar(value=value.get("index_path", ""))
-        self.rectified_vocoder_path = tk.StringVar(value=value.get("rectified_vocoder_path", ""))
-        self.rectified_steps = tk.IntVar(value=value.get("rectified_steps", 0))
-        self.rectified_flow_window = tk.BooleanVar(value=value.get("rectified_flow_window", True))
-        self.show_flow_options = tk.BooleanVar(
-            value=value.get(
-                "show_flow_options",
-                bool(value.get("rectified_vocoder_path") or value.get("rectified_steps")),
-            )
-        )
         embedder = value.get("embedder_model", "contentvec")
         self.embedder_model = tk.StringVar(value=embedder if embedder in EMBEDDERS else "contentvec")
         self.input_device = tk.StringVar(value=value.get("input_device", ""))
@@ -866,16 +828,9 @@ class RealtimeGUI:
         self.monitor_gain_db = tk.DoubleVar(value=value.get("monitor_gain_db", 0.0))
         self.input_noise_reduce = tk.BooleanVar(value=value.get("input_noise_reduce", False))
         self.output_noise_reduce = tk.BooleanVar(value=value.get("output_noise_reduce", False))
-        self.formant_shift = tk.DoubleVar(value=value.get("formant_shift", 0.0))
-        self.vq_neighbors = tk.IntVar(value=value.get("vq_neighbors", 0))
         f0_method = value.get("f0_method", "rmvpe")
         self.f0_method = tk.StringVar(value=f0_method if f0_method in PITCH_METHODS.values() else "rmvpe")
-        self.block_times = {
-            "rvc": value.get("block_time", 0.3),
-            "beatrice": BEATRICE_BLOCK_TIME,
-        }
-        self.block_kind = "rvc"
-        self.block_time = tk.DoubleVar(value=self.block_times["rvc"])
+        self.block_time = tk.DoubleVar(value=value.get("block_time", 0.3))
         self.crossfade_time = tk.DoubleVar(value=min(value.get("crossfade_time", 0.01), MAX_CROSSFADE_TIME))
         self.extra_time = tk.DoubleVar(value=value.get("extra_time", 3.0))
         self.use_fp32 = tk.BooleanVar(value=value.get("use_fp32", False))
@@ -948,7 +903,6 @@ class RealtimeGUI:
         frame = self._card(parent, "Model")
         self.locked_widgets.update(self._path_row(frame, 0, "Voice model", self.model_path, self._browse_model))
         index_row = self._path_row(frame, 1, "Feature index", self.index_path, self._browse_index)
-        self.rvc_widgets.update(index_row)
         self.locked_widgets.update(index_row)
         embedder_label = ttk.Label(frame, text="Embedder")
         embedder_label.grid(row=2, column=0, sticky="w", padx=(0, 12), pady=3)
@@ -958,39 +912,9 @@ class RealtimeGUI:
         embedder = ttk.Combobox(options, textvariable=self.embedder_model, values=EMBEDDERS,
                                 state="readonly", width=12)
         embedder.grid(row=0, column=0, sticky="w")
-        self.rvc_widgets.update((embedder_label, embedder))
         self.locked_widgets.add(embedder)
         ttk.Label(options, text="Speaker ID").grid(row=0, column=1, sticky="w", padx=(20, 8))
         ttk.Spinbox(options, from_=0, to=255, textvariable=self.speaker_id, width=5).grid(row=0, column=2, sticky="w")
-        self.flow_toggle = ttk.Checkbutton(
-            options,
-            text="Rectified Flow options",
-            variable=self.show_flow_options,
-            command=self._refresh_states,
-            style="Switch.TCheckbutton",
-        )
-        self.flow_toggle.grid(row=0, column=3, sticky="e")
-        self.flow_rows = self._path_row(frame, 3, "Flow vocoder", self.rectified_vocoder_path, self._browse_vocoder)
-        Tooltip(self.flow_rows[1], "Optional vocoder for Rectified Flow models. Leave empty to use the model's own.")
-        steps_label = ttk.Label(frame, text="Flow steps")
-        steps_label.grid(row=4, column=0, sticky="w", padx=(0, 12), pady=3)
-        steps = ttk.Frame(frame)
-        steps.grid(row=4, column=1, columnspan=2, sticky="ew", pady=3)
-        steps_box = ttk.Spinbox(steps, from_=0, to=1000, textvariable=self.rectified_steps, width=6)
-        steps_box.pack(side="left")
-        ttk.Label(steps, text="0 = model default, fewer = faster", style="Muted.TLabel").pack(side="left", padx=(8, 0))
-        flow_window = ttk.Checkbutton(steps, text="Flow window", variable=self.rectified_flow_window)
-        flow_window.pack(side="right")
-        Tooltip(flow_window, "Generate only the newest audio plus 0.5 s of context. Faster, same output.")
-        self.flow_rows += [steps_label, steps]
-        self.locked_widgets.update((*self.flow_rows[:3], steps_box, flow_window))
-        beatrice_label = ttk.Label(frame, text="Beatrice")
-        beatrice_label.grid(row=5, column=0, sticky="w", padx=(0, 12), pady=3)
-        beatrice = ttk.Frame(frame)
-        beatrice.grid(row=5, column=1, columnspan=2, sticky="ew", pady=3)
-        beatrice.columnconfigure(1, weight=1)
-        self._slider(beatrice, 0, "Formant", self.formant_shift, -2.0, 2.0, 0.5)
-        self.beatrice_rows = [beatrice_label, beatrice]
         return frame
 
     def _path_row(self, parent, row, label, variable, command):
@@ -1095,14 +1019,14 @@ class RealtimeGUI:
     def _build_voice(self, parent):
         frame = self._card(parent, "Voice")
         self._slider(frame, 0, "Pitch", self.pitch, -24, 24, 1, tooltip="Shift in semitones. +12 is one octave up.")
-        self.rvc_widgets.update(self._slider(
+        self._slider(
             frame, 1, "Index rate", self.index_rate, 0, 1, 0.01,
             tooltip="How strongly the feature index pulls the voice toward the training data.",
-        ))
-        self.rvc_widgets.update(self._slider(
+        )
+        self._slider(
             frame, 2, "RMS mix", self.rms_mix_rate, 0, 1, 0.01,
             tooltip="0 follows your input loudness, 1 keeps the model's own loudness.",
-        ))
+        )
         self._slider(
             frame, 3, "Noise gate", self.threshold, -60, 0, 1,
             tooltip="Input quieter than this (dB) is muted. -60 turns the gate off.",
@@ -1119,14 +1043,10 @@ class RealtimeGUI:
         frame = self._card(parent, "Performance")
         block_widgets = self._slider(
             frame, 0, "Block time", self.block_time, 0.02, 1.5, 0.01,
-            tooltip=(
-                "Seconds of audio per step. Lower is less latency but more load. "
-                "Beatrice always uses 0.02 s."
-            ),
+            tooltip="Seconds of audio per step. Lower is less latency but more load.",
         )
         self.block_time_slider = block_widgets[-2]
         self.block_time_slider.configure(variable=self.block_time)
-        self.rvc_widgets.update(block_widgets)
         self.locked_widgets.update(block_widgets)
         crossfade = self._slider(
             frame, 1, "Crossfade", self.crossfade_time, 0.01, MAX_CROSSFADE_TIME, 0.01,
@@ -1142,20 +1062,15 @@ class RealtimeGUI:
         precision = ttk.Checkbutton(frame, text="FP32 inference", variable=self.use_fp32)
         precision.grid(row=3, column=0, columnspan=3, sticky="w", pady=3)
         Tooltip(precision, "Use full precision. Otherwise compatible NVIDIA GPUs use FP16 for RVC. "
-                           "CPU, GTX 16-series and Flow models use FP32. Applies on the next Start.")
-        self.rvc_widgets.update(crossfade + extra + [precision])
+                           "CPU and GTX 16-series use FP32. Applies on the next Start.")
         self.locked_widgets.update(crossfade + extra + [precision])
         pitch_label = ttk.Label(frame, text="Pitch extraction")
         pitch_label.grid(row=4, column=0, sticky="w", padx=(0, 12), pady=(6, 3))
         methods = ttk.Frame(frame)
         methods.grid(row=4, column=1, columnspan=2, sticky="w", pady=(6, 3))
-        self.rvc_widgets.add(pitch_label)
-        self.pitch_radios = {}
         for label, method in PITCH_METHODS.items():
             radio = ttk.Radiobutton(methods, text=label, variable=self.f0_method, value=method)
             radio.pack(side="left", padx=(0, 12))
-            self.rvc_widgets.add(radio)
-            self.pitch_radios[method] = radio
         return frame
 
     def _build_actions(self, parent):
@@ -1186,50 +1101,21 @@ class RealtimeGUI:
         frame.bind("<Configure>", lambda event: status.configure(wraplength=max(200, event.width)))
         return frame
 
-    def _refresh_states(self, *_):
-        path = self.model_path.get().strip()
-        beatrice = bool(path) and find_paraphernalia(path) is not None
-        kind = "beatrice" if beatrice else "rvc"
-        if kind != self.block_kind:
-            self.block_times[self.block_kind] = self.block_time.get()
-            self.block_kind = kind
-            self.block_time.set(self.block_times[kind])
-        if beatrice:
-            self.block_time.set(BEATRICE_BLOCK_TIME)
-        running = self.engine.running
-        for widget in self.rvc_widgets | self.locked_widgets:
-            disabled = (beatrice and widget in self.rvc_widgets) or (running and widget in self.locked_widgets)
-            widget.state(["disabled"] if disabled else ["!disabled"])
-        show_flow = not beatrice and self.show_flow_options.get()
-        for widget in self.flow_rows:
-            widget.grid() if show_flow else widget.grid_remove()
-        for widget in self.beatrice_rows:
-            widget.grid() if beatrice else widget.grid_remove()
-        self.flow_toggle.grid_remove() if beatrice else self.flow_toggle.grid()
-        rectified = not beatrice and is_rectified_model(path)
-        parselmouth = self.pitch_radios["pm"]
-        parselmouth.pack_forget() if rectified else parselmouth.pack(side="left", padx=(0, 12))
-        if rectified and self.f0_method.get() == "pm":
-            self.f0_method.set("rmvpe")
+    def _refresh_states(self):
+        state = ["disabled"] if self.engine.running else ["!disabled"]
+        for widget in self.locked_widgets:
+            widget.state(state)
 
     def _browse_model(self):
         path = filedialog.askopenfilename(
             initialdir=ROOT / "logs",
             filetypes=(
-                ("RVC / Rectified Flow / Beatrice model", "*.pth *.toml"),
+                ("RVC voice model", "*.pth"),
                 ("All files", "*.*"),
             ),
         )
         if path:
             self.model_path.set(path)
-
-    def _browse_vocoder(self):
-        path = filedialog.askopenfilename(
-            initialdir=ROOT / "models" / "pretraineds" / "rectified",
-            filetypes=(("Flow vocoder", "*.pth *.ckpt *.onnx"), ("All files", "*.*")),
-        )
-        if path:
-            self.rectified_vocoder_path.set(path)
 
     def _browse_index(self):
         path = filedialog.askopenfilename(
@@ -1320,9 +1206,6 @@ class RealtimeGUI:
         return {
             "model_path": self.model_path.get().strip(),
             "index_path": self.index_path.get().strip(),
-            "rectified_vocoder_path": self.rectified_vocoder_path.get().strip(),
-            "rectified_steps": self.rectified_steps.get(),
-            "rectified_flow_window": self.rectified_flow_window.get(),
             "embedder_model": self.embedder_model.get(),
             "input_device": self.input_devices[self.input_device.get()],
             "output_device": self.output_devices[self.output_device.get()],
@@ -1346,10 +1229,8 @@ class RealtimeGUI:
             "monitor_gain_db": self.monitor_gain_db.get(),
             "input_noise_reduce": self.input_noise_reduce.get(),
             "output_noise_reduce": self.output_noise_reduce.get(),
-            "formant_shift": self.formant_shift.get(),
-            "vq_neighbors": self.vq_neighbors.get(),
             "f0_method": self.f0_method.get(),
-            "block_time": BEATRICE_BLOCK_TIME if self.block_kind == "beatrice" else self.block_time.get(),
+            "block_time": self.block_time.get(),
             "crossfade_time": self.crossfade_time.get(),
             "extra_time": self.extra_time.get(),
             "use_fp32": self.use_fp32.get(),
@@ -1363,11 +1244,7 @@ class RealtimeGUI:
         saved["monitor_device"] = saved.pop("monitor_device_label")
         for key in ("passthrough", "input_selectors", "output_selectors", "monitor_selectors"):
             saved.pop(key, None)
-        self.block_times[self.block_kind] = self.block_time.get()
-        saved["block_time"] = self.block_times["rvc"]
-        saved["beatrice_block_time"] = BEATRICE_BLOCK_TIME
         saved["theme"] = self.theme
-        saved["show_flow_options"] = self.show_flow_options.get()
         saved["passthrough_hotkey"] = self.hotkey
         saved["passthrough_hold"] = self.passthrough_hold.get()
         self._write_config(saved)
@@ -1391,17 +1268,11 @@ class RealtimeGUI:
             self.root.update_idletasks()
             self.engine.start(settings)
             self._save_config(settings)
-            if self.engine.beatrice is not None:
-                status = (
-                    f"Running Beatrice model {self.engine.beatrice.model.name} "
-                    f"on the CPU in FP32 at {self.engine.sample_rate} Hz"
-                )
-            else:
-                status = (
-                    f"Running {self.engine.rvc.vocoder} with "
-                    f"{self.engine.rvc.embedder_name} in FP32 at "
-                    f"{self.engine.sample_rate} Hz"
-                )
+            status = (
+                f"Running {self.engine.rvc.vocoder} with "
+                f"{self.engine.rvc.embedder_name} in FP32 at "
+                f"{self.engine.sample_rate} Hz"
+            )
             if self.engine.shared_fallbacks:
                 status += "; WASAPI exclusive unavailable, shared mode for " + ", ".join(
                     self.engine.shared_fallbacks
@@ -1426,11 +1297,6 @@ class RealtimeGUI:
         try:
             self.engine.update_pitch(self.pitch.get())
             self.engine.update_index_rate(self.index_rate.get())
-            self.engine.update_beatrice(
-                self.speaker_id.get(),
-                self.formant_shift.get(),
-                self.vq_neighbors.get(),
-            )
             for key, variable in (
                 ("rms_mix_rate", self.rms_mix_rate),
                 ("threshold", self.threshold),

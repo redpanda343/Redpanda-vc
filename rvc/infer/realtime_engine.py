@@ -1,6 +1,5 @@
 import gc
 import logging
-import sys
 import time
 
 import numpy as np
@@ -8,15 +7,12 @@ import torch
 import torch.nn.functional as F
 from torchaudio.transforms import Resample
 
-from beatrice.inference import OUT_SAMPLE_RATE, find_paraphernalia, is_beatrice_checkpoint
-from beatrice.realtime import BeatriceRealtime
-from rectified_flow.realtime import RealtimeGraph
 from rvc.infer.realtime import RealTimeRVC
+from rvc.infer.realtime_graph import RealtimeGraph
 
 
-BEATRICE_BLOCK_TIME = 0.02
 AUTOTUNE_HEADROOM = 1 << 30
-PITCH_METHODS = ("rmvpe", "swift", "beatrice", "pm")
+PITCH_METHODS = ("rmvpe", "swift", "pm")
 RESAMPLE_FILTER = dict(
     lowpass_filter_width=64,
     rolloff=0.9475937167399596,
@@ -80,13 +76,6 @@ DEVICE_BUFFERS = (
 )
 
 
-def release_flow_models():
-    for module_name, cache_name in (("rectified_flow.pitch", "_RMVPE"), ("rectified_flow.variance", "_SEPARATORS")):
-        cache = getattr(sys.modules.get(module_name), cache_name, None)
-        if cache:
-            cache.clear()
-
-
 def db_to_linear(db):
     return 10.0 ** (float(db) / 20.0)
 
@@ -94,7 +83,6 @@ def db_to_linear(db):
 class RealtimeProcessor:
     def __init__(self):
         self.rvc = None
-        self.beatrice = None
         self.settings = {}
         self.sample_rate = 0
         self.channels = 1
@@ -106,45 +94,21 @@ class RealtimeProcessor:
 
     def load_model(self, settings):
         self.settings = settings
-        beatrice_path = find_paraphernalia(settings["model_path"])
-        if beatrice_path is None and is_beatrice_checkpoint(settings["model_path"]):
-            raise ValueError(
-                "This is a Beatrice training checkpoint, not a model. Select the paraphernalia_* model folder "
-                "or its .toml file from the same training run."
-            )
-        if beatrice_path is None:
-            self.rvc = RealTimeRVC(
-                model_path=settings["model_path"],
-                index_path=settings["index_path"],
-                index_rate=settings["index_rate"],
-                pitch=settings["pitch"],
-                speaker_id=settings["speaker_id"],
-                embedder_model=settings["embedder_model"],
-                rectified_vocoder_path=settings.get("rectified_vocoder_path", ""),
-                rectified_steps=settings.get("rectified_steps", 0),
-                rectified_flow_window=settings.get("rectified_flow_window", True),
-                use_fp32=settings.get("use_fp32", False),
-            )
-            model_rate = self.rvc.sample_rate
-            self.device = self.rvc.device
-        else:
-            model_rate = OUT_SAMPLE_RATE
-            self.device = torch.device("cpu")
-        return model_rate, beatrice_path
+        self.rvc = RealTimeRVC(
+            model_path=settings["model_path"],
+            index_path=settings["index_path"],
+            index_rate=settings["index_rate"],
+            pitch=settings["pitch"],
+            speaker_id=settings["speaker_id"],
+            embedder_model=settings["embedder_model"],
+            use_fp32=settings.get("use_fp32", False),
+        )
+        self.device = self.rvc.device
+        return self.rvc.sample_rate
 
     @torch.inference_mode()
-    def prepare(self, beatrice_path=None):
-        settings = self.settings
+    def prepare(self):
         self._prepare_buffers()
-        if beatrice_path is not None:
-            self.beatrice = BeatriceRealtime(
-                beatrice_path,
-                self.sample_rate,
-                speaker=settings["speaker_id"],
-                pitch=settings["pitch"],
-                formant=settings["formant_shift"],
-                vq_neighbors=settings["vq_neighbors"],
-            )
         self._prewarm()
 
     def _prepare_buffers(self):
@@ -152,15 +116,12 @@ class RealtimeProcessor:
         rate = self.sample_rate
         device = self.device
         self.zc = rate // 100
-        block_time = BEATRICE_BLOCK_TIME if self.rvc is None else settings["block_time"]
+        block_time = settings["block_time"]
         self.block_frame = int(np.round(block_time * rate / self.zc)) * self.zc
         self.block_frame_16k = 160 * self.block_frame // self.zc
-        if self.rvc is None:
-            self.crossfade_frame = self.zc
-        else:
-            self.crossfade_frame = min(
-                int(np.round(settings["crossfade_time"] * rate / self.zc)) * self.zc, self.block_frame
-            )
+        self.crossfade_frame = min(
+            int(np.round(settings["crossfade_time"] * rate / self.zc)) * self.zc, self.block_frame
+        )
         self.sola_buffer_frame = self.crossfade_frame
         self.sola_search_frame = self.zc
         self.extra_frame = int(np.round(settings["extra_time"] * rate / self.zc)) * self.zc
@@ -193,13 +154,13 @@ class RealtimeProcessor:
             ** 2
         )
         self.fade_out_window = 1 - self.fade_in_window
-        graph_enabled = self.rvc is not None and self.rvc.cuda_graph
+        graph_enabled = self.rvc.cuda_graph
         self.resampler = RealtimeGraph(
             Resample(orig_freq=rate, new_freq=16000, dtype=torch.float32, **RESAMPLE_FILTER).to(device),
             "input resample", graph_enabled,
         )
         self.resampler2 = None
-        if self.rvc is not None and self.rvc.sample_rate != rate:
+        if self.rvc.sample_rate != rate:
             self.resampler2 = RealtimeGraph(
                 Resample(orig_freq=self.rvc.sample_rate, new_freq=rate, dtype=torch.float32, **RESAMPLE_FILTER).to(device),
                 "output resample", graph_enabled,
@@ -214,12 +175,10 @@ class RealtimeProcessor:
         self.recent_input[:] = 0
         if self.rvc is not None:
             self.rvc.reset_caches()
-        if self.beatrice is not None:
-            self.beatrice.reset()
 
     def _warm_up(self):
         silence = np.zeros((self.block_frame, self.channels), dtype=np.float32)
-        for _ in range(2 if self.beatrice is None else 3):
+        for _ in range(2):
             self.process(silence, warm_up=True)
 
     def _budgeted_warm_up(self):
@@ -262,29 +221,19 @@ class RealtimeProcessor:
 
     def _release_models(self):
         self.rvc = None
-        self.beatrice = None
         for name in DEVICE_BUFFERS:
             setattr(self, name, None)
-        release_flow_models()
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
     def update_pitch(self, pitch):
-        if self.beatrice is not None:
-            self.beatrice.model.set_pitch_shift(pitch)
-        elif self.rvc is not None:
+        if self.rvc is not None:
             self.rvc.change_pitch(pitch)
 
     def update_index_rate(self, index_rate):
         if self.rvc is not None:
             self.rvc.change_index_rate(index_rate)
-
-    def update_beatrice(self, speaker, formant_shift, vq_neighbors):
-        if self.beatrice is not None:
-            self.beatrice.model.set_speaker(speaker)
-            self.beatrice.model.set_formant_shift(formant_shift)
-            self.beatrice.model.set_vq_neighbors(vq_neighbors)
 
     def _gate(self, indata):
         indata = np.append(self.rms_buffer, indata)
@@ -348,57 +297,39 @@ class RealtimeProcessor:
             input_wav[: self.sola_buffer_frame] += self.nr_buffer * self.fade_out_window
             self.input_wav_denoise[-self.block_frame :] = input_wav[: self.block_frame]
             self.nr_buffer[:] = input_wav[self.block_frame :]
-            if self.rvc is not None:
-                resample_input = self.input_wav_denoise[-self.block_frame - 2 * self.zc :]
-                self.input_wav_res[-self.block_frame_16k - 160 :] = self.resampler(resample_input)[160:]
-        elif self.rvc is not None:
+            resample_input = self.input_wav_denoise[-self.block_frame - 2 * self.zc :]
+            self.input_wav_res[-self.block_frame_16k - 160 :] = self.resampler(resample_input)[160:]
+        else:
             resample_input = self.input_wav[-indata.shape[0] - 2 * self.zc :]
             self.input_wav_res[-160 * (indata.shape[0] // self.zc + 1) :] = self.resampler(resample_input)[160:]
         source = self.input_wav_denoise if denoise else self.input_wav
         passthrough = settings["passthrough"] and not warm_up
         infer_seconds = 0.0
-        silent = passthrough
-        if self.beatrice is not None:
-            block = source[-self.block_frame :]
-            if passthrough:
-                infer_wav = torch.zeros_like(block)
-            else:
-                infer_started = time.perf_counter()
-                infer_wav = torch.from_numpy(self.beatrice.process(block.cpu().numpy())).to(self.device)
-                infer_seconds = time.perf_counter() - infer_started
-            if settings["output_noise_reduce"] and not passthrough:
-                self.output_buffer[: -self.block_frame] = self.output_buffer[self.block_frame :].clone()
-                self.output_buffer[-self.block_frame :] = infer_wav
-                infer_wav = self.tg(infer_wav.unsqueeze(0), self.output_buffer.unsqueeze(0)).squeeze(0)
-            output_block = infer_wav[: self.block_frame]
+        start = max(0, self.extra_frame - self.rvc.pitch_lookahead_frames(settings["f0_method"]) * self.zc)
+        quiet = not warm_up and not self.recent_input[start - self.input_wav.shape[0] :].any()
+        silent = passthrough or quiet
+        if silent:
+            self.rvc.skip_block(self.block_frame_16k)
+            infer_wav = torch.zeros_like(source[self.extra_frame :])
         else:
-            start = max(0, self.extra_frame - self.rvc.pitch_lookahead_frames(settings["f0_method"]) * self.zc)
-            quiet = not warm_up and not self.recent_input[start - self.input_wav.shape[0] :].any()
-            silent = passthrough or quiet
-            if silent:
-                self.rvc.skip_block(self.block_frame_16k)
-                infer_wav = torch.zeros_like(source[self.extra_frame :])
+            infer_wav, infer_seconds = self.rvc.infer(
+                self.input_wav_res,
+                self.block_frame_16k,
+                self.skip_head,
+                self.return_length,
+                settings["f0_method"],
+            )
+            if self.resampler2 is not None:
+                infer_wav = self.resampler2(infer_wav)
             else:
-                infer_wav, infer_seconds = self.rvc.infer(
-                    self.input_wav_res,
-                    self.block_frame_16k,
-                    self.skip_head,
-                    self.return_length,
-                    settings["f0_method"],
-                    source,
-                    self.sample_rate,
-                )
-                if self.resampler2 is not None:
-                    infer_wav = self.resampler2(infer_wav)
-                else:
-                    infer_wav = infer_wav.clone()
-            if settings["output_noise_reduce"] and not silent:
-                self.output_buffer[: -self.block_frame] = self.output_buffer[self.block_frame :].clone()
-                self.output_buffer[-self.block_frame :] = infer_wav[-self.block_frame :]
-                infer_wav = self.tg(infer_wav.unsqueeze(0), self.output_buffer.unsqueeze(0)).squeeze(0)
-            if settings["rms_mix_rate"] < 1 and not silent:
-                infer_wav = self._mix_volume(infer_wav, source)
-            output_block = self._apply_sola(infer_wav)
+                infer_wav = infer_wav.clone()
+        if settings["output_noise_reduce"] and not silent:
+            self.output_buffer[: -self.block_frame] = self.output_buffer[self.block_frame :].clone()
+            self.output_buffer[-self.block_frame :] = infer_wav[-self.block_frame :]
+            infer_wav = self.tg(infer_wav.unsqueeze(0), self.output_buffer.unsqueeze(0)).squeeze(0)
+        if settings["rms_mix_rate"] < 1 and not silent:
+            infer_wav = self._mix_volume(infer_wav, source)
+        output_block = self._apply_sola(infer_wav)
         gain = db_to_linear(settings["output_gain_db"])
         if warm_up and not bool(torch.isfinite(output_block).all()):
             raise FloatingPointError("Realtime warm-up produced non-finite audio.")

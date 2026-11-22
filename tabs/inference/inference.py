@@ -15,6 +15,7 @@ from core import (
     run_multi_model_batch_infer_script,
     run_multi_model_infer_script,
 )
+from rvc.infer.checkpoint import load_voice_checkpoint
 from shared.utils import format_title
 from tabs.inference.realtime import realtime_tab
 from tabs.settings.sections.filter import get_filter_trigger, load_config_filter
@@ -81,24 +82,10 @@ def alias_score(path: str, want_model: bool) -> int:
         return 2 if has_idx else (1 if has_mdl else 0)
 
 
-def get_vocoders():
-    roots = (
-        os.path.join(now_dir, "models", "pretraineds", "rectified"),
-        os.path.join(now_dir, "models", "rectified", "custom"),
-    )
-    return sorted(
-        os.path.relpath(os.path.join(folder, name), now_dir)
-        for root in roots
-        for folder, _, files in os.walk(root)
-        for name in files
-        if name.lower().endswith((".pth", ".ckpt", ".onnx", ".safetensors"))
-    )
-
-
 def get_files(type="model"):
     assert type in ("model", "index"), "Invalid type for get_files (models or index)"
     is_model = type == "model"
-    exts = (".pth", ".onnx", ".ckpt") if is_model else (".index",)
+    extension = ".pth" if is_model else ".index"
     exclude_prefixes = ("G_", "D_") if is_model else ("trained_",)
 
     best = {}
@@ -106,14 +93,12 @@ def get_files(type="model"):
 
     for root, _, files in os.walk(model_root_relative, followlinks=True):
         for file in files:
-            if not file.endswith(exts):
+            if not file.lower().endswith(extension):
                 continue
             if file.startswith(exclude_prefixes):
                 continue
 
             full = os.path.join(root, file)
-            if is_model and file.endswith('.ckpt') and not get_model_info(full)[2]:
-                continue
             real = os.path.realpath(full)
             score = alias_score(full, is_model)
 
@@ -130,7 +115,7 @@ def get_files(type="model"):
 
     paths = [t[2] for t in sorted(best.values(), key=lambda x: x[1])]
     if is_model:
-        paths.extend(path for path in get_vocoders() if os.path.realpath(path) not in best)
+        paths = [path for path in paths if model_speaker_count(path) is not None]
     return paths
 
 
@@ -297,8 +282,6 @@ def folders_same(
 
 
 def match_index(model_file_value, available_indexes=None):
-    if get_model_info(model_file_value)[2]:
-        return ""
     if not model_file_value:
         return ""
 
@@ -376,52 +359,31 @@ def match_index(model_file_value, available_indexes=None):
     return ""
 
 
-@lru_cache(maxsize=32)
-def read_model_info(path, modified, size):
-    from nsf_hifigan.infer import is_nsf_hifigan, load_checkpoint
-    from rectified_flow.vocos import is_vocos
-    from rectified_flow.pupu import is_pupu
-    from rectified_flow.nsf_bigvgan import is_nsf_bigvgan
-
-    if path.lower().endswith('.onnx'):
-        from rectified_flow.openvpi import onnx_generator_state
-
-        state = onnx_generator_state(path)
-        return False, 1, is_nsf_hifigan({'generator': state})
-    model_data = load_checkpoint(path)
-    if is_nsf_hifigan(model_data) or is_vocos(model_data) or is_pupu(model_data) or is_nsf_bigvgan(model_data):
-        return False, 1, True
-    rectified = model_data.get("kind") == "rectified_flow"
-    speakers = model_data.get("speaker_count", model_data.get("speakers_id")) or 1
-    return rectified, speakers, False
+@lru_cache(maxsize=256)
+def read_speaker_count(path, modified, size):
+    try:
+        checkpoint = load_voice_checkpoint(path)
+        return int(checkpoint["weight"]["emb_g.weight"].shape[0])
+    except Exception:
+        return None
 
 
-def get_model_info(model):
-    if model:
-        try:
-            path = os.path.abspath(os.path.join(now_dir, model))
-            stat = os.stat(path)
-            return read_model_info(path, stat.st_mtime_ns, stat.st_size)
-        except Exception:
-            pass
-    return False, 1, False
+def model_speaker_count(model):
+    if not model:
+        return None
+    path = os.path.abspath(os.path.join(now_dir, model))
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return read_speaker_count(path, stat.st_mtime_ns, stat.st_size)
 
 
 def get_speakers_id(model):
-    return list(range(get_model_info(model)[1]))
+    return list(range(model_speaker_count(model) or 1))
 
 
-def pitch_methods(rectified, vocoder):
-    if vocoder:
-        return ['rmvpe']
-    if rectified:
-        return ['rmvpe', 'swift', 'beatrice']
-    return ['rmvpe', 'swift', 'beatrice', ('parselmouth', 'pm')]
-
-
-def pitch_update(choices, value):
-    methods = {choice if isinstance(choice, str) else choice[1] for choice in choices}
-    return gr.update(choices=choices, value=value if value in methods else 'rmvpe')
+PITCH_CHOICES = ["rmvpe", "swift", ("parselmouth", "pm")]
 
 
 default_weight = next(iter(get_files("model")), None)
@@ -448,13 +410,11 @@ def update_filter_visibility(_):
 # Inference tab
 def inference_tab():
     trigger = get_filter_trigger()
-    rectified_selected, _, vocoder_selected = get_model_info(default_weight)
-    pitch_choices = pitch_methods(rectified_selected, vocoder_selected)
     with gr.Column() as model_controls:
         with gr.Row():
             model_file = gr.Dropdown(
-                label=i18n("Voice Model / Vocoder"),
-                info=i18n("Select a voice model or NSF-HiFiGAN vocoder. Keep config.json or vocoder.yaml beside the vocoder."),
+                label=i18n("Voice Model"),
+                info=i18n("Select an exported RVC voice model."),
                 choices=sorted(get_files("model"), key=extract_model_and_epoch),
                 value=default_weight,
                 interactive=True,
@@ -473,21 +433,9 @@ def inference_tab():
                 info=i18n("Select the index file to use for the conversion."),
                 choices=sorted(get_files("index")),
                 value=match_index(default_weight),
-                visible=not vocoder_selected,
                 interactive=True,
                 allow_custom_value=True,
             )
-        rectified_vocoder_path = gr.Dropdown(
-            label=i18n("Rectified Flow Vocoder"),
-            info=i18n(
-                "Optional: select a compatible NSF-HiFiGAN, NSF-BigVGAN, Vocos, Pupu-Vocoder or BigVGAN vocoder or enter its .pth/.ckpt/.onnx/.safetensors path. Leave empty to use the model's recorded vocoder or the default. Keep any config.json or vocoder.yaml beside the vocoder."
-            ),
-            choices=get_vocoders(),
-            value=None,
-            interactive=True,
-            allow_custom_value=True,
-            visible=get_model_info(default_weight)[0],
-        )
         filter_box_inf.blur(
             fn=filter_dropdowns,
             inputs=[filter_box_inf],
@@ -502,13 +450,6 @@ def inference_tab():
         with gr.Row():
             unload_button = gr.Button(i18n("Unload Voice"))
             refresh_button = gr.Button(i18n("Refresh"))
-            refresh_button.click(
-                fn=lambda: gr.update(choices=get_vocoders()),
-                inputs=[],
-                outputs=[rectified_vocoder_path],
-                show_progress=False,
-            )
-
             unload_button.click(
                 fn=lambda: (
                     {"value": "", "__type__": "update"},
@@ -568,7 +509,6 @@ def inference_tab():
                     label=i18n("Speaker ID"),
                     info=i18n("Select the speaker ID to use for the conversion."),
                     choices=get_speakers_id(model_file.value),
-                    visible=not vocoder_selected,
                     value=0,
                     interactive=True,
                 )
@@ -932,7 +872,6 @@ def inference_tab():
                         "Influence exerted by the index file; a higher value corresponds to greater influence. However, opting for lower values can help mitigate artifacts present in the audio."
                     ),
                     value=0.75,
-                    visible=not vocoder_selected,
                     interactive=True,
                 )
                 normalization_db = gr.Slider(
@@ -955,7 +894,6 @@ def inference_tab():
                         "Safeguard distinct consonants and breathing sounds to prevent electro-acoustic tearing and other artifacts. Pulling the parameter to its maximum value of 0.5 offers comprehensive protection. However, reducing this value might decrease the extent of protection while potentially mitigating the indexing effect."
                     ),
                     value=0.5,
-                    visible=not vocoder_selected,
                     interactive=True,
                 )
                 f0_method = gr.Radio(
@@ -963,7 +901,7 @@ def inference_tab():
                     info=i18n(
                         "Pitch extraction algorithm to use for the audio conversion. The default algorithm is rmvpe, which is recommended for most cases."
                     ),
-                    choices=pitch_choices,
+                    choices=PITCH_CHOICES,
                     value="rmvpe",
                     interactive=True,
                 )
@@ -975,7 +913,6 @@ def inference_tab():
                         "spin-v2",
                     ],
                     value="contentvec",
-                    visible=not vocoder_selected,
                     interactive=True,
                 )
         def convert_audio(*args):
@@ -1048,7 +985,6 @@ def inference_tab():
                     label=i18n("Speaker ID"),
                     info=i18n("Select the speaker ID to use for the conversion."),
                     choices=get_speakers_id(model_file.value),
-                    visible=not vocoder_selected,
                     value=0,
                     interactive=True,
                 )
@@ -1412,7 +1348,6 @@ def inference_tab():
                         "Influence exerted by the index file; a higher value corresponds to greater influence. However, opting for lower values can help mitigate artifacts present in the audio."
                     ),
                     value=0.75,
-                    visible=not vocoder_selected,
                     interactive=True,
                 )
                 normalization_db_batch = gr.Slider(
@@ -1435,7 +1370,6 @@ def inference_tab():
                         "Safeguard distinct consonants and breathing sounds to prevent electro-acoustic tearing and other artifacts. Pulling the parameter to its maximum value of 0.5 offers comprehensive protection. However, reducing this value might decrease the extent of protection while potentially mitigating the indexing effect."
                     ),
                     value=0.5,
-                    visible=not vocoder_selected,
                     interactive=True,
                 )
                 f0_method_batch = gr.Radio(
@@ -1443,7 +1377,7 @@ def inference_tab():
                     info=i18n(
                         "Pitch extraction algorithm to use for the audio conversion. The default algorithm is rmvpe, which is recommended for most cases."
                     ),
-                    choices=pitch_choices,
+                    choices=PITCH_CHOICES,
                     value="rmvpe",
                     interactive=True,
                 )
@@ -1455,7 +1389,6 @@ def inference_tab():
                         "spin-v2",
                     ],
                     value="contentvec",
-                    visible=not vocoder_selected,
                     interactive=True,
                 )
         convert_button_batch = gr.Button(i18n("Convert"))
@@ -1512,7 +1445,6 @@ def inference_tab():
                         interactive=True,
                         allow_custom_value=True,
                         key=("multi-model-index", model_path),
-                        visible=not get_model_info(model_path)[2],
                     )
                 )
 
@@ -1615,7 +1547,7 @@ def inference_tab():
             multi_f0_method = gr.Radio(
                 label=i18n("Pitch extraction algorithm"),
                 info=i18n("Pitch extraction algorithm used by every model."),
-                choices=["rmvpe", "swift", "beatrice", ("parselmouth", "pm")],
+                choices=PITCH_CHOICES,
                 value="rmvpe",
                 interactive=True,
             )
@@ -1699,7 +1631,6 @@ def inference_tab():
                         interactive=True,
                         allow_custom_value=True,
                         key=("batch-multi-model-index", model_path),
-                        visible=not get_model_info(model_path)[2],
                     )
                 )
 
@@ -1801,7 +1732,7 @@ def inference_tab():
             batch_multi_f0_method = gr.Radio(
                 label=i18n("Pitch extraction algorithm"),
                 info=i18n("Pitch extraction algorithm used by every model."),
-                choices=["rmvpe", "swift", "beatrice", ("parselmouth", "pm")],
+                choices=PITCH_CHOICES,
                 value="rmvpe",
                 interactive=True,
             )
@@ -2279,7 +2210,6 @@ def inference_tab():
             delay_mix,
             sid,
             seed,
-            rectified_vocoder_path,
         ],
         outputs=[vc_output1, vc_output2],
     )
@@ -2342,7 +2272,6 @@ def inference_tab():
             delay_mix_batch,
             sid_batch,
             seed_batch,
-            rectified_vocoder_path,
         ],
         outputs=[vc_output3],
     ).then(
@@ -2361,47 +2290,5 @@ def inference_tab():
         outputs=[convert_button_batch_multi, stop_button_batch_multi],
     )
 
-    with gr.Tab(i18n("Real-time"), visible=not vocoder_selected) as realtime_panel:
-        realtime_f0_method = realtime_tab(model_file, index_file, rectified_vocoder_path, pitch_choices)
-
-    voice_controls = [index_file, index_rate, index_rate_batch, protect, protect_batch,
-                      embedder_model, embedder_model_batch, sid, sid_batch]
-
-    def update_model_controls(model, single_pitch, batch_pitch, realtime_pitch):
-        rectified, _, vocoder = get_model_info(model)
-        choices = pitch_methods(rectified, vocoder)
-        return (gr.update(visible=rectified),
-                *[gr.update(visible=not vocoder) for _ in voice_controls],
-                gr.update(visible=not vocoder),
-                *[pitch_update(choices, value) for value in (single_pitch, batch_pitch, realtime_pitch)])
-
-    model_file.change(
-        fn=update_model_controls,
-        inputs=[model_file, f0_method, f0_method_batch, realtime_f0_method],
-        outputs=[rectified_vocoder_path, *voice_controls, realtime_panel, f0_method, f0_method_batch,
-                 realtime_f0_method],
-        show_progress=False,
-    )
-
-    def update_multi_model_controls(models, current_pitch):
-        infos = [get_model_info(model) for model in (models or [])]
-        vocoders = [vocoder for _, _, vocoder in infos]
-        voice_visible = not vocoders or not all(vocoders)
-        choices = pitch_methods(any(rectified for rectified, _, _ in infos), any(vocoders))
-        return (gr.update(visible=voice_visible), gr.update(visible=voice_visible),
-                gr.update(visible=voice_visible), gr.update(visible=voice_visible),
-                pitch_update(choices, current_pitch))
-
-    multi_model_files.change(
-        fn=update_multi_model_controls,
-        inputs=[multi_model_files, multi_f0_method],
-        outputs=[multi_index_rate, multi_protect, multi_embedder_model, multi_sid, multi_f0_method],
-        show_progress=False,
-    )
-    batch_multi_model_files.change(
-        fn=update_multi_model_controls,
-        inputs=[batch_multi_model_files, batch_multi_f0_method],
-        outputs=[batch_multi_index_rate, batch_multi_protect, batch_multi_embedder_model,
-                 batch_multi_sid, batch_multi_f0_method],
-        show_progress=False,
-    )
+    with gr.Tab(i18n("Real-time")):
+        realtime_tab(model_file, index_file, PITCH_CHOICES)

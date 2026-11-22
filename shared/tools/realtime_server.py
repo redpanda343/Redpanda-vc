@@ -13,7 +13,6 @@ import numpy as np
 from fastapi import Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 
-from beatrice.inference import find_paraphernalia
 from shared.tools.realtime_worker import RealtimeWorker, realtime_devices
 from shared.tools.web_auth import current_user
 
@@ -229,11 +228,8 @@ class RealtimeSession:
 def _select_device(settings, busy):
     requested = str(settings.get("inference_device", "auto") or "auto")
     devices = [entry["value"] for entry in realtime_devices()]
-    beatrice = find_paraphernalia(settings["model_path"]) is not None
-    if beatrice and requested not in {"auto", "cpu"}:
-        raise ValueError("Beatrice real-time inference uses the CPU. Select Automatic or CPU.")
     if requested == "auto":
-        candidates = [device for device in devices if device.startswith("cuda:")] if not beatrice else []
+        candidates = [device for device in devices if device.startswith("cuda:")]
         candidates = candidates or ["cpu"]
     else:
         if requested not in devices:

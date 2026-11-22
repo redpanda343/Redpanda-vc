@@ -1,6 +1,5 @@
 import os
 import sys
-import soxr
 import inspect
 import threading
 import time
@@ -15,6 +14,7 @@ from functools import wraps
 now_dir = os.getcwd()
 sys.path.append(now_dir)
 
+from rvc.infer.checkpoint import load_voice_checkpoint
 from rvc.infer.pipeline import InferenceRNG, Pipeline as VC
 from shared.utils import load_audio_infer, load_embedding
 from shared.tools.split_audio import process_audio, merge_audio
@@ -345,16 +345,6 @@ class VoiceConverter:
             chunks, intervals = [audio], None
         return audio, chunks, intervals
 
-    def rectified_sources(self, audio_input_path, chunks, intervals):
-        rate = int(self.cpt["config"]["data"]["sample_rate"])
-        source = load_audio_infer(audio_input_path, rate).astype(np.float32)
-        if intervals is None:
-            return [source]
-        return [
-            source[round(start * rate / 16000) : round(end * rate / 16000)]
-            for start, end in intervals
-        ]
-
     @deterministic_inference
     def convert_audio(
         self,
@@ -409,13 +399,8 @@ class VoiceConverter:
             return
 
         self.get_vc(model_path, sid)
-        vocoder = self.cpt.get('kind') == 'vocoder'
-        rectified = not vocoder and isinstance(self.cpt.get('config'), dict)
-        if rectified:
-            self.vc.set_vocoder(kwargs.pop('rectified_vocoder_path', ''))
-        if rectified or vocoder:
-            self.tgt_sr = int(self.cpt['config']['data']['sample_rate'])
-
+        if self.cpt is None:
+            raise FileNotFoundError(f"Voice model not found: {model_path}")
         start_time = time.time()
         print(f"Converting audio '{audio_input_path}'...")
 
@@ -431,27 +416,26 @@ class VoiceConverter:
             chunks = prepared_chunks
             intervals = prepared_intervals
 
-        if not vocoder:
-            expected_embedder = self.cpt.get("embedder_model")
-            built_in_embedders = {"contentvec", "spin-v2"}
-            if expected_embedder and expected_embedder not in built_in_embedders:
-                raise RuntimeError(
-                    f"This voice model uses unsupported embedder {expected_embedder}."
-                )
-            if (
-                expected_embedder in built_in_embedders
-                and embedder_model != expected_embedder
-            ):
-                raise RuntimeError(
-                    f"This voice model was trained with {expected_embedder}, but "
-                    f"{embedder_model} is selected."
-                )
-            if not self.hubert_model or embedder_model != self.last_embedder_model:
-                self.load_hubert(embedder_model)
-                self.last_embedder_model = embedder_model
+        expected_embedder = self.cpt.get("embedder_model")
+        built_in_embedders = {"contentvec", "spin-v2"}
+        if expected_embedder and expected_embedder not in built_in_embedders:
+            raise RuntimeError(
+                f"This voice model uses unsupported embedder {expected_embedder}."
+            )
+        if (
+            expected_embedder in built_in_embedders
+            and embedder_model != expected_embedder
+        ):
+            raise RuntimeError(
+                f"This voice model was trained with {expected_embedder}, but "
+                f"{embedder_model} is selected."
+            )
+        if not self.hubert_model or embedder_model != self.last_embedder_model:
+            self.load_hubert(embedder_model)
+            self.last_embedder_model = embedder_model
 
         file_index = (
-            ("" if vocoder else index_path).strip()
+            index_path.strip()
             .strip('"')
             .strip("\n")
             .strip('"')
@@ -459,42 +443,29 @@ class VoiceConverter:
             .replace("trained", "added")
         )
 
-        if not (rectified or vocoder) and self.tgt_sr != resample_sr >= 16000:
+        if self.tgt_sr != resample_sr >= 16000:
             self.tgt_sr = resample_sr
 
         if split_audio:
             print(f"Audio split into {len(chunks)} chunks for processing.")
 
-        sources = [{}] * len(chunks)
-        if rectified or vocoder:
-            sources = [
-                {"source_audio": source}
-                for source in self.rectified_sources(
-                    audio_input_path, chunks, intervals if split_audio else None
-                )
-            ]
-
         inference_rng = InferenceRNG(seed) if seed is not None else None
         converted_chunks = []
-        for c, source in zip(chunks, sources):
-            if vocoder:
-                audio_opt = self.vc.infer(source['source_audio'], pitch, f0_method, seed)
-            else:
-                audio_opt = self.vc.pipeline(
-                    model=self.hubert_model,
-                    net_g=self.net_g,
-                    sid=sid,
-                    audio=c,
-                    pitch=pitch,
-                    f0_method=f0_method,
-                    file_index=file_index,
-                    index_rate=index_rate,
-                    pitch_guidance=self.use_f0,
-                    version=self.version,
-                    protect=protect,
-                    inference_rng=inference_rng,
-                    **source,
-                )
+        for chunk in chunks:
+            audio_opt = self.vc.pipeline(
+                model=self.hubert_model,
+                net_g=self.net_g,
+                sid=sid,
+                audio=chunk,
+                pitch=pitch,
+                f0_method=f0_method,
+                file_index=file_index,
+                index_rate=index_rate,
+                pitch_guidance=self.use_f0,
+                version=self.version,
+                protect=protect,
+                inference_rng=inference_rng,
+            )
             converted_chunks.append(audio_opt)
             if split_audio:
                 print(f"Converted audio chunk {len(converted_chunks)}")
@@ -505,10 +476,6 @@ class VoiceConverter:
             )
         else:
             audio_opt = converted_chunks[0]
-
-        if (rectified or vocoder) and self.tgt_sr != resample_sr >= 16000:
-            audio_opt = soxr.resample(audio_opt, self.tgt_sr, resample_sr, quality="HQ")
-            self.tgt_sr = resample_sr
 
         if clean_audio:
             cleaned_audio = self.remove_audio_noise(
@@ -662,11 +629,6 @@ class VoiceConverter:
         """
         Cleans up the model and releases resources.
         """
-        if self.cpt is not None and self.cpt.get('kind') == 'vocoder':
-            self.net_g = self.vc = self.cpt = self.loaded_model = self.tgt_sr = None
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            return
         if self.hubert_model is not None:
             del self.net_g, self.n_spk, self.vc, self.hubert_model, self.tgt_sr
             self.hubert_model = self.net_g = self.n_spk = self.vc = self.tgt_sr = None
@@ -685,63 +647,14 @@ class VoiceConverter:
         Args:
             weight_root (str): Path to the model weights.
         """
-        from nsf_hifigan.infer import load_checkpoint
-
-        self.model_path = weight_root
-        if str(weight_root).lower().endswith('.onnx') and os.path.isfile(weight_root):
-            from rectified_flow.openvpi import onnx_generator_state
-
-            state = onnx_generator_state(weight_root)
-            if state is None:
-                raise ValueError('Select an RVC, Rectified Flow or NSF-HiFiGAN model.')
-            self.cpt = {'generator': state}
-            return
-        self.cpt = (
-            load_checkpoint(weight_root)
-            if os.path.isfile(weight_root)
-            else None
-        )
+        self.cpt = load_voice_checkpoint(weight_root) if os.path.isfile(weight_root) else None
 
     def setup_network(self):
         """
         Sets up the network configuration based on the loaded checkpoint.
         """
         if self.cpt is not None:
-            from nsf_hifigan.infer import NSFBigVGANInference, VocoderInference, is_nsf_hifigan
-            from rectified_flow.nsf_bigvgan import is_nsf_bigvgan
-            from rectified_flow.vocos import VocosInference, is_vocos
-            from rectified_flow.pupu import PupuInference, is_pupu
-            from rectified_flow.bigvgan import BigVGANInference, is_bigvgan
-
-            inferences = ((is_vocos, VocosInference), (is_pupu, PupuInference), (is_bigvgan, BigVGANInference),
-                          (is_nsf_bigvgan, NSFBigVGANInference), (is_nsf_hifigan, VocoderInference))
-            inference = next((inference for match, inference in inferences if match(self.cpt)), None)
-            if inference is not None:
-                self.net_g = inference(self.model_path, self.cpt, self.config.device)
-                self.cpt = {'kind': 'vocoder', 'config': {'data': self.net_g.data}}
-                self.tgt_sr = int(self.net_g.data['sample_rate'])
-                self.version, self.use_f0, self.n_spk = 'v2', 1, 1
-                self.hubert_model = self.last_embedder_model = None
-                return
-            if isinstance(self.cpt.get('config'), dict):
-                from rectified_flow.config import resolve_config
-                from rectified_flow.flow_model import build_flow
-                from rectified_flow.infer import is_rectified
-                from rectified_flow.resources import recorded_vocoder, vocoder_title
-
-                if not is_rectified(self.cpt):
-                    raise ValueError('Select an RVC model or Rectified Flow voice checkpoint, not a vocoder checkpoint.')
-                self.cpt['config'] = resolve_config(self.cpt['config'])
-                weights = self.cpt['model']
-                self.n_spk = int(self.cpt['speaker_count'])
-                self.tgt_sr = int(self.cpt['config']['data']['sample_rate'])
-                self.version, self.use_f0 = 'v2', 1
-                self.text_enc_hidden_dim = int(self.cpt['config']['flow']['model']['content_channels'])
-                self.vocoder = vocoder_title(recorded_vocoder(self.cpt))
-                self.net_g = build_flow(self.cpt['config'], self.n_spk)
-                self.net_g.load_state_dict(weights, strict=True)
-                self.net_g = self.net_g.to(self.config.device).float().eval().requires_grad_(False)
-                return
+            self.cpt["config"] = list(self.cpt["config"])
             self.tgt_sr = self.cpt["config"][-1]
             self.cpt["config"][-3] = self.cpt["weight"]["emb_g.weight"].shape[0]
             self.use_f0 = self.cpt.get("f0", 1)
@@ -769,18 +682,10 @@ class VoiceConverter:
         Sets up the voice conversion pipeline instance based on the target sampling rate and configuration.
         """
         if self.cpt is not None:
-            if self.cpt.get('kind') == 'vocoder':
-                self.vc = self.net_g
-                return
             previous_vc = self.vc
-            if isinstance(self.cpt.get('config'), dict):
-                from rectified_flow.infer import RectifiedPipeline
-
-                self.vc = RectifiedPipeline(self.tgt_sr, self.config, self.cpt)
-            else:
-                self.vc = VC(self.tgt_sr, self.config)
+            self.vc = VC(self.tgt_sr, self.config)
             if previous_vc is not None:
-                for predictor_name in ("model_rmvpe", "model_swift", "model_beatrice"):
+                for predictor_name in ("model_rmvpe", "model_swift"):
                     predictor = getattr(previous_vc, predictor_name, None)
                     if predictor is None:
                         continue
@@ -789,5 +694,4 @@ class VoiceConverter:
                     ):
                         continue
                     setattr(self.vc, predictor_name, predictor)
-            if not isinstance(self.cpt.get("config"), dict):
-                self.n_spk = self.cpt["config"][-3]
+            self.n_spk = self.cpt["config"][-3]

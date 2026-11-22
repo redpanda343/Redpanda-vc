@@ -107,7 +107,6 @@ def run_infer_script(
     delay_mix: float = 0.5,
     sid: int = 0,
     seed: int = 0,
-    rectified_vocoder_path: str = "",
 ):
     seed = resolve_inference_seed(seed)
     kwargs = {
@@ -163,7 +162,6 @@ def run_infer_script(
         "delay_mix": delay_mix,
         "sid": sid,
         "seed": seed,
-        "rectified_vocoder_path": rectified_vocoder_path,
     }
     infer_pipeline = import_voice_converter()
     infer_pipeline.convert_audio(**kwargs)
@@ -226,7 +224,6 @@ def run_batch_infer_script(
     delay_mix: float = 0.5,
     sid: int = 0,
     seed: int = 0,
-    rectified_vocoder_path: str = "",
 ):
     seed = resolve_inference_seed(seed)
     kwargs = {
@@ -282,7 +279,6 @@ def run_batch_infer_script(
         "delay_mix": delay_mix,
         "sid": sid,
         "seed": seed,
-        "rectified_vocoder_path": rectified_vocoder_path,
     }
     infer_pipeline = import_voice_converter()
     infer_pipeline.convert_audio_batch(**kwargs)
@@ -964,25 +960,8 @@ def run_prerequisites_script(
     pretraineds_hifigan: bool,
     models: bool,
     exe: bool,
-    beatrice: bool = False,
-    vocoders: bool = False,
 ):
-    prequisites_download_pipeline(
-        pretraineds_hifigan,
-        models,
-        exe,
-        vocoders,
-    )
-    if beatrice:
-        from beatrice.resources import ensure_trainer
-
-        try:
-            ensure_trainer()
-        except Exception as error:
-            print(
-                f"Beatrice Trainer download failed: {error}. "
-                "It is retried when Beatrice training starts."
-            )
+    prequisites_download_pipeline(pretraineds_hifigan, models, exe)
     return "Prerequisites installed successfully."
 
 
@@ -1045,7 +1024,6 @@ def _infer_opts(func):
                 [
                     "rmvpe",
                     "swift",
-                    "beatrice",
                     "pm",
                 ]
             ),
@@ -1376,7 +1354,7 @@ def preprocess(**kwargs):
 @click.option("--model-name", required=True, help="Name of the model.")
 @click.option(
     "--f0-method",
-    type=click.Choice(["rmvpe", "swift", "beatrice"]),
+    type=click.Choice(["rmvpe", "swift"]),
     default="rmvpe",
     help="Pitch extraction method.",
 )
@@ -1658,25 +1636,12 @@ def download(**kwargs):
 )
 @click.option("--models/--no-models", default=True, help="Download additional models.")
 @click.option("--exe/--no-exe", default=True, help="Download required executables.")
-@click.option(
-    "--beatrice/--no-beatrice",
-    default=False,
-    help="Download Beatrice Trainer and its pretrained models ahead of the first training run.",
-)
-@click.option(
-    "--vocoders/--no-vocoders",
-    default=True,
-    help="Download the pretrained PC-NSF-HiFiGAN vocoder and the Vocos, Pupu-Vocoder, BigVGAN and NSF-BigVGAN flow "
-    "vocoders.",
-)
 def prerequisites(**kwargs):
     """Install prerequisites for RVC."""
     result = run_prerequisites_script(
         kwargs["pretraineds_hifigan"],
         kwargs["models"],
         kwargs["exe"],
-        kwargs["beatrice"],
-        kwargs["vocoders"],
     )
     click.echo(result)
 

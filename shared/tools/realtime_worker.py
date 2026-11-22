@@ -253,7 +253,6 @@ def _run_worker():
     os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
     sys.stdout = sys.stderr
     processor = None
-    beatrice_path = None
     try:
         while True:
             command, payload = _receive(incoming)
@@ -275,13 +274,13 @@ def _run_worker():
                     torch.set_num_threads(max(1, min(4, os.cpu_count() or 1)))
                     processor = RealtimeProcessor()
                     _send(outgoing, {"stage": "loading the voice model and embedder"})
-                    _, beatrice_path = processor.load_model(payload)
+                    processor.load_model(payload)
                 elif command == "start":
                     processor.sample_rate = payload
                     processor.channels = 1
                     with torch.inference_mode():
-                        processor.prepare(beatrice_path)
-                    lookahead = 0 if processor.rvc is None else processor.rvc.pitch_lookahead_frames(processor.settings["f0_method"])
+                        processor.prepare()
+                    lookahead = processor.rvc.pitch_lookahead_frames(processor.settings["f0_method"])
                     delay = (processor.crossfade_frame + processor.sola_search_frame) / payload + lookahead / 100
                     result = {"block": processor.block_frame, "sampleRate": payload, "delay": delay}
                 elif command == "process":
