@@ -652,6 +652,19 @@ async function runJob(kind, args) {
   }
 }
 
+function applyTheme(theme, persist = false) {
+  const dark = theme === "dark";
+  if (dark) document.documentElement.dataset.theme = "dark";
+  else delete document.documentElement.dataset.theme;
+  const button = $("toggle-theme");
+  if (button) button.setAttribute("aria-pressed", String(dark));
+  const label = $("theme-label");
+  if (label) label.textContent = dark ? "Light mode" : "Dark mode";
+  if (persist) {
+    try { localStorage.setItem("redpanda-theme", dark ? "dark" : "light"); } catch {}
+  }
+}
+
 function bind() {
   $("log-details").addEventListener("toggle", () => {
     if ($("log-details").open) showLog(true);
@@ -672,6 +685,10 @@ function bind() {
   document.querySelectorAll("[data-pick]").forEach(button => button.addEventListener("click", () => browse(button, state.root).catch(reportError)));
   document.querySelectorAll("[data-windows]").forEach(element => { element.hidden = !/Windows/i.test(navigator.userAgent); });
   $("retry-runtime").addEventListener("click", () => initRuntime());
+  $("toggle-theme").addEventListener("click", () => {
+    applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark", true);
+  });
+  applyTheme(document.documentElement.dataset.theme === "dark" ? "dark" : "light");
   $("open-data").addEventListener("click", async () => {
     try { await invoke("show_file", { path: state.root || await invoke("workspace") }); }
     catch (error) { reportError(error); }

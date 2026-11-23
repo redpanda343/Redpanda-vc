@@ -16,6 +16,7 @@
 *.png
 !assets/redpanda_mascot.png
 !desktop/ui/redpanda-aero.png
+!desktop/ui/redpanda-aero-dark.png
 *.safetensors
 *.nbi
 *.nbc

@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Redpanda VC</title>
+  <script src="theme.js"></script>
   <link rel="stylesheet" href="style.css">
   <script type="module" src="app.js"></script>
 </head>
@@ -18,13 +19,14 @@
         <button data-page="tensorboard"><span aria-hidden="true">∿</span>TensorBoard</button>
       </nav>
       <div class="sidebar-bottom">
+        <button id="toggle-theme" type="button" class="sidebar-link theme-toggle" aria-pressed="false"><span class="theme-orb" aria-hidden="true"></span><span id="theme-label">Dark mode</span></button>
         <button id="open-data" class="sidebar-link">Open data folder</button>
       </div>
     </aside>
 
     <main class="workspace">
       <header class="hero">
-        <svg class="aero-aurora" viewBox="0 0 1200 180" preserveAspectRatio="none" aria-hidden="true">
+        <svg class="aero-aurora aero-aurora-light" viewBox="0 0 1200 180" preserveAspectRatio="none" aria-hidden="true">
           <defs>
             <linearGradient id="aero-ribbon-a" x1="0%" y1="0%" x2="100%" y2="0%">
               <stop offset="0%" stop-color="#ffffff" stop-opacity="0.06"/>
@@ -50,12 +52,60 @@
           <path d="M-20,142 C240,175 490,32 790,94 C980,134 1110,64 1230,12" fill="none" stroke="rgba(255,255,255,0.68)" stroke-width="2.5"/>
           <path d="M-20,96 C260,18 520,164 850,82 C1020,40 1130,96 1230,52" fill="none" stroke="rgba(255,230,239,0.52)" stroke-width="1.6"/>
         </svg>
+        <svg class="aero-aurora aero-aurora-dark" viewBox="0 0 1200 180" preserveAspectRatio="none" aria-hidden="true">
+          <defs>
+            <radialGradient id="dark-mist" cx="50%" cy="22%" r="62%">
+              <stop offset="0%" stop-color="#e8f3ff" stop-opacity="0.22"/>
+              <stop offset="48%" stop-color="#a8bed6" stop-opacity="0.09"/>
+              <stop offset="100%" stop-color="#000000" stop-opacity="0"/>
+            </radialGradient>
+            <linearGradient id="dark-cyan-beam" x1="0%" y1="100%" x2="100%" y2="0%">
+              <stop offset="0%" stop-color="#1966d6" stop-opacity="0"/>
+              <stop offset="32%" stop-color="#228cf5" stop-opacity="0.34"/>
+              <stop offset="68%" stop-color="#4de2ff" stop-opacity="0.62"/>
+              <stop offset="100%" stop-color="#d8f8ff" stop-opacity="0.38"/>
+            </linearGradient>
+            <linearGradient id="dark-green-beam" x1="15%" y1="100%" x2="90%" y2="0%">
+              <stop offset="0%" stop-color="#1cb85c" stop-opacity="0"/>
+              <stop offset="46%" stop-color="#3ce87d" stop-opacity="0.38"/>
+              <stop offset="78%" stop-color="#8affb8" stop-opacity="0.66"/>
+              <stop offset="100%" stop-color="#e6fff0" stop-opacity="0.22"/>
+            </linearGradient>
+            <linearGradient id="dark-cyan-edge" x1="0%" y1="100%" x2="100%" y2="0%">
+              <stop offset="0%" stop-color="#58b8ff" stop-opacity="0"/>
+              <stop offset="45%" stop-color="#6ce4ff" stop-opacity="0.88"/>
+              <stop offset="75%" stop-color="#ffffff" stop-opacity="0.95"/>
+              <stop offset="100%" stop-color="#98e6ff" stop-opacity="0.45"/>
+            </linearGradient>
+            <linearGradient id="dark-green-edge" x1="10%" y1="100%" x2="95%" y2="0%">
+              <stop offset="0%" stop-color="#44e884" stop-opacity="0"/>
+              <stop offset="55%" stop-color="#86ffad" stop-opacity="0.86"/>
+              <stop offset="85%" stop-color="#ecfff2" stop-opacity="0.92"/>
+              <stop offset="100%" stop-color="#54e88c" stop-opacity="0.35"/>
+            </linearGradient>
+            <radialGradient id="dark-glow" cx="50%" cy="50%" r="50%">
+              <stop offset="0%" stop-color="#7ef2ff" stop-opacity="0.38"/>
+              <stop offset="50%" stop-color="#38e890" stop-opacity="0.14"/>
+              <stop offset="100%" stop-color="#000000" stop-opacity="0"/>
+            </radialGradient>
+          </defs>
+          <ellipse cx="470" cy="40" rx="280" ry="170" fill="url(#dark-mist)"/>
+          <ellipse cx="640" cy="68" rx="220" ry="150" fill="url(#dark-mist)" opacity="0.65"/>
+          <circle cx="885" cy="96" r="115" fill="url(#dark-glow)"/>
+          <path d="M590,190 C740,148 860,82 1045,-10 L1115,-10 C940,94 825,152 675,190 Z" fill="url(#dark-green-beam)"/>
+          <path d="M380,190 C610,145 835,96 1220,-6 L1220,38 C870,126 655,165 460,190 Z" fill="url(#dark-cyan-beam)"/>
+          <path d="M510,190 C740,142 930,96 1220,28 L1220,58 C955,120 770,158 580,190 Z" fill="url(#dark-green-beam)" opacity="0.62"/>
+          <path d="M380,190 C610,145 835,96 1220,-6" fill="none" stroke="url(#dark-cyan-edge)" stroke-width="2.6"/>
+          <path d="M620,190 C775,142 900,78 1075,-10" fill="none" stroke="url(#dark-green-edge)" stroke-width="2.2"/>
+          <path d="M460,190 C680,152 885,112 1220,22" fill="none" stroke="rgba(220,248,255,0.48)" stroke-width="1.3"/>
+        </svg>
         <div class="hero-copy"><h1 id="page-title">Inference</h1><p id="page-description">Convert an audio file or a folder with a trained voice.</p></div>
         <div class="hero-mascot-wrap" aria-hidden="true">
           <span class="aero-bubble b1"></span>
           <span class="aero-bubble b2"></span>
           <span class="aero-bubble b3"></span>
-          <img class="hero-mascot" src="redpanda-aero.png" alt="">
+          <img class="hero-mascot hero-mascot-light" src="redpanda-aero.png" alt="">
+          <img class="hero-mascot hero-mascot-dark" src="redpanda-aero-dark.png" alt="">
         </div>
       </header>
 
