@@ -12,15 +12,13 @@ scipy==1.17.1; python_version < "3.12"
 scikit-learn==1.9.0
 soundfile==0.14.0
 sounddevice>=0.5.0,<1
-stftpitchshift==2.0
 soxr==1.1.0
 fireredvad==0.0.2
-# Installed with --no-deps by run-install: swift-f0==0.3.0, pyrnnoise==0.4.6
+# Installed with --no-deps by run-install / portable bootstrap: swift-f0==0.3.0, pyrnnoise==0.4.6
 
 torch==2.14.1
 setuptools<82
 torchaudio==2.11.0
-torchvision==0.29.1
 praat-parselmouth
 onnxruntime-gpu==1.30.0
 transformers==5.13.1

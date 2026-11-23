@@ -14,7 +14,7 @@
 !requirements.txt
 *.zip
 *.png
-!assets/applio_mascot.png
+!assets/redpanda_mascot.png
 !desktop/ui/redpanda-aero.png
 *.safetensors
 *.nbi

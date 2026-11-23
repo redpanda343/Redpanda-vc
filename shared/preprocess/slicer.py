@@ -62,7 +62,7 @@ def _get_aed_model(use_gpu: bool = False):
             from fireredvad import FireRedAed, FireRedAedConfig
         except ImportError as exc:
             raise RuntimeError(
-                "Post normalization requires FireRedVAD. Install the Applio "
+                "Post normalization requires FireRedVAD. Install the Redpanda VC "
                 "requirements (or run `pip install fireredvad==0.0.2`)."
             ) from exc
 
@@ -98,12 +98,16 @@ def _get_aed_model(use_gpu: bool = False):
 
 
 def fireredvad_cuda_available():
-    setting = os.getenv("APPLIO_FIREREDVAD_DEVICE", "auto").strip().lower()
+    setting = (
+        os.getenv("REDPANDA_FIREREDVAD_DEVICE")
+        or os.getenv("APPLIO_FIREREDVAD_DEVICE")
+        or "auto"
+    ).strip().lower()
     if setting == "cpu":
         return False
     if setting not in {"auto", "cuda"}:
         raise ValueError(
-            "APPLIO_FIREREDVAD_DEVICE must be 'auto', 'cpu', or 'cuda'."
+            "REDPANDA_FIREREDVAD_DEVICE must be 'auto', 'cpu', or 'cuda'."
         )
     try:
         import torch

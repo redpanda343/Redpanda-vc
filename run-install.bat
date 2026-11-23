@@ -1,8 +1,8 @@
 @echo off
 setlocal enabledelayedexpansion
-title Applio Installer
+title Redpanda VC Installer
 
-echo Welcome to the Applio Installer!
+echo Welcome to the Redpanda VC Installer!
 echo.
 
 set "INSTALL_DIR=%cd%"
@@ -42,8 +42,8 @@ set /a seconds = elapsed %% 60
 echo Installation time: %hours% hours, %minutes% minutes, %seconds% seconds.
 echo.
 
-echo Applio has been installed successfully!
-echo Open Redpanda.exe or choose Connect in Runtime settings.
+echo Redpanda VC has been installed successfully!
+echo Open Redpanda.exe or run run-web.bat to launch the browser WebUI.
 echo.
 pause
 exit /b 0

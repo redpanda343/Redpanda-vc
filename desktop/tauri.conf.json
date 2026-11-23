@@ -26,6 +26,6 @@
   },
   "bundle": {
     "active": false,
-    "icon": ["../assets/red_panda_favicon.ico", "../assets/applio_mascot.png"]
+    "icon": ["../assets/red_panda_favicon.ico", "../assets/redpanda_mascot.png"]
   }
 }

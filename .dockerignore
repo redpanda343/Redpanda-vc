@@ -1,6 +1,7 @@
 .git
 .github
-desktop
+desktop/target
+desktop/gen/schemas
 dist
 env
 venv

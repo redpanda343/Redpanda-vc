@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-echo "Welcome to the Applio Installer!"
+echo "Welcome to the Redpanda VC Installer!"
 echo
 
 INSTALL_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -99,6 +99,6 @@ elapsed=$((SECONDS - start_time))
 printf 'Installation time: %d hours, %d minutes, %d seconds.\n\n' \
     $((elapsed / 3600)) $(((elapsed % 3600) / 60)) $((elapsed % 60))
 
-echo "Applio has been installed successfully!"
-echo "Open redpanda or choose Connect in Runtime settings."
+echo "Redpanda VC has been installed successfully!"
+echo "Open redpanda or run ./run-web.sh to launch the browser WebUI."
 echo

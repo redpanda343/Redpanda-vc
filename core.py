@@ -917,7 +917,7 @@ def _infer_opts(func):
 
 @click.group(invoke_without_command=True)
 @click.version_option(
-    version=VERSION, prog_name="Applio", message="%(prog)s v%(version)s"
+    version=VERSION, prog_name="Redpanda VC", message="%(prog)s v%(version)s"
 )
 @click.pass_context
 def cli(ctx):
