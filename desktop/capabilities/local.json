@@ -1,0 +1,6 @@
+{
+  "identifier": "local",
+  "description": "Local Redpanda desktop window",
+  "windows": ["main"],
+  "permissions": ["core:event:default", "dialog:allow-open", "dialog:allow-save"]
+}

@@ -15,8 +15,8 @@ from pathlib import Path
 
 from filelock import FileLock
 
-ROOT = Path(__file__).resolve().parent.parent
-FOLDER = Path(os.environ.get("CAUSALVC_WEIGHTS", ROOT / "weights"))
+ROOT = Path(os.environ.get("REDPANDA_DATA_ROOT") or Path(__file__).resolve().parent.parent).resolve()
+FOLDER = Path(os.environ.get("CAUSALVC_WEIGHTS", (ROOT / "models" / "causalvc") if os.environ.get("REDPANDA_DATA_ROOT") else (ROOT / "weights")))
 
 FILES = {
     # The pitch model used to label training audio, from the same place Applio fetches it.

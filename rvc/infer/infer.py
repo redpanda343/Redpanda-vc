@@ -96,17 +96,6 @@ def deterministic_inference(func):
     return wrapper
 
 
-def _toast(message, warning=False):
-    """Shows a toast notification in the Gradio UI, falling back to stdout
-    when Gradio is unavailable (e.g. when the engine runs headless)."""
-    try:
-        import gradio as gr
-
-        (gr.Warning if warning else gr.Info)(message)
-    except Exception:
-        print(message)
-
-
 class VoiceConverter:
     """
     A class for performing voice conversion using the Retrieval-Based Voice Conversion (RVC) method.
@@ -142,27 +131,6 @@ class VoiceConverter:
         self.hubert_model.eval()
 
     @staticmethod
-    def remove_audio_noise(data, sr, reduction_strength=0.7):
-        """
-        Removes noise from an audio file using the NoiseReduce library.
-
-        Args:
-            data (numpy.ndarray): The audio data as a NumPy array.
-            sr (int): The sample rate of the audio data.
-            reduction_strength (float): Strength of the noise reduction. Default is 0.7.
-        """
-        try:
-            import noisereduce as nr
-
-            reduced_noise = nr.reduce_noise(
-                y=data, sr=sr, prop_decrease=reduction_strength
-            )
-            return reduced_noise
-        except Exception as error:
-            print(f"An error occurred removing audio noise: {error}")
-            return None
-
-    @staticmethod
     def convert_audio_format(input_path, output_path, output_format):
         """
         Converts an audio file to a specified output format.
@@ -195,84 +163,6 @@ class VoiceConverter:
             return output_path
         except Exception as error:
             print(f"An error occurred converting the audio format: {error}")
-
-    @staticmethod
-    def post_process_audio(
-        audio_input,
-        sample_rate,
-        **kwargs,
-    ):
-        from pedalboard import (
-            Pedalboard,
-            Chorus,
-            Distortion,
-            Reverb,
-            PitchShift,
-            Limiter,
-            Gain,
-            Bitcrush,
-            Clipping,
-            Compressor,
-            Delay,
-        )
-
-        board = Pedalboard()
-        if kwargs.get("reverb", False):
-            reverb = Reverb(
-                room_size=kwargs.get("reverb_room_size", 0.5),
-                damping=kwargs.get("reverb_damping", 0.5),
-                wet_level=kwargs.get("reverb_wet_level", 0.33),
-                dry_level=kwargs.get("reverb_dry_level", 0.4),
-                width=kwargs.get("reverb_width", 1.0),
-                freeze_mode=kwargs.get("reverb_freeze_mode", 0),
-            )
-            board.append(reverb)
-        if kwargs.get("pitch_shift", False):
-            pitch_shift = PitchShift(semitones=kwargs.get("pitch_shift_semitones", 0))
-            board.append(pitch_shift)
-        if kwargs.get("limiter", False):
-            limiter = Limiter(
-                threshold_db=kwargs.get("limiter_threshold", -6),
-                release_ms=kwargs.get("limiter_release", 0.05),
-            )
-            board.append(limiter)
-        if kwargs.get("gain", False):
-            gain = Gain(gain_db=kwargs.get("gain_db", 0))
-            board.append(gain)
-        if kwargs.get("distortion", False):
-            distortion = Distortion(drive_db=kwargs.get("distortion_gain", 25))
-            board.append(distortion)
-        if kwargs.get("chorus", False):
-            chorus = Chorus(
-                rate_hz=kwargs.get("chorus_rate", 1.0),
-                depth=kwargs.get("chorus_depth", 0.25),
-                centre_delay_ms=kwargs.get("chorus_delay", 7),
-                feedback=kwargs.get("chorus_feedback", 0.0),
-                mix=kwargs.get("chorus_mix", 0.5),
-            )
-            board.append(chorus)
-        if kwargs.get("bitcrush", False):
-            bitcrush = Bitcrush(bit_depth=kwargs.get("bitcrush_bit_depth", 8))
-            board.append(bitcrush)
-        if kwargs.get("clipping", False):
-            clipping = Clipping(threshold_db=kwargs.get("clipping_threshold", 0))
-            board.append(clipping)
-        if kwargs.get("compressor", False):
-            compressor = Compressor(
-                threshold_db=kwargs.get("compressor_threshold", 0),
-                ratio=kwargs.get("compressor_ratio", 1),
-                attack_ms=kwargs.get("compressor_attack", 1.0),
-                release_ms=kwargs.get("compressor_release", 100),
-            )
-            board.append(compressor)
-        if kwargs.get("delay", False):
-            delay = Delay(
-                delay_seconds=kwargs.get("delay_seconds", 0.5),
-                feedback=kwargs.get("delay_feedback", 0.0),
-                mix=kwargs.get("delay_mix", 0.5),
-            )
-            board.append(delay)
-        return board(audio_input, sample_rate)
 
     @staticmethod
     def normalize_output(audio, sample_rate, source_audio, target_dbfs):
@@ -360,10 +250,7 @@ class VoiceConverter:
         hop_length: int = 128,
         split_audio: bool = False,
         embedder_model: str = "contentvec",
-        clean_audio: bool = False,
-        clean_strength: float = 0.5,
         export_format: str = "WAV",
-        post_process: bool = False,
         resample_sr: int = 0,
         sid: int = 0,
         seed: int = None,
@@ -384,8 +271,6 @@ class VoiceConverter:
             model_path (str): Path to the voice conversion model.
             index_path (str): Path to the index file.
             split_audio (bool): Whether to split the audio for processing.
-            clean_audio (bool): Whether to clean the audio.
-            clean_strength (float): Strength of the audio cleaning.
             export_format (str): Format for exporting the audio.
             f0_file (str): Path to the F0 file.
             embedder_model (str): Path to the embedder model.
@@ -477,26 +362,12 @@ class VoiceConverter:
         else:
             audio_opt = converted_chunks[0]
 
-        if clean_audio:
-            cleaned_audio = self.remove_audio_noise(
-                audio_opt, self.tgt_sr, clean_strength
-            )
-            if cleaned_audio is not None:
-                audio_opt = cleaned_audio
-
         audio_opt = self.normalize_output(
             audio_opt,
             self.tgt_sr,
             audio,
             normalization_db,
         )
-
-        if post_process:
-            audio_opt = self.post_process_audio(
-                audio_input=audio_opt,
-                sample_rate=self.tgt_sr,
-                **kwargs,
-            )
 
         audio_opt = self.limit_output_peak(audio_opt)
 
@@ -562,7 +433,7 @@ class VoiceConverter:
             total = len(audio_files)
             converted = skipped = 0
             _next_milestone = 25
-            _toast(f"Batch conversion started: {total} files")
+            print(f"Batch conversion started: {total} files")
             for a in audio_files:
                 new_input = os.path.join(audio_input_paths, a)
                 new_output = os.path.splitext(a)[0] + "_output.wav"
@@ -577,27 +448,23 @@ class VoiceConverter:
                     )
                     converted += 1
                 processed = converted + skipped
-                # Milestone toast: fires at the first file past each threshold
-                # (the label carries the threshold). processed < total
-                # suppresses the 100% milestone (it would double-announce with
-                # the terminal toast); total >= 8 keeps small batches
-                # toast-free between start and terminal.
+                # Report milestones for larger batches.
                 if (
                     total >= 8
                     and processed < total
                     and processed * 100 // total >= _next_milestone
                 ):
-                    _toast(f"{processed}/{total} files converted ({_next_milestone}%)")
+                    print(f"{processed}/{total} files converted ({_next_milestone}%)")
                     _next_milestone += 25
             print(f"Conversion completed at '{audio_input_paths}'.")
             elapsed_time = time.time() - start_time
             print(f"Batch conversion completed in {elapsed_time:.2f} seconds.")
-            _toast(
+            print(
                 f"Batch conversion completed: {converted} converted, "
                 f"{skipped} skipped in {elapsed_time:.0f}s"
             )
         except Exception as e:
-            _toast(f"Batch conversion failed: {e}", warning=True)
+            print(f"Batch conversion failed: {e}")
             raise
         finally:
             os.remove(os.path.join(now_dir, "assets", "infer_pid.txt"))

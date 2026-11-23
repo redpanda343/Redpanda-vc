@@ -17,7 +17,8 @@ from shared.platform import migrate_models_folder
 migrate_models_folder(now_dir)
 
 current_script_directory = os.path.dirname(os.path.realpath(__file__))
-logs_path = os.path.join(current_script_directory, "logs")
+data_directory = os.path.realpath(os.environ.get("REDPANDA_DATA_ROOT") or current_script_directory)
+logs_path = os.path.join(data_directory, "logs")
 
 from shared.tools.analyzer import analyze_audio
 from shared.tools.launch_tensorboard import launch_tensorboard_pipeline
@@ -65,46 +66,8 @@ def run_infer_script(
     pth_path: str,
     index_path: str,
     split_audio: bool,
-    clean_audio: bool,
-    clean_strength: float,
     export_format: str,
     embedder_model: str,
-    post_process: bool = False,
-    reverb: bool = False,
-    pitch_shift: bool = False,
-    limiter: bool = False,
-    gain: bool = False,
-    distortion: bool = False,
-    chorus: bool = False,
-    bitcrush: bool = False,
-    clipping: bool = False,
-    compressor: bool = False,
-    delay: bool = False,
-    reverb_room_size: float = 0.5,
-    reverb_damping: float = 0.5,
-    reverb_wet_gain: float = 0.5,
-    reverb_dry_gain: float = 0.5,
-    reverb_width: float = 0.5,
-    reverb_freeze_mode: float = 0.5,
-    pitch_shift_semitones: float = 0.0,
-    limiter_threshold: float = -6,
-    limiter_release_time: float = 0.01,
-    gain_db: float = 0.0,
-    distortion_gain: float = 25,
-    chorus_rate: float = 1.0,
-    chorus_depth: float = 0.25,
-    chorus_center_delay: float = 7,
-    chorus_feedback: float = 0.0,
-    chorus_mix: float = 0.5,
-    bitcrush_bit_depth: int = 8,
-    clipping_threshold: float = -6,
-    compressor_threshold: float = 0,
-    compressor_ratio: float = 1,
-    compressor_attack: float = 1.0,
-    compressor_release: float = 100,
-    delay_seconds: float = 0.5,
-    delay_feedback: float = 0.0,
-    delay_mix: float = 0.5,
     sid: int = 0,
     seed: int = 0,
 ):
@@ -120,46 +83,8 @@ def run_infer_script(
         "protect": protect,
         "f0_method": f0_method,
         "split_audio": split_audio,
-        "clean_audio": clean_audio,
-        "clean_strength": clean_strength,
         "export_format": export_format,
         "embedder_model": embedder_model,
-        "post_process": post_process,
-        "reverb": reverb,
-        "pitch_shift": pitch_shift,
-        "limiter": limiter,
-        "gain": gain,
-        "distortion": distortion,
-        "chorus": chorus,
-        "bitcrush": bitcrush,
-        "clipping": clipping,
-        "compressor": compressor,
-        "delay": delay,
-        "reverb_room_size": reverb_room_size,
-        "reverb_damping": reverb_damping,
-        "reverb_wet_level": reverb_wet_gain,
-        "reverb_dry_level": reverb_dry_gain,
-        "reverb_width": reverb_width,
-        "reverb_freeze_mode": reverb_freeze_mode,
-        "pitch_shift_semitones": pitch_shift_semitones,
-        "limiter_threshold": limiter_threshold,
-        "limiter_release": limiter_release_time,
-        "gain_db": gain_db,
-        "distortion_gain": distortion_gain,
-        "chorus_rate": chorus_rate,
-        "chorus_depth": chorus_depth,
-        "chorus_delay": chorus_center_delay,
-        "chorus_feedback": chorus_feedback,
-        "chorus_mix": chorus_mix,
-        "bitcrush_bit_depth": bitcrush_bit_depth,
-        "clipping_threshold": clipping_threshold,
-        "compressor_threshold": compressor_threshold,
-        "compressor_ratio": compressor_ratio,
-        "compressor_attack": compressor_attack,
-        "compressor_release": compressor_release,
-        "delay_seconds": delay_seconds,
-        "delay_feedback": delay_feedback,
-        "delay_mix": delay_mix,
         "sid": sid,
         "seed": seed,
     }
@@ -182,46 +107,8 @@ def run_batch_infer_script(
     pth_path: str,
     index_path: str,
     split_audio: bool,
-    clean_audio: bool,
-    clean_strength: float,
     export_format: str,
     embedder_model: str,
-    post_process: bool = False,
-    reverb: bool = False,
-    pitch_shift: bool = False,
-    limiter: bool = False,
-    gain: bool = False,
-    distortion: bool = False,
-    chorus: bool = False,
-    bitcrush: bool = False,
-    clipping: bool = False,
-    compressor: bool = False,
-    delay: bool = False,
-    reverb_room_size: float = 0.5,
-    reverb_damping: float = 0.5,
-    reverb_wet_gain: float = 0.5,
-    reverb_dry_gain: float = 0.5,
-    reverb_width: float = 0.5,
-    reverb_freeze_mode: float = 0.5,
-    pitch_shift_semitones: float = 0.0,
-    limiter_threshold: float = -6,
-    limiter_release_time: float = 0.01,
-    gain_db: float = 0.0,
-    distortion_gain: float = 25,
-    chorus_rate: float = 1.0,
-    chorus_depth: float = 0.25,
-    chorus_center_delay: float = 7,
-    chorus_feedback: float = 0.0,
-    chorus_mix: float = 0.5,
-    bitcrush_bit_depth: int = 8,
-    clipping_threshold: float = -6,
-    compressor_threshold: float = 0,
-    compressor_ratio: float = 1,
-    compressor_attack: float = 1.0,
-    compressor_release: float = 100,
-    delay_seconds: float = 0.5,
-    delay_feedback: float = 0.0,
-    delay_mix: float = 0.5,
     sid: int = 0,
     seed: int = 0,
 ):
@@ -237,46 +124,8 @@ def run_batch_infer_script(
         "protect": protect,
         "f0_method": f0_method,
         "split_audio": split_audio,
-        "clean_audio": clean_audio,
-        "clean_strength": clean_strength,
         "export_format": export_format,
         "embedder_model": embedder_model,
-        "post_process": post_process,
-        "reverb": reverb,
-        "pitch_shift": pitch_shift,
-        "limiter": limiter,
-        "gain": gain,
-        "distortion": distortion,
-        "chorus": chorus,
-        "bitcrush": bitcrush,
-        "clipping": clipping,
-        "compressor": compressor,
-        "delay": delay,
-        "reverb_room_size": reverb_room_size,
-        "reverb_damping": reverb_damping,
-        "reverb_wet_level": reverb_wet_gain,
-        "reverb_dry_level": reverb_dry_gain,
-        "reverb_width": reverb_width,
-        "reverb_freeze_mode": reverb_freeze_mode,
-        "pitch_shift_semitones": pitch_shift_semitones,
-        "limiter_threshold": limiter_threshold,
-        "limiter_release": limiter_release_time,
-        "gain_db": gain_db,
-        "distortion_gain": distortion_gain,
-        "chorus_rate": chorus_rate,
-        "chorus_depth": chorus_depth,
-        "chorus_delay": chorus_center_delay,
-        "chorus_feedback": chorus_feedback,
-        "chorus_mix": chorus_mix,
-        "bitcrush_bit_depth": bitcrush_bit_depth,
-        "clipping_threshold": clipping_threshold,
-        "compressor_threshold": compressor_threshold,
-        "compressor_ratio": compressor_ratio,
-        "compressor_attack": compressor_attack,
-        "compressor_release": compressor_release,
-        "delay_seconds": delay_seconds,
-        "delay_feedback": delay_feedback,
-        "delay_mix": delay_mix,
         "sid": sid,
         "seed": seed,
     }
@@ -482,8 +331,6 @@ def run_preprocess_script(
     sample_rate: int,
     cpu_cores: int,
     cut_preprocess: str,
-    noise_reduction: bool,
-    clean_strength: float,
     chunk_len: float,
     overlap_len: float,
     normalization_mode: str = "chunk",
@@ -500,7 +347,7 @@ def run_preprocess_script(
         raise ValueError(f"Unsupported RVC version: {version}")
     if version == "v1" and int(sample_rate) != 40000:
         raise ValueError("RVC v1 preprocessing requires a 40000 Hz model.")
-    preprocess_script_path = os.path.join("shared", "preprocess", "preprocess.py")
+    preprocess_script_path = os.path.join(current_script_directory, "shared", "preprocess", "preprocess.py")
     command = [
         python,
         preprocess_script_path,
@@ -512,8 +359,6 @@ def run_preprocess_script(
                 sample_rate,
                 cpu_cores,
                 cut_preprocess,
-                noise_reduction,
-                clean_strength,
                 chunk_len,
                 overlap_len,
                 normalization_mode,
@@ -553,7 +398,7 @@ def run_extract_script(
     ):
         raise ValueError("RVC v1 extraction requires ContentVec at 40000 Hz.")
     model_path = os.path.join(logs_path, model_name)
-    extract = os.path.join("shared", "extract", "extract.py")
+    extract = os.path.join(current_script_directory, "shared", "extract", "extract.py")
 
     command_1 = [
         python,
@@ -682,7 +527,7 @@ def _build_train_command(
             raise ValueError("Please provide the path to the pretrained G and D models.")
         pg, pd = g_pretrained_path, d_pretrained_path
 
-    train_script_path = os.path.join("rvc", "train", "train.py")
+    train_script_path = os.path.join(current_script_directory, "rvc", "train", "train.py")
     command = [
         python,
         train_script_path,
@@ -842,6 +687,7 @@ def start_train_script(
     lr_schedule: str = "exponential",
     lr_final_ratio: float = 0.1,
     reset_optimizer: bool = False,
+    env=None,
 ):
     command = _build_train_command(
         model_name,
@@ -901,12 +747,13 @@ def start_train_script(
         model_name,
         cwd=now_dir,
         on_success=on_success,
+        env=env,
     )
 
 
 # Index
 def run_index_script(model_name: str, index_algorithm: str):
-    index_script_path = os.path.join("rvc", "train", "process", "extract_index.py")
+    index_script_path = os.path.join(current_script_directory, "rvc", "train", "process", "extract_index.py")
     command = [
         python,
         index_script_path,
@@ -1043,18 +890,6 @@ def _infer_opts(func):
             help="Set the inference seed. Use 0 for a random seed; values above 0 are deterministic.",
         ),
         click.option(
-            "--clean-audio",
-            is_flag=True,
-            default=False,
-            help="Clean output audio using noise reduction.",
-        ),
-        click.option(
-            "--clean-strength",
-            type=click.FloatRange(0, 1),
-            default=0.7,
-            help="Intensity of the audio cleaning process.",
-        ),
-        click.option(
             "--export-format",
             type=click.Choice(["WAV", "MP3", "FLAC", "OGG", "M4A"]),
             default="WAV",
@@ -1074,77 +909,6 @@ def _infer_opts(func):
         click.option(
             "--sid", type=int, default=0, help="Speaker ID for multi-speaker models."
         ),
-    ]
-    for opt in reversed(opts):
-        func = opt(func)
-    return func
-
-
-def _post_process_opts(func):
-    """Post-processing options shared by infer and batch_infer."""
-    opts = [
-        click.option(
-            "--post-process",
-            is_flag=True,
-            default=False,
-            help="Apply post-processing effects.",
-        ),
-        click.option(
-            "--reverb", is_flag=True, default=False, help="Apply reverb effect."
-        ),
-        click.option("--reverb-room-size", type=float, default=0.5),
-        click.option("--reverb-damping", type=float, default=0.5),
-        click.option("--reverb-wet-gain", type=float, default=0.5),
-        click.option("--reverb-dry-gain", type=float, default=0.5),
-        click.option("--reverb-width", type=float, default=0.5),
-        click.option("--reverb-freeze-mode", type=float, default=0.5),
-        click.option(
-            "--pitch-shift",
-            is_flag=True,
-            default=False,
-            help="Apply pitch shift effect.",
-        ),
-        click.option("--pitch-shift-semitones", type=float, default=0.0),
-        click.option(
-            "--limiter", is_flag=True, default=False, help="Apply limiter effect."
-        ),
-        click.option("--limiter-threshold", type=float, default=-6),
-        click.option("--limiter-release-time", type=float, default=0.01),
-        click.option("--gain", is_flag=True, default=False, help="Apply gain effect."),
-        click.option("--gain-db", type=float, default=0.0),
-        click.option(
-            "--distortion", is_flag=True, default=False, help="Apply distortion effect."
-        ),
-        click.option("--distortion-gain", type=float, default=25),
-        click.option(
-            "--chorus", is_flag=True, default=False, help="Apply chorus effect."
-        ),
-        click.option("--chorus-rate", type=float, default=1.0),
-        click.option("--chorus-depth", type=float, default=0.25),
-        click.option("--chorus-center-delay", type=float, default=7),
-        click.option("--chorus-feedback", type=float, default=0.0),
-        click.option("--chorus-mix", type=float, default=0.5),
-        click.option(
-            "--bitcrush", is_flag=True, default=False, help="Apply bitcrush effect."
-        ),
-        click.option("--bitcrush-bit-depth", type=int, default=8),
-        click.option(
-            "--clipping", is_flag=True, default=False, help="Apply clipping effect."
-        ),
-        click.option("--clipping-threshold", type=float, default=-6),
-        click.option(
-            "--compressor", is_flag=True, default=False, help="Apply compressor effect."
-        ),
-        click.option("--compressor-threshold", type=float, default=0),
-        click.option("--compressor-ratio", type=float, default=1),
-        click.option("--compressor-attack", type=float, default=1.0),
-        click.option("--compressor-release", type=float, default=100),
-        click.option(
-            "--delay", is_flag=True, default=False, help="Apply delay effect."
-        ),
-        click.option("--delay-seconds", type=float, default=0.5),
-        click.option("--delay-feedback", type=float, default=0.0),
-        click.option("--delay-mix", type=float, default=0.5),
     ]
     for opt in reversed(opts):
         func = opt(func)
@@ -1174,7 +938,6 @@ def cli(ctx):
     "--index-path", required=True, help="Full path to the index file (.index)."
 )
 @_infer_opts
-@_post_process_opts
 def infer(**kwargs):
     """Run voice conversion on a single audio file."""
     result = run_infer_script(**kwargs)
@@ -1195,7 +958,6 @@ def infer(**kwargs):
     "--index-path", required=True, help="Full path to the index file (.index)."
 )
 @_infer_opts
-@_post_process_opts
 def batch_infer(**kwargs):
     """Run voice conversion on multiple audio files in a folder."""
     result = run_batch_infer_script(**kwargs)
@@ -1228,18 +990,6 @@ def batch_infer(**kwargs):
     type=click.Choice(["Skip", "Simple", "Automatic"]),
     default="Automatic",
     help="Dataset cutting method.",
-)
-@click.option(
-    "--noise-reduction",
-    is_flag=True,
-    default=False,
-    help="Enable noise reduction during preprocessing.",
-)
-@click.option(
-    "--noise-reduction-strength",
-    type=click.FloatRange(0, 1),
-    default=0.7,
-    help="Strength of the noise reduction filter.",
 )
 @click.option(
     "--chunk-len",
@@ -1319,7 +1069,6 @@ def batch_infer(**kwargs):
 def preprocess(**kwargs):
     """Preprocess a dataset for training."""
     kwargs["sample_rate"] = int(kwargs["sample_rate"])
-    kwargs["noise_reduction_strength"] = float(kwargs["noise_reduction_strength"])
     kwargs["chunk_len"] = float(kwargs["chunk_len"])
     kwargs["overlap_len"] = float(kwargs["overlap_len"])
     kwargs["cpu_cores"] = kwargs.get("cpu_cores") or 1
@@ -1329,8 +1078,6 @@ def preprocess(**kwargs):
         sample_rate=kwargs["sample_rate"],
         cpu_cores=kwargs["cpu_cores"],
         cut_preprocess=kwargs["cut_preprocess"],
-        noise_reduction=kwargs["noise_reduction"],
-        clean_strength=kwargs["noise_reduction_strength"],
         chunk_len=kwargs["chunk_len"],
         overlap_len=kwargs["overlap_len"],
         normalization_mode=kwargs["normalization_mode"],
@@ -1618,6 +1365,25 @@ def model_blender(**kwargs):
 def tensorboard():
     """Launch TensorBoard for monitoring training progress."""
     run_tensorboard_script()
+
+
+@cli.command()
+@click.option("--host", default="127.0.0.1", show_default=True, help="Host interface to bind.")
+@click.option("--port", type=int, default=7860, show_default=True, help="Port to listen on.")
+@click.option("--open/--no-open", "open_browser", default=True, show_default=True, help="Open the WebUI in your default browser.")
+@click.option("--auth", default=None, help="Optional HTTP Basic auth credentials as user:pass.")
+@click.option("--allow-external-paths", is_flag=True, default=False, help="Allow browsing paths outside the workspace when bound to a non-loopback host.")
+def web(host, port, open_browser, auth, allow_external_paths):
+    """Launch the browser WebUI (same interface as the desktop app, without Gradio)."""
+    from shared.desktop.web import serve_web
+
+    serve_web(
+        host=host,
+        port=port,
+        open_browser=open_browser,
+        auth=auth,
+        allow_external_paths=allow_external_paths,
+    )
 
 
 @cli.command()

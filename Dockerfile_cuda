@@ -21,8 +21,7 @@ RUN .venv/bin/pip install --no-cache-dir --upgrade pip
 RUN .venv/bin/pip install --no-cache-dir torch==2.14.1 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cu130
 
 RUN .venv/bin/pip install --no-cache-dir -r requirements.txt
-RUN .venv/bin/pip install --no-cache-dir --no-deps swift-f0==0.3.0
+RUN .venv/bin/pip install --no-cache-dir --no-deps swift-f0==0.3.0 pyrnnoise==0.4.6
 
-EXPOSE 6969
-
-CMD [".venv/bin/python", "app.py", "--server-name", "0.0.0.0"]
+ENTRYPOINT [".venv/bin/python", "core.py"]
+CMD ["--help"]

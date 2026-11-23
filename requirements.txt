@@ -12,12 +12,10 @@ scipy==1.17.1; python_version < "3.12"
 scikit-learn==1.9.0
 soundfile==0.14.0
 sounddevice>=0.5.0,<1
-sv-ttk==2.6.1
-noisereduce==3.0.3
-pedalboard==0.9.26
 stftpitchshift==2.0
 soxr==1.1.0
 fireredvad==0.0.2
+# Installed with --no-deps by run-install: swift-f0==0.3.0, pyrnnoise==0.4.6
 
 torch==2.14.1
 setuptools<82
@@ -30,8 +28,6 @@ huggingface_hub>=1.5.0,<2
 
 matplotlib==3.11.0
 tensorboard==2.21.0
-gradio==6.29.1
-websockets>=13,<16
 
 beautifulsoup4==4.15.0
 psutil==7.2.2

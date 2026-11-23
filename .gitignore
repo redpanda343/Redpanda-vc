@@ -15,6 +15,7 @@
 *.zip
 *.png
 !assets/applio_mascot.png
+!desktop/ui/redpanda-aero.png
 *.safetensors
 *.nbi
 *.nbc
@@ -38,4 +39,10 @@ venv
 /weights/
 /custom-base/
 *.cvc
+/desktop/target/
+/desktop/gen/schemas/
+/dist/
+/uploads/
+/datasets/
+/assets/desktop_python.json
 

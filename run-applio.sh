@@ -3,14 +3,11 @@ set -euo pipefail
 
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 
-if [ "$(id -u)" -eq 0 ]; then
-    echo "Applio does not require root permissions and should be run as a regular user."
-    exit 1
+if [ -x ./redpanda ]; then
+    exec ./redpanda "$@"
 fi
-
-if [ ! -d env ]; then
-    echo "Please run './run-install.sh' first to set up the environment."
-    exit 1
+if [ -x desktop/target/release/redpanda ]; then
+    exec desktop/target/release/redpanda "$@"
 fi
-
-env/bin/python app.py --open
+printf '%s\n' 'Build with cargo build --release --locked --manifest-path desktop/Cargo.toml'
+exit 1

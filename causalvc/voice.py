@@ -38,7 +38,7 @@ import uuid
 import zipfile
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(os.environ.get("REDPANDA_DATA_ROOT") or Path(__file__).resolve().parent.parent).resolve()
 SUFFIXES = (".causalvc.json", ".nextvc.json")
 #: A voice packed into one file.
 CVC_SUFFIX = ".cvc"

@@ -27,9 +27,10 @@ if sys.platform != "win32":  # PyTorch supports this only on Linux
     # taken. Set before torch is imported; a value the user set themselves is kept.
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(os.environ.get("REDPANDA_DATA_ROOT") or Path(__file__).resolve().parent.parent).resolve()
+RUNS = Path(os.environ.get("CAUSALVC_RUNS") or (ROOT / "runs" / "models")).resolve()
 DEFAULT_BASES = ("runs/models/dec-s8-100hz-v4", "runs/models/dec-s7-100hz", "runs/models/dec-s6-100hz", "runs/models/dec-s6")
-CUSTOM = ROOT / "custom-base"
+CUSTOM = (ROOT / "models" / "custom-base") if os.environ.get("REDPANDA_DATA_ROOT") else (ROOT / "custom-base")
 
 
 def bases() -> dict[str, Path]:
@@ -124,7 +125,7 @@ def main() -> None:
     from causalvc.progress import stop_before_training
 
     run = a.run or f"voice-{a.name}"
-    run_dir = ROOT / "runs/models" / run
+    run_dir = RUNS / run
     stop_file = Path(os.environ.get("CAUSALVC_STOP_FILE", run_dir / "stop"))
     if stop_before_training(stop_file):
         return
@@ -167,7 +168,7 @@ def main() -> None:
     index_bank = max(0, a.index_bank)
     exc = a.exc or ("bandlimit" if base.get("exc", "full") == "full" else base["exc"])
     smooth_in = (base.get("smooth_in") or "cp") if a.smooth_in is None else a.smooth_in
-    argv = ["--name", run, "--encoder", encoder,
+    argv = ["--name", run, "--out", str(RUNS), "--encoder", encoder,
             "--disc", str(base["disc"]), "--bands", str(base["bands"]), "--lookahead", str(base["lookahead"]),
             "--channels", str(base["channels"]), "--dim", str(base["dim"]), "--exc", exc,
             "--batch", str(a.batch), "--lr", "1e-4", "--stft-loss", "20", "--steps", str(a.steps),

@@ -47,8 +47,10 @@ import threading
 import uuid
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-SETTINGS = ROOT / "runs" / "gui.json"
+CODE_ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(os.environ.get("REDPANDA_DATA_ROOT") or CODE_ROOT).resolve()
+RUNS = Path(os.environ.get("CAUSALVC_RUNS") or (ROOT / "runs" / "models")).resolve()
+SETTINGS = (ROOT / "assets" / "causal_gui.json") if os.environ.get("REDPANDA_DATA_ROOT") else (ROOT / "runs" / "gui.json")
 PROGRESS = re.compile(r"^step (\d+)/(\d+) \((\d+)%\)\s+elapsed (\S+)\s+remaining (\S+)\s+([\d.]+) it/s")
 #: Library warnings that say nothing about the build.
 NOISE = ("Warning", "warnings.warn", "WeightNorm.apply", "_canonical_mask")
@@ -132,7 +134,7 @@ class Job:
     def start(self, name: str, audio: str, batch: int, steps: int, save_every: int, base: str, device: str,
               restart: bool = False, app_models: str = "", fixes: bool = True, noise: bool = False,
               colour: bool = True) -> None:
-        self.run_dir, self.stopping = ROOT / "runs" / "models" / f"voice-{name}", False
+        self.run_dir, self.stopping = RUNS / f"voice-{name}", False
         self.stop_file = self.run_dir / f".stop-{uuid.uuid4().hex}"
         self.stopped = False
         cmd = [sys.executable, "-u", "-m", "causalvc.build", "--name", name, "--audio", audio, "--batch", str(batch),
@@ -150,7 +152,7 @@ class Job:
         # Trained to stay quiet through clicks, snaps, claps and background noise; costs a little on whispers and laughs.
         cmd += ["--noise-aug", "0.6"] if noise else []
         cmd += ["--app-models", app_models] if app_models else []
-        env = dict(os.environ, PYTHONPATH=str(ROOT), CAUSALVC_PROGRESS_SECONDS="1", PYTHONIOENCODING="utf-8",
+        env = dict(os.environ, PYTHONPATH=str(CODE_ROOT), CAUSALVC_PROGRESS_SECONDS="1", PYTHONIOENCODING="utf-8",
                    CAUSALVC_STOP_FILE=str(self.stop_file))
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         self.proc = subprocess.Popen(cmd, cwd=ROOT, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,

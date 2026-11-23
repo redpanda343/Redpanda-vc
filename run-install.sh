@@ -84,7 +84,7 @@ install_dependencies() {
     uv pip install -r "$INSTALL_DIR/requirements.txt" \
         --extra-index-url https://download.pytorch.org/whl/cu130 \
         --index-strategy unsafe-best-match
-    uv pip install --no-deps swift-f0==0.3.0
+    uv pip install --no-deps swift-f0==0.3.0 pyrnnoise==0.4.6
     conda deactivate
     echo "Dependencies installation complete."
     echo
@@ -100,5 +100,5 @@ printf 'Installation time: %d hours, %d minutes, %d seconds.\n\n' \
     $((elapsed / 3600)) $(((elapsed % 3600) / 60)) $((elapsed % 60))
 
 echo "Applio has been installed successfully!"
-echo "To start Applio, please run './run-applio.sh'."
+echo "Open redpanda or choose Connect in Runtime settings."
 echo

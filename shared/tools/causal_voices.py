@@ -1,12 +1,13 @@
 import json
 import math
+import os
 from pathlib import Path
 
 from causalvc.voice import CVC_SETTINGS, CVC_SUFFIX, SUFFIXES, is_cvc, settings_in
 
 
-ROOT = Path(__file__).resolve().parents[2]
-VOICE_RUNS = ROOT / "runs" / "models"
+ROOT = Path(os.environ.get("REDPANDA_DATA_ROOT") or Path(__file__).resolve().parents[2]).resolve()
+VOICE_RUNS = Path(os.environ.get("CAUSALVC_RUNS") or (ROOT / "runs" / "models")).resolve()
 SAMPLE_RATE = 48000
 VOICE_SUFFIXES = (CVC_SUFFIX, *SUFFIXES)
 

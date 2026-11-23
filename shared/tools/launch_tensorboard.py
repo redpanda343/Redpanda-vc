@@ -8,6 +8,7 @@ from tensorboard import program
 
 log_path = os.path.abspath("logs")
 _tb_url = None
+_tb_error = None
 _tb_thread = None
 _tb_ready = threading.Event()
 _tb_lock = threading.Lock()
@@ -55,9 +56,14 @@ def get_tb_url():
     return None
 
 
+def get_tb_error():
+    return _tb_error
+
+
 def launch_tensorboard_pipeline():
     logging.getLogger("root").setLevel(logging.WARNING)
     logging.getLogger("tensorboard").setLevel(logging.WARNING)
+    logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
     tb = _new_tensorboard()
     url = tb.launch()
@@ -67,34 +73,39 @@ def launch_tensorboard_pipeline():
         time.sleep(600)
 
 
-def launch_tensorboard():
-    global _tb_url, _tb_thread
+def launch_tensorboard(quiet: bool = False):
+    global _tb_url, _tb_error, _tb_thread
     with _tb_lock:
         if _tb_thread is not None and _tb_thread.is_alive():
             _tb_ready.wait(timeout=10)
             return get_tb_url()
         _tb_url = None
+        _tb_error = None
         _tb_ready.clear()
-        _tb_thread = threading.Thread(target=_start_tb, daemon=True)
+        _tb_thread = threading.Thread(target=_start_tb, args=(quiet,), daemon=True)
         _tb_thread.start()
     _tb_ready.wait(timeout=15)
     return get_tb_url()
 
 
-def _start_tb():
-    global _tb_url
+def _start_tb(quiet: bool = False):
+    global _tb_url, _tb_error
     logging.getLogger("root").setLevel(logging.WARNING)
-    logging.getLogger("tensorboard").setLevel(logging.WARNING)
+    logging.getLogger("tensorboard").setLevel(logging.ERROR if quiet else logging.WARNING)
+    logging.getLogger("werkzeug").setLevel(logging.ERROR)
     tb = _new_tensorboard()
     try:
         _tb_url = tb.launch()
     except Exception as error:
         _tb_url = None
-        print(f"TensorBoard failed to start: {error}")
+        _tb_error = str(error) or type(error).__name__
+        if not quiet:
+            print(f"TensorBoard failed to start: {error}")
     finally:
         _tb_ready.set()
     if not _tb_url:
         return
-    print(f"TensorBoard running at: {_tb_url}{PINNED_CARDS}")
+    if not quiet:
+        print(f"TensorBoard running at: {_tb_url}{PINNED_CARDS}")
     while True:
         time.sleep(600)

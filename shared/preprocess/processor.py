@@ -1,7 +1,6 @@
 import os
 
 import librosa
-import noisereduce as nr
 import numpy as np
 import soundfile as sf
 from scipy import signal
@@ -228,10 +227,9 @@ class PreProcess:
     def should_stream_simple_audio(
         self,
         path: str,
-        noise_reduction: bool,
         normalization_mode: str,
     ) -> bool:
-        if noise_reduction or normalization_mode != "none":
+        if normalization_mode != "none":
             return False
         try:
             duration = float(sf.info(_clean_audio_path(path)).duration)
@@ -283,8 +281,6 @@ class PreProcess:
         path: str,
         idx0: int,
         sid: int,
-        noise_reduction: bool,
-        reduction_strength: float,
         chunk_len: float,
         overlap_len: float,
         normalization_mode: str,
@@ -297,7 +293,6 @@ class PreProcess:
     ):
         if truncate_silence_enabled and self.should_stream_simple_audio(
             path,
-            noise_reduction,
             normalization_mode,
         ):
             return self.process_simple_audio_streaming(
@@ -324,12 +319,7 @@ class PreProcess:
                 action=truncate_silence_action,
                 compress_percent=truncate_silence_compress_percent,
             )
-        audio = self._prepare_audio(
-            audio,
-            noise_reduction,
-            reduction_strength,
-            normalization_mode,
-        )
+        audio = self._prepare_audio(audio, normalization_mode)
         normalization_gain = 1.0
         if normalization_mode == "post" and audio is not None:
             normalization_gain = self._detect_post_normalization_gain(audio)
@@ -347,17 +337,11 @@ class PreProcess:
     def _prepare_audio(
         self,
         audio: np.ndarray,
-        noise_reduction: bool,
-        reduction_strength: float,
         normalization_mode: str,
     ):
         audio = signal.lfilter(self.b_high, self.a_high, audio)
         if normalization_mode == "pre":
             audio = self._normalize_audio(audio)
-        if noise_reduction and audio is not None and audio.size:
-            audio = nr.reduce_noise(
-                y=audio, sr=self.sr, prop_decrease=reduction_strength
-            )
         return audio
 
     def _process_automatic(
@@ -365,18 +349,11 @@ class PreProcess:
         path: str,
         idx0: int,
         sid: int,
-        noise_reduction: bool,
-        reduction_strength: float,
         normalization_mode: str,
     ):
         audio = load_audio_ffmpeg(path, self.sr)
         duration_s = librosa.get_duration(y=audio, sr=self.sr)
-        audio = self._prepare_audio(
-            audio,
-            noise_reduction,
-            reduction_strength,
-            normalization_mode,
-        )
+        audio = self._prepare_audio(audio, normalization_mode)
         if audio is None:
             return duration_s, 0
         normalization_gain = 1.0
@@ -424,20 +401,13 @@ class PreProcess:
         path: str,
         idx0: int,
         sid: int,
-        noise_reduction: bool,
-        reduction_strength: float,
         normalization_mode: str,
         threshold_db: float,
         minimum_seconds: float,
     ):
         audio = load_audio_ffmpeg(path, self.sr)
         duration_s = len(audio) / self.sr
-        audio = self._prepare_audio(
-            audio,
-            noise_reduction,
-            reduction_strength,
-            normalization_mode,
-        )
+        audio = self._prepare_audio(audio, normalization_mode)
         if audio is None:
             return duration_s, 0
         normalization_gain = 1.0
@@ -471,8 +441,6 @@ class PreProcess:
         idx0: int,
         sid: int,
         cut_preprocess: str,
-        noise_reduction: bool,
-        reduction_strength: float,
         chunk_len: float,
         overlap_len: float,
         normalization_mode: str,
@@ -487,8 +455,6 @@ class PreProcess:
                     path,
                     idx0,
                     sid,
-                    noise_reduction,
-                    reduction_strength,
                     normalization_mode,
                     pause_threshold_db,
                     pause_minimum_seconds,
@@ -498,19 +464,12 @@ class PreProcess:
                     path,
                     idx0,
                     sid,
-                    noise_reduction,
-                    reduction_strength,
                     normalization_mode,
                 )
 
             audio = load_audio_ffmpeg(path, self.sr)
             audio_length = librosa.get_duration(y=audio, sr=self.sr)
-            audio = self._prepare_audio(
-                audio,
-                noise_reduction,
-                reduction_strength,
-                normalization_mode,
-            )
+            audio = self._prepare_audio(audio, normalization_mode)
             if audio is None:
                 return audio_length, skipped_short
             normalization_gain = 1.0

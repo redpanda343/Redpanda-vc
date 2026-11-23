@@ -1,5 +1,7 @@
 .git
 .github
+desktop
+dist
 env
 venv
 .venv
@@ -22,7 +24,10 @@ __pycache__
 assets/audios
 assets/datasets
 assets/config.json
-logs
+logs/*
+!logs/mute/
+!logs/mute_spin-v2/
+!logs/mute*/**
 models
 runs
 weights

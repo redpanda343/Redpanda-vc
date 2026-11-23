@@ -4,6 +4,7 @@ import os
 from random import shuffle
 
 current_directory = os.getcwd()
+_CODE_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def generate_config(sample_rate: int, model_path: str, version: str = "v2"):
@@ -13,9 +14,9 @@ def generate_config(sample_rate: int, model_path: str, version: str = "v2"):
     if version == "v1":
         if int(sample_rate) != 40000:
             raise ValueError("RVC v1 preprocessing requires a 40000 Hz model.")
-        config_path = os.path.join("rvc", "configs", "v1", "40k.json")
+        config_path = os.path.join(_CODE_ROOT, "rvc", "configs", "v1", "40k.json")
     else:
-        config_path = os.path.join("rvc", "configs", f"{sample_rate}.json")
+        config_path = os.path.join(_CODE_ROOT, "rvc", "configs", f"{sample_rate}.json")
     config_save_path = os.path.join(model_path, "config.json")
     if os.path.exists(config_save_path):
         with open(config_save_path, "r", encoding="utf-8") as config_file:

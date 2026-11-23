@@ -23,48 +23,6 @@ RESAMPLE_FILTER = dict(
 logger = logging.getLogger(__name__)
 
 
-def smoothing_ramp(count):
-    return torch.cat((torch.linspace(0, 1, count + 2)[:-1], torch.linspace(1, 0, count + 2)))[1:-1]
-
-
-def amplitude_db(spectrum, top_db=40.0):
-    values = 20 * torch.log10(spectrum.abs() + torch.finfo(torch.float64).eps)
-    return torch.max(values, (values.max(-1).values - top_db).unsqueeze(-1))
-
-
-class BlockTorchGate(torch.nn.Module):
-    def __init__(self, sr, n_fft, prop_decrease=0.9, std_threshold=1.5, freq_smooth_hz=500, time_smooth_ms=50):
-        super().__init__()
-        self.n_fft = n_fft
-        self.hop_length = n_fft // 4
-        self.prop_decrease = prop_decrease
-        self.std_threshold = std_threshold
-        self.register_buffer("window", torch.hann_window(n_fft), persistent=False)
-        frequency = int(freq_smooth_hz / (sr / (n_fft / 2)))
-        time_bins = int(time_smooth_ms / ((self.hop_length / sr) * 1000))
-        smoothing = None
-        if frequency > 1 or time_bins > 1:
-            smoothing = torch.outer(smoothing_ramp(frequency), smoothing_ramp(time_bins))[None, None]
-            smoothing = smoothing / smoothing.sum()
-        self.register_buffer("smoothing", smoothing, persistent=False)
-
-    def _stft(self, audio):
-        return torch.stft(audio, n_fft=self.n_fft, hop_length=self.hop_length, win_length=self.n_fft,
-                          return_complex=True, pad_mode="constant", center=True, window=self.window)
-
-    def forward(self, x, xn):
-        spectrum = self._stft(x)
-        spectrum_db = amplitude_db(spectrum)
-        deviation, mean = torch.std_mean(amplitude_db(self._stft(xn)).to(spectrum_db.dtype), dim=-1)
-        mask = spectrum_db > (mean + deviation * self.std_threshold).unsqueeze(2)
-        mask = self.prop_decrease * (mask.float() - 1.0) + 1.0
-        if self.smoothing is not None:
-            mask = F.conv2d(mask.unsqueeze(1), self.smoothing.to(mask.dtype), padding="same").squeeze(1)
-        y = torch.istft(spectrum * mask, n_fft=self.n_fft, hop_length=self.hop_length, win_length=self.n_fft,
-                        center=True, window=self.window)
-        return y.to(dtype=x.dtype)
-
-
 def frame_rms(signal, frame_length, hop_length):
     power = np.pad(np.square(signal), frame_length // 2)
     frames = np.lib.stride_tricks.sliding_window_view(power, frame_length)[::hop_length]
@@ -72,8 +30,8 @@ def frame_rms(signal, frame_length, hop_length):
 
 
 DEVICE_BUFFERS = (
-    "input_wav", "input_wav_denoise", "input_wav_res", "sola_buffer", "sola_den_kernel", "sola_positions",
-    "nr_buffer", "output_buffer", "fade_in_window", "fade_out_window", "resampler", "resampler2", "tg",
+    "input_wav", "input_wav_res", "sola_buffer", "sola_den_kernel", "sola_positions",
+    "fade_in_window", "fade_out_window", "resampler", "resampler2",
 )
 
 
@@ -85,6 +43,8 @@ class RealtimeProcessor:
     def __init__(self):
         self.rvc = None
         self.causal = None
+        self.rnnoise = None
+        self._rnnoise_active = False
         self.settings = {}
         self.sample_rate = 0
         self.channels = 1
@@ -93,6 +53,18 @@ class RealtimeProcessor:
         self.last_block_ms = 0
         self.input_level = 0.0
         self.output_level = 0.0
+
+    def ensure_rnnoise(self):
+        if self.rnnoise is not None and self.rnnoise.sample_rate == self.sample_rate:
+            return self.rnnoise
+        if self.rnnoise is not None:
+            self.rnnoise.close()
+            self.rnnoise = None
+        from shared.tools.rnnoise import RNNoiseDenoiser
+
+        self.rnnoise = RNNoiseDenoiser(self.sample_rate)
+        self._rnnoise_active = False
+        return self.rnnoise
 
     def load_model(self, settings):
         self.settings = settings
@@ -117,6 +89,12 @@ class RealtimeProcessor:
 
     @torch.inference_mode()
     def prepare(self):
+        self._rnnoise_active = False
+        if self.rnnoise is not None and self.rnnoise.sample_rate != self.sample_rate:
+            self.rnnoise.close()
+            self.rnnoise = None
+        if self.settings.get("input_noise_reduce"):
+            self.ensure_rnnoise().reset()
         if self.causal is not None:
             self.block_frame = self.causal.prepare(self.sample_rate)
             self.zc = self.sample_rate // 100
@@ -151,7 +129,6 @@ class RealtimeProcessor:
             device=device,
             dtype=torch.float32,
         )
-        self.input_wav_denoise = self.input_wav.clone()
         self.input_wav_res = torch.zeros(
             160 * self.input_wav.shape[0] // self.zc, device=device, dtype=torch.float32
         )
@@ -163,8 +140,6 @@ class RealtimeProcessor:
         self.sola_buffer = torch.zeros(self.sola_buffer_frame, device=device, dtype=torch.float32)
         self.sola_den_kernel = torch.ones(1, 1, self.sola_buffer_frame, device=device, dtype=torch.float32)
         self.sola_positions = torch.arange(self.block_frame + self.sola_buffer_frame, device=device)
-        self.nr_buffer = self.sola_buffer.clone()
-        self.output_buffer = self.input_wav.clone()
         self.skip_head = self.extra_frame // self.zc
         self.return_length = (self.block_frame + self.sola_buffer_frame + self.sola_search_frame) // self.zc
         self.fade_in_window = (
@@ -186,14 +161,15 @@ class RealtimeProcessor:
                 Resample(orig_freq=self.rvc.sample_rate, new_freq=rate, dtype=torch.float32, **RESAMPLE_FILTER).to(device),
                 "output resample", graph_enabled,
             )
-        self.tg = BlockTorchGate(sr=rate, n_fft=4 * self.zc, prop_decrease=0.9).to(device)
 
     def _reset_buffers(self):
-        for buffer in (self.input_wav, self.input_wav_denoise, self.input_wav_res, self.output_buffer,
-                       self.sola_buffer, self.nr_buffer):
+        for buffer in (self.input_wav, self.input_wav_res, self.sola_buffer):
             buffer.zero_()
         self.rms_buffer[:] = 0
         self.recent_input[:] = 0
+        self._rnnoise_active = False
+        if self.rnnoise is not None:
+            self.rnnoise.reset()
         if self.rvc is not None:
             self.rvc.reset_caches()
 
@@ -243,6 +219,10 @@ class RealtimeProcessor:
     def _release_models(self):
         self.rvc = None
         self.causal = None
+        self._rnnoise_active = False
+        if self.rnnoise is not None:
+            self.rnnoise.close()
+            self.rnnoise = None
         for name in DEVICE_BUFFERS:
             setattr(self, name, None)
         gc.collect()
@@ -309,6 +289,16 @@ class RealtimeProcessor:
         indata *= np.float32(db_to_linear(settings["input_gain_db"]))
         np.clip(indata, -1.0, 1.0, out=indata)
         self.input_level = float(np.abs(indata).max(initial=0.0))
+        if settings.get("input_noise_reduce") and not warm_up:
+            denoiser = self.ensure_rnnoise()
+            if not self._rnnoise_active:
+                denoiser.reset()
+                self._rnnoise_active = True
+            indata = denoiser.process(indata)
+        elif self._rnnoise_active:
+            self._rnnoise_active = False
+            if self.rnnoise is not None:
+                self.rnnoise.reset()
         if self.causal is not None:
             return self._process_causal(indata, started)
         if settings["threshold"] > -60:
@@ -320,21 +310,8 @@ class RealtimeProcessor:
         tail = indata[-recent.shape[0] :]
         recent[-tail.shape[0] :] = tail
         self.input_wav_res[: -self.block_frame_16k] = self.input_wav_res[self.block_frame_16k :].clone()
-        denoise = settings["input_noise_reduce"]
-        if denoise:
-            self.input_wav_denoise[: -self.block_frame] = self.input_wav_denoise[self.block_frame :].clone()
-            input_wav = self.input_wav[-self.sola_buffer_frame - self.block_frame :]
-            input_wav = self.tg(input_wav.unsqueeze(0), self.input_wav.unsqueeze(0)).squeeze(0)
-            input_wav[: self.sola_buffer_frame] *= self.fade_in_window
-            input_wav[: self.sola_buffer_frame] += self.nr_buffer * self.fade_out_window
-            self.input_wav_denoise[-self.block_frame :] = input_wav[: self.block_frame]
-            self.nr_buffer[:] = input_wav[self.block_frame :]
-            resample_input = self.input_wav_denoise[-self.block_frame - 2 * self.zc :]
-            self.input_wav_res[-self.block_frame_16k - 160 :] = self.resampler(resample_input)[160:]
-        else:
-            resample_input = self.input_wav[-indata.shape[0] - 2 * self.zc :]
-            self.input_wav_res[-160 * (indata.shape[0] // self.zc + 1) :] = self.resampler(resample_input)[160:]
-        source = self.input_wav_denoise if denoise else self.input_wav
+        resample_input = self.input_wav[-indata.shape[0] - 2 * self.zc :]
+        self.input_wav_res[-160 * (indata.shape[0] // self.zc + 1) :] = self.resampler(resample_input)[160:]
         passthrough = settings["passthrough"] and not warm_up
         infer_seconds = 0.0
         start = max(0, self.extra_frame - self.rvc.pitch_lookahead_frames(settings["f0_method"]) * self.zc)
@@ -342,7 +319,7 @@ class RealtimeProcessor:
         silent = passthrough or quiet
         if silent:
             self.rvc.skip_block(self.block_frame_16k)
-            infer_wav = torch.zeros_like(source[self.extra_frame :])
+            infer_wav = torch.zeros_like(self.input_wav[self.extra_frame :])
         else:
             infer_wav, infer_seconds = self.rvc.infer(
                 self.input_wav_res,
@@ -355,12 +332,8 @@ class RealtimeProcessor:
                 infer_wav = self.resampler2(infer_wav)
             else:
                 infer_wav = infer_wav.clone()
-        if settings["output_noise_reduce"] and not silent:
-            self.output_buffer[: -self.block_frame] = self.output_buffer[self.block_frame :].clone()
-            self.output_buffer[-self.block_frame :] = infer_wav[-self.block_frame :]
-            infer_wav = self.tg(infer_wav.unsqueeze(0), self.output_buffer.unsqueeze(0)).squeeze(0)
         if settings["rms_mix_rate"] < 1 and not silent:
-            infer_wav = self._mix_volume(infer_wav, source)
+            infer_wav = self._mix_volume(infer_wav, self.input_wav)
         output_block = self._apply_sola(infer_wav)
         gain = db_to_linear(settings["output_gain_db"])
         if warm_up and not bool(torch.isfinite(output_block).all()):

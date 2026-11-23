@@ -1,0 +1,31 @@
+{
+  "productName": "Redpanda VC",
+  "identifier": "com.redpanda.vc",
+  "version": "0.1.0",
+  "build": {
+    "frontendDist": "ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Redpanda VC",
+        "width": 1160,
+        "height": 780,
+        "minWidth": 640,
+        "minHeight": 460,
+        "visible": false,
+        "dragDropEnabled": false,
+        "backgroundColor": "#fff6f4"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self' data: blob:; frame-src 'self' http://127.0.0.1:* http://localhost:*; connect-src 'self' ipc: http://ipc.localhost https://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": false,
+    "icon": ["../assets/red_panda_favicon.ico", "../assets/applio_mascot.png"]
+  }
+}

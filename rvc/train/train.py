@@ -8,6 +8,7 @@ import glob
 import json
 import logging
 import math
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from random import randint
 
@@ -538,6 +539,46 @@ class Trainer:
         self.epoch = 0
         self.epoch_step = 0
         self.logged_losses = None
+        self.progress_file = os.environ.get("REDPANDA_PROGRESS_FILE") if self.rank == 0 else None
+        self._progress_started = 0.0
+        self._progress_start_step = 0
+        self._progress_last_write = 0.0
+
+    def _report_progress(self, force=False):
+        if not self.progress_file:
+            return
+        now = time.monotonic()
+        if not force and (now - self._progress_last_write) < 0.25:
+            return
+        self._progress_last_write = now
+        elapsed = max(0.0, now - self._progress_started)
+        done = max(0, self.global_step - self._progress_start_step)
+        rate = done / elapsed if done > 0 and elapsed > 0 else 0.0
+        total = max(self.args.total_steps, self.global_step)
+        remaining = max(0, total - self.global_step)
+        eta = (remaining / rate) if rate > 0 else None
+        payload = {
+            "step": int(self.global_step),
+            "total": int(total),
+            "epoch": int(self.epoch),
+            "rate": round(rate, 2),
+            "elapsed": round(elapsed, 1),
+            "eta": round(eta, 1) if eta is not None else None,
+        }
+        if self.logged_losses is not None:
+            g_loss, d_loss, mel_loss = self.logged_losses
+            payload["losses"] = {
+                "g": round(float(g_loss), 3),
+                "d": round(float(d_loss), 3),
+                "mel": round(float(mel_loss), 3),
+            }
+        tmp = f"{self.progress_file}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+            os.replace(tmp, self.progress_file)
+        except OSError:
+            pass
 
     def fit(self):
         self.build_data()
@@ -579,11 +620,15 @@ class Trainer:
             dynamic_ncols=True,
             disable=self.rank != 0 or finished,
         )
+        self._progress_started = time.monotonic()
+        self._progress_start_step = self.global_step
+        self._report_progress(force=True)
         try:
             while self.global_step < total_steps:
                 self.train_epoch(epoch, start_batch)
                 epoch, start_batch = epoch + 1, 0
         finally:
+            self._report_progress(force=True)
             self.progress.close()
             if self.exporter is not None:
                 self.exporter.close()
@@ -931,6 +976,7 @@ class Trainer:
             self.epoch_step += 1
             self.progress.update(1)
             final = self.global_step >= self.args.total_steps
+            self._report_progress(force=final or self.global_step == self._progress_start_step + 1)
             if final or self.global_step % self.args.save_every_steps == 0:
                 self.save(epoch, final)
             if final:

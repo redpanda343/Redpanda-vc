@@ -150,7 +150,7 @@ def _watch_training(process, logs_root, model_name, run_id, on_success):
         _set_finished_message(logs_root, model_name, run_id, message)
 
 
-def start_training(command, logs_root, model_name, cwd=None, on_success=None):
+def start_training(command, logs_root, model_name, cwd=None, on_success=None, env=None):
     if not model_name:
         return "Select a model before starting training."
 
@@ -160,7 +160,7 @@ def start_training(command, logs_root, model_name, cwd=None, on_success=None):
         if state.get("status") in ACTIVE_STATES:
             return state.get("message", "Training is already active for this model.")
 
-        process = subprocess.Popen(command, cwd=cwd)
+        process = subprocess.Popen(command, cwd=cwd, env=env)
         process_info = psutil.Process(process.pid)
         run_id = uuid.uuid4().hex
         state = {

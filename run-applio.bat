@@ -1,24 +1,13 @@
 @echo off
-
-if /i "%cd%"=="C:\Windows\System32" (
-    color 0C
-    echo Applio does not require administrator permissions and should be run as a regular user.
-    echo.
-    pause
-    exit /b 1
-)
-
 setlocal
-for %%F in ("%~dp0.") do set "folder_name=%%~nF"
-
-title %folder_name%
-
-if not exist env (
-    echo Please run 'run-install.bat' first to set up the environment.
-    pause
-    exit /b 1
+cd /d "%~dp0"
+if exist "Redpanda.exe" (
+    start "" "Redpanda.exe"
+    exit /b
 )
-
-env\python.exe app.py --open
-echo.
-pause
+if exist "desktop\target\release\redpanda.exe" (
+    start "" "desktop\target\release\redpanda.exe"
+    exit /b
+)
+echo Build with cargo build --release --locked --manifest-path desktop\Cargo.toml
+exit /b 1

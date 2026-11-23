@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Redpanda VC</title>
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="app.js"></script>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand"><span class="mark" aria-hidden="true"><i></i><i></i><i></i></span><span>Redpanda <small>VC</small></span></div>
+      <nav aria-label="Workspace">
+        <button data-page="inference" class="selected" aria-current="page"><span aria-hidden="true">↔</span>Inference</button>
+        <button data-page="training"><span aria-hidden="true">◈</span>Training</button>
+        <button data-page="realtime"><span aria-hidden="true">≋</span>Realtime</button>
+        <button data-page="tensorboard"><span aria-hidden="true">∿</span>TensorBoard</button>
+      </nav>
+      <div class="sidebar-bottom">
+        <button id="open-data" class="sidebar-link">Open data folder</button>
+      </div>
+    </aside>
+
+    <main class="workspace">
+      <header class="hero">
+        <svg class="aero-aurora" viewBox="0 0 1200 180" preserveAspectRatio="none" aria-hidden="true">
+          <defs>
+            <linearGradient id="aero-ribbon-a" x1="0%" y1="0%" x2="100%" y2="0%">
+              <stop offset="0%" stop-color="#ffffff" stop-opacity="0.06"/>
+              <stop offset="45%" stop-color="#ffbfd4" stop-opacity="0.42"/>
+              <stop offset="100%" stop-color="#ffffff" stop-opacity="0.22"/>
+            </linearGradient>
+            <linearGradient id="aero-ribbon-b" x1="0%" y1="100%" x2="100%" y2="0%">
+              <stop offset="0%" stop-color="#ff8ab3" stop-opacity="0.05"/>
+              <stop offset="55%" stop-color="#ffffff" stop-opacity="0.34"/>
+              <stop offset="100%" stop-color="#ffd4e3" stop-opacity="0.12"/>
+            </linearGradient>
+            <radialGradient id="aero-bokeh" cx="35%" cy="35%" r="65%">
+              <stop offset="0%" stop-color="#ffffff" stop-opacity="0.65"/>
+              <stop offset="55%" stop-color="#ff9ab8" stop-opacity="0.24"/>
+              <stop offset="100%" stop-color="#ff4d84" stop-opacity="0"/>
+            </radialGradient>
+          </defs>
+          <circle cx="690" cy="48" r="56" fill="url(#aero-bokeh)"/>
+          <circle cx="835" cy="126" r="72" fill="url(#aero-bokeh)"/>
+          <circle cx="965" cy="36" r="34" fill="url(#aero-bokeh)"/>
+          <path d="M-20,142 C240,175 490,32 790,94 C980,134 1110,64 1230,12 L1230,190 L-20,190 Z" fill="url(#aero-ribbon-a)"/>
+          <path d="M-20,96 C260,18 520,164 850,82 C1020,40 1130,96 1230,52 L1230,125 C1100,152 960,118 810,148 C500,208 260,72 -20,148 Z" fill="url(#aero-ribbon-b)"/>
+          <path d="M-20,142 C240,175 490,32 790,94 C980,134 1110,64 1230,12" fill="none" stroke="rgba(255,255,255,0.68)" stroke-width="2.5"/>
+          <path d="M-20,96 C260,18 520,164 850,82 C1020,40 1130,96 1230,52" fill="none" stroke="rgba(255,230,239,0.52)" stroke-width="1.6"/>
+        </svg>
+        <div class="hero-copy"><h1 id="page-title">Inference</h1><p id="page-description">Convert an audio file or a folder with a trained voice.</p></div>
+        <div class="hero-mascot-wrap" aria-hidden="true">
+          <span class="aero-bubble b1"></span>
+          <span class="aero-bubble b2"></span>
+          <span class="aero-bubble b3"></span>
+          <img class="hero-mascot" src="redpanda-aero.png" alt="">
+        </div>
+      </header>
+
+      <div class="content">
+        <section id="inference" aria-label="Inference">
+          <form id="infer-form" class="panel stack">
+            <fieldset id="infer-fields" disabled>
+              <div class="panel-heading"><h2>Audio conversion</h2><div class="inline-controls"><button id="refresh-catalog" type="button">Refresh models</button><label class="check"><input type="checkbox" name="batch"> Folder mode</label></div></div>
+              <div class="grid two">
+                <label class="field">Voice model<span class="path"><input name="model_path" list="models" placeholder="Choose a voice" required><button type="button" data-pick="voice" data-field="model_path">Browse</button></span></label>
+                <label class="field" data-infer-rvc>Feature index <small>Optional</small><span class="path"><input name="index_path" list="indexes" placeholder="Choose an index"><button type="button" data-pick="index" data-field="index_path">Browse</button></span></label>
+                <label class="field"><span id="input-caption">Input audio</span><span class="path"><input name="input" required placeholder="Choose an audio file"><button id="infer-input-picker" type="button" data-pick="audio" data-field="input">Browse</button></span></label>
+                <label class="field"><span id="output-caption">Save as</span><span class="path"><input name="output" placeholder="Next to the input"><button id="infer-output-picker" type="button" data-pick="save" data-field="output">Browse</button></span></label>
+              </div>
+              <div class="grid three inset">
+                <label class="field">Pitch (semitones)<input type="number" name="pitch" value="0" min="-48" max="48" step="1"></label>
+                <label class="field">Index rate<input type="number" name="index_rate" min="0" max="1" step="0.01" value="0"></label>
+                <label class="field">Export format<select name="format"><option value="wav">WAV</option><option value="flac">FLAC</option><option value="mp3">MP3</option><option value="ogg">OGG</option></select></label>
+              </div>
+              <details data-infer-rvc>
+                <summary>Advanced settings</summary>
+                <div class="grid three details-content">
+                  <label class="field">Pitch tracker<select name="f0_method"><option value="rmvpe">RMVPE</option><option value="pm">Parselmouth</option><option value="swift">SwiftF0</option></select></label>
+                  <label class="field">Embedder<select name="embedder_model"><option value="contentvec">ContentVec</option><option value="spin-v2">SPIN v2</option></select></label>
+                  <label class="field">Speaker ID<input type="number" name="sid" min="0" value="0"></label>
+                  <label class="field">Protect voiceless sounds<input type="number" name="protect" min="0" max="0.5" step="0.01" value="0.5"></label>
+                  <label class="field">Normalization (dB) <small>-12 off</small><input type="number" name="normalization_db" min="-12" max="0" step="0.5" value="-12"></label>
+                  <label class="field">Seed<input type="number" name="seed" min="0" max="2147483647" value="0"></label>
+                  <label class="check"><input type="checkbox" name="split_audio"> Split long audio</label>
+                </div>
+              </details>
+              <div class="actions"><button class="primary" type="submit">Convert audio</button><button id="infer-result" type="button" hidden>Open output</button></div>
+            </fieldset>
+          </form>
+        </section>
+
+        <section id="training" aria-label="Training" hidden>
+          <div class="panel stack">
+            <div class="panel-heading"><h2>Train a voice</h2><div class="segmented" role="group" aria-label="Training engine">
+              <button id="choose-rvc" aria-pressed="true">RVC</button><button id="choose-causal" aria-pressed="false">Casual Voice Changer</button>
+            </div></div>
+            <form id="rvc-form">
+              <fieldset id="rvc-fields" disabled>
+                <div class="grid two">
+                  <label class="field">Model name<input name="model_name" placeholder="New voice or existing run" list="runs" required></label>
+                  <label class="field">Dataset folder<span class="path"><input name="dataset_path" placeholder="Choose recordings (blank to resume)"><button type="button" data-pick="folder" data-field="dataset_path">Browse</button></span></label>
+                </div>
+                <div class="grid four inset">
+                  <label class="field">Sample rate<select name="sample_rate"><option value="32000">32 kHz</option><option value="40000">40 kHz</option><option value="48000">48 kHz</option><option value="24000">24 kHz</option></select></label>
+                  <label class="field">Training steps<input name="total_steps" type="number" min="1" value="10000" required></label>
+                  <label class="field">Save every (steps)<input name="save_every_steps" type="number" min="1" value="1000" required></label>
+                  <label class="field">Batch size<input name="batch_size" type="number" min="1" value="8" required></label>
+                </div>
+                <details>
+                  <summary>Advanced settings</summary>
+                  <div class="grid three details-content">
+                    <label class="field">Version<select name="version"><option value="v2">RVC v2</option><option value="v1">RVC v1</option></select></label>
+                    <label class="field">Vocoder<select name="vocoder"><option>HiFi-GAN</option><option>RefineGAN</option></select></label>
+                    <label class="field">Precision<select name="precision"><option value="fp16">FP16</option><option value="bf16">BF16</option><option value="fp32">FP32</option></select></label>
+                    <label class="field">Model author<input name="model_author" placeholder="Optional nickname"></label>
+                    <label class="field">GPU IDs<input name="gpu" value="0" pattern="(-|[0-9]+(-[0-9]+)*)" placeholder="0, 0-1, or -"></label>
+                    <label class="field">CPU workers<input name="cpu_cores" type="number" min="1" max="64" value="4"></label>
+                    <label class="field">Pitch tracker<select name="f0_method"><option value="rmvpe">RMVPE</option><option value="swift">SwiftF0</option></select></label>
+                    <label class="field">Embedder<select name="embedder_model"><option value="contentvec">ContentVec</option><option value="spin-v2">SPIN v2</option></select></label>
+                    <label class="field">Slicing<select name="cut_preprocess"><option value="Automatic">Automatic</option><option value="Simple">Simple</option><option value="Skip">Skip</option><option value="Silence">Silence</option></select></label>
+                    <label class="field">Normalization<select name="normalization_mode"><option value="chunk">Chunk</option><option value="none">None</option><option value="pre">Pre</option><option value="post">Post (VAD)</option></select></label>
+                    <label class="field">Dataset format<select name="dataset_format"><option value="WAV 32-bit float">WAV 32-bit float</option><option value="WAV 16-bit">WAV 16-bit</option><option value="FLAC">FLAC</option></select></label>
+                    <label class="field">Chunk length (s)<input name="chunk_len" type="number" min="0.5" max="10" step="0.1" value="3.0"></label>
+                    <label class="field">Overlap (s)<input name="overlap_len" type="number" min="0" max="0.4" step="0.05" value="0.3"></label>
+                    <label class="field">Mute samples<input name="include_mutes" type="number" min="0" value="2"></label>
+                    <label class="field">Index algorithm<select name="index_algorithm"><option>Auto</option><option>Faiss</option><option>KMeans</option></select></label>
+                    <label class="field">EMA decay<input name="ema_decay" type="number" min="0" max="0.99999" step="any" value="0.999"></label>
+                    <label class="field">Warmup steps<input name="warmup_steps" type="number" min="0" value="0"></label>
+                    <label class="field">LR schedule<select name="lr_schedule"><option value="exponential">Exponential</option><option value="cosine">Cosine</option></select></label>
+                    <label class="field">LR decay interval (steps)<input name="lr_decay_steps" type="number" min="0" value="0"></label>
+                    <label class="field">Final LR ratio<input name="lr_final_ratio" type="number" min="0.0001" max="1" step="any" value="0.1"></label>
+                    <label class="field">Max audio per batch (s)<input name="max_batch_seconds" type="number" min="0" step="0.1" value="0"></label>
+                    <label class="check"><input type="checkbox" name="pretrained" checked> Use pretrained weights</label>
+                    <label class="check"><input type="checkbox" name="cache_data_in_gpu"> Cache data on GPU</label>
+                    <label class="check"><input type="checkbox" name="checkpointing"> Gradient checkpointing</label>
+                    <label class="check"><input type="checkbox" name="reset_optimizer"> Reset optimizer on resume</label>
+                    <label class="check"><input type="checkbox" name="save_only_latest" checked> Keep latest training checkpoint</label>
+                  </div>
+                  <div class="grid two details-content">
+                    <label class="field">Custom generator <small>Optional</small><span class="path"><input name="g_pretrained_path"><button type="button" data-pick="rvc" data-field="g_pretrained_path">Browse</button></span></label>
+                    <label class="field">Custom discriminator <small>Optional</small><span class="path"><input name="d_pretrained_path"><button type="button" data-pick="rvc" data-field="d_pretrained_path">Browse</button></span></label>
+                  </div>
+                </details>
+                <div class="actions"><button class="primary" type="submit">Run full workflow</button></div>
+              </fieldset>
+            </form>
+            <form id="causal-form" hidden>
+              <fieldset id="causal-fields" disabled>
+                <div class="grid two">
+                  <label class="field">Voice name<input name="name" list="causal-runs" required placeholder="New voice or existing run"></label>
+                  <label class="field">Training audio<span class="path"><input name="audio" required placeholder="Choose a file or folder"><button type="button" data-pick="audio" data-field="audio">File</button><button type="button" data-pick="folder" data-field="audio">Folder</button></span></label>
+                </div>
+                <div class="grid three inset">
+                  <label class="field">Training steps<input name="steps" type="number" min="1" value="10000" required></label>
+                  <label class="field">Save every (steps)<input name="save_every" type="number" min="1" value="10000" required></label>
+                  <label class="field">Batch size<input name="batch" type="number" min="1" value="8" required></label>
+                </div>
+                <details>
+                  <summary>Advanced settings</summary>
+                  <div class="grid two details-content">
+                    <label class="field">Device<select name="device"><option value="cuda:0">GPU 0</option><option value="cpu">CPU</option></select></label>
+                    <label class="field">Base model<span class="path"><input name="base" value="default"><button type="button" data-pick="folder" data-field="base">Browse</button></span></label>
+                    <label class="check"><input type="checkbox" name="restart"> Restart from scratch</label>
+                  </div>
+                  <p class="hint">The default base downloads on first use and is licensed for noncommercial use.</p>
+                </details>
+                <div class="actions"><button class="primary" type="submit">Train / resume</button></div>
+              </fieldset>
+            </form>
+          </div>
+        </section>
+
+        <section id="realtime" aria-label="Realtime inference" hidden>
+          <form id="realtime-form" class="panel stack">
+            <fieldset id="realtime-fields" disabled>
+              <div class="panel-heading"><h2>Audio routing</h2><button id="refresh-devices" type="button" data-locked>Refresh devices</button></div>
+              <div class="grid two">
+                <label class="field">Voice model<span class="path"><input name="model_path" list="models" placeholder="Choose a voice" required data-locked><button type="button" data-pick="voice" data-field="model_path" data-locked>Browse</button></span></label>
+                <label class="field" data-rt-rvc>Feature index <small>Optional</small><span class="path"><input name="index_path" list="indexes" data-locked><button type="button" data-pick="index" data-field="index_path" data-locked>Browse</button></span></label>
+                <label class="field">Microphone<select name="input_label" required data-locked><option value="">Scanning…</option></select></label>
+                <label class="field">Output<select name="output_label" required data-locked><option value="">Scanning…</option></select></label>
+                <label class="field">Monitor<select name="monitor_label" data-locked><option value="">Off</option></select></label>
+                <label class="field">Block time (s)<input name="block_time" type="number" min="0.01" max="1.5" step="0.01" value="0.30" data-locked></label>
+              </div>
+              <div class="grid four inset">
+                <label class="field">Pitch (semitones)<input name="pitch" type="number" min="-48" max="48" step="1" value="0" data-live></label>
+                <label class="field">Index rate<input name="index_rate" type="number" min="0" max="1" step="0.01" value="0" data-live></label>
+                <label class="field">Input gain (dB)<input name="input_gain_db" type="number" min="-24" max="24" step="0.5" value="0" data-live></label>
+                <label class="field">Output gain (dB)<input name="output_gain_db" type="number" min="-24" max="24" step="0.5" value="0" data-live></label>
+              </div>
+              <details>
+                <summary>Advanced settings</summary>
+                <div class="grid three details-content">
+                  <label class="field">Gate (dB)<input name="threshold" type="number" min="-60" max="0" step="0.1" value="-60" data-live></label>
+                  <label class="field">Monitor gain (dB)<input name="monitor_gain_db" type="number" min="-24" max="24" step="0.5" value="0" data-live></label>
+                  <label class="check"><input name="input_noise_reduce" type="checkbox" data-live> Reduce input noise (RNNoise)</label>
+                  <label class="check"><input name="all_drivers" type="checkbox" data-locked> Show all audio drivers</label>
+                  <label class="check" data-windows><input name="exclusive_input" type="checkbox" data-locked> WASAPI exclusive input</label>
+                  <label class="check" data-windows><input name="exclusive_output" type="checkbox" data-locked> WASAPI exclusive output</label>
+                </div>
+                <div class="grid three details-content" data-rt-rvc>
+                  <label class="field">Pitch tracker<select name="f0_method" data-live><option value="rmvpe">RMVPE</option><option value="pm">Parselmouth</option><option value="swift">SwiftF0</option></select></label>
+                  <label class="field">Embedder<select name="embedder_model" data-locked><option value="contentvec">ContentVec</option><option value="spin-v2">SPIN v2</option></select></label>
+                  <label class="field">Speaker ID<input name="speaker_id" type="number" min="0" value="0" data-locked></label>
+                  <label class="field">RMS mix<input name="rms_mix_rate" type="number" min="0" max="1" step="0.05" value="0" data-live></label>
+                  <label class="field">Crossfade (s)<input name="crossfade_time" type="number" min="0.01" max="0.10" step="0.01" value="0.01" data-locked></label>
+                  <label class="field">Context (s)<input name="extra_time" type="number" min="0.05" max="5" step="0.05" value="3" data-locked></label>
+                  <label class="check"><input name="use_fp32" type="checkbox" data-locked> Force FP32</label>
+                </div>
+                <div class="grid three details-content" data-rt-causal hidden>
+                  <label class="field">Pitch offset (Hz)<input name="pitch_offset_hz" type="number" min="-300" max="300" step="1" value="0" data-live></label>
+                  <label class="field">Pitch floor (Hz)<input name="pitch_floor_hz" type="number" min="0" max="500" step="1" value="0" data-live></label>
+                  <label class="field">Pitch ceiling (Hz)<input name="pitch_ceiling_hz" type="number" min="0" max="1000" step="1" value="0" data-live></label>
+                  <label class="field">Share below floor<input name="pitch_floor_keep" type="number" min="0" max="1" step="0.01" value="0.25" data-live></label>
+                  <label class="field">Share above ceiling<input name="pitch_ceiling_keep" type="number" min="0" max="1" step="0.01" value="0.25" data-live></label>
+                </div>
+                <p class="hint" data-rt-causal hidden>Set the floor or ceiling to 0 Hz to turn it off.</p>
+              </details>
+              <div class="actions"><button id="start-realtime" class="primary" type="submit">Start realtime</button><button id="stop-realtime" type="button" disabled>Stop</button><label class="check"><input name="passthrough" type="checkbox" data-live> Passthrough</label></div>
+            </fieldset>
+          </form>
+          <div class="panel telemetry">
+            <label>Input<meter id="input-level" min="0" max="1" value="0"></meter></label>
+            <label>Output<meter id="output-level" min="0" max="1" value="0"></meter></label>
+            <div><span>Latency</span><output id="latency">—</output></div>
+            <div><span>Dropouts</span><output id="dropouts">—</output></div>
+            <div><span>Sample rate</span><output id="sample-rate">—</output></div>
+          </div>
+        </section>
+
+        <section id="tensorboard" aria-label="TensorBoard" hidden>
+          <div class="panel tensorboard-panel">
+            <div class="panel-heading">
+              <div>
+                <h2>TensorBoard</h2>
+                <p id="tensorboard-status" aria-live="polite">Waiting for the Python runtime…</p>
+              </div>
+              <div class="actions compact">
+                <button id="reload-tensorboard" type="button" disabled>Reload</button>
+                <button id="open-tensorboard-browser" type="button" class="primary" disabled>Open in browser</button>
+              </div>
+            </div>
+            <iframe id="tensorboard-frame" class="tensorboard-frame" title="TensorBoard" hidden></iframe>
+          </div>
+        </section>
+
+        <section id="activity-panel" class="panel activity" aria-label="Activity">
+          <div class="panel-heading">
+            <div class="activity-title">
+              <h2>Activity</h2>
+              <span id="activity-badge" class="badge" data-state="idle">Connecting</span>
+            </div>
+            <div class="actions compact">
+              <button id="retry-runtime" type="button" hidden>Retry</button>
+              <button id="pause-job" type="button" hidden>Pause</button>
+              <button id="stop-job" type="button" hidden>Stop training</button>
+              <button id="job-output" type="button" hidden>Open output</button>
+            </div>
+          </div>
+          <ol id="job-stages" class="stages" aria-label="Workflow stages" hidden></ol>
+          <div id="job-meter" class="job-meter" hidden>
+            <div class="meter-header">
+              <strong id="job-percent">0% of 100%</strong>
+              <span id="job-steps"></span>
+            </div>
+            <progress id="job-progress" aria-label="Job progress"></progress>
+            <p id="job-meta" class="job-meta" hidden></p>
+          </div>
+          <p id="activity-status" aria-live="polite">Starting the Python runtime…</p>
+          <p id="activity-notice" class="notice" aria-live="polite" hidden></p>
+          <details id="log-details">
+            <summary><span>Logs</span><span class="log-actions"><button id="copy-log" type="button" class="mini">Copy</button><button id="clear-log" type="button" class="mini">Clear</button></span></summary>
+            <pre id="log" aria-label="Worker log" tabindex="0"></pre>
+          </details>
+        </section>
+      </div>
+      <footer class="statusbar"><span id="runtime-status"><i></i>Connecting…</span></footer>
+    </main>
+  </div>
+  <datalist id="models"></datalist><datalist id="indexes"></datalist><datalist id="runs"></datalist><datalist id="causal-runs"></datalist>
+  <dialog id="web-picker-dialog" class="file-dialog">
+    <div class="stack">
+      <div class="panel-heading"><h2 id="picker-title">Choose a file</h2><button id="picker-close" type="button" aria-label="Close file browser">×</button></div>
+      <div class="path">
+        <button id="picker-up" type="button">Up</button>
+        <input id="picker-path" aria-label="Current folder" placeholder="Enter a folder path">
+        <button id="picker-go" type="button">Go</button>
+      </div>
+      <ul id="picker-list" class="picker-list" aria-label="Folder contents"></ul>
+      <label id="picker-save-row" class="field" hidden>File name<input id="picker-filename" placeholder="output.wav"></label>
+      <p id="picker-status" class="hint" aria-live="polite"></p>
+      <div class="actions picker-actions">
+        <button id="picker-upload" type="button">Upload file…</button>
+        <input id="picker-upload-input" type="file" hidden>
+        <span class="spacer"></span>
+        <button id="picker-cancel" type="button">Cancel</button>
+        <button id="picker-confirm" type="button" class="primary" disabled>Select</button>
+      </div>
+    </div>
+  </dialog>
+  <dialog id="web-output-dialog" class="file-dialog">
+    <div class="stack">
+      <div class="panel-heading"><h2 id="output-title">Output</h2><button id="output-close" type="button" aria-label="Close output browser">×</button></div>
+      <div class="output-bar">
+        <button id="output-up" type="button" hidden>Up</button>
+        <span id="output-path" class="output-path"></span>
+      </div>
+      <div id="output-audio-wrap" class="output-audio" hidden>
+        <audio id="output-audio" controls></audio>
+      </div>
+      <ul id="output-list" class="picker-list" aria-label="Output files" hidden></ul>
+      <p id="output-status" class="hint" aria-live="polite"></p>
+      <div class="actions">
+        <a id="output-download" class="button-link primary" hidden>Download</a>
+      </div>
+    </div>
+  </dialog>
+</body>
+</html>

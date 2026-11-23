@@ -1,8 +1,4 @@
 {
-  "theme": {
-    "file": "Applio.py",
-    "class": "Applio"
-  },
   "version": "3.6.4",
   "model_author": "None",
   "precision": "fp16"
