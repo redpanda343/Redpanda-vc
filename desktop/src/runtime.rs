@@ -126,6 +126,14 @@ pub fn prepare_portable_workspace(path: &Path) -> io::Result<Workspace> {
     })
 }
 
+fn standalone_python(python_dir: &Path) -> PathBuf {
+    if cfg!(windows) {
+        python_dir.join("python.exe")
+    } else {
+        python_dir.join("bin/python3")
+    }
+}
+
 fn venv_python(venv_dir: &Path) -> PathBuf {
     if cfg!(windows) {
         venv_dir.join("Scripts/python.exe")
@@ -134,11 +142,11 @@ fn venv_python(venv_dir: &Path) -> PathBuf {
     }
 }
 
-fn venv_has_torch(venv_dir: &Path) -> bool {
+fn env_has_torch(env_dir: &Path) -> bool {
     if cfg!(windows) {
-        return venv_dir.join("Lib/site-packages/torch").is_dir();
+        return env_dir.join("Lib/site-packages/torch").is_dir();
     }
-    let lib = venv_dir.join("lib");
+    let lib = env_dir.join("lib");
     if let Ok(entries) = fs::read_dir(lib) {
         for entry in entries.flatten() {
             if entry.path().join("site-packages/torch").is_dir() {
@@ -158,10 +166,18 @@ pub fn find_existing_python(ws: &Workspace) -> Option<PathBuf> {
     }
 
     let runtime_dir = ws.data_root.join("runtime");
+    let portable_python_dir = runtime_dir.join("python");
+    let standalone_py = standalone_python(&portable_python_dir);
+    if standalone_py.is_file()
+        && (runtime_dir.join(BOOTSTRAP_MARKER).is_file() || env_has_torch(&portable_python_dir))
+    {
+        return Some(standalone_py);
+    }
+
     let portable_venv = runtime_dir.join("venv");
     let portable_py = venv_python(&portable_venv);
     if portable_py.is_file()
-        && (runtime_dir.join(BOOTSTRAP_MARKER).is_file() || venv_has_torch(&portable_venv))
+        && (runtime_dir.join(BOOTSTRAP_MARKER).is_file() || env_has_torch(&portable_venv))
     {
         return Some(portable_py);
     }
@@ -487,10 +503,13 @@ pub fn python_command(runtime: &Runtime) -> Command {
         }
     }
     if let Some(parent) = runtime.python.parent().filter(|p| p.is_absolute()) {
+        let scripts = parent.join("Scripts");
+        let dlls = parent.join("DLLs");
         let conda_libraries = parent.join("Library/bin");
         let paths = env::var_os("PATH").unwrap_or_default();
-        let search = [parent.to_path_buf(), conda_libraries]
+        let search = [parent.to_path_buf(), scripts, dlls, conda_libraries]
             .into_iter()
+            .filter(|dir| dir.is_dir())
             .chain(env::split_paths(&paths));
         if let Ok(paths) = env::join_paths(search) {
             command.env("PATH", paths);
@@ -627,6 +646,12 @@ mod tests {
         fs::write(&fake_py, b"").unwrap();
         fs::write(ws.data_root.join("runtime").join(BOOTSTRAP_MARKER), b"ok\n").unwrap();
         assert_eq!(find_existing_python(&ws), Some(fake_py));
+
+        // Relocatable standalone runtime/python should take priority when present
+        let standalone_py = standalone_python(&ws.data_root.join("runtime/python"));
+        fs::create_dir_all(standalone_py.parent().unwrap()).unwrap();
+        fs::write(&standalone_py, b"").unwrap();
+        assert_eq!(find_existing_python(&ws), Some(standalone_py));
 
         fs::remove_dir_all(&dir).unwrap();
     }
