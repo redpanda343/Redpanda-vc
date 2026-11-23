@@ -101,7 +101,7 @@ def main() -> None:
     ap.add_argument("--audio", required=True, help="folder or file of the target voice")
     ap.add_argument("--base", default="default", help="'default', a folder name under custom-base/, or a path to a base run")
     ap.add_argument("--steps", type=int, default=10000)
-    ap.add_argument("--save-every", type=int, default=0, help="steps between checkpoints (default: a quarter of --steps)")
+    ap.add_argument("--save-every", type=int, default=1000, help="steps between checkpoints (default: 1000)")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--restart", action="store_true", help="ignore an existing checkpoint for this name and start over")
@@ -172,7 +172,7 @@ def main() -> None:
             "--disc", str(base["disc"]), "--bands", str(base["bands"]), "--lookahead", str(base["lookahead"]),
             "--channels", str(base["channels"]), "--dim", str(base["dim"]), "--exc", exc,
             "--batch", str(a.batch), "--lr", "1e-4", "--stft-loss", "20", "--steps", str(a.steps),
-            "--save-every", str(a.save_every or max(1, a.steps // 4)), "--device", a.device,
+            "--save-every", str(a.save_every or 1000), "--device", a.device,
             "--voice", f"{a.name}={a.audio}", "--only", a.name, "--index-bank", str(index_bank),
             "--perturb", str(a.perturb), "--energy-loss", str(a.energy_loss), "--decorr", str(a.decorr), "--noise-aug", str(a.noise_aug)]
     argv += ["--resume"] if done is not None else ["--init", str((base_dir / "last.pt").resolve())]

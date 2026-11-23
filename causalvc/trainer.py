@@ -60,7 +60,7 @@ DEFAULT_FORM = {
     "name": "",
     "batch": 8,
     "steps": 10000,
-    "save_every": 10000,
+    "save_every": 1000,
     "base": "default",
     "device": "cuda:0",
     "fixes": True,

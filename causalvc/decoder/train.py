@@ -11,6 +11,7 @@ reconstructs the last part of the crop from them.
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import math
 import random
@@ -78,6 +79,34 @@ class Crops(torch.utils.data.Dataset):
             name: [p for p in files if any(tag in Path(p).stem for tag in EXPRESSIVE_TAGS)] if not only else []
             for name, files in spk.items()
         }
+        self.file_meta: dict[str, tuple[int, int]] = {}
+        self.cum_weights: dict[str, list[float]] = {}
+        # Weight files by duration during voice fine-tuning so mixing long and short recordings
+        # samples every second of speech evenly without slicing files on disk.
+        if only:
+            for s in self.pick:
+                name = self.names[s]
+                files = self.spk[name]
+                weights: list[float] = []
+                for p in files:
+                    try:
+                        info = sf.info(p)
+                        self.file_meta[p] = (info.frames, info.samplerate)
+                        weights.append(max(info.frames / max(1, info.samplerate), 0.05))
+                    except Exception:
+                        weights.append(1.0)
+                if len(weights) > 1:
+                    self.cum_weights[name] = list(itertools.accumulate(weights))
+
+    def _pick_file(self, name: str, pool: list[str]) -> tuple[str, int, int]:
+        cum = self.cum_weights.get(name) if pool is self.spk[name] else None
+        path = random.choices(pool, cum_weights=cum, k=1)[0] if cum and len(cum) == len(pool) else random.choice(pool)
+        meta = self.file_meta.get(path)
+        if meta is None:
+            info = sf.info(path)
+            meta = (info.frames, info.samplerate)
+            self.file_meta[path] = meta
+        return path, meta[0], meta[1]
 
     def __len__(self) -> int:
         return self.steps
@@ -89,10 +118,10 @@ class Crops(torch.utils.data.Dataset):
             if random.random() < 0.5:
                 return torch.zeros(n), s
             # Release-into-silence crop: speech that fades cleanly to exact 0 halfway through the clip.
-            path = random.choice(self.spk[self.names[s]])
-            info = sf.info(path)
-            want = int(self.seconds * info.samplerate)
-            wav, sr = sf.read(path, start=random.randint(0, max(0, info.frames - want)), frames=want, dtype="float32", always_2d=True)
+            name = self.names[s]
+            path, frames, sr_in = self._pick_file(name, self.spk[name])
+            want = int(self.seconds * sr_in)
+            wav, sr = sf.read(path, start=random.randint(0, max(0, frames - want)), frames=want, dtype="float32", always_2d=True)
             wav = torch.from_numpy(wav[:, 0])
             if sr != SR:
                 wav = torchaudio.functional.resample(wav, sr, SR)
@@ -104,15 +133,14 @@ class Crops(torch.utils.data.Dataset):
             wav[cut - fade : cut] *= 0.5 * (1.0 + torch.cos(math.pi * torch.arange(fade) / max(1, fade)))
             wav[cut:] = 0.0
             return wav, s
-        for _try in range(8):
+        for _try in range(16):
             s = random.choice(self.pick)
             name = self.names[s]
             exp = self.expressive.get(name)
             pool = exp if exp and random.random() < 0.40 else self.spk[name]
-            path = random.choice(pool)
-            info = sf.info(path)
-            want = int(self.seconds * info.samplerate)
-            start = random.randint(0, max(0, info.frames - want))
+            path, frames, sr_in = self._pick_file(name, pool)
+            want = int(self.seconds * sr_in)
+            start = random.randint(0, max(0, frames - want))
             wav, sr = sf.read(path, start=start, frames=want, dtype="float32", always_2d=True)
             wav = torch.from_numpy(wav[:, 0])
             if sr != SR:
